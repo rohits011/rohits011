@@ -1,0 +1,39 @@
+# Channel identity — this feeds directly into the script prompts.
+# The research was clear: niche + editorial voice is what separates monetizable
+# channels from demonetized "inauthentic content". Make these specific.
+channel:
+  niche: "business & finance documentary"
+  tone: "curious, concrete, narrative — follows conflicts, decisions, and consequences"
+  audience: "professionals interested in how businesses actually work"
+
+video:
+  width: 1920
+  height: 1080
+  fps: 30
+  target_minutes: 8        # long-form; Shorts RPM is 3-14% of long-form
+  words_per_minute: 150
+
+llm:
+  model: claude-opus-5-5   # script quality is the whole product; don't skimp here
+  effort: high
+
+tts:
+  provider: openai         # openai | elevenlabs
+  openai:
+    voice: alloy
+    model: gpt-4o-mini-tts # ~$0.015/min
+  elevenlabs:              # better quality, ~$0.05-0.10/1K chars
+    voice_id: ""           # pick one at elevenlabs.io/voice-library
+    model_id: eleven_multilingual_v2
+
+visuals:
+  provider: pexels         # free: 200 req/hr, 20K/mo
+
+upload:
+  privacy: private         # review on YouTube before publishing — keep this
+  category_id: "27"        # 27 = Education
+  client_secrets: secrets/client_secret.json
+  token_file: secrets/token.json
+
+paths:
+  workdir: videos          # per-video project folders live here (gitignored)

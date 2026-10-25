@@ -1,0 +1,9 @@
+anthropic
+requests
+pyyaml
+python-dotenv
+Pillow
+
+# Only needed for the upload stage:
+google-api-python-client
+google-auth-oauthlib
