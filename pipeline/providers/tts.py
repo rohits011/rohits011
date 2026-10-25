@@ -52,6 +52,33 @@ class OpenAITTS(TTSProvider):
         out_path.write_bytes(response.content)
 
 
+class EdgeTTS(TTSProvider):
+    """Microsoft Edge neural voices via the edge-tts package: free, no API key.
+
+    Quality is below ElevenLabs but solid for validating a channel at $0.
+    Unofficial endpoint, so treat it as a starter provider and swap via
+    config.yaml if it ever breaks.
+    """
+
+    def __init__(self, voice: str = "en-US-AndrewMultilingualNeural"):
+        self.voice = voice
+
+    def synthesize(self, text: str, out_path: Path) -> None:
+        import asyncio
+
+        try:
+            import edge_tts
+        except ImportError:
+            raise RuntimeError(
+                "The free TTS provider needs the edge-tts package: pip install edge-tts"
+            )
+
+        async def _speak():
+            await edge_tts.Communicate(text, self.voice).save(str(out_path))
+
+        asyncio.run(_speak())
+
+
 class DryRunTTS(TTSProvider):
     """Generates silent audio so --dry-run exercises the render stage for free."""
 
@@ -71,7 +98,9 @@ class DryRunTTS(TTSProvider):
 def make_tts(config, dry_run: bool) -> TTSProvider:
     if dry_run:
         return DryRunTTS()
-    provider = config.get("tts.provider", "openai")
+    provider = config.get("tts.provider", "edge")
+    if provider == "edge":
+        return EdgeTTS(voice=config.get("tts.edge.voice", "en-US-AndrewMultilingualNeural"))
     if provider == "elevenlabs":
         return ElevenLabsTTS(
             voice_id=config.get("tts.elevenlabs.voice_id"),

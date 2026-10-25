@@ -1,8 +1,11 @@
-anthropic
 requests
 pyyaml
 python-dotenv
 Pillow
+edge-tts        # free TTS (default provider)
+
+# Only needed if you generate scripts via the API instead of --script-file:
+anthropic
 
 # Only needed for the upload stage:
 google-api-python-client

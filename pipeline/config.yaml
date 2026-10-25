@@ -18,11 +18,13 @@ llm:
   effort: high
 
 tts:
-  provider: openai         # openai | elevenlabs
-  openai:
+  provider: edge           # edge (free, no key) | openai | elevenlabs
+  edge:
+    voice: en-US-AndrewMultilingualNeural  # list all: edge-tts --list-voices
+  openai:                  # paid upgrade, ~$0.015/min
     voice: alloy
-    model: gpt-4o-mini-tts # ~$0.015/min
-  elevenlabs:              # better quality, ~$0.05-0.10/1K chars
+    model: gpt-4o-mini-tts
+  elevenlabs:              # best quality, ~$0.05-0.10/1K chars
     voice_id: ""           # pick one at elevenlabs.io/voice-library
     model_id: eleven_multilingual_v2
 

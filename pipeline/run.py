@@ -84,6 +84,9 @@ def main():
     p_new.add_argument("--slug", help="directory name (default: derived from topic)")
     p_new.add_argument("--dry-run", action="store_true",
                        help="run the whole pipeline with offline stub providers (no API keys)")
+    p_new.add_argument("--script-file", metavar="PATH",
+                       help="use this script.json instead of generating one with the LLM "
+                            "(zero-cost mode; see README for the JSON shape)")
 
     p_resume = sub.add_parser("resume", help="continue a project from its checkpoint")
     p_resume.add_argument("slug")
@@ -111,6 +114,9 @@ def main():
     if args.command == "new":
         manifest = Manifest.create(workdir, args.topic, args.slug, args.dry_run)
         print(f"Created project '{manifest.slug}' in {manifest.project_dir}")
+        if args.script_file:
+            script.install_manual_script(manifest, args.script_file)
+            print("[script] installed from file (review gate satisfied)")
         orchestrate(manifest, config, args.until, args.yes)
 
     elif args.command == "resume":

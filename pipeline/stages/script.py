@@ -99,6 +99,34 @@ def run(ctx):
             "approved": manifest.dry_run}  # dry runs auto-approve
 
 
+def install_manual_script(manifest, script_path):
+    """Bring-your-own-script mode: install a human-provided script.json.
+
+    Zero-cost path — write the script yourself or ask Claude in a chat you
+    already pay for (the README has the exact prompt). Since the script came
+    from the human, the review gate is already satisfied.
+    """
+    with open(script_path) as f:
+        script = json.load(f)
+    _validate(script)
+
+    with open(manifest.project_dir / "script.json", "w") as f:
+        json.dump(script, f, indent=2)
+    _write_readable(manifest.project_dir / "script.md", script)
+
+    manifest.data["meta"] = {
+        "title": script.get("title", manifest.topic),
+        "description": script.get("description", ""),
+        "tags": script.get("tags", []),
+    }
+    manifest.mark_done("script", {
+        "script_file": "script.json",
+        "scene_count": len(script["scenes"]),
+        "source": "manual",
+        "approved": True,
+    })
+
+
 def load_script(ctx) -> dict:
     with open(ctx["project_dir"] / "script.json") as f:
         return json.load(f)

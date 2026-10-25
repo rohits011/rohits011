@@ -28,23 +28,50 @@ topic ──> script ──> [HUMAN REVIEW GATE] ──> voiceover ──> asset
    Studio. Also pragmatic: unverified YouTube API projects can *only* upload
    private videos, and each upload costs 1,600 of your 10,000 daily quota units.
 
-## Quick start
+## Quick start — the $0 stack
+
+No paid API needed. Script comes from you (or any Claude/ChatGPT chat you
+already have), voiceover from edge-tts (free, no key), footage from Pexels
+(free key, no card: pexels.com/api).
 
 ```bash
 cd pipeline
 pip install -r requirements.txt
 
-# Free end-to-end test — no API keys, stub script, silent audio, test-pattern video:
-python run.py new "How container shipping ate the world" --dry-run --yes
+# Free end-to-end smoke test — no keys at all, stub providers:
+python run.py new "Any topic" --dry-run --yes
 
-# Real run:
-cp .env.example .env   # fill in ANTHROPIC_API_KEY, OPENAI_API_KEY (or ElevenLabs), PEXELS_API_KEY
+# Real $0 run:
+cp .env.example .env               # fill in only PEXELS_API_KEY (free)
+python run.py new "The ATM Story" --script-file examples/sample-script.json
+#   -> voiceover -> assets -> render -> thumbnail -> upload (private)
+```
+
+To write your own script, paste this into any Claude chat and save the
+result as `my-script.json` (edit it before rendering — the editing IS the
+editorial value that keeps the channel monetizable):
+
+> Write a narration script for a ~8-minute faceless YouTube video about
+> TOPIC, in a curious, concrete, business-documentary tone. Structure it as
+> one thesis with narrative tension. No stock YouTube phrases. Output only
+> JSON in this exact shape: {"title": "...", "hook": "...", "description":
+> "... (include a one-line AI-assistance disclosure)", "tags": ["..."],
+> "scenes": [{"id": 1, "text": "40-90 words of narration",
+> "broll_keywords": "2-4 stock footage search words"}]} — the hook is
+> scene 1, ~1200 words total.
+
+## Quick start — API mode (optional paid upgrade)
+
+With `ANTHROPIC_API_KEY` set, the pipeline generates the script itself
+(3-pass: outline → draft → critique) for ~$0.10–0.50/video, then stops at
+the review gate:
+
+```bash
 python run.py new "How container shipping ate the world"
 #   -> writes videos/<slug>/script.md + script.json, then stops for review
 #   -> edit script.json (this file is authoritative)
 python run.py approve <slug>
 python run.py resume <slug>
-#   -> voiceover -> assets -> render -> thumbnail -> upload (private)
 ```
 
 Other commands: `status <slug>`, `list`, `resume <slug> --from render`
@@ -54,13 +81,13 @@ Requires `ffmpeg`/`ffprobe` on PATH.
 
 ## Cost per video (research estimates, 8-min video)
 
-| Stage | Budget | Quality |
-|---|---|---|
-| Script (Claude, 3 passes) | ~$0.10–0.50 | same |
-| TTS | OpenAI ~$0.12 | ElevenLabs ~$0.50–0.90 |
-| Footage | Pexels: free | + AI images/b-roll $1–7 |
-| Render / thumbnail | free (local ffmpeg) | free |
-| **Total** | **< $1** | **~$2–9** |
+| Stage | $0 stack | Budget API | Quality |
+|---|---|---|---|
+| Script | you + any chat: free | Claude 3-pass ~$0.10–0.50 | same |
+| TTS | edge-tts: free | OpenAI ~$0.12 | ElevenLabs ~$0.50–0.90 |
+| Footage | Pexels: free | Pexels: free | + AI images/b-roll $1–7 |
+| Render / thumbnail | free (local ffmpeg) | free | free |
+| **Total** | **$0** | **< $1** | **~$2–9** |
 
 ## YouTube upload setup (one-time)
 

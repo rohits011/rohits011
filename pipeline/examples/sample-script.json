@@ -1,0 +1,33 @@
+{
+  "title": "The ATM Was Built to Kill Bank Branches. It Did the Opposite.",
+  "hook": "In 1967, a machine bolted into a wall in north London was supposed to make bank tellers obsolete. Instead, it created more branch jobs than ever. Here's why everyone got the ATM story backwards.",
+  "description": "The strange economics of the ATM: how a machine built to replace bank tellers ended up multiplying bank branches instead, and what that says about every automation wave since. Narration is AI-assisted with human-written research; visuals are stock footage. (Example script shipped with the pipeline — verify all claims before publishing.)",
+  "tags": ["ATM history", "automation", "banking", "economics", "business documentary", "technology history", "jobs and automation", "finance explained"],
+  "scenes": [
+    {
+      "id": 1,
+      "text": "In June 1967, a Barclays branch in Enfield, north London, switched on the world's first cash machine. The press called it a robot cashier. The prediction was obvious: machines hand out the cash, so the people behind the counter disappear. Banks bought in. Over the next three decades, hundreds of thousands of ATMs went up around the world, each one supposedly a nail in the bank teller's coffin.",
+      "broll_keywords": "atm cash machine street"
+    },
+    {
+      "id": 2,
+      "text": "And the first half of the prediction came true. A cash withdrawal at an ATM cost a bank a fraction of the same transaction at a counter. By the nineties, the machines were handling the routine work: deposits, withdrawals, balance checks. The average branch needed far fewer tellers just to keep the doors open. On paper, the teller was finished.",
+      "broll_keywords": "bank counter cashier"
+    },
+    {
+      "id": 3,
+      "text": "But something strange happened on the way to the funeral. Because each branch now ran so much cheaper, opening a new one suddenly made financial sense. Banks responded by opening thousands of them. In the United States, the number of branches rose by more than a third in the decades after the ATM spread, right through the years the machines were supposedly hollowing banking out.",
+      "broll_keywords": "city bank buildings"
+    },
+    {
+      "id": 4,
+      "text": "More branches meant more jobs. Economist James Bessen found that American teller employment stayed roughly stable, around half a million people, from 1980 through 2010, even as the machines multiplied. What changed was the work itself. Freed from counting twenties, tellers became relationship staff: selling mortgages, opening accounts, solving the problems a machine couldn't.",
+      "broll_keywords": "business meeting handshake"
+    },
+    {
+      "id": 5,
+      "text": "The ATM didn't delete the teller. It deleted a task, and the job grew around what was left. That pattern has repeated with spreadsheets and accountants, with barcode scanners and cashiers, and it's the question hanging over every AI headline today. The machine takes the routine. Whether that shrinks the work or multiplies it depends on what the routine was holding back.",
+      "broll_keywords": "artificial intelligence computer"
+    }
+  ]
+}
