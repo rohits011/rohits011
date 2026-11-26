@@ -287,7 +287,7 @@ sequenceDiagram
   participant A as Authorization Server
   participant R as Orders API (resource server)
   B->>F: GET /app (no session)
-  F->>F: create state, nonce, code_verifier; store in server session
+  F->>F: create state, nonce, code_verifier, store in server session
   F-->>B: 302 to A /authorize with code_challenge = S256(verifier), state, nonce
   B->>A: GET /authorize ...
   A->>B: login page (passkey / password + MFA)
@@ -297,11 +297,11 @@ sequenceDiagram
   F->>F: verify state and iss
   F->>A: POST /token (code, code_verifier, client auth)
   A-->>F: access_token, refresh_token, id_token
-  F->>F: validate id_token (sig, iss, aud, nonce); store tokens server-side
+  F->>F: validate id_token (sig, iss, aud, nonce), store tokens server-side
   F-->>B: Set-Cookie SESSION (HttpOnly, Secure, SameSite=Lax)
   B->>F: GET /api/orders (cookie + CSRF token for writes)
   F->>R: GET /orders (Authorization: Bearer access_token)
-  R->>R: validate JWT (alg, sig, iss, aud, exp, typ); authorize
+  R->>R: validate JWT (alg, sig, iss, aud, exp, typ), authorize
   R-->>F: 200 orders
   F-->>B: 200 orders
 </pre>
