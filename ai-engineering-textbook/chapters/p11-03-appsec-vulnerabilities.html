@@ -322,3 +322,491 @@ flowchart LR
   <h3>6.5 Cost amplification</h3>
   <p>API4 includes downstream cost: an endpoint that sends an SMS costing \( c \) per message with no per-number limit lets an attacker spend \( c \times q \times t \) of your money ("SMS pumping"); an LLM-backed endpoint with no token budget does the same with model costs. Limit by the resource that costs money (per destination number, per tenant token budget), not just by request count.</p>
 </section>
+
+<section id="code">
+  <h2>7. Code: Vulnerable vs Secure, Side by Side</h2>
+  <p><span class="tag version">Version-sensitive · checked Nov 2026</span> Spring Boot 3.5 / 4.x, Spring Security 6.5 / 7.x, Java 21, Bucket4j 8.x, Python 3.12, Go 1.24+.</p>
+
+  <h3>7.1 BOLA, BOPLA and mass assignment</h3>
+  <pre data-file="AccountController.java"><code class="language-java">// VULNERABLE: entity as request body (mass assignment) and as response (excessive exposure), no ownership check.
+@PutMapping("/api/accounts/{id}")
+public Account update(@PathVariable Long id, @RequestBody Account incoming) {
+    incoming.setId(id);
+    return accountRepository.save(incoming);   // client can set role, balance, ownerId...; response leaks passwordHash
+}</code></pre>
+  <pre data-file="AccountController.java (secure)"><code class="language-java">package com.example.accounts;
+
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+import java.util.UUID;
+import org.springframework.http.HttpStatus;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
+
+@RestController
+@RequestMapping("/api/accounts")
+class AccountController {
+
+    // Only fields a customer may change. Unknown JSON properties are rejected (see JacksonConfig).
+    record UpdateProfileRequest(
+        @NotBlank @Size(max = 100) String displayName,
+        @Email @Size(max = 254) String contactEmail) {}
+
+    // Only fields a customer may see.
+    record AccountView(UUID id, String displayName, String contactEmail) {
+        static AccountView of(Account a) { return new AccountView(a.getId(), a.getDisplayName(), a.getContactEmail()); }
+    }
+
+    private final AccountRepository accounts;
+    AccountController(AccountRepository accounts) { this.accounts = accounts; }
+
+    @PutMapping("/{id}")
+    @Transactional
+    AccountView update(@PathVariable UUID id,
+                       @Valid @RequestBody UpdateProfileRequest req,
+                       @AuthenticationPrincipal Jwt jwt) {
+        Account a = accounts.findByIdAndOwnerSub(id, jwt.getSubject())          // object-level check (BOLA)
+                .orElseThrow(() -&gt; new ResponseStatusException(HttpStatus.NOT_FOUND));
+        a.changeProfile(req.displayName(), req.contactEmail());                // explicit mapping (no mass assignment)
+        return AccountView.of(a);                                               // property-level exposure control (BOPLA)
+    }
+}</code></pre>
+  <pre data-file="JacksonConfig.java"><code class="language-java">package com.example.config;
+
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import org.springframework.boot.autoconfigure.jackson.Jackson2ObjectMapperBuilderCustomizer;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+class JacksonConfig {
+    @Bean
+    Jackson2ObjectMapperBuilderCustomizer strictJson() {
+        // Spring Boot disables FAIL_ON_UNKNOWN_PROPERTIES by default; re-enable it so smuggled fields are rejected.
+        return b -&gt; b.featuresToEnable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
+        // Never call activateDefaultTyping(...) on a mapper that reads untrusted input.
+    }
+}
+// Note: Spring Boot 4 defaults to Jackson 3 (package tools.jackson); the same feature exists there.
+// Equivalent property for Boot 3.x: spring.jackson.deserialization.fail-on-unknown-properties=true</code></pre>
+
+  <h3>7.2 Rate limiting with Bucket4j</h3>
+  <pre data-file="RateLimitFilter.java"><code class="language-java">package com.example.ratelimit;
+
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import io.github.bucket4j.Bandwidth;
+import io.github.bucket4j.Bucket;
+import io.github.bucket4j.ConsumptionProbe;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.time.Duration;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+/** Per-principal token bucket. Register AFTER authentication (e.g. http.addFilterAfter(..., AuthorizationFilter.class)).
+ *  Single-instance demo: use bucket4j-redis / bucket4j-jcache for a shared limit across replicas. */
+public class RateLimitFilter extends OncePerRequestFilter {
+    private final Cache&lt;String, Bucket&gt; buckets = Caffeine.newBuilder()
+            .expireAfterAccess(Duration.ofMinutes(10)).maximumSize(200_000).build();
+
+    private Bucket newBucket() {
+        return Bucket.builder()
+                .addLimit(Bandwidth.builder().capacity(20).refillGreedy(20, Duration.ofMinutes(1)).build())  // 20/min, burst 20
+                .addLimit(Bandwidth.builder().capacity(5).refillIntervally(5, Duration.ofSeconds(1)).build()) // and max 5/s
+                .build();
+    }
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest req, HttpServletResponse res, FilterChain chain)
+            throws ServletException, IOException {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        String key = (auth != null &amp;&amp; auth.isAuthenticated()) ? "u:" + auth.getName() : "ip:" + req.getRemoteAddr();
+        ConsumptionProbe probe = buckets.get(key, k -&gt; newBucket()).tryConsumeAndReturnRemaining(1);
+        if (probe.isConsumed()) {
+            res.setHeader("RateLimit-Remaining", String.valueOf(probe.getRemainingTokens()));
+            chain.doFilter(req, res);
+        } else {
+            long waitSeconds = Math.max(1, probe.getNanosToWaitForRefill() / 1_000_000_000L);
+            res.setHeader("Retry-After", String.valueOf(waitSeconds));
+            res.sendError(429, "Too Many Requests");
+        }
+    }
+}</code></pre>
+  <p><code>req.getRemoteAddr()</code> is the proxy's address behind a load balancer unless you configure <code>server.forward-headers-strategy</code> and trust only your proxies' <code>X-Forwarded-For</code>; never trust that header from the internet directly, or attackers will rotate it to evade limits.</p>
+
+  <h3>7.3 Injection: SQL, dynamic sorting, JPQL and MongoDB</h3>
+  <pre data-file="ProductSearchRepository.java"><code class="language-java">package com.example.catalog;
+
+import java.util.List;
+import java.util.Map;
+import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
+import org.springframework.stereotype.Repository;
+
+@Repository
+class ProductSearchRepository {
+    private final NamedParameterJdbcTemplate jdbc;
+    ProductSearchRepository(NamedParameterJdbcTemplate jdbc) { this.jdbc = jdbc; }
+
+    // Identifiers cannot be bound, so map user choices onto a fixed set of SQL fragments.
+    private static final Map&lt;String, String&gt; SORTABLE = Map.of(
+        "name", "p.name", "price", "p.price_cents", "newest", "p.created_at");
+
+    List&lt;ProductRow&gt; search(String text, String sort, boolean desc, int limit) {
+        String orderBy = SORTABLE.getOrDefault(sort, "p.name") + (desc ? " DESC" : " ASC");
+        int safeLimit = Math.min(Math.max(limit, 1), 100);                        // API4: cap page size
+        String sql = """
+            SELECT p.id, p.name, p.price_cents FROM product p
+            WHERE p.name ILIKE :pattern
+            ORDER BY %s
+            LIMIT :limit
+            """.formatted(orderBy);                                                // only allow-listed text is formatted in
+        var params = new MapSqlParameterSource()
+            .addValue("pattern", "%" + escapeLike(text) + "%")                     // value is bound, not concatenated
+            .addValue("limit", safeLimit);
+        return jdbc.query(sql, params, (rs, i) -&gt;
+            new ProductRow(rs.getObject("id", java.util.UUID.class), rs.getString("name"), rs.getLong("price_cents")));
+    }
+
+    // LIKE wildcards in user input would otherwise broaden the match (and can be expensive).
+    private static String escapeLike(String s) {
+        return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_");
+    }
+}
+
+record ProductRow(java.util.UUID id, String name, long priceCents) {}</code></pre>
+  <pre data-file="CustomerQueries.java"><code class="language-java">// JPQL: named parameters (safe)
+@Query("select c from Customer c where c.tenantId = :tenant and lower(c.email) = lower(:email)")
+Optional&lt;Customer&gt; findByEmail(@Param("tenant") String tenant, @Param("email") String email);
+
+// MongoDB: Criteria API binds values as BSON values, never as query operators.
+Query q = new Query(Criteria.where("username").is(username).and("tenantId").is(tenant));
+// VULNERABLE alternative: new BasicQuery("{ username: '" + username + "' }")
+// Also ensure 'username' is bound to a String in the DTO, so a JSON object like {"$ne": null} fails binding.</code></pre>
+
+  <h3>7.4 XSS: encoding, sanitising, CSP nonces</h3>
+  <pre data-file="templates/invoice.html"><code class="language-xml">&lt;!-- SAFE: th:text HTML-encodes, so &lt;script&gt;alert(1)&lt;/script&gt; in a note renders as visible text --&gt;
+&lt;p th:text="${invoice.note}"&gt;note&lt;/p&gt;
+
+&lt;!-- UNSAFE unless invoice.noteHtml was sanitised server-side with an allow-list sanitizer --&gt;
+&lt;div th:utext="${invoice.noteHtml}"&gt;&lt;/div&gt;
+
+&lt;!-- URL attribute: Thymeleaf link expressions build URLs; still validate the scheme of user-supplied links --&gt;
+&lt;a th:href="@{/invoices/{id}(id=${invoice.id})}"&gt;open&lt;/a&gt;
+
+&lt;!-- Passing data to JavaScript: inline serialisation in a JS context, with the CSP nonce --&gt;
+&lt;script th:nonce="${cspNonce}" th:inline="javascript"&gt;
+  const invoiceId = /*[[${invoice.id}]]*/ null;
+&lt;/script&gt;</code></pre>
+  <pre data-file="RichTextSanitizer.java"><code class="language-java">package com.example.content;
+
+import org.owasp.html.HtmlPolicyBuilder;
+import org.owasp.html.PolicyFactory;
+import org.owasp.html.Sanitizers;
+
+public final class RichTextSanitizer {
+    // com.googlecode.owasp-java-html-sanitizer:owasp-java-html-sanitizer
+    private static final PolicyFactory POLICY = Sanitizers.FORMATTING
+            .and(Sanitizers.BLOCKS)
+            .and(new HtmlPolicyBuilder()
+                    .allowElements("a")
+                    .allowUrlProtocols("https")                      // no javascript:, data:
+                    .allowAttributes("href").onElements("a")
+                    .requireRelNofollowOnLinks()
+                    .toFactory());
+
+    public static String sanitize(String untrustedHtml) { return POLICY.sanitize(untrustedHtml); }
+    private RichTextSanitizer() {}
+}</code></pre>
+  <pre data-file="CspNonceFilter.java"><code class="language-java">package com.example.web;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.security.SecureRandom;
+import java.util.Base64;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+/** Generates a per-response nonce, exposes it to templates as ${cspNonce}, and sets a strict CSP. */
+public class CspNonceFilter extends OncePerRequestFilter {
+    private static final SecureRandom RNG = new SecureRandom();
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest req, HttpServletResponse res, FilterChain chain)
+            throws ServletException, IOException {
+        byte[] b = new byte[16];
+        RNG.nextBytes(b);
+        String nonce = Base64.getEncoder().encodeToString(b);
+        req.setAttribute("cspNonce", nonce);
+        res.setHeader("Content-Security-Policy",
+            "script-src 'nonce-" + nonce + "' 'strict-dynamic'; object-src 'none'; base-uri 'none'; "
+          + "frame-ancestors 'none'; require-trusted-types-for 'script'");
+        chain.doFilter(req, res);
+    }
+}
+// Expose the request attribute to Thymeleaf via a @ControllerAdvice @ModelAttribute("cspNonce"),
+// and never cache HTML responses that embed a nonce in a shared cache.</code></pre>
+
+  <h3>7.5 CSRF for a cookie-authenticated SPA</h3>
+  <pre data-file="CsrfConfig.java"><code class="language-java">@Bean
+SecurityFilterChain web(HttpSecurity http) throws Exception {
+    http
+        .authorizeHttpRequests(a -&gt; a.anyRequest().authenticated())
+        .oauth2Login(Customizer.withDefaults())                          // cookie session (BFF)
+        .csrf(csrf -&gt; csrf
+            .csrfTokenRepository(CookieCsrfTokenRepository.withHttpOnlyFalse())   // SPA reads XSRF-TOKEN cookie
+            .csrfTokenRequestHandler(new SpaCsrfTokenRequestHandler()));           // as documented in the Spring reference
+    return http.build();
+}
+// Rule of thumb:
+//  - Cookie (or Basic, or client-cert) authentication from browsers  -&gt; CSRF protection ON.
+//  - Authorization: Bearer header only, no cookies                    -&gt; CSRF can be disabled for that chain.</code></pre>
+  <p><code>SpaCsrfTokenRequestHandler</code> is a small class (about 30 lines) given verbatim in the Spring Security reference under "Single-Page Applications"; it delegates to the XOR handler for rendered tokens and the plain handler for header values read from the cookie. Recent Spring Security releases add a one-line shorthand (<code>csrf.spa()</code>) for this configuration; check whether your version has it before copying the handler class. <span class="tag version">Version-sensitive · checked Nov 2026</span></p>
+
+  <h3>7.6 SSRF-safe outbound fetching</h3>
+  <pre data-file="SafeUrlFetcher.java"><code class="language-java">package com.example.fetch;
+
+import java.net.InetAddress;
+import java.net.URI;
+import java.net.UnknownHostException;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.Set;
+
+public final class SafeUrlFetcher {
+    private static final Set&lt;String&gt; ALLOWED_HOSTS = Set.of("images.partner.example", "cdn.example.net");
+    private static final long MAX_BYTES = 2 * 1024 * 1024;
+
+    private final HttpClient client = HttpClient.newBuilder()
+            .followRedirects(HttpClient.Redirect.NEVER)          // a redirect could point anywhere
+            .connectTimeout(Duration.ofSeconds(3))
+            .build();
+
+    public byte[] fetch(String raw) throws Exception {
+        URI uri = URI.create(raw).normalize();
+        if (!"https".equalsIgnoreCase(uri.getScheme())) throw new IllegalArgumentException("https only");
+        if (uri.getUserInfo() != null) throw new IllegalArgumentException("no credentials in URL");
+        String host = uri.getHost();
+        if (host == null || !ALLOWED_HOSTS.contains(host.toLowerCase())) throw new IllegalArgumentException("host not allowed");
+        if (uri.getPort() != -1 &amp;&amp; uri.getPort() != 443) throw new IllegalArgumentException("port not allowed");
+
+        for (InetAddress a : resolve(host)) {
+            if (a.isAnyLocalAddress() || a.isLoopbackAddress() || a.isLinkLocalAddress()
+                    || a.isSiteLocalAddress() || a.isMulticastAddress() || isUniqueLocalV6(a)) {
+                throw new IllegalArgumentException("resolves to a non-public address");
+            }
+        }
+        // Residual risk: DNS may change between this check and connect (rebinding). With a strict host
+        // allow-list the risk is small; for open-ended fetching, route through an egress proxy that
+        // re-checks the connected IP, or use a resolver-pinned client.
+        HttpRequest req = HttpRequest.newBuilder(uri).timeout(Duration.ofSeconds(5)).GET().build();
+        HttpResponse&lt;byte[]&gt; res = client.send(req, HttpResponse.BodyHandlers.ofByteArray());
+        if (res.statusCode() != 200) throw new IllegalStateException("upstream status " + res.statusCode());
+        if (res.body().length &gt; MAX_BYTES) throw new IllegalStateException("too large");  // also cap Content-Length up front
+        return res.body();
+    }
+
+    private static InetAddress[] resolve(String host) throws UnknownHostException {
+        return InetAddress.getAllByName(host);
+    }
+
+    private static boolean isUniqueLocalV6(InetAddress a) {
+        byte[] b = a.getAddress();
+        return b.length == 16 &amp;&amp; (b[0] &amp; 0xFE) == 0xFC;      // fc00::/7
+    }
+}</code></pre>
+  <p>Java's <code>isSiteLocalAddress</code> covers 10/8, 172.16/12 and 192.168/16; <code>isLinkLocalAddress</code> covers 169.254/16 (including the metadata address) and fe80::/10. Also consider carrier-grade NAT (100.64/10) and IPv4-mapped IPv6 addresses for completeness. Pair this with the network controls in Figure 4.</p>
+
+  <h3>7.7 Deserialization and path traversal</h3>
+  <pre data-file="LegacyImport.java"><code class="language-java">// If you truly must read Java-serialized data from a semi-trusted source, allow-list classes BEFORE loading.
+ObjectInputFilter filter = ObjectInputFilter.Config.createFilter(
+        "com.example.legacy.ExportRecord;java.lang.String;java.time.*;java.util.ArrayList;maxdepth=5;maxrefs=10000;maxbytes=1048576;!*");
+try (ObjectInputStream in = new ObjectInputStream(inputStream)) {
+    in.setObjectInputFilter(filter);
+    ExportRecord rec = (ExportRecord) in.readObject();
+}
+// Better: replace with JSON into records, or Protobuf. Also set a JVM-wide filter:
+//   -Djdk.serialFilter=!*   (if the application never needs Java serialization)
+
+// Jackson polymorphism done safely: closed set of logical names, not class names.
+@JsonTypeInfo(use = JsonTypeInfo.Id.NAME, property = "type")
+@JsonSubTypes({ @JsonSubTypes.Type(value = CardPayment.class, name = "card"),
+                @JsonSubTypes.Type(value = BankPayment.class, name = "bank") })
+sealed interface Payment permits CardPayment, BankPayment {}</code></pre>
+  <pre data-file="DownloadController.java"><code class="language-java">@GetMapping("/api/reports/{reportId}/file")
+ResponseEntity&lt;Resource&gt; download(@PathVariable UUID reportId, @AuthenticationPrincipal Jwt jwt) throws IOException {
+    // Best: never take a path from the user. Look up the stored file name by an ID the caller is authorized for.
+    Report r = reports.findByIdAndOwner(reportId, jwt.getSubject()).orElseThrow(NotFound::new);
+
+    Path base = Path.of("/var/app/reports").toRealPath();
+    Path file = base.resolve(r.storedFileName()).normalize();
+    if (!file.startsWith(base)) throw new AccessDeniedException("path escapes base");  // Path-aware comparison
+    Path real = file.toRealPath();                                                     // resolves symlinks
+    if (!real.startsWith(base)) throw new AccessDeniedException("symlink escapes base");
+
+    return ResponseEntity.ok()
+        .contentType(MediaType.APPLICATION_OCTET_STREAM)
+        .header(HttpHeaders.CONTENT_DISPOSITION, ContentDisposition.attachment()
+                .filename(r.displayName(), StandardCharsets.UTF_8).build().toString())
+        .body(new FileSystemResource(real));
+}</code></pre>
+
+  <h3>7.8 The same defences in Python and Go</h3>
+  <div class="code-tabs">
+  <pre data-lang="Python"><code class="language-python"># secure_api.py — FastAPI + SQLAlchemy 2.0 + Pydantic v2
+import ipaddress, socket
+from pathlib import Path
+from urllib.parse import urlsplit
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+class UpdateProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid")          # mass assignment: unknown fields -&gt; 422
+    display_name: str = Field(min_length=1, max_length=100)
+    contact_email: EmailStr
+
+SORTABLE = {"name": "name", "price": "price_cents"}
+
+def search(db: Session, q: str, sort: str, limit: int):
+    order = SORTABLE.get(sort, "name")                  # identifiers from an allow-list only
+    stmt = text(f"SELECT id, name FROM product WHERE name ILIKE :p ORDER BY {order} LIMIT :n")
+    return db.execute(stmt, {"p": f"%{q}%", "n": max(1, min(limit, 100))}).all()
+    # VULNERABLE: db.execute(text(f"... WHERE name ILIKE '%{q}%'"))
+
+ALLOWED_HOSTS = {"images.partner.example"}
+
+def check_url(raw: str) -&gt; str:
+    u = urlsplit(raw)
+    if u.scheme != "https" or u.hostname not in ALLOWED_HOSTS or u.username or (u.port not in (None, 443)):
+        raise ValueError("url not allowed")
+    for info in socket.getaddrinfo(u.hostname, 443, proto=socket.IPPROTO_TCP):
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global:                            # rejects private, loopback, link-local, reserved
+            raise ValueError("non-public address")
+    return raw  # fetch with httpx: follow_redirects=False, timeout=5, and a max response size
+
+BASE = Path("/var/app/reports").resolve()
+
+def safe_path(stored_name: str) -&gt; Path:
+    p = (BASE / stored_name).resolve()
+    if not p.is_relative_to(BASE):                      # Python 3.9+
+        raise PermissionError("path escapes base")
+    return p
+
+# Never: pickle.loads(untrusted), yaml.load(untrusted) without SafeLoader -- use yaml.safe_load.
+# Jinja2 outside Flask: Environment(autoescape=select_autoescape(["html", "xml"]))</code></pre>
+  <pre data-lang="Go"><code class="language-go">// secure.go — Go 1.24+
+package secure
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"html/template"
+	"net"
+	"net/http"
+	"os"
+	"syscall"
+	"time"
+)
+
+// SQL: placeholders bind values; identifiers come from an allow-list.
+var sortable = map[string]string{"name": "name", "price": "price_cents"}
+
+func Search(ctx context.Context, db *sql.DB, q, sort string, limit int) (*sql.Rows, error) {
+	col, ok := sortable[sort]
+	if !ok {
+		col = "name"
+	}
+	limit = max(1, min(limit, 100))
+	query := fmt.Sprintf("SELECT id, name FROM product WHERE name ILIKE $1 ORDER BY %s LIMIT $2", col)
+	return db.QueryContext(ctx, query, "%"+q+"%", limit)
+}
+
+// XSS: html/template escapes by context (HTML, attribute, URL, JS). Never wrap user data in template.HTML.
+var page = template.Must(template.New("p").Parse(`&lt;p&gt;{{.Note}}&lt;/p&gt;&lt;a href="{{.Link}}"&gt;link&lt;/a&gt;`))
+
+// SSRF: check the IP actually being connected to, at connect time (defeats DNS rebinding).
+func ssrfSafeClient() *http.Client {
+	dialer := &amp;net.Dialer{
+		Timeout: 3 * time.Second,
+		Control: func(network, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return err
+			}
+			ip := net.ParseIP(host)
+			if ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+				ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+				return errors.New("destination not allowed")
+			}
+			return nil
+		},
+	}
+	return &amp;http.Client{
+		Timeout:   10 * time.Second,
+		Transport: &amp;http.Transport{DialContext: dialer.DialContext, Proxy: nil},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse // do not follow redirects
+		},
+	}
+}
+
+// Path traversal: os.Root (Go 1.24) confines all operations to a directory, including symlink resolution.
+func OpenReport(name string) (*os.File, error) {
+	root, err := os.OpenRoot("/var/app/reports")
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	return root.Open(name) // returns an error if name escapes the root
+}</code></pre>
+  </div>
+  <p>The Go <code>Dialer.Control</code> hook is the most robust SSRF check of the three, because it runs after DNS resolution on the exact address being dialled, so rebinding cannot slip between check and use. Setting <code>Proxy: nil</code> matters: if an environment proxy were used, the dialled address would be the proxy's. Python's <code>ipaddress.is_global</code> conveniently excludes all special-purpose ranges.</p>
+
+  <h3>7.9 SAST in CI</h3>
+  <pre data-file=".github/workflows/sast.yml"><code class="language-yaml">name: sast
+on: [pull_request]
+permissions:
+  contents: read
+  security-events: write
+jobs:
+  semgrep:
+    runs-on: ubuntu-latest
+    container: { image: semgrep/semgrep }
+    steps:
+      - uses: actions/checkout@v4
+      - run: semgrep scan --config p/java --config p/owasp-top-ten --config p/secrets --sarif --output semgrep.sarif --error
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with: { sarif_file: semgrep.sarif }</code></pre>
+  <p>A custom Semgrep rule catches your organisation's own anti-patterns, for example JPA entities used as request bodies:</p>
+  <pre data-file="rules/no-entity-request-body.yml"><code class="language-yaml">rules:
+  - id: no-entity-as-request-body
+    languages: [java]
+    severity: ERROR
+    message: "JPA @Entity bound from @RequestBody enables mass assignment; use a request DTO."
+    patterns:
+      - pattern: |
+          $RET $M(..., @RequestBody $T $P, ...) { ... }
+      - metavariable-pattern:
+          metavariable: $T
+          patterns:
+            - pattern-regex: ^(Account|User|Order|Customer)$   # or generate the list of entity class names in CI</code></pre>
+</section>

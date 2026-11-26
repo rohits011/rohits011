@@ -218,7 +218,7 @@ sequenceDiagram
   P-->>R: 4.1% errors (fail, limit exceeded)
   R->>T: weights 100 / 0 (abort)
   R->>R: scale canary down, status Degraded
-  Note over G,A: Engineer reverts the commit; Argo CD syncs the old digest
+  Note over G,A: Engineer reverts the commit, then Argo CD syncs the old digest
 </pre>
 <figcaption>Figure 12.14 — A canary aborted automatically by metric analysis.</figcaption>
 </figure>
@@ -900,3 +900,284 @@ resource "aws_db_instance" "orders_replica" {
   }
 }</code></pre>
 </section>
+
+<section id="applications">
+  <h2>8. Applications: How Teams Deliver Software and Infrastructure</h2>
+  <h3>8.1 Platform-provided pipelines</h3>
+  <p>Platform teams publish reusable workflows (GitHub <code>workflow_call</code>, GitLab CI includes, Jenkins shared libraries) that encode the organisation's standard: test, build, scan, sign, publish, promote. A service's own workflow file is ten lines that call the shared workflow with language and path parameters. Security and compliance improvements (adding SBOMs, changing signing) then ship to every service at once.</p>
+  <h3>8.2 Monorepo vs polyrepo pipelines</h3>
+  <p>Lumen keeps its three services in a monorepo with path filters so a Python change does not rebuild the Java service; build tools such as Bazel, Gradle's build cache, Nx or Pants compute affected targets precisely. Polyrepos simplify ownership and permissions but make cross-service changes and shared tooling harder. Either way, the GitOps repository is usually separate, because its write permissions and review rules differ from application code.</p>
+  <h3>8.3 Preview environments</h3>
+  <p>Argo CD's pull-request generator (or Flux equivalents) creates a short-lived namespace per pull request with the PR's image, so reviewers and product managers can click through a change before merge. Combined with seeded test data and ephemeral databases (a Neon branch, an RDS snapshot clone, or a Testcontainers-style Postgres), preview environments move end-to-end testing left.</p>
+  <h3>8.4 Infrastructure delivery</h3>
+  <p>Teams run Terraform through PR-driven automation: plan on PR, human review of the plan, policy checks, apply on merge with a protected environment, scheduled drift detection, and module versioning with changelogs. Self-service modules ("give me a Postgres database") are often exposed through Backstage templates or Crossplane compositions so that application teams get compliant infrastructure without writing HCL.</p>
+  <h3>8.5 Delivery of AI components</h3>
+  <p>Models, prompts and retrieval indexes are deployable artifacts too. Lumen versions prompt templates in Git, ships them as ConfigMaps or as part of the <code>assist-service</code> image, runs an evaluation suite as a pipeline gate, and canaries prompt changes behind feature flags with business metrics (deflection rate, thumbs-down rate) in the analysis, not just HTTP errors.</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 Knight Capital (2012): deployment without automation or kill switches</h3>
+  <p><span class="tag fact">Verified</span> On 1 August 2012, Knight Capital deployed new trading code to its servers; according to the SEC's later order, one of eight servers did not receive the new code, and a repurposed flag activated old, dormant functionality on that server. In about 45 minutes, Knight's router sent more than 4 million orders while trying to fill 212 customer orders, causing losses the firm reported at over $460 million. In October 2013 the SEC charged Knight under the market access rule and imposed a $12 million penalty. The engineering lessons map directly onto this chapter: automated, verified deployment to every instance; never reuse flag names for new behaviour; remove dead code; and have tested kill switches and automated anomaly detection. Source: <a href="https://www.sec.gov/news/press-release/2013-222">SEC press release 2013-222</a>.</p>
+  <h3>9.2 GitLab (2017): backups that were never tested</h3>
+  <p><span class="tag fact">Verified</span> On 31 January 2017, during an incident response, an engineer accidentally removed data from GitLab.com's primary database directory. GitLab's public postmortem describes how several backup and replication mechanisms turned out not to be working as assumed, and about six hours of data were lost. The lesson for IaC and pipelines: recovery procedures are code that must be exercised regularly (restore drills in CI), and destructive commands on production should be guarded by automation. Source: <a href="https://about.gitlab.com/blog/postmortem-of-database-outage-of-january-31/">GitLab, "Postmortem of database outage of January 31"</a>.</p>
+  <h3>9.3 Meta (2021): a configuration change and a buggy audit</h3>
+  <p><span class="tag fact">Verified</span> On 4 October 2021, Facebook, Instagram and WhatsApp were unavailable for several hours. Meta's engineering write-up explains that a command issued during routine backbone maintenance unintentionally disconnected its data centres, that an audit tool meant to catch such commands had a bug, and that the resulting loss of connectivity caused its DNS servers to withdraw their BGP advertisements. Recovery was slowed because remote tooling depended on the same network. Lessons: change-validation tooling is itself critical code to test; changes need staged rollout even for infrastructure; and recovery paths must not depend on the system being recovered. Source: <a href="https://engineering.fb.com/2021/10/05/networking-traffic/outage-details/">Engineering at Meta, "More details about the Oct. 4 Facebook outage"</a>.</p>
+  <h3>9.4 Google: release engineering as a discipline</h3>
+  <p><span class="tag fact">Verified</span> The Google SRE book's release engineering chapter describes hermetic, reproducible builds, self-service release processes, enforced policies (who may release what), and treating configuration with the same rigor as code — principles that GitOps and signed, digest-pinned artifacts reproduce for everyone else. Source: <a href="https://sre.google/sre-book/release-engineering/">Site Reliability Engineering, ch. 8 "Release Engineering"</a> (free online).</p>
+  <h3>9.5 Argo CD's origin at Intuit</h3>
+  <p><span class="tag fact">Verified</span> Argo CD was created at Intuit and open-sourced in 2018; the Argo project (Workflows, CD, Rollouts, Events) graduated in the CNCF in December 2022, and Argo CD 3.0 was released in 2025. It is widely used for multi-cluster GitOps. Source: <a href="https://argo-cd.readthedocs.io/en/stable/">Argo CD documentation</a>; <a href="https://www.cncf.io/projects/argo/">CNCF project page</a>.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Strengths, Limits and Operational Cost</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Approach</th><th>Strengths</th><th>Limitations</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>GitHub Actions</td><td>Integrated with code, huge action ecosystem, OIDC, matrix builds</td><td>Supply-chain risk in third-party actions; YAML logic gets complex; minutes cost</td><td>Low (hosted) to medium (self-hosted runners)</td></tr>
+      <tr><td>Jenkins</td><td>Extremely flexible, self-hosted, plugins for everything</td><td>Plugin and controller maintenance, security patching, snowflake configuration</td><td>High</td></tr>
+      <tr><td>Push CD (CI runs kubectl/helm)</td><td>Simple, immediate feedback</td><td>CI holds prod credentials; no drift detection</td><td>Low</td></tr>
+      <tr><td>GitOps (Argo CD/Flux)</td><td>Audit trail, drift detection/self-heal, easy rollback, no inbound creds</td><td>Extra repo and indirection; secrets need extra tooling; feedback loop to CI</td><td>Medium</td></tr>
+      <tr><td>Argo Rollouts</td><td>Automated canary/blue-green with analysis</td><td>Replaces Deployment semantics; needs traffic router and good metrics</td><td>Medium</td></tr>
+      <tr><td>Feature flags</td><td>Decouple deploy and release, kill switches</td><td>Flag debt, testing combinations, vendor cost</td><td>Low–medium</td></tr>
+      <tr><td>Terraform / OpenTofu</td><td>Multi-provider, plan before apply, huge module ecosystem</td><td>State management, drift between applies, HCL limits, provider upgrade churn</td><td>Medium</td></tr>
+      <tr><td>CloudFormation / CDK</td><td>AWS-native, no state to manage, CDK in Java/Python</td><td>AWS only; slower feature support for some services; stack limits</td><td>Low–medium</td></tr>
+      <tr><td>Crossplane</td><td>Continuous reconciliation, Kubernetes-native APIs</td><td>Kubernetes as a dependency for infra; debugging compositions</td><td>Medium–high</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+  <h3>11.1 Decision table</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Decision</th><th>Prefer</th><th>When</th></tr></thead>
+    <tbody>
+      <tr><td>Argo CD vs Flux</td><td>Argo CD</td><td>Central UI, many clusters from one place, app teams want visibility</td></tr>
+      <tr><td></td><td>Flux</td><td>Per-cluster autonomy, CRD-only, image automation, smaller footprint</td></tr>
+      <tr><td>Canary vs blue-green</td><td>Canary</td><td>Enough traffic for statistics; want gradual exposure</td></tr>
+      <tr><td></td><td>Blue-green</td><td>Low traffic, need full pre-switch verification, or stateful constraints that forbid mixing versions</td></tr>
+      <tr><td>Terraform vs OpenTofu</td><td>Terraform</td><td>Using HCP Terraform/Enterprise features, vendor support contracts</td></tr>
+      <tr><td></td><td>OpenTofu</td><td>Open-source licence requirements (MPL 2.0), state encryption, building a commercial product on IaC</td></tr>
+      <tr><td>Terraform vs CDK/Pulumi</td><td>Terraform</td><td>Multi-provider, ops-heavy teams, reviewable plans</td></tr>
+      <tr><td></td><td>CDK/Pulumi</td><td>App teams owning infra in Java/Python/Go with strong abstractions and tests</td></tr>
+      <tr><td>Workspaces vs directories</td><td>Directories per env</td><td>Long-lived envs with different shapes and approvals</td></tr>
+      <tr><td></td><td>Workspaces</td><td>Identical ephemeral copies (per-PR test stacks)</td></tr>
+    </tbody>
+  </table></div>
+  <h3>11.2 Choosing a deployment strategy</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A["New release"] --> B{"Change type?"}
+  B -->|"new user-facing behaviour"| F["Ship dark behind a feature flag, ramp by segment"]
+  B -->|"code/infra change"| C{"Traffic sufficient for statistical analysis?"}
+  C -->|yes| D["Canary with automated analysis (Argo Rollouts)"]
+  C -->|no| E{"Can versions coexist (schema, protocol)?"}
+  E -->|yes| G["Rolling update + synthetic checks"]
+  E -->|no| H["Blue-green with pre-switch verification"]
+  B -->|"schema change"| I["Expand-contract migration across releases"]
+</pre>
+<figcaption>Figure 12.17 — Matching delivery strategy to change type and traffic.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> feature flags handle <em>release</em> risk (is this behaviour good?), canaries handle <em>deployment</em> risk (does this build work under real traffic?), and expand-contract handles <em>data</em> risk (can old and new code share the schema?). Most real releases combine two of the three.</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Production Failures</h2>
+  <ol>
+    <li><strong>Rebuilding per environment</strong> ("build for staging, build again for prod"): what you tested is not what you shipped.</li>
+    <li><strong>Long-lived cloud keys in CI secrets.</strong> Use OIDC federation with narrowly scoped trust policies.</li>
+    <li><strong>Unpinned third-party actions</strong> (<code>@main</code>) — a compromised action runs with your token and secrets.</li>
+    <li><strong>GitOps with <code>replicas</code> in Git and an HPA</strong>, or other fields owned by controllers, causing endless OutOfSync or reverted scaling. Use <code>ignoreDifferences</code> or omit the field.</li>
+    <li><strong>Branch-per-environment GitOps</strong> leading to divergent branches and painful promotions.</li>
+    <li><strong>Plain Kubernetes Secrets committed to Git.</strong> Use External Secrets, Sealed Secrets or SOPS.</li>
+    <li><strong>Canary analysis on metrics that are too noisy or too slow</strong> (e.g., daily business KPIs), or on the whole service instead of the canary's own series.</li>
+    <li><strong>Non-backward-compatible migrations</strong> in a rolling or canary deploy, breaking the old version still serving traffic.</li>
+    <li><strong>Local Terraform state or state in Git</strong>; no locking; state containing plaintext secrets readable by everyone.</li>
+    <li><strong>Applying unreviewed plans</strong> or running <code>apply</code> without a saved plan, so the change applied differs from the one reviewed.</li>
+    <li><strong>Huge monolithic Terraform roots</strong>: 40-minute plans, API throttling, and every change risking everything.</li>
+    <li><strong>Using <code>count</code> for keyed collections</strong>, so removing one element renumbers and replaces the rest. Use <code>for_each</code>.</li>
+    <li><strong>Ignoring drift</strong> until an apply unexpectedly reverts an emergency console fix — or destroys something.</li>
+    <li><strong>Feature flags never removed</strong>, until a flag name is reused (Knight Capital) or the code becomes untestable.</li>
+  </ol>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Performance</h3>
+  <p>Keep PR feedback under ten minutes: cache dependencies and build layers, run jobs in parallel, shard slow tests, and use larger or ARM runners where cheaper. Measure queue time for runners — a fast pipeline that waits 15 minutes for a runner is a slow pipeline. For Argo CD at scale, shard the application controller, tune repo-server caching, and use webhooks instead of polling.</p>
+  <h3>13.2 Security</h3>
+  <ul>
+    <li>OIDC everywhere; separate roles for plan/apply and publish/deploy; protected environments with required reviewers for production.</li>
+    <li>Signed images and admission verification (Kyverno <code>verifyImages</code>, Sigstore policy-controller).</li>
+    <li>Branch protection and CODEOWNERS on the gitops and infra repositories — they <em>are</em> production access.</li>
+    <li>Terraform state encrypted with KMS, bucket versioning and access logging, no public access; OpenTofu can additionally encrypt state client-side.</li>
+    <li>Secrets fetched at runtime from a secret manager; never echo secrets in logs (masking is a backstop, not a control).</li>
+  </ul>
+  <h3>13.3 Scalability</h3>
+  <p>Standardise with reusable workflows and ApplicationSets so adding service #50 costs the same as service #5. Split Terraform state by blast radius and ownership. Use a promotion tool or bot rather than humans copying digests between files.</p>
+  <h3>13.4 Monitoring</h3>
+  <p>Track DORA metrics; pipeline success rate, duration and flaky-test rate; Argo CD sync and health status (alert on apps OutOfSync or Degraded for more than N minutes); Rollout aborts; Terraform drift detection results. Annotate Grafana dashboards with deployment events so latency changes can be correlated with releases instantly.</p>
+  <h3>13.5 Reliability and maintainability</h3>
+  <p>Rollback must be faster than roll-forward diagnosis: one revert commit, an Argo Rollouts abort, or a feature flag toggle. Practise it. Keep module and chart versions moving with Renovate. Document the delivery path in a single diagram (like Figure 12.13) so new engineers and incident responders know where to look.</p>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundation</p>
+    <p>Your Jenkins pipeline builds the JAR, deploys it to staging, runs tests, then rebuilds the JAR with <code>-Pprod</code> and deploys to production with SSH keys stored in Jenkins. List three risks and the modern replacement for each.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>(1) Rebuild per environment → artifact tested ≠ artifact shipped; replace with build-once images referenced by digest and environment config outside the artifact. (2) Long-lived SSH keys with prod access in CI → credential theft risk; replace with GitOps pull (no inbound prod creds) or OIDC short-lived credentials. (3) Profile baked into the artifact (<code>-Pprod</code>) → config coupled to build; replace with ConfigMaps/Helm values. Also: no drift detection, bespoke rollback.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Write the IAM trust-policy condition that allows a GitHub Actions workflow to assume a role only when running in the <code>production</code> GitHub environment of repository <code>lumen/infra</code>.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-json">"Condition": {
+  "StringEquals": {
+    "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+    "token.actions.githubusercontent.com:sub": "repo:lumen/infra:environment:production"
+  }
+}</code></pre>
+      <p>When a job references an environment, the <code>sub</code> claim takes the <code>environment:</code> form instead of <code>ref:</code>. Combined with environment protection rules (required reviewers), this ensures prod credentials are only issued after approval.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>A Terraform plan shows <code>-/+ resource "aws_db_instance" "orders" ... # forces replacement</code> after a teammate renamed the resource from <code>aws_db_instance.orders</code> to <code>module.db.aws_db_instance.this</code>. What happened and how do you fix it without data loss?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Terraform sees the old address removed (destroy) and a new address added (create) because state is keyed by address. Add a <code>moved { from = aws_db_instance.orders, to = module.db.aws_db_instance.this }</code> block; the plan then shows a move with no replacement. Also add <code>prevent_destroy</code> and deletion protection on the database, and a CI guard that fails plans deleting stateful resources.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>Design a canary analysis for <code>assist-service</code>, whose responses are streamed LLM answers (p50 4 s, p99 20 s) and whose traffic is 30 requests/minute. Why is the error-rate template from §7.5 insufficient, and what would you use instead?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>At 30 req/min, a 10% canary gets 3 requests per minute — far too few for error-rate statistics (§6.3), and latency is dominated by the LLM provider, so p99 is noisy. Options: larger canary weight (50%) for longer windows (30–60 min); analysis on <em>counts</em> of hard failures (any 5xx or stream aborted) rather than ratios; a pre-promotion analysis using an offline evaluation suite run against the canary (quality gate: groundedness, refusal rate) plus synthetic traffic; time-to-first-token rather than total latency; and business signals (thumbs-down rate) as a background analysis with a long window. Blue-green with an evaluation gate may be the better strategy.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>Lumen's Terraform is one root with 1,800 resources (network, EKS, RDS, IAM, DNS for all environments) and a 35-minute plan. Propose a migration to a split layout with zero downtime.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Define target roots per environment and layer (network, eks, data, iam, dns). For each new root: write the configuration (using modules), then use <code>import</code> blocks (or <code>terraform state mv</code> across states / <code>removed { destroy = false }</code> in the old root) so resources are adopted by the new state and forgotten by the old one without being touched. Verify each step with plans showing no changes. Replace intra-root references with outputs consumed via data sources or SSM parameters. Migrate one layer at a time, starting with the least risky (DNS), during a change freeze on the old root, with state backups (S3 versioning) for rollback.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is the difference between continuous delivery and continuous deployment?</summary><div><p>Continuous delivery keeps every passing change releasable, with production deployment as a manual business decision. Continuous deployment pushes every passing change to production automatically, relying on progressive delivery and automated rollback.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain the four GitOps principles and how they relate to Kubernetes controllers.</summary><div><p>Declarative desired state; versioned and immutable storage (Git); pulled automatically by agents; continuously reconciled. Argo CD/Flux are controllers whose desired state is a Git revision — the same observe-diff-act loop as Deployment controllers, one level up.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Design the delivery pipeline for 40 microservices in Java, Python and Go.</summary><div><p>Monorepo or polyrepo with a shared reusable workflow per language; build once to an immutable signed image by digest with SBOM/provenance; GitOps repo with per-environment overlays; ApplicationSets to generate Argo CD apps; automated promotion to dev, PR-based promotion to staging/prod; Argo Rollouts canaries with standard analysis templates; feature flags via OpenFeature; DORA metrics and deployment annotations; policy as code in CI and admission.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why does Terraform need state, and what are the risks of state?</summary><div><p>State maps configuration addresses to real resource IDs and records attributes, enabling diffs, dependency ordering and performance (not querying every resource of every type). Risks: it can contain secrets; concurrent writes corrupt it (need locking); loss means Terraform forgets what it manages; drift between state and reality; large states slow plans.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> A canary passed analysis but customers report broken checkout an hour after full rollout. What went wrong in the process?</summary><div><p>The analysis measured the wrong things (HTTP 5xx while the bug returned 200 with wrong data), too briefly, or on aggregate rather than canary-specific series; checkout might be rare traffic not exercised at 10%. Fix: add business/semantic metrics (checkout success rate, order totals validation), synthetic transactions for critical journeys, longer bake times, and feature flags for risky behaviour.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Someone fixed production by editing a Deployment with kubectl during an incident. Argo CD has selfHeal on. What happens and what should the process be?</summary><div><p>Argo CD detects drift and reverts the change within minutes, potentially reintroducing the incident. Process: during incidents either disable auto-sync for that app (recorded) or make the fix via a fast-tracked Git commit; afterwards, ensure Git reflects the fix and re-enable sync. The postmortem should note the tooling gap.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Write a jq expression that lists all resources a Terraform plan JSON will replace.</summary><div><pre><code class="language-bash">terraform show -json tfplan | jq -r '.resource_changes[] | select((.change.actions | index("delete")) and (.change.actions | index("create"))) | .address'</code></pre></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What changed with Terraform's licence in 2023 and why does it matter to an engineering org?</summary><div><p>HashiCorp moved Terraform from MPL 2.0 to BSL 1.1 starting with 1.6, restricting use in competing commercial products. Most end-user companies can keep using it, but vendors and some legal departments prefer OpenTofu (MPL 2.0, Linux Foundation/CNCF). Feature sets are diverging, so choose deliberately and avoid mixing tools on the same state.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> Tell me about a time you made deployments safer without slowing the team down.</summary><div><p>Strong answers quantify before/after (deploy frequency, change failure rate, MTTR), describe incremental changes (parallelised CI, automated canary, flags), stakeholder buy-in, and how the team learned from failures along the way.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Small, frequent, automated changes reduce both incident probability and time to restore.</li>
+    <li>Build once; promote an immutable, signed image digest through environments via Git.</li>
+    <li>Use OIDC for CI credentials; pin actions; generate SBOMs and provenance.</li>
+    <li>GitOps = declarative, versioned, pulled, continuously reconciled; CI never touches clusters.</li>
+    <li>Canaries with automated analysis limit blast radius; flags decouple deploy from release; expand-contract protects data.</li>
+    <li>Terraform state must be remote, locked, encrypted and split by blast radius; review saved plans in PRs.</li>
+    <li>Use <code>for_each</code>, <code>moved</code>, <code>import</code>, <code>removed</code>, and <code>prevent_destroy</code> to evolve infrastructure safely.</li>
+    <li>Terraform (BSL) and OpenTofu (MPL, CNCF) share roots but are diverging; choose deliberately.</li>
+  </ul>
+  <div class="quiz" data-answer="c">
+    <p class="q">In a pull-based GitOps model, which component holds credentials to modify the production cluster?</p>
+    <ol>
+      <li data-k="a">The CI system</li>
+      <li data-k="b">Each developer's laptop</li>
+      <li data-k="c">The in-cluster agent (Argo CD or Flux)</li>
+      <li data-k="d">The container registry</li>
+    </ol>
+    <div class="explain">CI writes to Git and the registry; the agent in or near the cluster pulls and applies.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">What does a <code>moved</code> block do in Terraform?</p>
+    <ol>
+      <li data-k="a">Records that a resource's address changed so state is updated without destroying it</li>
+      <li data-k="b">Moves a resource to another AWS region</li>
+      <li data-k="c">Moves state to a new backend</li>
+      <li data-k="d">Imports a manually created resource</li>
+    </ol>
+    <div class="explain">Moved blocks refactor addresses. Imports use import blocks; backend migration uses init -migrate-state.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">Why reference container images by digest rather than tag in production manifests?</p>
+    <ol>
+      <li data-k="a">Digests pull faster</li>
+      <li data-k="b">Tags are not supported by Kubernetes</li>
+      <li data-k="c">Digests compress better</li>
+      <li data-k="d">A digest is immutable, so every environment runs exactly the tested bytes</li>
+    </ol>
+    <div class="explain">Tags are mutable pointers; digests are content hashes.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">A canary receives 10% of 200 requests/minute. Which analysis is most likely to be statistically meaningful within 5 minutes?</p>
+    <ol>
+      <li data-k="a">Detecting an error-rate increase from 0.1% to 0.2%</li>
+      <li data-k="b">Detecting an error-rate increase from 0.1% to 20%</li>
+      <li data-k="c">Detecting a 1% p99 latency change</li>
+      <li data-k="d">Detecting a change in daily revenue</li>
+    </ol>
+    <div class="explain">Only 100 canary requests arrive in 5 minutes; only gross regressions are detectable.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Since Terraform 1.10/1.11, what is the recommended way to lock state in an S3 backend?</p>
+    <ol>
+      <li data-k="a">A DynamoDB table (required)</li>
+      <li data-k="b">No locking is needed with S3 versioning</li>
+      <li data-k="c">S3-native lockfiles via use_lockfile = true</li>
+      <li data-k="d">A Git lock on the repository</li>
+    </ol>
+    <div class="explain">use_lockfile was added in 1.10; DynamoDB-based locking was deprecated in 1.11 but still works during migration.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">Which practice decouples deploying code from releasing a feature to users?</p>
+    <ol>
+      <li data-k="a">Feature flags</li>
+      <li data-k="b">Rolling updates</li>
+      <li data-k="c">Terraform workspaces</li>
+      <li data-k="d">Multi-stage Dockerfiles</li>
+    </ol>
+    <div class="explain">Flags let dark code ship and be enabled per segment at runtime.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Jez Humble and David Farley, <em>Continuous Delivery</em>, Addison-Wesley, 2010.</li>
+    <li><span class="ref-kind">Book</span> Nicole Forsgren, Jez Humble, Gene Kim, <em>Accelerate</em>, IT Revolution, 2018.</li>
+    <li><span class="ref-kind">Book</span> Yevgeniy Brikman, <em>Terraform: Up &amp; Running</em>, 3rd ed., O'Reilly, 2022.</li>
+    <li><span class="ref-kind">Book</span> Kief Morris, <em>Infrastructure as Code</em>, O'Reilly (2nd ed. 2020).</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://dora.dev/">DORA research and metrics</a></li>
+    <li><span class="ref-kind">Spec</span> <a href="https://opengitops.dev/">OpenGitOps principles</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://argo-cd.readthedocs.io/en/stable/">Argo CD documentation</a> and <a href="https://argoproj.github.io/argo-rollouts/">Argo Rollouts documentation</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://fluxcd.io/flux/">Flux documentation</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect">GitHub Actions: security hardening with OpenID Connect</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://developer.hashicorp.com/terraform/docs">Terraform documentation</a> and <a href="https://developer.hashicorp.com/terraform/language/tests">terraform test</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://opentofu.org/docs/">OpenTofu documentation</a></li>
+    <li><span class="ref-kind">Spec</span> <a href="https://slsa.dev/">SLSA supply-chain levels for software artifacts</a> and <a href="https://docs.sigstore.dev/">Sigstore documentation</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://openfeature.dev/docs/reference/intro">OpenFeature documentation</a></li>
+    <li><span class="ref-kind">Book</span> <a href="https://sre.google/sre-book/release-engineering/">Google SRE book, ch. 8 "Release Engineering"</a> (free online)</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

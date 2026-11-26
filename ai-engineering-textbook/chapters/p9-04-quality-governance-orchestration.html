@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data Quality, Governance, Feature Stores, Airflow &amp; dbt — AI-Era Software Engineering</title>
+<meta name="description" content="Data quality dimensions, tests and data contracts; Great Expectations, Soda and dbt tests; governance with catalogs, OpenLineage lineage, PII classification, access control and retention; feature stores and point-in-time correctness with Feast; Airflow 3 architecture and best practices; dbt and analytics engineering; Dagster and Prefect; and how data roles interact.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p9-04-quality-governance-orchestration" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 9 · Chapter 4</p>
+  <h1>Data Quality, Governance, Feature Stores, Airflow, dbt &amp; Analytics Engineering</h1>
+  <p class="lede">Moving data is the easy half. The hard half is knowing that it is right, knowing where it came from and who may see it, running thousands of interdependent jobs on time, and serving features to models without leaking the future. This chapter covers the control plane of a data platform: quality and contracts, governance and lineage, feature stores, orchestration with Airflow, transformation with dbt, and the human system of data engineers, analytics engineers, data scientists and ML engineers that all of it serves.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Chapters 9.1–9.3 (lifecycle and roles, analytical storage and modelling, pipelines and idempotency).</li>
+    <li><strong>You will be able to:</strong> define and test data quality across six dimensions; write a data contract; implement checks with Great Expectations, Soda and dbt; emit lineage with OpenLineage; design PII classification, masking and retention; build a Feast feature repository with point-in-time-correct training data; explain Airflow 3's architecture and write idiomatic, idempotent DAGs with assets and deferrable sensors; build dbt staging, incremental and snapshot models with contracts and unit tests; compare Airflow, Dagster and Prefect; and describe precisely how DE, AE, DS and MLE hand work to each other.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: The Control Plane of Data</h2>
+  <p>Chapter 9.3 built pipelines that move and transform data correctly under retries. That is necessary but not sufficient. A pipeline can be perfectly idempotent and still publish garbage because an upstream team changed <code>amount</code> from dollars to cents. A dashboard can be correct and still violate GDPR because it exposes email addresses to a contractor. A model can score brilliantly offline and fail in production because its training features were computed with data from after the prediction time. And two hundred pipelines with implicit dependencies run by cron will, sooner or later, run in the wrong order.</p>
+  <p>This chapter is about the <strong>control plane</strong>: the systems and practices that make data trustworthy, governed, reproducible and scheduled. It is the part of data engineering most similar to what you already do as a backend engineer (contracts, validation, access control, migrations, CI/CD, observability), which is exactly why backend engineers are often the ones who make it work.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>Bean Validation (<code>@NotNull</code>, <code>@Positive</code>) on request DTOs; OpenAPI and consumer-driven contract tests (Spring Cloud Contract, Pact) between services; Flyway migrations versioned in Git and applied in order by CI; Spring Security roles and method-level authorization; Quartz or <code>@Scheduled</code> jobs and Spring Batch's <code>JobRepository</code> for restartability; Micrometer metrics and alerts for SLOs.</dd>
+      <dt>Why that is not enough</dt><dd>Validation at the API boundary checks one request; data quality is about distributions, freshness, completeness and relationships across billions of rows from many producers you do not control. <code>@Scheduled</code> knows nothing about dependencies between jobs owned by different teams, backfills or data-aware triggering. Flyway evolves a schema you own; dbt evolves hundreds of derived models whose correctness depends on upstream data.</dd>
+      <dt>The modern approach</dt><dd>Data contracts at producer boundaries, automated tests at every layer (Great Expectations, Soda, dbt tests), observability for freshness/volume/schema/distribution anomalies, a catalog with column-level lineage (OpenLineage), policy-based access control with masking, a feature store for ML features, a workflow orchestrator (Airflow, Dagster, Prefect) for scheduling with explicit dependencies, and dbt for version-controlled, tested SQL transformations.</dd>
+      <dt>Where Python and Go fit</dt><dd>Airflow, Dagster, Prefect, Great Expectations, Soda, Feast and the OpenLineage client are Python-first. dbt is SQL plus Jinja (dbt Core is Python; the newer Fusion engine is Rust). Go appears in catalog and lineage backends and in Kubernetes operators that run tasks. Java appears in the Spark/Flink jobs that are orchestrated, and in OpenLineage's Spark and Flink integrations.</dd>
+      <dt>In production</dt><dd>Contracts are checked in CI on the producer's repository; quality checks gate publication (write-audit-publish); lineage drives impact analysis before changes; access policies are code; Airflow runs on Kubernetes with remote logging, a managed metadata database and alerting; dbt runs in CI on every pull request against sampled data.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Adopt the full control plane once more than one team produces or consumes shared data. For a single analyst and three tables, a scheduled script with a few assertions is enough; introducing Airflow, a catalog and a feature store too early creates more operational surface than value.</dd>
+    </dl>
+  </div>
+  <div class="callout insight"><p class="callout-title">Data as a product</p><p>The unifying idea of this chapter: treat each important dataset as a product with an owner, a documented interface (schema, semantics, freshness SLA), tests, versioning and consumers you notify before breaking changes, exactly as you treat a public API.</p></div>
+</section>
+
+<section id="history">
+  <h2>2. History</h2>
+  <h3>2.1 From cron to workflow engines (2000s–2015)</h3>
+  <p>Early pipelines were cron entries and shell scripts, with dependencies expressed as "job B starts at 3 a.m. because job A usually finishes by 2:30". Hadoop brought Apache Oozie (XML-defined workflows), and LinkedIn built Azkaban. Spotify open-sourced Luigi in 2012, defining tasks and dependencies in Python. Maxime Beauchemin started <strong>Airflow</strong> at Airbnb in 2014; it was open-sourced in 2015, entered the Apache incubator in 2016 and became a top-level project in 2019. Airflow 2.0 (December 2020) brought a highly available scheduler, the TaskFlow API and a stable REST API. <strong>Airflow 3.0</strong> (April 2025) was the largest change since: a Task SDK that separates task code from the core (workers talk to an API server rather than the metadata database), DAG versioning, assets (the renamed datasets) for data-aware scheduling, event-driven scheduling, a new React UI, and reworked backfills <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+  <p>Dagster (Elementl, now Dagster Labs, first released 2019) reframed orchestration around <em>software-defined assets</em>. Prefect (2018) emphasized Pythonic, dynamic flows with a hybrid execution model. Netflix open-sourced its Maestro orchestrator in 2024 and Lyft open-sourced Flyte in 2020, both from very large internal deployments.</p>
+  <h3>2.2 dbt and analytics engineering (2016–2026)</h3>
+  <p>Fishtown Analytics (now dbt Labs) released dbt in 2016: SQL <code>SELECT</code> statements as models, Jinja templating, <code>ref()</code> for dependencies, tests and documentation, all in Git. The role of <strong>analytics engineer</strong>, popularized by the dbt community around 2018–2019, emerged to describe people applying software engineering practices (version control, testing, CI, modularity) to analytical SQL. dbt added snapshots, incremental models, model contracts and versions (1.5, 2023), and unit tests (1.8, 2024). In May 2025 dbt Labs announced the <strong>dbt Fusion engine</strong>, a Rust rewrite with SQL comprehension, distributed under the ELv2 licence, while committing to maintain Apache-licensed dbt Core <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+  <h3>2.3 Data quality and observability (2017–2026)</h3>
+  <p>Great Expectations appeared in 2017–2018, introducing declarative "expectations" about data; it reached GX Core 1.0 in August 2024 with a simplified API. Amazon's Deequ (2018) brought unit tests for data on Spark. Soda introduced a YAML check language (SodaCL). Around 2019–2020 "data observability" vendors (Monte Carlo, Bigeye and others) applied monitoring and anomaly detection across warehouses. The term <strong>data contract</strong> gained wide currency around 2021–2022 as practitioners argued that quality problems must be fixed at the producer boundary rather than detected downstream.</p>
+  <h3>2.4 Governance, lineage and regulation</h3>
+  <p>The EU General Data Protection Regulation took effect on 25 May 2018, making data mapping, purpose limitation, retention and the right to erasure engineering requirements; California's CCPA followed in 2020. Open-source catalogs such as LinkedIn's DataHub (2020) and Lyft's Amundsen (2019), and later OpenMetadata, Unity Catalog (open-sourced 2024) and Apache Polaris, provided searchable metadata. <strong>OpenLineage</strong> (launched 2020, now an LF AI &amp; Data project) standardized lineage events emitted by Spark, Airflow, dbt, Flink and others.</p>
+  <h3>2.5 Feature stores (2017–2026)</h3>
+  <p>Uber's 2017 description of Michelangelo included a shared feature store with offline and online components, popularizing the pattern. Feast was released in 2019 by Gojek with Google Cloud and is now the most widely used open-source feature store. LinkedIn open-sourced Feathr (2022) and Airbnb open-sourced Chronon (2024). Managed offerings exist on every major ML platform.</p>
+</section>

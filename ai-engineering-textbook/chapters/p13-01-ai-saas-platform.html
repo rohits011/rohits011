@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capstone: Scalable AI SaaS Platform — AI-Era Software Engineering</title>
+<meta name="description" content="Capstone: design and build a multi-tenant AI SaaS platform with tenancy models, row-level isolation, an LLM gateway, quotas, usage metering and usage-based billing.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p13-01-ai-saas-platform" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 13 · Chapter 1 · Capstone</p>
+  <h1>Capstone: A Scalable, Multi-Tenant AI SaaS Platform</h1>
+  <p class="lede">You will design and build the platform layer behind an AI product sold to many businesses. It covers tenant onboarding and isolation, an LLM gateway that routes, caches, limits and meters every model call, quotas and plans, a usage-metering pipeline you can bill from, and the operational controls that stop one tenant from hurting the others. Your margins depend on this platform layer as much as on the model.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> <a href="p2-01-system-design-foundations.html">system design foundations</a>, <a href="p2-02-scaling-traffic.html">rate limiting</a>, <a href="p2-07-kafka-event-driven.html">Kafka</a>, <a href="p11-02-identity-oauth-oidc-jwt.html">OIDC/JWT</a>, <a href="p8-05-llm-reliability-operations.html">LLM cost &amp; observability</a>, <a href="p8-07-projects-knowledge-support-search.html">Projects I</a>.</li>
+    <li><strong>You will be able to:</strong> choose a tenancy model per tier; enforce tenant isolation in PostgreSQL with row-level security; build an LLM gateway with per-tenant rate limits, budgets, fallbacks and metering; design an idempotent usage pipeline that feeds billing; price an AI product on usage; and operate the platform with per-tenant observability.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: The Business Behind the Model</h2>
+  <p>The product in this capstone is <strong>Lumen</strong> <span class="tag illus">Illustrative</span>, a B2B AI workspace. Customers (tenants) upload documents, run AI workflows (summarise, extract, draft, ask questions with RAG), and call the same capabilities through a public API. Lumen sells three plans: Free, Team (per seat plus included AI credits) and Enterprise (committed spend, dedicated capacity options, SSO, data residency). The model providers bill Lumen per token. Lumen bills its customers per seat and per credit, so every request has a cost of goods sold (COGS) that must be measured, limited and recovered.</p>
+  <p>Earlier chapters showed how to build AI <em>features</em>. This capstone is about the <em>platform</em> those features run on. It has four concerns:</p>
+  <ol>
+    <li><strong>Tenancy and isolation:</strong> one codebase serving thousands of tenants without data leaks or noisy-neighbour outages.</li>
+    <li><strong>The LLM gateway:</strong> a single control point for all model traffic: authentication, routing, fallbacks, caching, quotas and metering.</li>
+    <li><strong>Metering and billing:</strong> turning millions of usage events into accurate invoices, idempotently and auditable.</li>
+    <li><strong>Plans and quotas:</strong> enforcing what each tenant has paid for, in real time.</li>
+  </ol>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>You have built Spring Boot services with Spring Security resource servers, Hibernate filters or <code>@Where</code> clauses for soft-deletes, Bucket4j or gateway rate limiting, Kafka consumers that aggregate events, and maybe a Stripe integration with webhooks.</dd>
+      <dt>Why that is not enough</dt><dd>Multi-tenancy turns every one of those into a security boundary. A forgotten <code>WHERE tenant_id = ?</code> is a data breach. A missing rate limit is an outage for other customers. A double-counted usage event is a billing dispute. LLM traffic adds two more problems: cost per request varies by two orders of magnitude depending on the tokens, and the upstream provider imposes its own rate limits that all your tenants share.</dd>
+      <dt>The modern approach</dt><dd>Enforce tenant isolation in the database (PostgreSQL row-level security driven by a session variable), not only in application code. Route all model calls through a gateway that knows the tenant, the plan and the budget. Emit an immutable usage event for every billable action with an idempotency key, and aggregate those events into meters that the billing system consumes. Choose the tenancy model per plan tier: pooled for Free and Team, bridged or siloed for Enterprise.</dd>
+      <dt>Where Python and Go fit</dt><dd>The LLM gateway is written in Go: a high-throughput proxy with streaming, low memory per connection and simple deployment. AI workflow workers are Python (document parsing, RAG). The control plane (tenants, plans, billing) is Spring Boot, where transactions, security and integrations dominate.</dd>
+      <dt>In production</dt><dd>You will run a control plane, a data plane per region, a gateway fleet, Redis for rate-limit state, Kafka for usage events, PostgreSQL (pooled plus a few dedicated clusters), a billing provider integration, and per-tenant dashboards that support and finance both rely on.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use a pooled multi-tenant platform when you have many small and mid-size customers and need unit economics. Avoid pooling for customers whose contracts demand physical isolation, dedicated keys or residency. Give them a silo, managed by the same control plane.</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="history">
+  <h2>2. History: From ASP Hosting to Token-Metered SaaS</h2>
+  <p>In the late 1990s, "application service providers" hosted a separate copy of enterprise software per customer, a model we would now call <em>siloed</em>. Salesforce, founded in 1999, popularised the <strong>multi-tenant</strong> architecture in which all customers share one application and one database schema, separated by an organisation identifier and metadata-driven customisation. Shared infrastructure brought the economics that made SaaS a mass market.</p>
+  <p>Cloud infrastructure (Amazon S3 and EC2 launched in 2006) made per-use pricing familiar to engineers: you pay for requests, gigabytes and instance-hours. Developer-facing APIs such as Twilio and Stripe made <strong>usage-based pricing</strong> standard for API businesses in the 2010s, and metering became core infrastructure. AWS later formalised SaaS architecture vocabulary (silo, pool, bridge; tenant isolation strategies) in its SaaS Lens and whitepapers. Its Builders' Library described <strong>shuffle sharding</strong> as a way to contain noisy neighbours.</p>
+  <p>LLM APIs, from OpenAI's API beta in 2020 onwards and then many providers, priced <em>per token</em>, separately for input and output, with discounts for cached and batched tokens. AI products therefore inherited a variable COGS per request at a scale classic SaaS never had. A single heavy user can cost more than their subscription. Since 2023, the industry has converged on a few patterns: an internal <strong>LLM gateway</strong> as the choke point, credits or token-based plans, hybrid pricing (seat plus usage), and billing platforms adding first-class AI metering. Stripe documents an LLM token billing feature, in preview at the time of writing, that meters tokens per customer by model and token type <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals: Requirements and Scope</h2>
+  <h3>3.1 Functional requirements</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>ID</th><th>Requirement</th></tr></thead>
+    <tbody>
+      <tr><td>FR-1</td><td>Self-serve tenant sign-up (Free/Team), sales-led Enterprise onboarding; tenant provisioning in under 60 s for pooled tiers</td></tr>
+      <tr><td>FR-2</td><td>Tenant-scoped identity: SSO (OIDC/SAML) per tenant for Enterprise, SCIM provisioning, roles (owner, admin, member)</td></tr>
+      <tr><td>FR-3</td><td>AI features (chat, RAG over tenant docs, workflows) and a public API with per-tenant API keys</td></tr>
+      <tr><td>FR-4</td><td>Plans with entitlements: included credits per month, rate limits (requests/min, tokens/min), allowed models, max document storage, feature flags</td></tr>
+      <tr><td>FR-5</td><td>Real-time quota enforcement with clear errors (HTTP 429 with <code>Retry-After</code>; 402-style "credits exhausted" response) and soft warnings at 80% and 100%</td></tr>
+      <tr><td>FR-6</td><td>Usage metering of every billable unit (credits derived from tokens by model, documents processed, storage GB-month) with per-tenant, per-user and per-API-key breakdowns</td></tr>
+      <tr><td>FR-7</td><td>Billing integration: monthly invoices with seats + overage credits; prepaid credit packs; Enterprise commitments with drawdown</td></tr>
+      <tr><td>FR-8</td><td>Tenant admin console: usage dashboards, budgets and alerts, key management, audit log export</td></tr>
+    </tbody>
+  </table></div>
+  <h3>3.2 Non-functional requirements</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>ID</th><th>Requirement</th></tr></thead>
+    <tbody>
+      <tr><td>NFR-1</td><td><strong>Isolation:</strong> no cross-tenant data access, enforced in at least two layers (application and database); tested continuously</td></tr>
+      <tr><td>NFR-2</td><td><strong>Fairness:</strong> one tenant's burst cannot push others' p95 latency beyond SLO; provider rate-limit capacity is allocated by plan</td></tr>
+      <tr><td>NFR-3</td><td><strong>Metering accuracy:</strong> billed usage matches provider-side usage within 0.5% monthly; every invoice line traceable to events</td></tr>
+      <tr><td>NFR-4</td><td><strong>Availability:</strong> API 99.9% monthly; gateway adds &lt; 15 ms p95 overhead (excluding upstream)</td></tr>
+      <tr><td>NFR-5</td><td><strong>Scale target:</strong> 20,000 tenants, 2M AI requests/day, 3,000 peak concurrent streams <span class="tag illus">Illustrative</span></td></tr>
+      <tr><td>NFR-6</td><td><strong>Compliance:</strong> SOC 2 controls, GDPR (DPA, deletion within 30 days of tenant offboarding), EU data residency option</td></tr>
+    </tbody>
+  </table></div>
+  <h3>3.3 Tenancy models</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Model</th><th>What is shared</th><th>Isolation</th><th>Cost per tenant</th><th>Lumen tier</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Pool</strong></td><td>Compute, database, schema; rows carry <code>tenant_id</code></td><td>Logical (RLS, app checks)</td><td>Lowest</td><td>Free, Team</td></tr>
+      <tr><td><strong>Bridge</strong></td><td>Compute shared; per-tenant schema or database in a shared cluster; per-tenant encryption key</td><td>Stronger data isolation; shared compute</td><td>Medium</td><td>Enterprise (default)</td></tr>
+      <tr><td><strong>Silo</strong></td><td>Nothing in the data plane: dedicated namespace/cluster, database, keys, optionally dedicated model capacity</td><td>Physical</td><td>Highest</td><td>Enterprise (regulated, residency)</td></tr>
+    </tbody>
+  </table></div>
+  <p>The control plane (tenant registry, plans, billing, identity federation, deployment orchestration) is shared across all models. Only the data plane varies. This "one control plane, many data-plane shapes" principle keeps operational cost bounded while letting sales offer stronger isolation.</p>
+  <h3>3.4 Success metrics</h3>
+  <ul>
+    <li><strong>Gross margin per plan:</strong> (revenue − model cost − infra cost) / revenue, tracked weekly per plan and for the top 50 tenants.</li>
+    <li><strong>Metering reconciliation error</strong> (our token totals vs provider invoices) &lt; 0.5%.</li>
+    <li><strong>Isolation:</strong> zero cross-tenant findings in continuous tests and pen tests.</li>
+    <li><strong>Noisy-neighbour impact:</strong> p95 latency of the least-busy tenants unchanged (± 10%) during the top tenant's bursts (measured in load tests).</li>
+    <li><strong>Time-to-first-value</strong> for new tenants: sign-up to first AI result &lt; 5 minutes.</li>
+  </ul>
+</section>

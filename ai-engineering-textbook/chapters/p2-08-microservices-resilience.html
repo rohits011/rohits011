@@ -175,6 +175,225 @@
   <p>Every retry policy assumes the retried operation is safe to repeat. For synchronous service-to-service calls this means: idempotent HTTP methods used correctly (PUT/DELETE), idempotency keys on POSTs that create or charge, conditional requests (<code>If-Match</code> with ETags for optimistic concurrency), and deterministic request ids propagated through the call chain so that a downstream service can deduplicate. Chapter 6 covered the server-side mechanics in depth; here the rule is simply: <em>do not add a retry policy to a call until you have proven the operation is idempotent.</em></p>
 </section>
 
+<section id="internals">
+  <h2>4. Internal Working</h2>
+
+  <h3>4.1 How a cascading failure unfolds</h3>
+  <p>Understanding the failure mechanism tells you which pattern stops which stage:</p>
+  <ol>
+    <li>A dependency (say, Inventory's database) slows from 20 ms to 2 s.</li>
+    <li>Callers' threads (or connections, or virtual-thread-held DB connections) now stay busy 100× longer. By Little's law, in-flight requests rise 100× at constant throughput.</li>
+    <li>The caller's pools saturate; requests queue; its <em>own</em> latency rises for <em>all</em> endpoints, including those that never touch Inventory.</li>
+    <li>Upstream callers time out and retry, adding load to the already-struggling path.</li>
+    <li>Health checks time out, the orchestrator restarts "unhealthy" pods, capacity drops further, and the remaining pods receive even more load.</li>
+  </ol>
+  <p>Timeouts bound step 2; bulkheads contain step 3 to the Inventory path; circuit breakers cut step 2 off entirely once failure is evident; retry budgets and jitter prevent step 4 from amplifying; load shedding keeps step 3 from becoming collapse; and separating liveness from readiness probes (Chapter 9) avoids step 5.</p>
+
+  <h3>4.2 Resilience4j circuit breaker internals</h3>
+  <p>Resilience4j's <code>CircuitBreakerStateMachine</code> holds the current state in an atomic reference and records each call's outcome in a <strong>sliding window</strong>:</p>
+  <ul>
+    <li><strong>Count-based window</strong> (<code>slidingWindowType=COUNT_BASED</code>, size N): a circular array of N outcome measurements. Each new outcome overwrites the oldest, and the total aggregation (failed calls, slow calls, total calls, total duration) is updated incrementally by subtracting the evicted measurement and adding the new one. Recording and reading the failure rate are therefore O(1).</li>
+    <li><strong>Time-based window</strong> (<code>TIME_BASED</code>, size N seconds): a circular array of N <em>partial aggregations</em> (buckets), one per epoch second. Calls in the same second update the same bucket; when time moves past a bucket's second it is reset before reuse. The total aggregation is maintained incrementally, again O(1) per call, and memory is O(N) regardless of call rate.</li>
+  </ul>
+  <p>Failure and slow-call rates are evaluated only after <code>minimumNumberOfCalls</code> outcomes have been recorded in the window; before that, the breaker cannot trip, which protects low-traffic services from tripping on one failure but also means a breaker with <code>minimumNumberOfCalls=100</code> on an endpoint receiving 10 calls per minute effectively never trips. When <code>failureRate ≥ failureRateThreshold</code> or <code>slowCallRate ≥ slowCallRateThreshold</code> (a call is slow if it exceeds <code>slowCallDurationThreshold</code>), the breaker transitions to OPEN.</p>
+  <p>In OPEN, calls are rejected with <code>CallNotPermittedException</code>, which is not recorded as a failure. After <code>waitDurationInOpenState</code> the breaker moves to HALF_OPEN, either lazily on the next call or proactively if <code>automaticTransitionFromOpenToHalfOpenEnabled</code> is set. In HALF_OPEN it permits exactly <code>permittedNumberOfCallsInHalfOpenState</code> calls, using a fresh measurement window; others are rejected. The rates of these trial calls decide: below thresholds, CLOSED; otherwise back to OPEN. <code>maxWaitDurationInHalfOpenState</code> bounds how long it can stay half-open. Special states DISABLED, FORCED_OPEN and METRICS_ONLY support operational overrides. Which exceptions count as failures is controlled by <code>recordExceptions</code>, <code>ignoreExceptions</code> and a <code>recordFailurePredicate</code> (e.g., do not count 4xx client errors as dependency failures).</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Property</th><th>Resilience4j default</th><th>Practical starting point</th></tr></thead>
+    <tbody>
+      <tr><td><code>slidingWindowType</code> / <code>slidingWindowSize</code></td><td>COUNT_BASED / 100</td><td>TIME_BASED / 10–30 s for variable traffic</td></tr>
+      <tr><td><code>minimumNumberOfCalls</code></td><td>100</td><td>Expected calls in the window at low traffic, e.g. 20</td></tr>
+      <tr><td><code>failureRateThreshold</code></td><td>50%</td><td>50% (lower for critical, fast-failing dependencies)</td></tr>
+      <tr><td><code>slowCallDurationThreshold</code> / <code>slowCallRateThreshold</code></td><td>60 s / 100%</td><td>Near your timeout, e.g. 1–2 s / 50–80%</td></tr>
+      <tr><td><code>waitDurationInOpenState</code></td><td>60 s</td><td>5–30 s</td></tr>
+      <tr><td><code>permittedNumberOfCallsInHalfOpenState</code></td><td>10</td><td>5–10</td></tr>
+    </tbody>
+  </table></div>
+  <p><span class="tag version">Version-sensitive · checked Nov 2026</span> The defaults are from the Resilience4j 2.x documentation; the slow-call defaults effectively disable slow-call tripping, so set them explicitly.</p>
+
+  <h3>4.3 Decorator ordering</h3>
+  <p>With the Spring Boot starter's annotations, Resilience4j applies aspects in this default order (outermost first): <strong>Retry → CircuitBreaker → RateLimiter → TimeLimiter → Bulkhead → your method</strong>. Consequences: each retry attempt passes through the circuit breaker and is recorded individually; when the breaker is open, <code>CallNotPermittedException</code> reaches the retry, which should be configured <em>not</em> to retry it (otherwise you spin against an open breaker); the time limiter bounds each individual attempt, not the total. If you compose decorators programmatically (<code>Decorators.ofSupplier(...)</code>), you choose the order yourself, and the same reasoning applies.</p>
+
+  <h3>4.4 Bulkhead and rate limiter internals</h3>
+  <p><code>SemaphoreBulkhead</code> wraps a fair semaphore with <code>maxConcurrentCalls</code> permits (default 25); a call waits up to <code>maxWaitDuration</code> (default 0, i.e., fail immediately) and otherwise gets <code>BulkheadFullException</code>. <code>FixedThreadPoolBulkhead</code> runs calls on a dedicated pool with a bounded queue, useful for isolating blocking calls in platform-thread applications. The <code>RateLimiter</code> divides time into cycles of <code>limitRefreshPeriod</code> and grants <code>limitForPeriod</code> permissions per cycle (a fixed-window style limiter computed lazily, with an atomic state). For outbound calls to rate-limited APIs (LLM providers measured in requests and tokens per minute), a client-side rate limiter avoids burning your quota on 429s.</p>
+
+  <h3>4.5 Spring Framework 7 core resilience</h3>
+  <p>Spring Framework 7 (with Boot 4) adds <code>@Retryable</code> (with delay, multiplier, jitter, max delay, includes/excludes, and support for reactive return types) and <code>@ConcurrencyLimit</code> (a bulkhead-like throttle, especially useful with virtual threads), enabled with <code>@EnableResilientMethods</code>, plus a programmatic <code>RetryTemplate</code>. Note that <code>maxAttempts</code> in core Spring counts retries <em>excluding</em> the initial call, unlike Spring Retry and Resilience4j, where it includes the initial call. It does not include a circuit breaker, so Resilience4j remains the standard for breakers. <span class="tag version">Version-sensitive · checked Nov 2026</span></p>
+
+  <h3>4.6 Eureka registration and client caching</h3>
+  <ol>
+    <li>On startup an instance registers (<code>POST /eureka/apps/ORDERS</code>) with its host, port, status and metadata (zone, version).</li>
+    <li>It renews its lease with a heartbeat (default every 30 s); the server expires an instance after about 90 s without renewal.</li>
+    <li>Clients fetch the full registry, then deltas (default every 30 s) and cache it locally. Spring Cloud LoadBalancer chooses an instance from the cached list, optionally preferring the same zone, and may add its own health-check filtering and caching.</li>
+    <li>On shutdown the instance de-registers. If it crashes, callers may route to it for up to a couple of minutes (heartbeat expiry plus cache refresh), which is why client-side retries to a <em>different</em> instance are part of the pattern.</li>
+    <li>If renewals drop below a threshold (as in a network partition between instances and the registry), the server enters self-preservation and stops expiring instances: availability of stale data over an empty registry.</li>
+  </ol>
+  <p>Kubernetes inverts this: the kubelet reports pod readiness, the control plane updates EndpointSlices, and kube-proxy or the CNI updates forwarding rules on every node within seconds. No registration code lives in your app; graceful shutdown requires a <code>preStop</code> delay so endpoints are removed before the pod stops accepting connections.</p>
+
+  <h3>4.7 Redis locks step by step, and where they break</h3>
+  <ol>
+    <li>Client A runs <code>SET lock:report-42 &lt;uuidA&gt; NX PX 30000</code>. Redis returns OK: A holds a 30 s lease.</li>
+    <li>A starts work. A stop-the-world GC pause (or a VM stall, or a slow network) freezes A for 40 s.</li>
+    <li>At 30 s the key expires. Client B acquires the lock with <code>&lt;uuidB&gt;</code> and starts the same work, writing results to storage.</li>
+    <li>A resumes, unaware that its lease has expired, and writes its (now stale) results to storage, overwriting B's.</li>
+    <li>A tries to release with the compare-and-delete script; the value is <code>uuidB</code>, so the delete correctly does nothing. Correct release did not prevent the corruption in step 4.</li>
+  </ol>
+  <p>Checking "do I still hold the lock?" before writing does not help: the pause can occur between the check and the write. The only robust fix is for the <em>storage</em> to reject A's write. With a fencing token, the lock service returns token 33 to A and token 34 to B; storage remembers it has seen 34 and rejects any write carrying 33. Redis's <code>SET NX</code> does not produce such a token; consensus systems do (etcd revisions, ZooKeeper zxids), and so does a database sequence.</p>
+
+  <h3>4.8 etcd and ZooKeeper locks</h3>
+  <p><strong>etcd:</strong> the client creates a lease with a TTL and keeps it alive; it creates a key under a lock prefix attached to the lease; the key with the lowest <em>create revision</em> under the prefix holds the lock, others watch the key just before theirs. The holder's create revision is globally monotonic, so it is a valid fencing token. If the client dies, the lease expires and its key disappears. <strong>ZooKeeper:</strong> create an <em>ephemeral sequential</em> znode under <code>/locks/report-42</code>; if yours has the lowest sequence number you hold the lock; otherwise watch the next-lower node (avoiding herd effects). The ephemeral node disappears when the session expires. Both still suffer from the "paused holder" problem; both give you a monotonic token to fence with.</p>
+
+  <h3>4.9 PostgreSQL advisory locks</h3>
+  <p>Advisory locks are application-defined locks keyed by a 64-bit integer (or two 32-bit ones), managed by PostgreSQL's lock manager. <code>pg_try_advisory_lock(k)</code> returns immediately; <code>pg_advisory_lock(k)</code> waits; session-level locks persist until released or the connection ends; <code>pg_advisory_xact_lock(k)</code> is released automatically at transaction end, which is safer with connection pools (a session-level lock on a pooled connection can leak to the next borrower if not released). Because the lock lives in the same database as the data, you can combine it with the write in one transaction, which sidesteps the fencing problem for writes to that database: if the session dies, its transaction aborts.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: Diagrams and Simulation</h2>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph Monolith["Spring Modulith application (one deployable)"]
+    O["order module (API: OrderManagement)"]
+    I["inventory module (API: InventoryManagement)"]
+    P["payment module"]
+    REG[("event_publication table")]
+    O -- "OrderPlaced (in-process event)" --> I
+    O -- OrderPlaced --> P
+    O -. "persisted until listeners complete" .-> REG
+  end
+  DB[(Single PostgreSQL, schema per module)]
+  Monolith --> DB
+  REG -. "externalised later" .-> K[(Kafka)]
+</pre>
+  <figcaption>Figure 8.1 — A modular monolith with Spring Modulith: enforced module APIs, in-process events and a built-in publication registry.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> modules talk through public APIs and events, never through each other's internals or tables, and <code>ApplicationModules.verify()</code> enforces it in tests. The event publication registry gives at-least-once delivery to listeners across crashes. Because the boundaries already match bounded contexts and communication is event-based, extracting the inventory module into a service later means moving the module and switching event delivery to Kafka, not redesigning.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  U[Clients] --> GW["API gateway / ingress (authn, rate limit, shedding)"]
+  GW --> OS[Order service]
+  GW --> CS[Catalog service]
+  OS -->|"gRPC, deadline 300 ms"| PS[Pricing service]
+  OS -->|events| K[(Kafka)]
+  K --> IS[Inventory service]
+  K --> NS[Notification service]
+  OS --- ODB[(orders DB)]
+  IS --- IDB[(inventory DB)]
+  CS --- CDB[(catalog DB)]
+  PS --- PC[(pricing cache)]
+</pre>
+  <figcaption>Figure 8.2 — Bounded-context services: one synchronous hop for fresh data, events for propagation, private databases.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the order flow makes a single synchronous call (pricing must be fresh and immediate) with an explicit deadline; everything else reacts to events. Each service has a private store. If Inventory is down, orders are still accepted and inventory catches up from Kafka; the compensating path (cancel if stock is unavailable) is a saga as in Chapter 6.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant A as orders pod
+  participant DNS as CoreDNS
+  participant KP as kube-proxy rules (node)
+  participant P1 as pricing pod 1
+  participant P2 as pricing pod 2
+  A->>DNS: resolve pricing.shop.svc.cluster.local
+  DNS-->>A: ClusterIP 10.96.12.7
+  A->>KP: TCP connect 10.96.12.7:8080
+  KP->>P2: DNAT to a ready endpoint (pod 2)
+  Note over A,P2: all requests on this connection go to pod 2
+  Note over KP,P1: readiness probe fails on pod 1, EndpointSlice updated, rules drop it
+</pre>
+  <figcaption>Figure 8.3 — Server-side discovery with Kubernetes Services.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> discovery is DNS to a stable virtual IP, and balancing happens once per connection in the kernel. That is efficient but coarse: a long-lived HTTP/2 or gRPC connection pins all its requests to one pod. Use a headless Service with client-side gRPC balancing, a mesh, or connection max-age settings to rebalance.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> CLOSED
+  CLOSED --> OPEN: failure or slow-call rate over threshold, after minimumNumberOfCalls
+  OPEN --> HALF_OPEN: waitDurationInOpenState elapsed
+  HALF_OPEN --> CLOSED: trial calls below thresholds
+  HALF_OPEN --> OPEN: trial calls above thresholds
+  CLOSED --> FORCED_OPEN: operator override
+  FORCED_OPEN --> CLOSED: operator reset
+</pre>
+  <figcaption>Figure 8.4 — Circuit breaker state machine as implemented by Resilience4j.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the only automatic way out of OPEN is through HALF_OPEN's limited trial, which is what prevents a recovering dependency from being flooded the instant the breaker closes. The operator states are worth exposing through an admin endpoint: forcing a breaker open is a fast, safe way to cut off a misbehaving dependency during an incident.</p>
+
+  <figure class="diagram">
+    <div class="widget" data-widget="circuit-breaker"></div>
+    <figcaption>Figure 8.5 — Interactive: circuit breaker states versus failure rate.</figcaption>
+  </figure>
+  <p><strong>What to try:</strong> raise the dependency's failure rate gradually and watch the moment the breaker trips relative to the threshold and window size; then shrink the window and see it react faster but also trip on short blips. Let the wait duration elapse with the dependency still failing to see HALF_OPEN fail back to OPEN, then heal the dependency and watch trial calls close it. Note how many calls actually reach the dependency while OPEN compared with a setup that has no breaker.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  REQ[Incoming request] --> SH{"Shed? in-flight over limit or deadline passed"}
+  SH -->|yes| R503["503 / 429 fast"]
+  SH -->|no| RT["Retry (budgeted, jittered, idempotent only)"]
+  RT --> CB{"Circuit breaker"}
+  CB -->|open| FB["Fallback or fail fast"]
+  CB -->|closed / half-open trial| TL["Time limiter (per-attempt timeout)"]
+  TL --> BH{"Bulkhead permit?"}
+  BH -->|no| FB
+  BH -->|yes| DEP[(Dependency)]
+</pre>
+  <figcaption>Figure 8.6 — Layered resilience on an outbound call path, in Resilience4j's default decorator order.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> shedding at ingress protects the service itself; the decorators protect the dependency and the service's resources from each other. Each layer converts a slow or failing situation into a fast, explicit outcome. Fallback is reached from two places (breaker open, bulkhead full), so it must be cheap and must not call the same dependency.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant A as Worker A
+  participant L as Lock service (etcd)
+  participant B as Worker B
+  participant S as Storage
+  A->>L: acquire lock
+  L-->>A: granted, token 33
+  Note over A: GC pause longer than lease
+  L->>L: lease expires
+  B->>L: acquire lock
+  L-->>B: granted, token 34
+  B->>S: write(data, token 34)
+  S->>S: highest token seen = 34
+  A->>S: write(stale data, token 33)
+  S-->>A: rejected, 33 is below 34
+</pre>
+  <figcaption>Figure 8.7 — Fencing tokens make a paused lock holder harmless.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the lock service cannot stop A from waking up and acting; only the resource can refuse. The token must be monotonic across grants and checked atomically with the write (for example, <code>UPDATE ... SET data=?, fence=? WHERE id=? AND fence &lt; ?</code>). If your storage cannot check tokens, a lock cannot give you correctness, and you should redesign the operation to be idempotent or conditional instead.</p>
+</section>
+
+<section id="math">
+  <h2>6. Math: Availability, Amplification, Concurrency and Timeouts</h2>
+  <h3>6.1 Availability of call chains</h3>
+  <p>Serial synchronous dependencies multiply: \( A_{chain} = \prod_{i=1}^{k} A_i \). Ten services at 99.95% give \( 0.9995^{10} \approx 99.5\% \), about 3.6 hours of downtime per month instead of 22 minutes for one service. Parallel redundant paths combine as \( 1 - \prod (1 - A_i) \): two independent replicas at 99% give 99.99%. This is the quantitative argument for async integration and fallbacks.</p>
+
+  <h3>6.2 Retry amplification</h3>
+  <p>If each of \( d \) layers makes up to \( r \) attempts, a failure at the bottom can cause up to \( r^{d} \) calls. With \( r=3 \) and \( d=4 \): 81 calls for one user request. With a retry budget of ratio \( \beta \) (say 0.1) at each layer, the worst-case load multiplier per layer is \( 1 + \beta \), so the total is \( (1+\beta)^{d} \approx 1.46 \) for \( d=4 \): bounded, regardless of failure rate.</p>
+
+  <h3>6.3 Backoff with jitter</h3>
+  <p>For attempt \( n \) (starting at 0), base \( b \) and cap \( c \):</p>
+  \[ \text{exp}(n) = \min(c,\; b \cdot 2^{n}), \qquad \text{full jitter: } s_n \sim U(0, \text{exp}(n)), \qquad \text{equal jitter: } s_n = \tfrac{\text{exp}(n)}{2} + U\!\left(0, \tfrac{\text{exp}(n)}{2}\right). \]
+  <p>Decorrelated jitter: \( s_n = \min(c, U(b, 3 s_{n-1})) \). Full jitter's expected wait is half the exponential value, and it spreads synchronized clients uniformly, which is why AWS's analysis found it does the least total work under contention.</p>
+
+  <h3>6.4 Sizing bulkheads with Little's law</h3>
+  <p>Little's law: average concurrency \( L = \lambda W \) (arrival rate times time in system). If a dependency is called 200 times/s with p99 latency 150 ms, steady-state concurrency is about \( 200 \times 0.15 = 30 \). A bulkhead of ~40 permits absorbs normal variance; if latency rises to 2 s, demand would be 400 concurrent calls, and the bulkhead caps it at 40, rejecting the excess quickly instead of letting it consume the whole service. The same arithmetic sizes connection pools: \( \text{pool} \approx \lambda \times W_{db} \times \text{headroom} \).</p>
+
+  <h3>6.5 Timeout budgets</h3>
+  <p>If the gateway's deadline is \( D \) and a request makes sequential calls with timeouts \( t_i \) and up to \( r_i \) attempts with backoff \( s \), the worst case is \( \sum_i r_i (t_i + s_i) \). This must be \( &lt; D \), otherwise you do work after the client has gone. Example: \( D = 1\,\text{s} \), two sequential calls, each with timeout 250 ms and 2 attempts with 50 ms backoff: \( 2 \times 2 \times 300 = 1{,}200 \) ms, which exceeds the budget. Either reduce to one retry on one call, or propagate the remaining deadline so that late retries are skipped. <span class="tag illus">Illustrative</span></p>
+
+  <h3>6.6 Circuit-breaker detection time</h3>
+  <p>With a time-based window of \( w \) seconds, threshold \( \theta \), and a dependency that fails at rate \( f &gt; \theta \) starting at time 0 while traffic is \( \lambda \) calls/s, the breaker needs (approximately) enough failures to push the windowed rate over \( \theta \) and at least \( m \) = <code>minimumNumberOfCalls</code> calls. For a previously healthy window, the earliest trip time \( t \) satisfies \( \frac{f \lambda t}{\lambda w} \ge \theta \), i.e., \( t \ge \theta w / f \), and \( \lambda t \ge m \) if the window is not yet full. With \( w = 10 \) s, \( \theta = 0.5 \), \( f = 1 \) (total outage): \( t \approx 5 \) s. Smaller windows detect faster but trip on noise.</p>
+
+  <h3>6.7 Lock lease safety</h3>
+  <p>A lease-based lock is safe without fencing only if every holder finishes its critical section, including any pause \( p \) and clock drift \( \delta \), within the lease: \( t_{work} + p_{max} + \delta &lt; \text{TTL} \). Because \( p_{max} \) is unbounded in practice (GC, swapping, VM migration, network delays), no TTL makes this provably true. Fencing replaces the timing assumption with a check at the resource.</p>
+</section>
+
 </article>
 <script src="../assets/js/toc.js"></script>
 <script src="../assets/js/widgets.js"></script>

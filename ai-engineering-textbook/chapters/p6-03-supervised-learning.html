@@ -785,3 +785,207 @@ flowchart TD
   <h3>13.5 Security and robustness</h3>
   <p>Validate inputs at the service boundary (ranges, types) before scoring; trees will happily score absurd inputs. Rate-limit and avoid exposing raw scores externally to reduce model extraction risk. Model files are code-adjacent: load only signed artifacts from your registry; avoid pickle where a data format (XGBoost JSON, ONNX) exists.</p>
 </section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>Fit y = a + bx by least squares to (0, 1), (1, 3), (2, 2), (3, 6) by hand. Report a, b, the residuals and the MSE.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>x̄ = 1.5, ȳ = 3. Σ(x − x̄)(y − ȳ) = (−1.5)(−2) + (−0.5)(0) + (0.5)(−1) + (1.5)(3) = 3 + 0 − 0.5 + 4.5 = 7. Σ(x − x̄)² = 2.25 + 0.25 + 0.25 + 2.25 = 5. b = 7/5 = 1.4; a = 3 − 1.4 × 1.5 = 0.9. Predictions 0.9, 2.3, 3.7, 5.1; residuals (y − ŷ) 0.1, 0.7, −1.7, 0.9 (sum 0). MSE = (0.01 + 0.49 + 2.89 + 0.81)/4 = 4.2/4 = 1.05.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Foundational</p>
+    <p>A node has 8 positives and 2 negatives. Candidate split A: left (6+, 0−), right (2+, 2−). Candidate B: left (5+, 1−), right (3+, 1−). Compute the Gini gain of each and choose.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Parent Gini = 1 − 0.64 − 0.04 = 0.32. A: left 0, right 0.5; weighted = 0.6 × 0 + 0.4 × 0.5 = 0.2; gain 0.12. B: left 1 − (5/6)² − (1/6)² = 0.278; right 1 − 0.5625 − 0.0625 = 0.375; weighted = 0.6 × 0.278 + 0.4 × 0.375 = 0.167 + 0.15 = 0.317; gain 0.003. Choose A.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>For binary log-loss boosting, g = p − y and h = p(1 − p) with p the current predicted probability. Four examples all currently at p = 0.5 have labels [1, 1, 1, 0]. With λ = 1, compute the optimal single-leaf value, and the new probability for these examples if the learning rate is 0.3. Then compute the gain of splitting into {first three} and {last one}, γ = 0.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>g = [−0.5, −0.5, −0.5, 0.5], h = 0.25 each. G = −1.0, H = 1.0. w* = −G/(H + λ) = 1/2 = 0.5. New log-odds = 0 + 0.3 × 0.5 = 0.15, p = σ(0.15) ≈ 0.537. Split: G<sub>L</sub> = −1.5, H<sub>L</sub> = 0.75; G<sub>R</sub> = 0.5, H<sub>R</sub> = 0.25. Gain = ½[2.25/1.75 + 0.25/1.25 − 1/2] = ½[1.286 + 0.2 − 0.5] = 0.493. Positive, so the split helps; leaf values 1.5/1.75 ≈ 0.857 and −0.5/1.25 = −0.4.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Intermediate</p>
+    <p>Derive the lasso solution for a single standardised feature, minimising ½Σ(y<sub>i</sub> − wx<sub>i</sub>)² + λ|w| with Σx<sub>i</sub>² = m. Show it is soft-thresholding of the OLS estimate.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>For w ≠ 0 the derivative is −Σx<sub>i</sub>(y<sub>i</sub> − wx<sub>i</sub>) + λ sign(w) = −Σx<sub>i</sub>y<sub>i</sub> + mw + λ sign(w). Let ŵ = Σx<sub>i</sub>y<sub>i</sub>/m (OLS). Setting to zero: w = ŵ − (λ/m) sign(w). If ŵ &gt; λ/m, w = ŵ − λ/m &gt; 0, consistent. If ŵ &lt; −λ/m, w = ŵ + λ/m. If |ŵ| ≤ λ/m, no non-zero w is consistent and the subgradient condition 0 ∈ −mŵ + λ[−1, 1] holds at w = 0. Hence w = sign(ŵ) max(|ŵ| − λ/m, 0): shrink by a constant, clip at zero.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>A random forest of trees with individual variance σ² = 4 and pairwise correlation ρ = 0.3. (a) Variance of the average of 50 trees? (b) Of infinitely many? (c) If reducing max_features lowers ρ to 0.15 but raises σ² to 4.5, is it worth it for 500 trees?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>(a) 0.3 × 4 + 0.7 × 4/50 = 1.2 + 0.056 = 1.256. (b) 1.2. (c) Before: 1.2 + 2.8/500 = 1.2056. After: 0.15 × 4.5 + 0.85 × 4.5/500 = 0.675 + 0.00765 = 0.683. Yes: the variance floor drops substantially, which is the core argument for feature subsampling. (Bias may rise slightly as each tree is weaker; validate.)</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 6 · Advanced (coding)</p>
+    <p>Extend <code>TinyGBM</code> (§7.5) to binary classification with log-loss: initialise with the log-odds of the base rate, fit trees to y − p, and set each leaf's value with a Newton step Σ(y − p)/Σp(1 − p). Test it on breast cancer against <code>HistGradientBoostingClassifier</code>.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-python">import numpy as np
+from sklearn.datasets import load_breast_cancer
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
+from sklearn.tree import DecisionTreeRegressor
+
+def sigmoid(z): return 1 / (1 + np.exp(-z))
+
+class TinyGBMClassifier:
+    def __init__(self, n=300, lr=0.1, depth=3, lam=1.0):
+        self.n, self.lr, self.depth, self.lam = n, lr, depth, lam
+
+    def fit(self, X, y):
+        p0 = y.mean()
+        self.f0 = np.log(p0 / (1 - p0))
+        F = np.full(len(y), self.f0)
+        self.trees = []
+        for t in range(self.n):
+            p = sigmoid(F)
+            g, h = y - p, p * (1 - p)
+            tree = DecisionTreeRegressor(max_depth=self.depth, random_state=t).fit(X, g)
+            leaf = tree.apply(X)
+            values = {}
+            for lf in np.unique(leaf):                       # Newton leaf values
+                idx = leaf == lf
+                values[lf] = g[idx].sum() / (h[idx].sum() + self.lam)
+            F += self.lr * np.vectorize(values.get)(leaf)
+            self.trees.append((tree, values))
+        return self
+
+    def decision_function(self, X):
+        F = np.full(len(X), self.f0)
+        for tree, values in self.trees:
+            F += self.lr * np.vectorize(values.get)(tree.apply(X))
+        return F
+
+X, y = load_breast_cancer(return_X_y=True)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, stratify=y, random_state=0)
+ours = TinyGBMClassifier().fit(X_tr, y_tr)
+ref = HistGradientBoostingClassifier(random_state=0).fit(X_tr, y_tr)
+print(roc_auc_score(y_te, ours.decision_function(X_te)), roc_auc_score(y_te, ref.predict_proba(X_te)[:, 1]))
+# Both ~0.99 (Illustrative)</code></pre>
+      <p>The tree's structure is chosen by fitting the gradient with squared error (as in Friedman's original algorithm); the leaf values are then replaced by Newton steps, which is the essence of XGBoost's leaf formula with λ.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain the difference between bagging and boosting.</summary><div><p>Bagging trains models independently on bootstrap samples and averages them, reducing variance; base learners are typically deep, low-bias trees; it parallelises and rarely overfits as trees are added. Boosting trains models sequentially, each correcting the current ensemble's errors (fitting negative gradients), reducing bias; base learners are shallow; it uses shrinkage and subsampling to control variance and needs early stopping.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why does L1 regularisation produce sparse models while L2 does not?</summary><div><p>Geometrically, the L1 constraint region has corners on the axes where loss contours tend to touch first. Analytically, the L1 subgradient applies a constant pull λ toward zero regardless of magnitude, so small coefficients are driven exactly to zero (soft-thresholding), whereas L2's pull 2λw vanishes as w approaches zero, only shrinking proportionally.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What does XGBoost add on top of classic gradient boosting?</summary><div><p>A regularised objective (γ per leaf, L2/L1 on leaf weights); a second-order Taylor approximation using gradients and hessians, giving closed-form leaf weights −G/(H + λ) and an analytic split gain; sparsity-aware default directions for missing values; weighted-quantile and histogram split finding; column/row subsampling; and systems work (cache-aware blocks, out-of-core, distributed and GPU training).</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Is logistic regression a linear model if it outputs a sigmoid?</summary><div><p>Yes: its log-odds are linear in the features, and its decision boundary wᵀx = threshold-logit is a hyperplane. The sigmoid is a monotone link mapping the linear score to a probability; it does not bend the boundary.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Implement one gradient-descent step of L2-regularised logistic regression in NumPy.</summary><div><pre><code class="language-python">def step(w, b, X, y, eta=0.1, lam=1e-3):
+    p = 1 / (1 + np.exp(-(X @ w + b)))
+    grad_w = X.T @ (p - y) / len(y) + 2 * lam * w
+    grad_b = (p - y).mean()
+    return w - eta * grad_w, b - eta * grad_b</code></pre><p>Mention numerical stability (clip logits or use a stable sigmoid), not regularising the bias, and feature scaling.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Your GBDT validation AUC is 0.92 but drops to 0.84 after a month in production. What do you check?</summary><div><p>Data drift (feature distributions, unknown categories, null rates), concept drift (fraud patterns change), training/serving skew (feature computation differences, feature order), label delay effects (immature labels in evaluation), leakage in the original validation (random split on time-dependent data). Remedies: temporal validation, retraining cadence, drift monitors, parity tests.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> A product manager wants the price model to never predict a lower price for a larger flat, all else equal. How?</summary><div><p>Use monotonic constraints on the size feature in XGBoost/LightGBM/HistGradientBoosting (+1 for increasing). Verify with partial dependence or ICE plots and property-based tests that sweep size while holding other features fixed. Alternatively use a linear or GAM-style model with constrained coefficients.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How would you serve an XGBoost model at 20k requests per second with p99 under 10 ms from a Spring Boot fleet?</summary><div><p>Load the model in-process (XGBoost4J or ONNX Runtime) to avoid network hops; batch micro-requests where possible; prefetch features in parallel from the online store with timeouts and defaults; cap trees/depth from a latency budget measured in load tests; warm up at startup; pool predictors if not thread-safe; expose metrics for feature fetch versus inference time; deploy new models via registry with canary and shadow scoring; keep a rule-based fallback on timeout.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why can't tree ensembles extrapolate and when does it matter?</summary><div><p>Each tree's prediction is a leaf value computed from training targets, so the ensemble's output is bounded by combinations of training-range values; beyond the last split threshold the prediction is flat. It matters for trends (prices rising over time, growth forecasting) and for inputs outside the training range. Mitigate with detrending, modelling ratios or differences, linear components (LightGBM's <code>linear_tree</code>), or linear models.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Every supervised method = hypothesis class + loss + optimiser + regulariser.</li>
+    <li>Linear regression minimises squared error (normal equation or GD); ridge shrinks, lasso selects, elastic net does both.</li>
+    <li>Logistic regression is a linear score through a sigmoid, trained with log-loss; gradient (p − y)x; softmax generalises it.</li>
+    <li>Trees split greedily on impurity reduction (Gini, entropy, variance) and must be constrained or pruned.</li>
+    <li>Random forests reduce variance by averaging decorrelated bootstrap trees; OOB gives free validation.</li>
+    <li>Gradient boosting is functional gradient descent: each shallow tree fits negative gradients, added with shrinkage, stopped early.</li>
+    <li>XGBoost uses second-order Taylor expansion: leaf weight −G/(H + λ), split gain from G²/(H + λ) terms minus γ.</li>
+    <li>LightGBM (histograms, leaf-wise, GOSS/EFB) is fastest at scale; CatBoost (ordered statistics, oblivious trees) shines with categoricals.</li>
+  </ul>
+  <div class="quiz" data-answer="b">
+    <p class="q">In scikit-learn's LogisticRegression, increasing C from 1 to 100 does what?</p>
+    <ol>
+      <li data-k="a">Strengthens regularisation</li>
+      <li data-k="b">Weakens regularisation</li>
+      <li data-k="c">Switches from L2 to L1</li>
+      <li data-k="d">Changes the decision threshold</li>
+    </ol>
+    <div class="explain">C is the inverse regularisation strength; larger C lets weights grow.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">What is the XGBoost optimal leaf weight for a leaf with G = −6, H = 2, λ = 1?</p>
+    <ol>
+      <li data-k="a">−2</li>
+      <li data-k="b">3</li>
+      <li data-k="c">2</li>
+      <li data-k="d">−3</li>
+    </ol>
+    <div class="explain">w* = −G/(H + λ) = 6/3 = 2.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">Why do random forests sample a subset of features at each split?</p>
+    <ol>
+      <li data-k="a">To decorrelate trees, lowering the variance floor of the average</li>
+      <li data-k="b">To make each tree more accurate</li>
+      <li data-k="c">To enable out-of-bag estimation</li>
+      <li data-k="d">To handle missing values</li>
+    </ol>
+    <div class="explain">The average's variance is ρσ² + (1 − ρ)σ²/B; only lowering ρ reduces the first term. OOB comes from bootstrapping rows.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">For log-loss gradient boosting, what is the pseudo-residual for an example with y = 1 and current p = 0.8?</p>
+    <ol>
+      <li data-k="a">0.8</li>
+      <li data-k="b">−0.2</li>
+      <li data-k="c">0.16</li>
+      <li data-k="d">0.2</li>
+    </ol>
+    <div class="explain">Negative gradient = y − p = 0.2. 0.16 is the hessian p(1 − p).</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">Which statement about LightGBM's leaf-wise growth is correct?</p>
+    <ol>
+      <li data-k="a">It always produces balanced trees.</li>
+      <li data-k="b">It splits the leaf with the highest gain, reaching lower loss per leaf but risking overfitting on small data.</li>
+      <li data-k="c">It is identical to CatBoost's oblivious trees.</li>
+      <li data-k="d">It cannot handle missing values.</li>
+    </ol>
+    <div class="explain">Leaf-wise growth is greedy on gain and can produce deep, unbalanced trees; constrain with num_leaves and min_data_in_leaf.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">About what fraction of training rows are out-of-bag for each bootstrap tree?</p>
+    <ol>
+      <li data-k="a">10%</li>
+      <li data-k="b">50%</li>
+      <li data-k="c">37%</li>
+      <li data-k="d">63%</li>
+    </ol>
+    <div class="explain">(1 − 1/m)<sup>m</sup> → e<sup>−1</sup> ≈ 0.368; about 63% of distinct rows are in the bootstrap sample.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Gareth James, Daniela Witten, Trevor Hastie, Robert Tibshirani, Jonathan Taylor, <em>An Introduction to Statistical Learning (with Applications in Python)</em>, Springer, 2023 — <a href="https://www.statlearning.com/">free at statlearning.com</a>.</li>
+    <li><span class="ref-kind">Book</span> Trevor Hastie, Robert Tibshirani, Jerome Friedman, <em>The Elements of Statistical Learning</em>, 2nd ed., Springer — <a href="https://hastie.su.domains/ElemStatLearn/">free PDF from the authors</a>; chapters 3, 4, 9, 10, 15.</li>
+    <li><span class="ref-kind">Course</span> Stanford CS229 lecture notes on linear models, GLMs and SVMs — <a href="https://cs229.stanford.edu/">cs229.stanford.edu</a>.</li>
+    <li><span class="ref-kind">Paper</span> Tianqi Chen, Carlos Guestrin, "XGBoost: A Scalable Tree Boosting System", KDD 2016 — <a href="https://arxiv.org/abs/1603.02754">arXiv:1603.02754</a>.</li>
+    <li><span class="ref-kind">Paper</span> Guolin Ke et al., "LightGBM: A Highly Efficient Gradient Boosting Decision Tree", NeurIPS 2017 — <a href="https://papers.nips.cc/paper/6907-lightgbm-a-highly-efficient-gradient-boosting-decision-tree">NeurIPS proceedings</a>.</li>
+    <li><span class="ref-kind">Paper</span> Liudmila Prokhorenkova et al., "CatBoost: unbiased boosting with categorical features" — <a href="https://arxiv.org/abs/1706.09516">arXiv:1706.09516</a>.</li>
+    <li><span class="ref-kind">Paper</span> Jerome H. Friedman, "Greedy Function Approximation: A Gradient Boosting Machine", <em>Annals of Statistics</em> 29(5), 2001.</li>
+    <li><span class="ref-kind">Paper</span> Leo Breiman, "Random Forests", <em>Machine Learning</em> 45, 2001.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://xgboost.readthedocs.io/en/stable/tutorials/model.html">XGBoost: Introduction to Boosted Trees</a> (the official derivation), <a href="https://lightgbm.readthedocs.io/en/stable/">LightGBM docs</a>, <a href="https://scikit-learn.org/stable/supervised_learning.html">scikit-learn supervised learning guide</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://tribuo.org/">Tribuo</a> — Java ML library for training and serving linear models and trees on the JVM.</li>
+    <li><span class="ref-kind">Paper</span> Léo Grinsztajn, Edouard Oyallon, Gaël Varoquaux, "Why do tree-based models still outperform deep learning on tabular data?" — <a href="https://arxiv.org/abs/2207.08815">arXiv:2207.08815</a>.</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

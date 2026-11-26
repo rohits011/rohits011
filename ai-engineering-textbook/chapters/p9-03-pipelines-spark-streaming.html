@@ -780,3 +780,287 @@ FROM TABLE(TUMBLE(TABLE trip_events, DESCRIPTOR(dropoff_ts), INTERVAL '5' MINUTE
 GROUP BY window_start, window_end, pu_location_id;</code></pre>
   <p>Flink's window table-valued functions (<code>TUMBLE</code>, <code>HOP</code>, <code>CUMULATE</code>, <code>SESSION</code>) mirror Spark's <code>window()</code>; the watermark is declared on the table. With checkpointing enabled and a transactional or upsert sink, results are exactly-once.</p>
 </section>
+
+<section id="applications">
+  <h2>8. Real-World Applications</h2>
+  <h3>8.1 Operational database replication into the lakehouse</h3>
+  <p>Every company with microservices eventually needs their state in one analytical place. CDC with Debezium into Kafka, then Spark or Flink merging into Iceberg/Delta silver tables, replaced nightly dumps at many organizations, giving minutes-fresh analytical copies without loading the primaries.</p>
+  <h3>8.2 Large-scale batch transformation</h3>
+  <p>Sessionizing billions of clickstream events, building daily aggregates and ML training sets, deduplicating and joining across dozens of sources: classic Spark territory, typically orchestrated daily or hourly with idempotent partition overwrites.</p>
+  <h3>8.3 Real-time features and metrics</h3>
+  <p>Fraud scores need "number of card attempts in the last 10 minutes"; ride-hailing needs "open requests per zone right now"; marketplaces need live inventory. Flink or Spark Streaming compute windowed aggregates and write them to an online store (Redis, Cassandra, a feature store) for low-latency reads by serving systems (Chapter 9.4 and Part 10).</p>
+  <h3>8.4 Search and cache synchronization</h3>
+  <p>CDC streams keep Elasticsearch/OpenSearch indexes and caches consistent with the source of truth, replacing fragile dual writes in application code.</p>
+  <h3>8.5 Event-driven reprocessing and backfills</h3>
+  <p>When a bug is found in a metric definition, teams re-run the corrected batch job over affected partitions, or replay retained Kafka topics or bronze tables through a new streaming job version, the Kappa pattern in practice.</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 LinkedIn and the log as a unifying abstraction</h3>
+  <p><span class="tag fact">Verified</span> Jay Kreps' 2013 essay, written while at LinkedIn, explains how a durable, ordered log (what became Kafka) unifies data integration, replication and stream processing, and why a central log replaces point-to-point pipelines between every system. It is the conceptual foundation for using Kafka in data pipelines rather than only for service messaging. Source: <a href="https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying">The Log: What every software engineer should know about real-time data's unifying abstraction</a>.</p>
+  <h3>9.2 Kappa: questioning Lambda</h3>
+  <p><span class="tag fact">Verified</span> In 2014, Kreps argued that maintaining the same logic in a batch and a streaming system is the Lambda architecture's main cost, and proposed reprocessing by replaying a retained log through a new job instance writing to a new output table, then switching readers. Source: <a href="https://www.oreilly.com/radar/questioning-the-lambda-architecture/">Questioning the Lambda Architecture</a>.</p>
+  <h3>9.3 Uber's incremental ETL on Hudi</h3>
+  <p><span class="tag fact">Verified</span> Uber describes moving from batch recomputation of whole partitions to incremental ETL on Apache Hudi, using incremental reads of only changed records and upserts into target tables, with snapshot reads reserved for backfills. The post contrasts this with batch processing's poor handling of late-arriving data. It is a concrete large-scale example of the idempotent-upsert and late-data patterns in Section 3.15. Source: <a href="https://www.uber.com/blog/ubers-lakehouse-architecture/">Setting Uber's Transactional Data Lake in Motion with Incremental ETL Using Apache Hudi</a>.</p>
+  <h3>9.4 The Dataflow model at Google</h3>
+  <p><span class="tag fact">Verified</span> Akidau et al. (VLDB 2015) separated <em>what</em> is computed, <em>where</em> in event time (windowing), <em>when</em> in processing time results are materialized (watermarks and triggers), and <em>how</em> refinements relate (accumulation modes). These four questions are the clearest way to specify any streaming job. Source: <a href="https://www.vldb.org/pvldb/vol8/p1792-Akidau.pdf">The Dataflow Model (VLDB 2015)</a>.</p>
+  <h3>9.5 Disaggregated state in Flink 2.0</h3>
+  <p><span class="tag fact">Verified</span> A VLDB 2025 paper describes Flink 2.0's disaggregated state management, which makes a distributed file system the primary state storage and decouples computation from state, aimed at cloud-native elasticity and faster recovery for jobs with very large state. Source: <a href="https://www.vldb.org/pvldb/vol18/p4846-mei.pdf">Disaggregated State Management in Apache Flink 2.0 (PVLDB vol. 18)</a>.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages, Limitations and Costs</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Technology</th><th>Strengths</th><th>Limitations</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>Spark batch</td><td>Scales to PB; SQL and Python; mature optimizer; huge ecosystem</td><td>JVM tuning, shuffle and skew issues; overkill for small data; startup latency</td><td>Cluster or managed (Databricks, EMR, Dataproc) compute; ops for Spark on K8s</td></tr>
+      <tr><td>Spark Structured Streaming</td><td>Same API as batch; exactly-once with lakehouse sinks; <code>availableNow</code> incremental batch</td><td>Micro-batch latency (typically sub-second to seconds); fewer event-time features than Flink</td><td>Always-on cluster for continuous mode</td></tr>
+      <tr><td>Flink</td><td>Low latency; rich event-time semantics; large keyed state; savepoints</td><td>Steeper learning curve; state backend and checkpoint tuning</td><td>Always-on cluster; checkpoint storage</td></tr>
+      <tr><td>Kafka + Connect</td><td>Durable replayable transport; decoupling; huge connector ecosystem</td><td>Broker, Connect and registry operations; partition planning; connectors vary in quality</td><td>Self-managed or managed (MSK, Confluent Cloud)</td></tr>
+      <tr><td>Debezium CDC</td><td>Complete, ordered, low-impact change capture incl. deletes</td><td>Replication slot risk to primary disk; schema changes need care; snapshot of huge tables is slow</td><td>Connect workers; DB configuration</td></tr>
+      <tr><td>ELT in warehouse (dbt)</td><td>Simple; SQL; raw data retained; fast iteration</td><td>Warehouse compute cost; limited for non-SQL logic and streaming</td><td>Warehouse credits</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  Q["How fast must results reflect new data?"] -->|"hours or daily"| B["Batch: Spark or warehouse ELT, scheduled"]
+  Q -->|"minutes"| M["Incremental batch: Structured Streaming availableNow or MoR upserts every 5 to 15 min"]
+  Q -->|"seconds"| S{"Complex event time, large keyed state, or sub-second?"}
+  S -->|"yes"| F["Flink"]
+  S -->|"no"| SS["Spark Structured Streaming"]
+  B --> V{"Data fits on one machine?"}
+  V -->|"yes"| D["DuckDB or Polars job"]
+  V -->|"no"| SP["Spark"]
+</pre>
+<figcaption>Figure 9.17 — Choosing a processing style by freshness requirement and data size.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> start from the freshness requirement the business can justify, not from technology enthusiasm. A surprising number of "real-time" requirements are satisfied by 10-minute incremental batches at a fraction of the cost and complexity of always-on streaming. Only when seconds matter, or state and event-time logic are complex, does Flink's operational cost pay off. At the other end, many batch jobs do not need a cluster at all.</p>
+  <h3>11.1 ETL or ELT?</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Choose ETL when</th><th>Choose ELT when</th></tr></thead>
+    <tbody>
+      <tr><td>Sensitive data must be masked or dropped before landing</td><td>The target is a powerful SQL engine</td></tr>
+      <tr><td>Transformation needs non-SQL code (parsing, ML, geospatial libraries)</td><td>Logic changes often and raw history must be re-transformable</td></tr>
+      <tr><td>The target is not queryable (search index, key-value store)</td><td>Analysts and analytics engineers own the transformations in SQL</td></tr>
+      <tr><td>Volume makes landing raw data prohibitively expensive</td><td>Storage is cheap relative to engineering time</td></tr>
+    </tbody>
+  </table></div>
+  <h3>11.2 Watermark delay</h3>
+  <p>Short delays give low latency and small state but drop more late data; long delays capture more data but hold state longer and delay results. A common pattern combines a short-delay streaming result for dashboards with a daily batch correction job that recomputes from the lakehouse, which is a bounded, deliberate form of Lambda.</p>
+  <h3>11.3 Raw CDC versus outbox</h3>
+  <p>Raw CDC gives completeness with zero application changes but couples consumers to internal schemas. Outbox gives stable, semantic contracts but requires application changes and discipline. Use both, for their respective consumers.</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Production Failures</h2>
+  <ul>
+    <li><strong>Non-idempotent appends.</strong> A task retried after a partial write appends the same day twice; revenue doubles. Use partition overwrite or MERGE.</li>
+    <li><strong>Using <code>now()</code> inside jobs.</strong> Backfills compute "yesterday" relative to today instead of the logical date.</li>
+    <li><strong>Calling <code>collect()</code> on big data.</strong> Pulls everything to the driver and OOMs it. Same for <code>toPandas()</code> on large frames.</li>
+    <li><strong>Python UDFs for simple logic.</strong> 10–100x slower than built-in functions <span class="tag illus">Illustrative</span>; prefer <code>pyspark.sql.functions</code> or pandas UDFs.</li>
+    <li><strong>Ignoring skew.</strong> One task runs for hours; adding executors does nothing. Check task duration distribution per stage.</li>
+    <li><strong>Over-caching.</strong> Caching every DataFrame, evicting useful blocks and spilling.</li>
+    <li><strong>Small files from streaming.</strong> A trigger every second writing to many partitions creates millions of files; use longer triggers and compaction.</li>
+    <li><strong>Deleting or sharing checkpoints.</strong> Deleting resets offsets and state (data loss or duplication); sharing corrupts both queries.</li>
+    <li><strong>Processing-time windows for business metrics.</strong> Results change with pipeline lag; a backlog after an outage creates a fake spike.</li>
+    <li><strong>No watermark on streaming aggregations or deduplication.</strong> State grows forever until the job falls over.</li>
+    <li><strong>Abandoned replication slots.</strong> A paused Debezium connector retains WAL until the primary's disk fills and the database stops. Monitor slot lag; cap with <code>max_slot_wal_keep_size</code>.</li>
+    <li><strong>Breaking schema changes upstream.</strong> A column renamed in the service silently nulls a downstream field. Enforce registry compatibility and data contracts (Chapter 9.4).</li>
+    <li><strong>Assuming Kafka exactly-once covers external sinks.</strong> It does not; the sink must be idempotent or transactional.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Performance tuning checklist for Spark</h3>
+  <ul>
+    <li>Read only needed columns; filter early on partition and sort columns.</li>
+    <li>Right-size executors (commonly 4–8 cores, with memory and <code>memoryOverhead</code> sized for the workload) rather than very large or tiny ones.</li>
+    <li>Use AQE; raise initial shuffle partitions for very large shuffles.</li>
+    <li>Broadcast small dimensions; consider storage-partitioned joins for repeated large joins.</li>
+    <li>Watch the Spark UI: stage timeline, shuffle read/write, spill, task-time skew, GC time.</li>
+    <li>Write files of hundreds of MB; sort within partitions by common filters.</li>
+  </ul>
+  <h3>13.2 Reliability</h3>
+  <p>Checkpoints on durable storage; idempotent sinks; dead-letter tables; retries with backoff at the orchestrator; graceful shutdown for streaming (stop between batches); savepoints before Flink upgrades; and runbooks for backlog catch-up (temporarily scale up, raise <code>maxOffsetsPerTrigger</code>).</p>
+  <h3>13.3 Monitoring</h3>
+  <p>For batch: duration, input/output row counts, freshness of output partitions, data-quality check results. For streaming: consumer lag per partition, batch duration versus trigger interval (if processing time exceeds the trigger, the job is falling behind), state size, watermark progression (a stuck watermark means an idle partition or a source problem), checkpoint duration. For CDC: replication slot lag, connector task status, snapshot progress. Export these to Prometheus via Spark's metrics system, Flink's reporters and Kafka JMX exporters, the same way you export Micrometer metrics from services.</p>
+  <h3>13.4 Security</h3>
+  <p>Kafka with mTLS or SASL and ACLs per topic and consumer group; Connect secrets via config providers (never in connector JSON); least-privilege database users for CDC; encryption of data at rest in object storage; PII masking in ETL before data reaches broadly accessible layers.</p>
+  <h3>13.5 Cost</h3>
+  <p>Batch on spot or preemptible instances with retry-tolerant jobs; autoscaling executors (dynamic allocation with shuffle tracking on Kubernetes); prefer incremental (<code>availableNow</code>) runs over always-on clusters where latency allows; avoid reprocessing everything when only recent partitions changed.</p>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>For the PySpark job in Section 7.3, predict the number of stages and explain where each shuffle occurs. Then run <code>out.explain(mode="formatted")</code> and verify.</p>
+    <details class="solution"><summary>Solution</summary><div>
+    <p>Expect: a scan/filter/partial-aggregate stage over trips, an exchange (hash partitioning on <code>PULocationID</code>) followed by final aggregation, a broadcast exchange for the zones CSV (a separate small job), and the join plus write in the post-shuffle stage. The data-quality <code>agg(...).first()</code> triggers its own job that recomputes the plan unless you cache <code>out</code>; since it is reused by the write, caching it (then unpersisting) is a legitimate optimization here.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>A daily job appends to a non-partitioned Parquet table. It failed halfway yesterday and the orchestrator retried it. Analysts report inflated numbers. Explain what happened and redesign the write.</p>
+    <details class="solution"><summary>Solution</summary><div>
+    <p>Plain Parquet appends are not atomic: the failed attempt left some output files, and the retry wrote a full set, so part of the day exists twice. Redesign: an Iceberg/Delta table partitioned by <code>metric_date</code>; the job writes with <code>overwritePartitions()</code> (or <code>INSERT OVERWRITE</code> of that partition, or a MERGE on natural key). The commit is atomic, so a failed attempt leaves no visible data, and a retry replaces exactly that day. Add a uniqueness test on <code>(metric_date, location_id)</code>.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>Write a Structured Streaming query that computes, per rider, sessions of app events separated by 30 minutes of inactivity, emitting session duration and event count when a session closes. Use a 15-minute watermark.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-python">from pyspark.sql import functions as F
+
+sessions = (events
+    .withWatermark("event_ts", "15 minutes")
+    .groupBy(F.session_window("event_ts", "30 minutes"), "rider_id")
+    .agg(F.count("*").alias("events"))
+    .select("rider_id",
+            F.col("session_window.start").alias("session_start"),
+            F.col("session_window.end").alias("session_end"),
+            (F.col("session_window.end").cast("long")
+             - F.col("session_window.start").cast("long")).alias("duration_s"),
+            "events"))
+
+(sessions.writeStream.outputMode("append")
+         .option("checkpointLocation", "s3a://checkpoints/rider-sessions/")
+         .toTable("lake.silver.rider_sessions"))</code></pre>
+    <p>A session is emitted once the watermark passes its end (last event + 30 minutes), so results lag event time by at least 45 minutes. <code>session_window</code> is supported since Spark 3.2.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>A join between 3 TB of payment events and a 40 GB merchant table takes 4 hours; the Spark UI shows one task in the join stage running for 3.5 hours while the median task takes 40 seconds. Diagnose and propose at least three fixes in order of effort.</p>
+    <details class="solution"><summary>Solution</summary><div>
+    <p>Classic join skew: one merchant (or null merchant ids) dominates one shuffle partition. (1) Verify AQE skew-join is enabled and thresholds suit the data (<code>skewedPartitionFactor</code>, <code>skewedPartitionThresholdInBytes</code>); it may already split the partition. (2) Handle nulls separately if the hot key is null (they cannot match anyway in an inner join: filter them). (3) Salt the hot keys as in Section 7.4. (4) Reduce the merchant table to the needed columns and recent rows; if it falls under a few hundred MB, broadcast it. (5) Pre-aggregate events by merchant before joining if the downstream only needs aggregates. Measure after each change.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>Design a pipeline that replicates a 2 TB Postgres <code>orders</code> table (5,000 updates/s at peak) into an Iceberg table with under 15 minutes of staleness, supports GDPR deletes, and can be backfilled. Specify components, table design, maintenance and failure handling.</p>
+    <details class="solution"><summary>Solution</summary><div>
+    <p>Debezium with <code>pgoutput</code>, Avro with schema registry, topic keyed by <code>order_id</code> with enough partitions for parallelism (e.g. 24). Initial load via Debezium's snapshot (or a parallel bulk export plus streaming from the snapshot's LSN for very large tables). A bronze append-only Iceberg table of raw change events (via sink connector or Spark), partitioned by ingestion day: this is the replayable source for backfills. A Spark <code>foreachBatch</code> MERGE job every 5 minutes (<code>availableNow</code> under an orchestrator) into silver <code>orders</code>, merge-on-read, partitioned by <code>bucket(32, order_id)</code> or by order month, with the LSN guard for idempotency. Maintenance: hourly compaction of recently touched partitions, daily snapshot expiry (7 days) so deletes become physical, weekly orphan cleanup. GDPR: the source delete flows through CDC as <code>op=d</code>; bronze rows for that subject are deleted by a scheduled job keyed on a deletion-request table. Failures: monitor slot lag and connector status; if the merge job falls behind, it catches up from Kafka offsets in its checkpoint; backfill = rebuild silver from bronze with a batch MERGE ordered by LSN.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is a stage in Spark and what causes a stage boundary?</summary><div><p>A stage is a set of tasks running the same pipelined narrow transformations over different partitions. Boundaries occur at wide dependencies (shuffles: groupBy, join without broadcast, distinct, repartition, window partitioning) because the next step needs data from many upstream partitions, which must first be written and exchanged.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain what AQE changes at runtime.</summary><div><p>Using actual shuffle statistics, it coalesces small partitions, converts sort-merge joins to broadcast or shuffled-hash joins when a side turns out small, and splits skewed partitions in joins. It cannot fix skew in aggregations or split oversized non-join partitions.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Event time versus processing time: why does it matter for a revenue-per-minute dashboard?</summary><div><p>Processing-time aggregates depend on when events arrive, so network delays, mobile offline queues and pipeline backlogs distort them (a backlog drains as a fake spike). Event-time aggregates assign events to the minute they happened, with watermarks bounding how long to wait for stragglers. Business metrics should be event-time.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How do you achieve end-to-end exactly-once from Kafka to an Iceberg table?</summary><div><p>Spark Structured Streaming with a checkpoint (offsets log written before processing, commit log after) and the Iceberg sink, which records the streaming query id and batch id in snapshot properties and skips a batch already committed; or a <code>foreachBatch</code> MERGE that is idempotent by key and version. Kafka is replayable; the sink deduplicates replays. Alternatively Flink with checkpointing and the Iceberg sink committing on checkpoint completion.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> When would you use the outbox pattern rather than CDC on business tables?</summary><div><p>When events are consumed by other teams or services and need stable, semantic contracts independent of internal schemas, and when you need business-level events (OrderPlaced) rather than row diffs. Raw-table CDC is fine for full-state analytical replication owned by the data platform.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Write a PySpark expression to keep the latest record per key by version.</summary><div>
+<pre><code class="language-python">from pyspark.sql import Window, functions as F
+w = Window.partitionBy("order_id").orderBy(F.col("lsn").desc())
+latest = df.withColumn("rn", F.row_number().over(w)).where("rn = 1").drop("rn")</code></pre>
+  <p>For simple max-by semantics, <code>df.groupBy("order_id").agg(F.max_by(F.struct(*cols), "lsn"))</code> avoids a sort per partition.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Your streaming job's batch duration has crept above the trigger interval and lag is rising. What do you check?</summary><div><p>Input rate changes (traffic growth, a backfill producer); state size growth (missing or too-long watermark, dedup without watermark); skew on a hot key; small-file or commit overhead in the sink (many partitions per batch); GC or memory pressure; slower external lookups. Short-term: scale executors, raise <code>maxOffsetsPerTrigger</code> for catch-up throughput; long-term: fix state growth or skew, increase Kafka partitions if parallelism is capped.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> The Postgres primary's disk usage climbed 200 GB overnight. Nothing changed in the app. Hypothesis?</summary><div><p>An inactive or lagging logical replication slot (Debezium connector failed or paused) retaining WAL. Check <code>pg_replication_slots</code> for an inactive slot with large lag, restart or fix the connector, and if necessary drop the slot (then re-snapshot). Prevent with alerting on slot lag and <code>max_slot_wal_keep_size</code>.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Lambda versus Kappa: which would you choose today?</summary><div><p>Usually neither in pure form: a single engine (Spark or Flink) with the same code running in streaming mode for freshness and in bounded/batch mode over lakehouse tables for backfills. That keeps one codebase (Kappa's advantage) while using cheap batch reprocessing from tables rather than replaying huge Kafka retention.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>ELT is the default for analytics; ETL remains right for masking-before-landing, non-SQL logic and non-queryable targets.</li>
+    <li>Log-based CDC (Debezium) captures every change in order; the outbox pattern makes events deliberate contracts.</li>
+    <li>Spark compiles DataFrames through Catalyst into stages separated by shuffles; shuffles and skew dominate cost; AQE fixes some of it at runtime.</li>
+    <li>Kafka in pipelines is a replayable, schema-governed log; exactly-once requires transactional or idempotent sinks.</li>
+    <li>Use event time with watermarks for business correctness; the watermark delay trades latency and state for completeness.</li>
+    <li>Idempotent partitioned writes, logical-date parameters and write-audit-publish make retries and backfills safe.</li>
+  </ul>
+  <div class="quiz" data-answer="c">
+    <p class="q">Which operation does NOT normally introduce a shuffle in Spark?</p>
+    <ol>
+      <li data-k="a"><code>groupBy("zone").count()</code></li>
+      <li data-k="b">A sort-merge join of two large tables</li>
+      <li data-k="c"><code>filter()</code> followed by <code>withColumn()</code></li>
+      <li data-k="d"><code>distinct()</code></li>
+    </ol>
+    <div class="explain">Filter and withColumn are narrow transformations pipelined within a stage. Aggregations, sort-merge joins and distinct require repartitioning by key.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">In Structured Streaming with a 10-minute watermark and 5-minute tumbling windows in append mode, when is the window 10:00–10:05 emitted?</p>
+    <ol>
+      <li data-k="a">When the maximum event time seen exceeds 10:15</li>
+      <li data-k="b">At 10:05 processing time</li>
+      <li data-k="c">After every micro-batch, with updated counts</li>
+      <li data-k="d">When the first event after 10:05 arrives</li>
+    </ol>
+    <div class="explain">Watermark = max event time − 10 min. The window is finalized when the watermark passes its end (10:05), i.e. when max event time passes 10:15.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">A retried daily job must not duplicate data. Which write is idempotent?</p>
+    <ol>
+      <li data-k="a"><code>df.write.mode("append").parquet(path)</code></li>
+      <li data-k="b">Appending to an Iceberg table with a new snapshot per attempt</li>
+      <li data-k="c">Inserting rows via JDBC with auto-commit</li>
+      <li data-k="d">Overwriting the run date's partition in a table format, or MERGE on a natural key</li>
+    </ol>
+    <div class="explain">Re-running a partition overwrite or a keyed MERGE produces the same final state; appends of any kind accumulate duplicates on retry.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">What does Kafka's <code>sendOffsetsToTransaction</code> achieve in a consume-transform-produce loop?</p>
+    <ol>
+      <li data-k="a">It makes the consumer read faster</li>
+      <li data-k="b">It commits consumed offsets atomically with the produced output records</li>
+      <li data-k="c">It deduplicates input messages</li>
+      <li data-k="d">It guarantees exactly-once delivery to a downstream database</li>
+    </ol>
+    <div class="explain">Offsets become part of the producer's transaction, so either both the outputs and the offset advance are visible, or neither. External databases are outside the transaction.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Why is the transactional outbox preferred over publishing to Kafka directly from a <code>@Transactional</code> service method?</p>
+    <ol>
+      <li data-k="a">Kafka cannot be called from Spring transactions</li>
+      <li data-k="b">The outbox is faster than Kafka</li>
+      <li data-k="c">It avoids the dual-write problem: the DB commit and the event publication can no longer diverge</li>
+      <li data-k="d">It removes the need for a schema registry</li>
+    </ol>
+    <div class="explain">Writing the event to a table in the same DB transaction makes both atomic; CDC then publishes the committed event. A direct publish can succeed while the DB rolls back, or vice versa.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">A stage's median task takes 30 s, but one task takes 50 minutes. Adding executors does not help. Most likely cause?</p>
+    <ol>
+      <li data-k="a">Data skew on the shuffle key</li>
+      <li data-k="b">Too few shuffle partitions overall</li>
+      <li data-k="c">Too much caching</li>
+      <li data-k="d">Catalyst failing to push down filters</li>
+    </ol>
+    <div class="explain">A single straggler with balanced others indicates one oversized partition: a hot key. More executors cannot split one task's work.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Tyler Akidau, Slava Chernyak, Reuven Lax, <em>Streaming Systems</em>, O'Reilly, 2018.</li>
+    <li><span class="ref-kind">Book</span> Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, O'Reilly, 2017 — ch. 10–11.</li>
+    <li><span class="ref-kind">Paper</span> <a href="https://www.usenix.org/conference/nsdi12/technical-sessions/presentation/zaharia">Zaharia et al., Resilient Distributed Datasets (NSDI 2012)</a>.</li>
+    <li><span class="ref-kind">Paper</span> <a href="https://people.csail.mit.edu/matei/papers/2015/sigmod_spark_sql.pdf">Armbrust et al., Spark SQL: Relational Data Processing in Spark (SIGMOD 2015)</a>.</li>
+    <li><span class="ref-kind">Paper</span> <a href="https://www.vldb.org/pvldb/vol8/p1792-Akidau.pdf">Akidau et al., The Dataflow Model (VLDB 2015)</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://spark.apache.org/docs/latest/sql-performance-tuning.html">Spark SQL performance tuning (AQE, joins, partitions)</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://spark.apache.org/docs/latest/streaming/index.html">Structured Streaming programming guide</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://spark.apache.org/releases/spark-release-4-0-0.html">Spark 4.0.0 release notes</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://debezium.io/documentation/reference/stable/connectors/postgresql.html">Debezium PostgreSQL connector</a> and <a href="https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html">outbox event router</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://nightlies.apache.org/flink/flink-docs-stable/">Apache Flink documentation</a>.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://www.oreilly.com/radar/questioning-the-lambda-architecture/">Jay Kreps, Questioning the Lambda Architecture</a>.</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>
