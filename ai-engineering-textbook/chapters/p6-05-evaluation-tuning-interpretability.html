@@ -581,3 +581,278 @@ print("after: equalized odds diff %.3f  accuracy %.3f" % (
     equalized_odds_difference(y_te, pred_fair, sensitive_features=s_te), accuracy_score(y_te, pred_fair)))
 # Whether group-specific thresholds are appropriate (or lawful) is a policy decision, not a code one.</code></pre>
 </section>
+
+<section id="applications">
+  <h2>8. Applications</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Use case</th><th>Primary offline metric</th><th>Operating-point metric</th><th>Online metric</th><th>Interpretability need</th></tr></thead>
+    <tbody>
+      <tr><td>Fraud detection</td><td>PR-AUC</td><td>Recall at fixed review capacity; $ caught per alert</td><td>Fraud losses, false-decline rate</td><td>Reason codes for analysts</td></tr>
+      <tr><td>Credit underwriting</td><td>ROC-AUC/Gini, calibration</td><td>Approval rate and default rate at cut-off</td><td>Portfolio loss rate</td><td>Adverse-action reasons, fairness review</td></tr>
+      <tr><td>Delivery ETA</td><td>MAE, quantile loss</td><td>% within ±5 min; P90 coverage</td><td>Cancellations, support contacts</td><td>Feature effects for ops teams</td></tr>
+      <tr><td>Search / recommendations</td><td>NDCG@10, recall@k</td><td>Same at production k</td><td>CTR, conversion, long-term retention</td><td>Debugging ranking anomalies</td></tr>
+      <tr><td>Churn propensity</td><td>PR-AUC, calibration</td><td>Uplift among targeted users</td><td>Retention lift from campaign (A/B)</td><td>Segment-level drivers</td></tr>
+      <tr><td>Demand forecasting</td><td>WAPE, pinball loss</td><td>Stock-out and overstock rates</td><td>Inventory cost</td><td>Explaining forecast changes to planners</td></tr>
+    </tbody>
+  </table></div>
+  <p>Note the pattern: the offline metric is chosen to correlate with the online one, and the operating-point metric connects the model to the decision rule actually deployed.</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 Booking.com: offline gains are not online gains</h3>
+  <p><span class="tag fact">Verified</span> Bernardi et al. (KDD 2019) report from roughly 150 customer-facing models at Booking.com that improvements in offline model performance did not necessarily translate into business-metric gains in randomised controlled trials, and they discuss causes such as metric saturation and proxy-target mismatch. Summary: <a href="https://blog.acolyer.org/2019/10/07/150-successful-machine-learning-models/">The Morning Paper review</a>. Implication: offline evaluation is a filter, online experiments are the verdict.</p>
+  <h3>9.2 Random search versus grid search</h3>
+  <p><span class="tag fact">Verified</span> Bergstra and Bengio showed empirically and theoretically that random search finds models as good as or better than grid search within a fraction of the computation for neural network hyperparameter optimisation, because typically only a few hyperparameters matter for a given dataset. Source: <a href="https://www.jmlr.org/papers/v13/bergstra12a.html">"Random Search for Hyper-Parameter Optimization", JMLR 13, 2012</a>.</p>
+  <h3>9.3 SHAP in practice</h3>
+  <p><span class="tag fact">Verified</span> Lundberg and Lee unified several attribution methods under Shapley values (NeurIPS 2017), and Lundberg et al. later published exact TreeSHAP for tree ensembles with applications in medicine (Nature Machine Intelligence, 2020), which is the algorithm behind <code>shap.TreeExplainer</code>. Sources: <a href="https://arxiv.org/abs/1705.07874">arXiv:1705.07874</a>; <a href="https://arxiv.org/abs/1905.04610">arXiv:1905.04610</a>.</p>
+  <h3>9.4 The impossibility of satisfying every fairness metric</h3>
+  <p><span class="tag fact">Verified</span> Kleinberg, Mullainathan and Raghavan proved that, except in degenerate cases (equal base rates or perfect prediction), calibration within groups and balance of error rates across groups cannot all hold simultaneously; Chouldechova reached a related conclusion analysing recidivism risk scores. Source: <a href="https://arxiv.org/abs/1609.05807">"Inherent Trade-Offs in the Fair Determination of Risk Scores", arXiv:1609.05807</a>. Teams must choose criteria explicitly.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages and Limits</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Tool</th><th>Advantages</th><th>Limits</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td>Accuracy</td><td>Simple</td><td>Meaningless under imbalance; ignores costs</td><td>Trivial</td></tr>
+      <tr><td>ROC-AUC</td><td>Threshold-free; balance-invariant ranking quality</td><td>Hides false-alarm burden with rare positives; ignores calibration</td><td>Trivial</td></tr>
+      <tr><td>PR-AUC</td><td>Reflects precision on rare positives</td><td>Baseline depends on prevalence; harder to compare across datasets</td><td>Trivial</td></tr>
+      <tr><td>Log-loss / Brier</td><td>Proper scoring rules; reward calibration</td><td>Less intuitive; log-loss explodes on confident errors</td><td>Trivial</td></tr>
+      <tr><td>k-fold CV</td><td>Uses all data; uncertainty estimate</td><td>k× training cost; wrong scheme leaks</td><td>k model fits</td></tr>
+      <tr><td>Grid search</td><td>Exhaustive, reproducible</td><td>Exponential; wastes trials on unimportant parameters</td><td>High</td></tr>
+      <tr><td>Bayesian/TPE + pruning</td><td>Sample-efficient; prunes bad trials</td><td>Sequential bias; can overfit validation with many trials</td><td>Moderate</td></tr>
+      <tr><td>Permutation importance</td><td>Model-agnostic; measured on held-out data</td><td>Correlated features share/lose credit; unrealistic samples</td><td>features × repeats predictions</td></tr>
+      <tr><td>SHAP</td><td>Additive, consistent local explanations; global summaries</td><td>Correlation handling depends on variant; KernelSHAP slow; not causal</td><td>Fast for trees, slow otherwise</td></tr>
+      <tr><td>LIME</td><td>Any model, any modality</td><td>Unstable; sensitive to kernel and sampling</td><td>Thousands of predictions per explanation</td></tr>
+      <tr><td>Fairness metrics</td><td>Make disparities visible</td><td>Mutually incompatible criteria; need sensitive attributes</td><td>Low compute, high governance</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  T["Task"] --> R{"Regression?"}
+  R -- yes --> RQ{"Large errors much worse?"}
+  RQ -- yes --> RMSE["RMSE"]
+  RQ -- no --> MAE["MAE / WAPE; quantile loss for intervals"]
+  R -- no --> C{"Ranking a list?"}
+  C -- yes --> NDCG["NDCG@k / recall@k / MRR"]
+  C -- no --> P{"Positives rare (under ~10%)?"}
+  P -- yes --> PR["PR-AUC + precision/recall at operating threshold"]
+  P -- no --> ROC["ROC-AUC + F1 / accuracy at threshold"]
+  PR --> CAL{"Probabilities used as numbers?"}
+  ROC --> CAL
+  CAL -- yes --> CB["Add log-loss / Brier + reliability diagram"]
+</pre>
+  <figcaption>Figure 6.5.5 — Choosing evaluation metrics.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the task type determines the metric family, the class balance determines whether ROC or PR curves are informative, and the downstream use of probabilities determines whether calibration metrics are mandatory. Every path should end with a metric at the actual operating point.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Decision</th><th>Options</th><th>Guidance</th></tr></thead>
+    <tbody>
+      <tr><td>Validation design</td><td>Single holdout vs k-fold vs nested</td><td>Large data: holdout (plus a temporal check); small data: k-fold; reporting a tuned model's performance rigorously: nested</td></tr>
+      <tr><td>Tuning budget</td><td>More trials vs more data/features</td><td>Diminishing returns after ~50–100 trials for GBDTs; feature work usually pays more <span class="tag opinion">Opinion</span></td></tr>
+      <tr><td>Explanation method</td><td>Permutation vs SHAP vs LIME</td><td>Permutation for global audits; TreeSHAP for trees, local reasons; LIME for quick checks on text/images</td></tr>
+      <tr><td>Interpretable model vs post-hoc explanations</td><td>Glass-box (scorecard, GAM, monotone GBDT) vs black box + SHAP</td><td>High-stakes regulated decisions favour glass-box or constrained models</td></tr>
+      <tr><td>Fairness criterion</td><td>Demographic parity, equal opportunity, calibration</td><td>Choose by harm analysis with legal and domain experts; document</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes</h2>
+  <ul>
+    <li><strong>Tuning on the test set,</strong> including "just checking" test scores between iterations.</li>
+    <li><strong>Reporting accuracy on imbalanced data.</strong></li>
+    <li><strong>Reporting ROC-AUC alone for rare-event detection.</strong></li>
+    <li><strong>Using 0.5 as the threshold by default.</strong></li>
+    <li><strong>Random K-fold on grouped or temporal data,</strong> producing optimistic scores.</li>
+    <li><strong>Ignoring variance across folds.</strong> A 0.003 AUC gain with fold standard deviation 0.01 is noise.</li>
+    <li><strong>Cherry-picking the best seed</strong> or the best of many runs and reporting it as the expected result.</li>
+    <li><strong>Trusting impurity importance,</strong> which favours high-cardinality features and is computed on training data.</li>
+    <li><strong>Interpreting SHAP or PDP causally.</strong></li>
+    <li><strong>Calibrating on the training data</strong> (calibration must use held-out data or cross-validation).</li>
+    <li><strong>Evaluating only aggregate metrics,</strong> missing a segment (new users, a country, a device) where the model is badly wrong.</li>
+    <li><strong>Dropping protected attributes and declaring the model fair</strong> without measuring outcomes by group.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Evaluation as CI</h3>
+  <p>Treat the evaluation report as a build artifact: generated automatically for each candidate, versioned with the model, and checked by gates (no regression beyond tolerance on primary metric; calibration error under threshold; no segment worse by more than X; fairness differences within agreed bounds; p99 latency within budget). This is your <code>mvn verify</code> for models.</p>
+  <h3>13.2 Delayed labels and online evaluation</h3>
+  <p>Many labels arrive late (chargebacks after weeks, churn after a billing cycle). Monitor proxies early (score distributions, early-label metrics), and compute true metrics when labels mature, joined on prediction logs. Log every prediction with model version, features hash and timestamp, exactly like an audit log, so evaluation can be reconstructed.</p>
+  <h3>13.3 Explanations in serving</h3>
+  <p>TreeSHAP per request costs much more than a prediction; budget for it or compute explanations asynchronously for decisions that need them (adverse-action notices). Cache explanations with the decision record. Expose stable, human-readable reason codes (mapped from top negative contributions) rather than raw SHAP vectors.</p>
+  <h3>13.4 Monitoring</h3>
+  <p>Monitor calibration drift (mean predicted versus observed rate per day), metric by segment, threshold flag rate (sudden changes signal drift or bugs) and fairness metrics over time. Alert thresholds should account for sampling noise (Chapter 6.1's confidence intervals).</p>
+  <h3>13.5 Governance and security</h3>
+  <p>Keep model cards documenting intended use, metrics, slices and limitations. Explanations can leak model internals or training data properties; restrict detailed explanations to authorised users. Fairness analyses involve sensitive attributes: store them separately with strict access control and purpose limitation.</p>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>A classifier on 1,000 emails (50 spam) flags 60, of which 45 are spam. Compute TP, FP, FN, TN, accuracy, precision, recall, F1 and FPR.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>TP = 45, FP = 15, FN = 5, TN = 935. Accuracy = 980/1000 = 0.98. Precision = 45/60 = 0.75. Recall = 45/50 = 0.9. F1 = 2 × 0.75 × 0.9/1.65 ≈ 0.818. FPR = 15/950 ≈ 0.0158.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Foundational</p>
+    <p>Scores: positives [0.8, 0.4], negatives [0.6, 0.3, 0.1]. Compute ROC-AUC by pair counting. Then square all scores; what is the AUC now and why?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Pairs: 0.8 beats all three (3); 0.4 beats 0.3 and 0.1 (2), loses to 0.6. AUC = 5/6 ≈ 0.833. Squaring is strictly increasing on [0, 1], so every comparison is preserved: AUC is still 5/6. AUC depends only on ranks.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>A chargeback costs $150 on average; a false decline costs $12 in lost margin and goodwill. (a) What probability threshold minimises expected cost for a calibrated model? (b) If the model was trained with positives weighted 20× and not recalibrated, what raw model score corresponds to that threshold?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>(a) t = c<sub>FP</sub>/(c<sub>FP</sub> + c<sub>FN</sub>) = 12/162 ≈ 0.074. (b) Weighted model odds are 20× the true odds. True odds at t: 0.074/0.926 ≈ 0.0800; model odds 1.60; model probability 1.60/2.60 ≈ 0.615. Using 0.074 on the uncalibrated scores would flag far too many transactions.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Intermediate</p>
+    <p>Compute Shapley values for three features with v(∅) = 0, v({a}) = 10, v({b}) = 10, v({c}) = 0, v({a,b}) = 30, v({a,c}) = 10, v({b,c}) = 10, v({a,b,c}) = 30.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>c never changes the value (v(S ∪ {c}) = v(S) for all S), so φ<sub>c</sub> = 0 (dummy property). Then a and b are symmetric: φ<sub>a</sub> = φ<sub>b</sub> = 15, by efficiency (30 − 0 = 30). Check φ<sub>a</sub> over the 6 orderings: abc: 10; acb: 10; bac: 20; bca: 20; cab: 10; cba: 20 → mean 15.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>Show that the expected squared error of the bagged average of B models, each with bias b, variance v and pairwise correlation ρ, is b² + ρv + (1 − ρ)v/B + σ². What does bagging do to bias?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>The average's mean equals each model's mean, so bias is unchanged: b. Its variance is (1/B²)[Bv + B(B − 1)ρv] = v/B + ρv(B − 1)/B = ρv + (1 − ρ)v/B. Substituting into the decomposition gives the result. Bagging reduces only variance, which is why it pairs with low-bias, high-variance base learners (deep trees).</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 6 · Advanced (design)</p>
+    <p>Design the offline evaluation for a churn model whose predictions drive a retention-discount campaign. Specify splits, metrics, threshold choice, segment analysis and what you would ask the online test to measure.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Splits: temporal (train on customers' states as of months 1–9 with labels from the following 60 days; validate as of month 10; test as of month 11), grouped by customer within the training period. Metrics: PR-AUC and log-loss/Brier (probabilities feed expected-value targeting), calibration plot, recall and precision at the campaign capacity (top N customers). Threshold: maximise expected value = P(churn) × value saved × discount effectiveness − discount cost; note that churn probability is not uplift. Segments: tenure bands, plan, region, acquisition channel. Online: randomise among high-score customers into discount versus no discount to measure the uplift (incremental retention), since the model predicts churn, not responsiveness; consider an uplift model later.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> When would you use PR-AUC instead of ROC-AUC?</summary><div><p>When positives are rare and false positives are costly relative to their count: fraud, defects, rare disease, retrieval. ROC's FPR divides by the large negative count, hiding many false alarms; precision exposes them. Report both plus the operating point.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Derive the bias–variance decomposition.</summary><div><p>Write y = f + ε; expand E[(y − f̂)²] into E[(f − f̂)²] + σ² since the cross term vanishes; add and subtract E[f̂] to split E[(f − f̂)²] into (f − E f̂)² + E[(f̂ − E f̂)²] since the cross term again vanishes. Result: bias² + variance + noise (see §6.1).</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is calibration and how do you fix a miscalibrated model?</summary><div><p>Predicted probabilities match observed frequencies. Diagnose with a reliability diagram, Brier score, ECE. Fix with Platt scaling or isotonic regression fitted on held-out data (CalibratedClassifierCV), or temperature scaling for neural nets; avoid class-weighting distortions or correct for them.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why is random search often better than grid search?</summary><div><p>Usually only a few hyperparameters matter. A grid spends most trials repeating the same values of the important parameter while varying unimportant ones; random sampling tests a distinct value of every parameter on every trial, covering important dimensions more densely for the same budget.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Your CV AUC is 0.93 but the model drops to 0.80 on next month's data. What could be wrong with your evaluation?</summary><div><p>Random K-fold on temporal data (future leaking into training folds), group leakage (same customers across folds), preprocessing fitted outside CV, tuning over-fitting the CV folds (no nested CV or test set), or genuine drift. Re-evaluate with a time-based, grouped split and a held-out recent period.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> A regulator asks why an applicant was declined. What do you provide?</summary><div><p>Reason codes from local attributions (TreeSHAP values on the log-odds, mapped to human-readable reasons, ranked by negative contribution), produced at decision time and stored with the decision record; documentation of the model, features, monotonic constraints, validation and fairness analysis; and ensure features used are permissible and explanations are stable (tested).</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Implement ROC-AUC without sklearn in O(m log m).</summary><div><pre><code class="language-python">import numpy as np
+from scipy.stats import rankdata
+
+def auc(y, s):
+    r = rankdata(s)                     # average ranks for ties
+    P = y.sum(); N = len(y) - P
+    return (r[y == 1].sum() - P * (P + 1) / 2) / (P * N)</code></pre><p>Mann-Whitney U normalised by P·N; ties contribute one half via average ranks.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Permutation importance says two correlated features are unimportant, but dropping both hurts badly. Explain.</summary><div><p>When one is permuted, the other still carries the shared signal, so the score barely drops for either individually. Importance is conditional on other features being present. Use grouped permutation (permute correlated features together), drop-column importance, or SHAP with awareness of correlation handling.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How would you build automated model-promotion gates?</summary><div><p>A pipeline step that loads the candidate and champion, evaluates both on the same frozen test set and a recent slice, computes metrics with bootstrap CIs, segment slices, calibration, fairness metrics and latency benchmarks, compares against configured tolerances, writes a report to the registry, and only then allows shadow deployment, followed by a canary or A/B test with guardrail metrics and automatic rollback.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Choose metrics from business costs before training; report at the operating threshold.</li>
+    <li>Precision, recall, F1 from the confusion matrix; ROC-AUC measures ranking; PR-AUC exposes false-alarm burden with rare positives.</li>
+    <li>Threshold = c<sub>FP</sub>/(c<sub>FP</sub> + c<sub>FN</sub>) for calibrated probabilities; calibrate with Platt or isotonic on held-out data.</li>
+    <li>NDCG, MRR, recall@k evaluate rankings.</li>
+    <li>Expected squared error = bias² + variance + noise; regularisation, bagging and data reduce variance; flexibility and boosting reduce bias.</li>
+    <li>Cross-validation must mirror deployment: stratified, grouped, temporal; nested for honest tuned estimates.</li>
+    <li>Random and Bayesian search with pruning and early stopping beat grids.</li>
+    <li>Permutation importance, PDP/ICE, SHAP and LIME explain models, not causality; fairness requires measurement and explicit choice of criteria.</li>
+  </ul>
+  <div class="quiz" data-answer="b">
+    <p class="q">A fraud model has ROC-AUC 0.97 but analysts complain most alerts are false. What is the most likely explanation?</p>
+    <ol>
+      <li data-k="a">ROC-AUC is computed incorrectly.</li>
+      <li data-k="b">Positives are rare, so even a small FPR produces many false alarms relative to true frauds.</li>
+      <li data-k="c">The model is underfitting.</li>
+      <li data-k="d">The threshold is too high.</li>
+    </ol>
+    <div class="explain">Precision = Rπ/(Rπ + F(1 − π)); with tiny π, false positives dominate. PR-AUC would reveal this.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">A missed default costs 9 times as much as a wrongly declined good applicant. For a calibrated model, which threshold minimises expected cost?</p>
+    <ol>
+      <li data-k="a">0.5</li>
+      <li data-k="b">0.9</li>
+      <li data-k="c">0.1</li>
+      <li data-k="d">0.01</li>
+    </ol>
+    <div class="explain">t = c<sub>FP</sub>/(c<sub>FP</sub> + c<sub>FN</sub>) = 1/(1 + 9) = 0.1.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">Training error is 2%, validation error 15%. Which remedy is most appropriate?</p>
+    <ol>
+      <li data-k="a">Increase regularisation or gather more data</li>
+      <li data-k="b">Use a more complex model</li>
+      <li data-k="c">Remove regularisation</li>
+      <li data-k="d">Train for more epochs</li>
+    </ol>
+    <div class="explain">A large train-validation gap indicates high variance (overfitting).</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">Which CV scheme is correct for a model that will score new patients, with several visits per patient?</p>
+    <ol>
+      <li data-k="a">Shuffled KFold</li>
+      <li data-k="b">Leave-one-out</li>
+      <li data-k="c">StratifiedKFold on visit outcome</li>
+      <li data-k="d">GroupKFold by patient</li>
+    </ol>
+    <div class="explain">All visits of a patient must be on one side, otherwise the model is evaluated on patients it has seen.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">Which property do SHAP values guarantee?</p>
+    <ol>
+      <li data-k="a">They identify causal effects.</li>
+      <li data-k="b">Base value plus the sum of a row's SHAP values equals that row's model output.</li>
+      <li data-k="c">They are identical to permutation importances.</li>
+      <li data-k="d">They are unaffected by feature correlation.</li>
+    </ol>
+    <div class="explain">Efficiency (local accuracy) is a defining Shapley property; SHAP is not causal and correlation handling depends on the variant.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Why use nested cross-validation?</p>
+    <ol>
+      <li data-k="a">To train faster</li>
+      <li data-k="b">To handle class imbalance</li>
+      <li data-k="c">To get an unbiased performance estimate for a procedure that includes hyperparameter tuning</li>
+      <li data-k="d">To compute SHAP values</li>
+    </ol>
+    <div class="explain">Selecting the best configuration on the same folds used to report performance biases the estimate upward; the outer loop measures on data the tuning never saw.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Docs</span> scikit-learn User Guide: <a href="https://scikit-learn.org/stable/modules/model_evaluation.html">Metrics and scoring</a>, <a href="https://scikit-learn.org/stable/modules/cross_validation.html">Cross-validation</a>, <a href="https://scikit-learn.org/stable/modules/calibration.html">Probability calibration</a>, <a href="https://scikit-learn.org/stable/inspection.html">Inspection</a>.</li>
+    <li><span class="ref-kind">Book</span> Christoph Molnar, <em>Interpretable Machine Learning</em> — <a href="https://christophm.github.io/interpretable-ml-book/">free online</a>.</li>
+    <li><span class="ref-kind">Paper</span> Scott Lundberg, Su-In Lee, "A Unified Approach to Interpreting Model Predictions", NeurIPS 2017 — <a href="https://arxiv.org/abs/1705.07874">arXiv:1705.07874</a>; <a href="https://shap.readthedocs.io/">SHAP docs</a>.</li>
+    <li><span class="ref-kind">Paper</span> Marco Tulio Ribeiro, Sameer Singh, Carlos Guestrin, "Why Should I Trust You?", KDD 2016 — <a href="https://arxiv.org/abs/1602.04938">arXiv:1602.04938</a>.</li>
+    <li><span class="ref-kind">Paper</span> James Bergstra, Yoshua Bengio, <a href="https://www.jmlr.org/papers/v13/bergstra12a.html">"Random Search for Hyper-Parameter Optimization"</a>, JMLR 2012.</li>
+    <li><span class="ref-kind">Paper</span> Takuya Akiba et al., "Optuna: A Next-generation Hyperparameter Optimization Framework", KDD 2019 — <a href="https://arxiv.org/abs/1907.10902">arXiv:1907.10902</a>; <a href="https://optuna.readthedocs.io/">Optuna docs</a>.</li>
+    <li><span class="ref-kind">Book</span> Solon Barocas, Moritz Hardt, Arvind Narayanan, <em>Fairness and Machine Learning</em> — <a href="https://fairmlbook.org/">fairmlbook.org</a>; <a href="https://fairlearn.org/">Fairlearn</a>.</li>
+    <li><span class="ref-kind">Paper</span> Takaya Saito, Marc Rehmsmeier, "The Precision-Recall Plot Is More Informative than the ROC Plot When Evaluating Binary Classifiers on Imbalanced Datasets", PLOS ONE, 2015.</li>
+    <li><span class="ref-kind">Book</span> Hastie, Tibshirani, Friedman, <em>The Elements of Statistical Learning</em>, chapter 7 (model assessment and selection) — <a href="https://hastie.su.domains/ElemStatLearn/">free PDF</a>.</li>
+    <li><span class="ref-kind">Paper</span> Kleinberg, Mullainathan, Raghavan, <a href="https://arxiv.org/abs/1609.05807">"Inherent Trade-Offs in the Fair Determination of Risk Scores"</a>.</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

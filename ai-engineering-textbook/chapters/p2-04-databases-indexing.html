@@ -1,0 +1,1020 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Database Selection, SQL vs NoSQL, Indexing &amp; Query Optimization — AI-Era Software Engineering</title>
+<meta name="description" content="A database selection framework, ACID and isolation anomalies with PostgreSQL and MySQL specifics, MVCC, NoSQL families including vector stores, B+tree versus LSM-tree storage engines, every major index type, EXPLAIN ANALYZE and the planner, join algorithms, N+1 in JPA, HikariCP sizing and keyset pagination.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p2-04-databases-indexing" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 2 · Chapter 4</p>
+  <h1>Database Selection, SQL vs NoSQL, Indexing &amp; Query Optimization</h1>
+  <p class="lede">Your database choice outlives your framework choice, your cloud choice, and usually your team. This chapter gives you a defensible way to choose one, then opens the engine: what isolation levels really guarantee in PostgreSQL and MySQL, how MVCC works, why B+trees and LSM-trees trade read, write and space amplification differently, which index serves which query, how the planner decides, and how to fix the performance problems a Spring Data JPA application most often creates.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> <a href="p2-01-system-design-foundations.html">Chapter 1</a>; production experience with JPA/Hibernate, Spring Data repositories, <code>@Transactional</code>, Flyway or Liquibase, and PostgreSQL or MySQL.</li>
+    <li><strong>You will be able to:</strong> choose a data store from access patterns and NFRs; predict which anomalies each isolation level allows on PostgreSQL and MySQL; explain MVCC, vacuum and the InnoDB clustered index; compare B+tree and LSM-tree engines quantitatively; design composite, partial, covering, expression, GIN, GiST and BRIN indexes; read <code>EXPLAIN (ANALYZE, BUFFERS)</code> output; eliminate N+1 queries; size HikariCP pools; and implement keyset pagination in Spring Data, Python and Go.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: The Most Consequential Decision You Will Make Twice</h2>
+  <p>Almost every performance and correctness problem in a backend eventually reaches the database. Requests are slow because a query scans instead of seeks; the system is wrong because two transactions interleaved in a way the developer did not imagine; the bill is high because an index nobody uses is maintained on every write; the migration is painful because the data model chosen in year one fits year three's access patterns badly. Unlike stateless services, which you can rewrite and redeploy in a day, data has gravity: moving it is slow, risky and expensive. Teams usually choose a database twice: once quickly at the start, and once, painfully, when the first choice stops fitting.</p>
+  <p>This chapter aims to make the first choice better and the second one rarer. It covers four layers that build on each other:</p>
+  <ul>
+    <li><strong>Selection</strong>: a framework that starts from access patterns and non-functional requirements rather than fashion, and an honest comparison of relational and NoSQL families, including the vector stores that AI features now require.</li>
+    <li><strong>Transactions</strong>: what ACID promises, the precise anomalies each isolation level allows, and how PostgreSQL and MySQL actually implement them with MVCC and locking.</li>
+    <li><strong>Storage engines and indexes</strong>: the two dominant on-disk structures (B+trees and LSM-trees), their amplification trade-offs, and every index type you are likely to use.</li>
+    <li><strong>Query execution</strong>: the planner, statistics, join algorithms, <code>EXPLAIN ANALYZE</code>, and the application-side problems (N+1, pool sizing, pagination) that dominate Spring applications.</li>
+  </ul>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>Entities, repositories, <code>@Transactional(isolation = ...)</code>, <code>@Version</code> optimistic locking, <code>@Query</code> with JPQL, Flyway migrations adding indexes, HikariCP defaults, <code>Pageable</code> with <code>Page&lt;T&gt;</code>, and the moment you discovered <code>spring.jpa.show-sql</code> printing 101 queries for one endpoint.</dd>
+      <dt>Why that is not enough</dt><dd>JPA abstracts the database so well that it hides the costs: lazy loading turns object navigation into network round trips; <code>Page&lt;T&gt;</code> issues an <code>OFFSET</code> query plus a <code>COUNT(*)</code>, both of which degrade linearly; <code>@Transactional</code>'s default isolation is whatever the database default is, which differs between PostgreSQL (Read Committed) and MySQL (Repeatable Read) and allows different anomalies; and an index declared in a migration may never be used because the query does not match its column order.</dd>
+      <dt>The modern approach</dt><dd>Choose stores per access pattern (a relational database as the default system of record, specialised stores where a pattern demands them); know the isolation guarantees you rely on and test for anomalies; design indexes from queries, verify with <code>EXPLAIN (ANALYZE, BUFFERS)</code>, and remove unused ones; fetch exactly the data needed (DTO projections, fetch joins, batch fetching); size pools from Little's Law; paginate with keysets.</dd>
+      <dt>Where Python and Go fit</dt><dd>Python (psycopg 3, SQLAlchemy 2) and Go (pgx v5, database/sql, sqlc) are common for data services and tooling; they make SQL more explicit than JPA does, which removes N+1 surprises but not planner or isolation surprises. §7 shows equivalent patterns.</dd>
+      <dt>In production</dt><dd>Managed PostgreSQL or MySQL (RDS/Aurora, Cloud SQL/AlloyDB, Azure) as the system of record; pg_stat_statements or Performance Schema to find expensive queries; read replicas; Redis for caching; OpenSearch/Elasticsearch for search; a columnar warehouse for analytics; pgvector or a dedicated vector database for embeddings.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use a relational database by default whenever data is related, needs transactions or ad-hoc querying, and fits within a large single primary (or a sharded deployment, Chapter 5). Reach for a NoSQL family only when a specific access pattern, scale profile or data shape clearly favours it, and you accept its consistency and query limitations.</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="history">
+  <h2>2. History: From Codd to Vectors</h2>
+  <h3>2.1 The relational model (1970–1990s)</h3>
+  <p>Edgar F. Codd's 1970 paper <em>A Relational Model of Data for Large Shared Data Banks</em> separated logical data from physical storage. IBM's System R (mid-1970s) produced SQL and the first cost-based optimizer (Selinger et al., 1979), whose dynamic-programming join ordering remains the template for planners today. Oracle shipped commercially in 1979. Rudolf Bayer and Edward McCreight published the B-tree in 1970–1972; its B+tree variant became the universal on-disk index. Jim Gray's work on transactions and the ACID acronym (named by Härder and Reuter in 1983), and the ARIES recovery algorithm (Mohan et al., 1992) defined how databases survive crashes using write-ahead logging.</p>
+  <h3>2.2 Open-source relational databases (1990s–2000s)</h3>
+  <p>Michael Stonebraker's POSTGRES project at Berkeley (from 1986) became PostgreSQL in 1996; MySQL appeared in 1995 and gained the transactional InnoDB engine (made the default in MySQL 5.5, 2010). Multi-version concurrency control, described academically in the late 1970s and early 1980s, became the dominant concurrency approach in both.</p>
+  <h3>2.3 The NoSQL wave (2006–2015)</h3>
+  <p>Google's Bigtable paper (2006) and Amazon's Dynamo paper (2007) showed how to build massively scalable stores by relaxing relational features. Their descendants include HBase, Cassandra (open-sourced by Facebook in 2008) and DynamoDB (2012). MongoDB (2009) popularised the document model; Redis (2009) the data-structure server; Neo4j the graph model. The log-structured merge-tree (O'Neil et al., 1996) became the storage engine of choice for write-heavy stores via LevelDB (2011) and RocksDB (Facebook, 2012). The "NoSQL" label itself spread in 2009.</p>
+  <h3>2.4 NewSQL and the relational comeback (2012–present)</h3>
+  <p>Google Spanner (2012) demonstrated globally distributed, externally consistent SQL transactions; CockroachDB, YugabyteDB and TiDB followed. Meanwhile PostgreSQL absorbed many NoSQL use cases: <code>jsonb</code> with GIN indexes (9.4, 2014), declarative partitioning (10, 2017), logical replication, and an extension ecosystem (PostGIS, TimescaleDB, Citus, pgvector). PostgreSQL 18 (September 2025) added an asynchronous I/O subsystem, B-tree skip scan for multicolumn indexes, and a built-in <code>uuidv7()</code> function; PostgreSQL 19 was released in November 2026 <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+  <h3>2.5 Vector search (2017–present)</h3>
+  <p>Approximate nearest-neighbour (ANN) indexes such as HNSW (Malkov and Yashunin, first published 2016) and libraries such as Faiss (Meta, 2017) made similarity search over embeddings practical. With retrieval-augmented generation, vector search became a mainstream database feature: dedicated systems (Milvus, Qdrant, Weaviate, Pinecone) and extensions/features in general-purpose stores (pgvector for PostgreSQL, OpenSearch/Elasticsearch k-NN, Redis 8 vector sets, MongoDB Atlas Vector Search).</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 A database selection framework</h3>
+  <p>Choose a database by answering these questions in order, writing the answers down. The first questions are about the data and its use; vendor and fashion come last.</p>
+  <ol>
+    <li><strong>What are the access patterns?</strong> List the top queries by frequency and importance: lookups by key, range scans by time, multi-attribute filters, joins across entities, full-text search, similarity search, graph traversals, aggregations over large ranges. The dominant patterns decide the data model.</li>
+    <li><strong>What consistency and transactional guarantees are required?</strong> Do multi-entity invariants need atomic enforcement (money, inventory, bookings)? Is read-your-writes enough? Can some reads be stale?</li>
+    <li><strong>What is the scale profile?</strong> Data volume and growth, read and write QPS, peak factor, value sizes, hot-spot risk (Chapter 1 estimation). Does it fit on one large primary for the planning horizon?</li>
+    <li><strong>What are latency and availability targets?</strong> Single-digit millisecond p99? Multi-region writes? RPO/RTO?</li>
+    <li><strong>How will the schema evolve?</strong> Stable and relational, or heterogeneous and fast-changing? (Note that "schemaless" stores still have a schema; it lives in application code.)</li>
+    <li><strong>What are the operational realities?</strong> Team expertise, managed-service availability, backup/restore and point-in-time recovery, observability, licensing, cost at projected scale, ecosystem (drivers, Spring Data support, migration tooling).</li>
+  </ol>
+  <p>For most new systems of record, the answer is a relational database (PostgreSQL is the default choice of many teams), possibly accompanied by purpose-built stores: Redis for caching, a search engine for full-text, a warehouse for analytics, and a vector index for embeddings. This is <strong>polyglot persistence</strong>; its cost is keeping derived stores in sync (usually via CDC and Kafka, Chapter 7) and operating several systems.</p>
+
+  <h3>3.2 The relational model and ACID</h3>
+  <p>The relational model stores data as relations (tables) of tuples (rows) with typed attributes, related by keys, queried declaratively. Its enduring strengths: <strong>normalisation</strong> eliminates update anomalies by storing each fact once; <strong>joins</strong> recombine facts flexibly for queries nobody anticipated; <strong>constraints</strong> (primary keys, foreign keys, unique, check, exclusion) enforce invariants in the database regardless of which application writes; and <strong>transactions</strong> group operations atomically.</p>
+  <p><strong>ACID</strong> is the set of transaction guarantees:</p>
+  <ul>
+    <li><strong>Atomicity</strong>: all of a transaction's writes take effect or none do. Implemented with a write-ahead log (WAL in PostgreSQL, redo log plus undo log in InnoDB); on abort or crash, partial work is rolled back.</li>
+    <li><strong>Consistency</strong>: transactions move the database from one valid state to another with respect to declared constraints. This is partly the application's responsibility; the database enforces only the constraints you declare.</li>
+    <li><strong>Isolation</strong>: concurrent transactions do not interfere beyond what the chosen isolation level permits. The ideal is <em>serializability</em> (the outcome equals some serial order); weaker levels trade anomalies for concurrency.</li>
+    <li><strong>Durability</strong>: once committed, data survives crashes. The WAL is flushed (<code>fsync</code>) at commit (<code>synchronous_commit</code> in PostgreSQL, <code>innodb_flush_log_at_trx_commit=1</code> in MySQL); replication extends durability beyond one machine.</li>
+  </ul>
+
+  <h3>3.3 Isolation levels and anomalies</h3>
+  <p>Anomalies are the observable effects of interleaving that would not happen serially:</p>
+  <ul>
+    <li><strong>Dirty write</strong>: overwriting another transaction's uncommitted write. Prevented by every practical level.</li>
+    <li><strong>Dirty read</strong>: seeing another transaction's uncommitted write.</li>
+    <li><strong>Non-repeatable read (read skew)</strong>: reading the same row twice and seeing different committed values, or reading two related rows at different points in time (e.g. seeing account A before a transfer and account B after it, so money appears to vanish).</li>
+    <li><strong>Phantom read</strong>: re-running a query with a predicate and seeing a different set of rows because another transaction inserted or deleted matching rows.</li>
+    <li><strong>Lost update</strong>: two transactions read a value, both compute a new value from it, both write; one update is lost (classic read-modify-write on a counter or JSON document).</li>
+    <li><strong>Write skew</strong>: two transactions read an overlapping set of rows, each makes a decision based on what it read, and each writes to <em>different</em> rows, together violating an invariant neither violated alone. Example: an on-call rule "at least one doctor on call"; two doctors simultaneously check that two are on call and each removes themselves.</li>
+  </ul>
+  <p>The SQL standard defines four levels by which of dirty, non-repeatable and phantom reads they allow, but real engines differ from the standard, especially around lost updates and write skew. What PostgreSQL and MySQL (InnoDB) actually do:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Level</th><th>PostgreSQL behaviour</th><th>MySQL InnoDB behaviour</th></tr></thead>
+    <tbody>
+      <tr><td>Read Uncommitted</td><td>Treated as Read Committed (no dirty reads ever)</td><td>Dirty reads possible</td></tr>
+      <tr><td>Read Committed</td><td><strong>Default.</strong> Each statement sees a fresh snapshot. Non-repeatable reads, phantoms, lost updates (for application-side read-modify-write) and write skew possible. Concurrent <code>UPDATE</code> of the same row waits, then re-evaluates its <code>WHERE</code> on the new row version.</td><td>Each consistent read sees a fresh snapshot; locking reads lock only matching rows (no gap locks).</td></tr>
+      <tr><td>Repeatable Read</td><td>Snapshot isolation: one snapshot for the whole transaction; no phantoms in reads; a concurrent update to a row you then try to update raises a serialization failure (<code>40001</code>), preventing lost updates; <strong>write skew still possible</strong>.</td><td><strong>Default.</strong> Plain <code>SELECT</code>s use a transaction-wide snapshot; locking reads (<code>SELECT ... FOR UPDATE</code>, <code>UPDATE</code>, <code>DELETE</code>) read the <em>latest committed</em> data and take next-key (record + gap) locks that block inserts into scanned ranges. Mixing snapshot reads and locking reads in one transaction can observe different states. Lost updates via application read-modify-write possible unless you use locking reads.</td></tr>
+      <tr><td>Serializable</td><td>Serializable Snapshot Isolation (SSI): snapshot isolation plus tracking of read/write dependencies (predicate "SIRead" locks); aborts a transaction with <code>40001</code> when a dangerous structure could produce a non-serializable outcome. Prevents write skew; requires retries.</td><td>Like Repeatable Read, but plain <code>SELECT</code>s are implicitly converted to <code>SELECT ... FOR SHARE</code> (when autocommit is off), i.e. two-phase locking; prevents anomalies at the cost of blocking and deadlocks.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Practical consequences for a Spring application: at the default levels, both databases allow the lost-update pattern "load entity, modify field, save" unless you add optimistic locking (<code>@Version</code>), pessimistic locking (<code>@Lock(PESSIMISTIC_WRITE)</code> → <code>SELECT ... FOR UPDATE</code>), or perform the update atomically in SQL (<code>UPDATE stock SET qty = qty - 1 WHERE id = ? AND qty &gt; 0</code>). Write-skew-shaped invariants require Serializable (with retry), explicit locks on the rows that represent the invariant, or a constraint the database can enforce (unique, exclusion constraints).</p>
+
+  <h3>3.4 MVCC</h3>
+  <p><strong>Multi-version concurrency control</strong> keeps multiple versions of each row so that readers see a consistent snapshot without blocking writers, and writers do not block readers. Each transaction (or statement) reads the versions visible to its snapshot; writes create new versions. Conflicts only arise between writers of the same row. MVCC is why a long analytical <code>SELECT</code> in PostgreSQL or InnoDB does not block your OLTP updates. The two engines implement it very differently (§4.1, §4.2): PostgreSQL stores old and new versions side by side in the table (and cleans up later with <code>VACUUM</code>), while InnoDB updates rows in place in the clustered index and keeps old versions in undo logs. The difference explains PostgreSQL's bloat and vacuum tuning, InnoDB's purge lag and "history list length", and much of the debate in the Uber case study (§9.1).</p>
+
+  <h3>3.5 NoSQL families and when to use each</h3>
+  <p>"NoSQL" groups very different systems. What they share is relaxing some relational property (joins, multi-row transactions, fixed schema, or strong consistency) in exchange for a scaling or modelling advantage for particular access patterns.</p>
+  <ul>
+    <li><strong>Key-value stores</strong> (Redis/Valkey, DynamoDB in its simplest use, etcd, FoundationDB's base layer, RocksDB embedded). Operations: get/put/delete by key, sometimes ranges. Use for sessions, caches, feature flags, idempotency keys, user preferences, anything accessed only by primary key at very high rates. Avoid when you need queries by attributes other than the key.</li>
+    <li><strong>Document stores</strong> (MongoDB, Couchbase, Firestore; also PostgreSQL <code>jsonb</code>). Store self-contained, nested documents (JSON/BSON), with secondary indexes on fields. Use when entities are naturally hierarchical and read/written as a whole (a product with variants, a CMS page, a user profile with nested settings), with heterogeneous attributes. Avoid when data is highly interconnected (many-to-many relationships require application-side joins or duplication).</li>
+    <li><strong>Wide-column stores</strong> (Apache Cassandra, ScyllaDB, HBase, Google Bigtable). Data is partitioned by a partition key and sorted within a partition by clustering columns; each partition is a sorted map that can be very large. Queries must specify the partition key; you design tables per query ("query-first modelling"), duplicating data across tables. Use for very high write throughput, time-ordered data per entity (messages per channel, events per device), multi-datacenter replication with tunable consistency. Avoid for ad-hoc queries, joins, or strong multi-row transactions.</li>
+    <li><strong>Graph databases</strong> (Neo4j, Amazon Neptune, JanusGraph; also recursive SQL CTEs or Apache AGE in PostgreSQL). Nodes and edges with properties; queries traverse relationships (Cypher, Gremlin, and the ISO GQL standard published in 2024). Use for deep or variable-length relationship queries: fraud rings, recommendations ("friends of friends who bought"), access-control graphs, knowledge graphs for GraphRAG. Avoid for simple one-hop relationships a relational join handles fine.</li>
+    <li><strong>Time-series databases</strong> (TimescaleDB on PostgreSQL, InfluxDB, Prometheus, QuestDB, ClickHouse for many TS workloads). Optimised for append-heavy timestamped data, time-range queries, downsampling, retention policies and compression. Use for metrics, IoT telemetry, financial ticks. Avoid for frequently updated entities.</li>
+    <li><strong>Search engines</strong> (Elasticsearch, OpenSearch, Apache Solr; Lucene underneath). Inverted indexes for full-text relevance ranking (BM25), faceting, fuzzy matching, aggregations. Usually a derived, eventually consistent copy of a system of record. Use for product search, log search, autocomplete. Avoid as the primary store of record.</li>
+    <li><strong>Vector databases and indexes</strong> (pgvector, Milvus, Qdrant, Weaviate, Pinecone, OpenSearch k-NN, Redis 8 vector sets). Store embeddings and answer approximate nearest-neighbour queries with indexes such as HNSW (graph-based) or IVF (cluster-based), often combined with metadata filters and keyword search (hybrid retrieval). Use for semantic search, RAG retrieval, recommendations and deduplication. Key trade-offs: recall versus latency versus memory, filter handling, and update cost. For up to millions of vectors with relational metadata, pgvector inside your existing PostgreSQL is often simplest; at hundreds of millions to billions, or with demanding latency, dedicated systems earn their operational cost. Part 8 covers retrieval in depth.</li>
+  </ul>
+
+  <h3>3.6 SQL versus NoSQL: the real trade-offs</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Dimension</th><th>Relational (PostgreSQL, MySQL)</th><th>Typical NoSQL</th></tr></thead>
+    <tbody>
+      <tr><td>Data model</td><td>Normalised tables, joins</td><td>Denormalised aggregates (document, partition) designed per query</td></tr>
+      <tr><td>Query flexibility</td><td>Ad-hoc SQL, any predicate, optimizer chooses plan</td><td>Efficient only along designed access paths</td></tr>
+      <tr><td>Transactions</td><td>Multi-row, multi-table ACID</td><td>Often single-item/partition atomicity; some offer multi-document transactions with limits</td></tr>
+      <tr><td>Consistency</td><td>Strong on primary; replicas lag</td><td>Often tunable or eventual; some strongly consistent</td></tr>
+      <tr><td>Scaling writes</td><td>Vertical first; sharding via extensions/middleware (Chapter 5)</td><td>Built-in horizontal partitioning</td></tr>
+      <tr><td>Schema evolution</td><td>Migrations (fast in modern engines for most changes)</td><td>Schema-on-read; application handles multiple versions</td></tr>
+      <tr><td>Operational maturity</td><td>Decades of tooling, PITR, well-understood failure modes</td><td>Varies widely by product</td></tr>
+    </tbody>
+  </table></div>
+  <p>Two myths to drop. First, "SQL doesn't scale": single PostgreSQL or MySQL primaries handle tens of thousands of transactions per second and many terabytes on modern hardware, and sharded relational systems run some of the largest services on the internet (Chapter 5). Second, "NoSQL means no schema": the schema moves from the database to every piece of code that reads the data, which is harder to change safely, not easier. Choose NoSQL for its access-pattern and scaling advantages, not to avoid migrations.</p>
+
+  <h3>3.7 Storage engines: B+trees and LSM-trees</h3>
+  <p>Under any data model, a storage engine organises bytes on disk. Two designs dominate.</p>
+  <p><strong>B+tree (update-in-place).</strong> Data lives in fixed-size pages (8 KB in PostgreSQL, 16 KB default in InnoDB) organised as a balanced tree. Internal pages hold keys and child pointers; leaf pages hold keys and either the row data (InnoDB clustered index) or pointers to it (PostgreSQL heap TIDs), and leaves are linked for range scans. Lookups descend from root to leaf in \(O(\log_F N)\) page reads, where fanout \(F\) is in the hundreds, so even billions of rows need only 3–5 levels, of which the upper levels are almost always cached. Writes modify pages in place (after logging to the WAL); a full page splits. Reads are fast and predictable; writes cost random I/O and write amplification (a 100-byte change rewrites an 8 KB page, plus WAL, plus full-page images after checkpoints in PostgreSQL). Used by PostgreSQL, InnoDB, SQL Server, Oracle, SQLite.</p>
+  <p><strong>LSM-tree (log-structured merge).</strong> Writes go to an in-memory sorted structure (the <strong>memtable</strong>) and a sequential WAL for durability. When the memtable fills, it is flushed to disk as an immutable sorted file (an <strong>SSTable</strong>). Over time many SSTables accumulate; background <strong>compaction</strong> merges them, discarding overwritten and deleted (tombstoned) entries. Reads check the memtable, then SSTables from newest to oldest; <strong>Bloom filters</strong> per SSTable skip files that definitely do not contain the key, and sparse indexes/fence pointers locate the block within a file. Writes are sequential and fast; reads may touch several files; compaction consumes I/O and CPU in the background. Used by RocksDB (and through it MyRocks, CockroachDB's earlier storage, TiKV, Kafka Streams state stores), Cassandra, ScyllaDB, HBase, LevelDB, and Pebble (CockroachDB).</p>
+  <p>The comparison is usually framed through three <strong>amplification factors</strong>: <em>write amplification</em> (bytes written to storage per byte written by the application), <em>read amplification</em> (I/Os or bytes read per query), and <em>space amplification</em> (bytes on disk per byte of live data). No structure minimises all three (the "RUM conjecture"); compaction strategy chooses the point on the trade-off:</p>
+  <ul>
+    <li><strong>Size-tiered compaction</strong> (Cassandra STCS default for many years): merge SSTables of similar size into bigger ones. Low write amplification, higher space amplification (temporarily up to 2x during large merges) and read amplification.</li>
+    <li><strong>Leveled compaction</strong> (RocksDB default, Cassandra LCS): levels L0, L1, …, each about 10x larger than the previous, each level (except L0) a set of non-overlapping SSTables. Lower read and space amplification (~1.1x), higher write amplification (each byte is rewritten roughly once per level times the fanout factor).</li>
+    <li><strong>Time-window compaction</strong> (Cassandra TWCS): group SSTables by time window, never compact across windows; ideal for TTL'd time-series where whole files expire.</li>
+    <li><strong>Unified / hybrid strategies</strong> (Cassandra 5.0's Unified Compaction Strategy, RocksDB universal compaction) let you tune between tiered and leveled behaviour.</li>
+  </ul>
+
+  <h3>3.8 Index types</h3>
+  <p>An index is a redundant data structure that trades write cost and space for faster reads on specific predicates. Each index type serves different operators.</p>
+  <ul>
+    <li><strong>B-tree</strong> (default in PostgreSQL and MySQL): equality and range (<code>=</code>, <code>&lt;</code>, <code>&gt;</code>, <code>BETWEEN</code>, <code>IN</code>), prefix <code>LIKE 'abc%'</code> (with appropriate collation/operator class), <code>ORDER BY</code> without a sort, <code>IS NULL</code>. The workhorse.</li>
+    <li><strong>Hash</strong>: equality only. In PostgreSQL, WAL-logged and crash-safe since 10; occasionally smaller and faster than B-tree for long keys with equality lookups, but no ordering or range support. InnoDB has no user-defined hash indexes (it has an internal adaptive hash index).</li>
+    <li><strong>Composite (multicolumn)</strong>: a B-tree on <code>(a, b, c)</code> is sorted by <code>a</code>, then <code>b</code> within <code>a</code>, then <code>c</code>. It efficiently serves predicates on a <strong>leftmost prefix</strong>: <code>a</code>; <code>a, b</code>; <code>a, b, c</code>; and <code>a = ? AND b &gt; ?</code> (equality columns first, then one range column). It cannot efficiently serve <code>b = ?</code> alone, because <code>b</code> values are scattered across the whole index, except via a full index scan, or via the <strong>skip scan</strong> optimisation (MySQL 8.0.13+; PostgreSQL 18+) when the leading column has few distinct values. Column order rule of thumb: equality-filtered columns first (most selective among them first is a minor concern), then the range or sort column.</li>
+    <li><strong>Covering index / index-only scan</strong>: if the index contains every column the query needs, the engine can answer from the index alone. PostgreSQL supports non-key payload columns with <code>INCLUDE</code> (11+), and index-only scans still check the visibility map (requires a well-vacuumed table). In InnoDB every secondary index implicitly includes the primary key, so a secondary index on <code>(email)</code> covers <code>SELECT id FROM users WHERE email = ?</code>.</li>
+    <li><strong>Partial (filtered) index</strong> (PostgreSQL): indexes only rows matching a predicate, e.g. <code>WHERE status = 'PENDING'</code>. Tiny, cheap to maintain, perfect for queue-like tables where queries target a small subset. Also used for conditional uniqueness (<code>UNIQUE (email) WHERE deleted_at IS NULL</code>).</li>
+    <li><strong>Expression (functional) index</strong>: index the result of an expression, e.g. <code>lower(email)</code> or <code>(payload -&gt;&gt; 'customerId')</code>. The query must use the identical expression. MySQL 8 supports functional key parts.</li>
+    <li><strong>GIN</strong> (Generalized Inverted Index, PostgreSQL): maps each element (array element, <code>jsonb</code> key/value, full-text lexeme, trigram) to the rows containing it. Serves containment and membership: <code>@&gt;</code>, <code>?</code>, <code>&amp;&amp;</code>, full-text <code>@@</code>, and <code>LIKE '%abc%'</code> via <code>pg_trgm</code>. Fast reads, slower writes (mitigated by the pending list / <code>fastupdate</code>).</li>
+    <li><strong>GiST</strong> (Generalized Search Tree): a balanced tree framework for data with overlap or distance semantics: geometric and geographic types (PostGIS), ranges (<code>tstzrange</code> overlap <code>&amp;&amp;</code>), nearest-neighbour ordering (<code>ORDER BY location &lt;-&gt; point</code>), and <strong>exclusion constraints</strong> (e.g. no two bookings for the same room with overlapping time ranges). SP-GiST covers space-partitioned structures (quadtrees, radix trees).</li>
+    <li><strong>BRIN</strong> (Block Range Index): stores min/max (or other summaries) per range of table blocks (default 128 pages). Minuscule (kilobytes for terabyte tables) and effective only when the column's values correlate with physical row order, such as an append-only <code>created_at</code>. Ideal for huge time-series or log tables queried by time range.</li>
+    <li><strong>Vector indexes</strong> (pgvector HNSW and IVFFlat): approximate nearest-neighbour over embeddings with distance operators (<code>&lt;-&gt;</code> L2, <code>&lt;=&gt;</code> cosine, <code>&lt;#&gt;</code> negative inner product).</li>
+    <li><strong>Unique indexes</strong> enforce constraints; <strong>clustered</strong> organisation (InnoDB primary key, SQL Server clustered index) stores rows in index order, which makes primary-key range scans fast and makes the choice of primary key a physical-layout decision (random UUIDv4 keys cause page splits and poor locality; time-ordered UUIDv7 or sequences do not).</li>
+  </ul>
+
+  <h3>3.9 Query optimization basics</h3>
+  <p>SQL is declarative: the <strong>planner/optimizer</strong> chooses how to execute. It enumerates candidate plans (access paths per table: sequential scan, index scan, bitmap scan, index-only scan; join orders; join algorithms), estimates each plan's cost using <strong>statistics</strong> about the data (row counts, distinct values, most common values, histograms, correlation), and picks the cheapest. Most bad plans are caused by bad <em>estimates</em> (stale statistics, correlated columns treated as independent, parameters whose selectivity varies wildly), not by the cost model itself. <code>EXPLAIN</code> shows the chosen plan with estimates; <code>EXPLAIN ANALYZE</code> executes it and shows actual rows and timings, so you can spot where estimate and reality diverge.</p>
+  <p>Join algorithms:</p>
+  <ul>
+    <li><strong>Nested loop</strong>: for each outer row, look up matching inner rows (ideally via an index). Best when the outer side is small and the inner side has an index on the join key. Cost roughly \(N_{outer} \times \text{cost(inner lookup)}\). Disastrous when the planner underestimates the outer side (estimated 10 rows, actually 1 million).</li>
+    <li><strong>Hash join</strong>: build a hash table on the smaller input's join key, then probe it with each row of the larger input. Best for large, unsorted inputs with equality joins. Needs memory (<code>work_mem</code>); spills to disk in batches if the hash table does not fit.</li>
+    <li><strong>Merge join</strong>: sort both inputs on the join key (or read them from indexes already sorted) and merge. Best when both inputs are large and already sorted, or for range-style join conditions in some engines.</li>
+  </ul>
+
+  <h3>3.10 Connection pooling</h3>
+  <p>Opening a database connection is expensive (TCP, TLS, authentication, and in PostgreSQL a new backend process with its own memory). A <strong>connection pool</strong> (HikariCP is Spring Boot's default) keeps connections open and lends them to threads. Pool size is the most commonly misconfigured setting in Spring applications, and bigger is usually worse: the database can only execute as many queries concurrently as it has cores (plus some overlap for I/O waits), and extra concurrent queries add context switching, lock contention and memory pressure. HikariCP's documentation suggests starting from <code>connections = (core_count × 2) + effective_spindle_count</code> <em>for the database server</em>, shared across all application instances, and validating with load tests. Little's Law (Chapter 1) gives the application-side view: connections needed ≈ queries per second × average connection hold time. Where many instances must share a small number of database connections, add a server-side pooler (PgBouncer in transaction mode, RDS Proxy, or built-in poolers in some managed services).</p>
+
+  <h3>3.11 Pagination: offset versus keyset</h3>
+  <p><strong>Offset pagination</strong> (<code>ORDER BY created_at DESC LIMIT 20 OFFSET 10000</code>) makes the database produce and discard 10,000 rows to return 20, so cost grows linearly with page depth; and concurrent inserts shift rows between pages, causing duplicates or skipped items. Spring Data's <code>Page&lt;T&gt;</code> adds a <code>COUNT(*)</code> query on every page, which on large tables can cost more than the page itself. <strong>Keyset (seek, cursor) pagination</strong> remembers the last row's sort key and asks for rows after it: <code>WHERE (created_at, id) &lt; (:lastCreatedAt, :lastId) ORDER BY created_at DESC, id DESC LIMIT 20</code>. With an index on <code>(created_at DESC, id DESC)</code>, every page is an index seek plus 20 rows, regardless of depth, and results are stable under inserts. The trade-off: no "jump to page 537", which users rarely need; infinite scroll and API cursors fit keyset naturally. Spring Data 3.1+ supports keyset scrolling with <code>Window&lt;T&gt;</code> and <code>ScrollPosition</code>.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working</h2>
+
+  <h3>4.1 PostgreSQL MVCC: tuples, visibility and vacuum</h3>
+  <p>Every row version (tuple) in a PostgreSQL heap page carries a header with <code>xmin</code> (the ID of the transaction that created it) and <code>xmax</code> (the ID of the transaction that deleted or superseded it, or zero). An <code>UPDATE</code> never modifies a tuple in place: it marks the old tuple's <code>xmax</code> and inserts a new tuple (with a pointer from old to new, <code>t_ctid</code>). A <code>DELETE</code> just sets <code>xmax</code>. A transaction's <strong>snapshot</strong> records which transaction IDs were committed when it was taken; a tuple is visible if its <code>xmin</code> committed before the snapshot and its <code>xmax</code> is unset, aborted, or not yet committed as of the snapshot. Commit status is looked up in the commit log (<code>pg_xact</code>) and cached in tuple hint bits.</p>
+  <p>Consequences:</p>
+  <ul>
+    <li><strong>Dead tuples accumulate.</strong> Old versions remain until no snapshot can see them. <code>VACUUM</code> (usually autovacuum) removes them, making space reusable, and updates the <em>visibility map</em> (which enables index-only scans) and <em>free space map</em>. A long-running transaction (or an idle-in-transaction session, or a stale replication slot) holds back the cleanup horizon for the whole database, causing <strong>bloat</strong> in busy tables.</li>
+    <li><strong>Every index points at a tuple location.</strong> A new tuple version normally requires new entries in every index on the table, even if indexed columns did not change. The <strong>HOT</strong> (heap-only tuple) optimisation avoids this when no indexed column changes and the new version fits on the same page; leaving free space in pages (<code>fillfactor</code> &lt; 100) increases HOT updates for update-heavy tables.</li>
+    <li><strong>Transaction ID wraparound.</strong> XIDs are 32-bit; vacuum must "freeze" old tuples before IDs wrap around (about 2 billion transactions). Neglected vacuum on huge, busy databases can force emergency anti-wraparound vacuums, which is why vacuum monitoring is a production essential.</li>
+  </ul>
+
+  <h3>4.2 InnoDB: clustered index, undo logs and next-key locks</h3>
+  <p>InnoDB stores each table as a B+tree <strong>clustered on the primary key</strong>: leaf pages contain the full rows in primary-key order. <strong>Secondary indexes</strong> store the indexed columns plus the primary key value, not a physical pointer; a lookup by secondary index finds the primary key and then descends the clustered index (a "bookmark lookup"). Consequences: a long primary key bloats every secondary index; random primary keys (UUIDv4) scatter inserts across the clustered tree, causing page splits and poor cache locality; and updating a row does not change secondary indexes unless their columns change, because they reference the stable primary key.</p>
+  <p>Updates are made in place in the clustered index; the previous version is written to the <strong>undo log</strong>, and each row carries a hidden transaction ID and a roll pointer to its undo record. A consistent read reconstructs the version visible to its read view by following undo records. The purge thread removes undo records no longer needed; a long-running transaction stops purge, and the <em>history list length</em> grows (InnoDB's analogue of PostgreSQL bloat). The <strong>redo log</strong> (WAL) provides durability; the <strong>doublewrite buffer</strong> protects against torn page writes.</p>
+  <p>For locking reads under Repeatable Read, InnoDB takes <strong>next-key locks</strong>: a lock on an index record plus the gap before it, which prevents other transactions from inserting into the scanned range (preventing phantoms for locking reads). Range scans without a suitable index lock large parts of the table, which is a common cause of unexpected blocking and deadlocks in MySQL applications; insert intention locks and gap locks are what <code>SHOW ENGINE INNODB STATUS</code> deadlock reports are full of.</p>
+
+  <h3>4.3 The write-ahead log and checkpoints</h3>
+  <p>Both engines follow the WAL rule: a change is durable once its log record is flushed, and data pages can be written lazily later. At commit, the log is flushed (one sequential <code>fsync</code>, often batched across concurrent commits: <em>group commit</em>). Periodic <strong>checkpoints</strong> write dirty pages to data files so recovery need only replay the log since the last checkpoint. In PostgreSQL, the first modification of a page after a checkpoint writes a <strong>full-page image</strong> into the WAL (to survive torn pages), so very frequent checkpoints inflate WAL volume; <code>max_wal_size</code> and <code>checkpoint_timeout</code> balance recovery time against WAL volume. The WAL is also the replication stream (Chapter 5) and the source for CDC.</p>
+
+  <h3>4.4 The LSM write and read paths</h3>
+  <ol>
+    <li><strong>Write</strong>: append the record to the WAL (sequential), insert into the memtable (a skiplist in RocksDB), acknowledge. Deletes write a <em>tombstone</em>.</li>
+    <li><strong>Flush</strong>: when the memtable reaches its size limit, it becomes immutable, a new memtable takes writes, and the immutable one is written as an L0 SSTable (sorted key-value blocks, an index block, a Bloom filter block, and metadata).</li>
+    <li><strong>Compaction</strong>: background threads merge SSTables per the compaction strategy, keeping the newest version of each key and dropping tombstones once no older data could be shadowed by them. If compaction falls behind the write rate, L0 files pile up and the engine <em>stalls</em> writes to protect read performance: the classic LSM failure mode under sustained heavy writes.</li>
+    <li><strong>Point read</strong>: memtable → immutable memtables → L0 files (which may overlap, so each is checked) → one file per deeper level. For each candidate file, consult the Bloom filter (in memory); if it says "maybe", use the block index to read one block (often from block cache).</li>
+    <li><strong>Range scan</strong>: merge iterators over the memtable and all levels; Bloom filters do not help (prefix Bloom filters can, for prefix-bounded scans).</li>
+  </ol>
+  <p>Tombstones have a cost of their own: a range of deleted data still has to be read past until compaction removes it. Cassandra users meet this as "tombstone overwhelming" errors when queue-like access patterns delete heavily and then scan.</p>
+
+  <h3>4.5 From SQL text to rows: the PostgreSQL query pipeline</h3>
+  <ol>
+    <li><strong>Parse</strong> the SQL into a parse tree; <strong>analyse</strong> it (resolve names, types, functions).</li>
+    <li><strong>Rewrite</strong> using rules (views are expanded here).</li>
+    <li><strong>Plan</strong>: generate access paths for each relation; for joins, explore join orders by dynamic programming (or, beyond <code>geqo_threshold</code> tables, a genetic algorithm); estimate costs from statistics and cost parameters (<code>seq_page_cost</code>, <code>random_page_cost</code>, <code>cpu_tuple_cost</code>, <code>effective_cache_size</code>…); choose the cheapest plan.</li>
+    <li><strong>Execute</strong> the plan tree using the Volcano/iterator model: each node pulls rows from its children.</li>
+  </ol>
+  <p>Statistics are gathered by <code>ANALYZE</code> (run by autovacuum) from a random sample: per column, the fraction of nulls, number of distinct values, most common values with frequencies, a histogram of the rest, and the physical-order correlation. Since columns are assumed independent, correlated predicates (<code>city = 'Paris' AND country = 'FR'</code>) are underestimated; <code>CREATE STATISTICS</code> (extended statistics: dependencies, n-distinct, MCV lists over column groups) fixes this. Prepared statements (which JDBC drivers use) may switch from custom plans to a cached <em>generic plan</em> after five executions if the generic plan's estimated cost is not much worse; with highly skewed parameters this can produce a plan that is terrible for some values (<code>plan_cache_mode</code> controls it).</p>
+
+  <h3>4.6 How Hibernate produces N+1</h3>
+  <p>Loading 50 <code>Order</code> entities with <code>findAll()</code> issues one query. Each <code>Order</code> has a lazy <code>@ManyToOne Customer</code> represented by a proxy and a lazy <code>@OneToMany</code> collection of <code>OrderLine</code>s represented by a <code>PersistentBag</code>. When serialisation or a loop touches <code>order.getCustomer().getName()</code> and <code>order.getLines()</code>, each uninitialised proxy and collection triggers its own <code>SELECT</code>: 1 + 50 + 50 = 101 queries, each a network round trip (~0.5 ms or more), so an endpoint that should take 5 ms takes 60+ ms and holds a connection for all of it. (Eager <code>@ManyToOne</code>, the JPA default for to-one associations, does not fix this for queries: JPQL ignores the mapping's fetch type and loads the association with separate selects after the main query.) The fixes (§7.3) all make the number of queries independent of the number of rows: fetch joins, entity graphs, batch fetching (<code>IN</code> lists), or DTO projections.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture and Visual Models</h2>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A["New data domain"] --> B{"Need multi-entity transactions or ad-hoc queries?"}
+  B -- "Yes" --> C{"Fits one large primary for 2-3 years?"}
+  C -- "Yes" --> PG["Relational (PostgreSQL / MySQL)"]
+  C -- "No" --> NS["Sharded relational (Vitess, Citus, app sharding) or distributed SQL"]
+  B -- "No" --> D{"Dominant access pattern?"}
+  D -- "Key lookup, very high rate" --> KV["Key-value (Redis, DynamoDB)"]
+  D -- "Whole nested aggregate" --> DOC["Document (MongoDB) or jsonb"]
+  D -- "High-volume writes partitioned by entity and time" --> WC["Wide-column (Cassandra, ScyllaDB)"]
+  D -- "Deep relationship traversal" --> GR["Graph"]
+  D -- "Full-text relevance" --> SE["Search engine (derived copy)"]
+  D -- "Similarity over embeddings" --> VEC["Vector index (pgvector or dedicated)"]
+  D -- "Append-only metrics by time" --> TS["Time-series"]
+</pre>
+  <figcaption>Figure 4.1 — A database selection flow driven by transactions, scale and access patterns.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the first question is about transactional and query needs, because that is where relational databases are uniquely strong and the hardest to retrofit. Scale is the second gate, and the answer is usually yes for longer than teams expect. Only when transactions and ad-hoc querying are not central does the dominant access pattern pick a NoSQL family. Many real systems traverse this chart several times, one per domain, ending with a relational system of record plus derived specialised stores.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph BT["B+tree engine (update in place)"]
+    W1["Write"] --> WAL1["WAL append + fsync"]
+    WAL1 --> BP["Modify page in buffer pool"]
+    BP --> CK["Checkpoint: random page writes"]
+    R1["Read"] --> TR["Root to leaf: 3-4 page reads, mostly cached"]
+  end
+  subgraph LSM["LSM engine (append and merge)"]
+    W2["Write"] --> WAL2["WAL append"]
+    WAL2 --> MT["Memtable (sorted, in memory)"]
+    MT --> FL["Flush to L0 SSTable"]
+    FL --> CP["Compaction L0 to L1 to Ln"]
+    R2["Read"] --> CHK["Memtable, then SSTables newest first"]
+    CHK --> BF["Bloom filter skips most files"]
+  end
+</pre>
+  <figcaption>Figure 4.2 — Write and read paths of B+tree and LSM-tree engines.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> both engines log first for durability; they differ in what happens next. The B+tree mutates pages in place, so each logical write eventually costs a random page write (amortised by checkpoints), and reads go straight to one leaf. The LSM engine never mutates files; writes are cheap and sequential, and the cost moves to background compaction and to reads, which may consult several structures. Bloom filters are what make LSM point reads competitive. The right engine depends on whether your workload is read-dominated with updates (B+tree) or write-dominated, append-heavy, and possibly larger than memory (LSM).</p>
+
+  <figure class="diagram">
+  <div class="widget" data-widget="btree"></div>
+  <figcaption>Figure 4.3 — Interactive: step-by-step B-tree insertion with configurable order.</figcaption>
+  </figure>
+  <p><strong>What to try:</strong> insert sequential keys (1, 2, 3, …) with a small order and watch splits always happen at the rightmost leaf, which leaves earlier leaves half full; this mirrors what happens with sequence or UUIDv7 primary keys (PostgreSQL and InnoDB both optimise the rightmost-split case to fill pages more fully). Then insert random keys: splits happen everywhere, mirroring UUIDv4 keys and their poorer page fill and cache locality. Increase the order and observe how few levels are needed for many keys; real database pages have orders in the hundreds, which is why a billion-row index is only about four levels deep.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant T1 as Txn 1 (doctor A)
+  participant DB as PostgreSQL
+  participant T2 as Txn 2 (doctor B)
+  T1->>DB: BEGIN REPEATABLE READ
+  T2->>DB: BEGIN REPEATABLE READ
+  T1->>DB: SELECT count(*) on call (sees 2)
+  T2->>DB: SELECT count(*) on call (sees 2)
+  T1->>DB: UPDATE doctors SET on_call=false WHERE id=A
+  T2->>DB: UPDATE doctors SET on_call=false WHERE id=B
+  T1->>DB: COMMIT (ok)
+  T2->>DB: COMMIT (ok under RR: write skew, zero on call)
+  Note over DB: Under SERIALIZABLE, one commit fails with 40001 and must retry
+</pre>
+  <figcaption>Figure 4.4 — Write skew under snapshot isolation and how SSI prevents it.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> each transaction reads a consistent snapshot and updates a different row, so snapshot isolation sees no write-write conflict and both commit, violating the invariant. Under Serializable, PostgreSQL's SSI notices that each transaction read data the other wrote (a rw-antidependency cycle) and aborts one with a serialization failure. The application must retry, which is why using Serializable requires a retry loop around the transaction (§7.4). Alternatives: lock the rows that represent the invariant with <code>SELECT ... FOR UPDATE</code>, or materialise the invariant into a row both transactions must update.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  Q["SELECT ... FROM orders o JOIN customers c ... WHERE o.status='PENDING' AND o.created_at &gt; now() - 1 day"] --> P["Parser and analyser"]
+  P --> RW["Rewriter (views expanded)"]
+  RW --> PL["Planner"]
+  ST[("pg_statistic: MCVs, histograms, n_distinct, correlation")] --> PL
+  PL --> AP["Access paths per table: seq scan, index scan, bitmap scan, index-only"]
+  PL --> JO["Join order and algorithm: nested loop, hash, merge"]
+  AP --> CM["Cost model picks cheapest plan"]
+  JO --> CM
+  CM --> EX["Executor (iterator tree)"]
+  EX --> RES["Rows"]
+</pre>
+  <figcaption>Figure 4.5 — The PostgreSQL query pipeline and where statistics enter.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> statistics feed the planner's row-count estimates, which feed costs, which choose access paths and join strategies. If the estimate for <code>status='PENDING'</code> is wrong by 1,000x (stale statistics after a bulk update, or skew the histogram misses), every downstream choice can be wrong: a nested loop where a hash join was needed, a sequential scan where an index was ideal. <code>EXPLAIN ANALYZE</code> exposes exactly this mismatch as estimated versus actual rows per node.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math</h2>
+
+  <h3>6.1 B+tree height and lookup cost</h3>
+  <p>With page size \(P\), key-plus-pointer size \(s\), fanout \(F \approx P/s\) and \(N\) keys, height is about \(\lceil \log_F N \rceil\). For 8 KB pages and 16-byte entries (8-byte key + overhead), \(F \approx 500\) (in practice less after headers and fill factor, say 300). Then \(300^3 = 2.7\times10^7\) and \(300^4 = 8.1\times10^9\): <strong>four levels</strong> index eight billion keys. The root and second level (1 + 300 pages ≈ 2.4 MB) are always cached; the third level (90,000 pages ≈ 700 MB) usually is; so a point lookup costs about one or two physical reads in the worst case.</p>
+
+  <h3>6.2 Amplification in LSM compaction</h3>
+  <p><strong>Leveled</strong> with size ratio \(T\) (typically 10) and \(L\) levels: each byte is rewritten about \(T\) times per level as it is merged down, so write amplification \(\approx T \cdot L\) in the worst case (often half that in practice); space amplification \(\approx 1 + 1/T\) (about 1.1); point-read amplification about one file per level, mostly eliminated by Bloom filters. <strong>Tiered</strong> with \(T\) runs per tier: write amplification \(\approx L\) (each byte rewritten once per tier); space amplification up to \(T\) in the worst case for overwrite-heavy data; more runs to check per read. Example: 1 TB of data, \(T = 10\), memtable/L1 base of 256 MB gives \(L \approx \log_{10}(10^{12}/2.56\times10^8) \approx 3.6\), so 4 levels: leveled write amplification up to ~40x versus tiered ~4x. This is why tiered/universal compaction is chosen for write-dominated workloads and leveled for read- and space-sensitive ones.</p>
+
+  <h3>6.3 Bloom filters</h3>
+  <p>A Bloom filter of \(m\) bits with \(k\) hash functions holding \(n\) keys has false-positive probability</p>
+  \[ p \approx \left(1 - e^{-kn/m}\right)^k \]
+  <p>minimised at \(k = \frac{m}{n}\ln 2\), giving \(p \approx 0.6185^{m/n}\). Bits per key for a target \(p\): \(\frac{m}{n} = -\frac{\ln p}{(\ln 2)^2} \approx 1.44\log_2(1/p)\). For 1% false positives: about 9.6 bits per key and 7 hash functions; for 0.1%: about 14.4 bits per key. One billion keys at 1% costs about 1.2 GB of filter memory, which is why RocksDB lets you tune bits per key and skip filters on the last level.</p>
+
+  <h3>6.4 Selectivity and when an index is worth it</h3>
+  <p>An index scan reads \(\sigma N\) rows via random access (cost per row roughly <code>random_page_cost</code> if not cached), while a sequential scan reads all \(N/r\) pages sequentially (\(r\) rows per page). With PostgreSQL's default <code>random_page_cost = 4</code> and <code>seq_page_cost = 1</code>, an index scan fetching one page per row beats a sequential scan only if \(4\sigma N &lt; N/r\), i.e. \(\sigma &lt; \frac{1}{4r}\). With 100 rows per page that is \(\sigma &lt; 0.25\%\). Bitmap heap scans (which sort row locations by page) widen this range, and on SSDs many teams lower <code>random_page_cost</code> to about 1.1–2. The intuition holds: indexes win for selective predicates; for predicates matching a large fraction of the table, a sequential scan is correct, not a planner bug.</p>
+
+  <h3>6.5 Join costs</h3>
+  <p>With outer size \(N\), inner size \(M\): nested loop with index on inner: \(O(N \log M)\); nested loop without index: \(O(NM)\); hash join: \(O(N + M)\) time with \(O(\min(N,M))\) memory; merge join: \(O(N \log N + M \log M)\) if sorting is needed, \(O(N + M)\) if inputs are pre-sorted. A planner mis-estimate that predicts \(N = 10\) but gets \(N = 10^6\) turns a nested loop from 10 index lookups into a million.</p>
+
+  <h3>6.6 Offset versus keyset pagination</h3>
+  <p>Offset page \(p\) of size \(s\) costs \(O(\log N + (p+1)s)\) rows processed; keyset costs \(O(\log N + s)\) for every page. Fetching all pages of \(N\) rows by offset costs \(\sum_{p=0}^{N/s} (p+1)s \approx \frac{N^2}{2s}\): quadratic. For \(N = 10^6\) and \(s = 100\), that is \(5\times10^9\) rows processed versus \(10^6\) with keyset, a 5,000x difference, which is why offset-based exports and sync jobs time out on large tables.</p>
+
+  <h3>6.7 Pool sizing</h3>
+  <p>Application side (Little's Law): \(c = \lambda \times t_{hold}\). Database side: useful concurrency is bounded by the server's cores and I/O parallelism. HikariCP's guidance \((\text{cores} \times 2) + \text{effective spindles}\) for a 16-core database server with SSD storage suggests on the order of 30–40 <em>total</em> active connections doing work concurrently. With 20 application instances, that is about 2 per instance actively executing at once, which is why pools of 10 per instance with short transactions perform better than pools of 100. If \(\lambda t_{hold}\) exceeds what the database can execute concurrently, the fix is shorter hold times (faster queries, no remote calls inside transactions), caching, or read replicas, not a bigger pool.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code</h2>
+
+  <h3>7.1 Schema and indexes for an order service (PostgreSQL)</h3>
+<pre data-file="V12__orders_indexes.sql"><code class="language-sql">CREATE TABLE customers (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email       text NOT NULL,
+    tier        text NOT NULL DEFAULT 'STANDARD',
+    deleted_at  timestamptz
+);
+
+CREATE TABLE orders (
+    id           uuid PRIMARY KEY DEFAULT uuidv7(),   -- PostgreSQL 18+: time-ordered UUIDs
+    customer_id  bigint NOT NULL REFERENCES customers(id),
+    status       text   NOT NULL,
+    total_cents  bigint NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    attrs        jsonb  NOT NULL DEFAULT '{}'
+);
+
+-- Case-insensitive unique email among non-deleted customers: expression + partial
+CREATE UNIQUE INDEX customers_email_live_uq
+    ON customers (lower(email)) WHERE deleted_at IS NULL;
+
+-- "Customer's recent orders" with keyset pagination: equality column first, then sort keys.
+-- INCLUDE makes the list query index-only (no heap fetch for these columns).
+CREATE INDEX orders_customer_created_idx
+    ON orders (customer_id, created_at DESC, id DESC) INCLUDE (status, total_cents);
+
+-- Work queue: only a tiny fraction of rows are PENDING; index just those
+CREATE INDEX orders_pending_idx ON orders (created_at) WHERE status = 'PENDING';
+
+-- jsonb containment queries: attrs @&gt; '{"channel":"mobile"}'
+CREATE INDEX orders_attrs_gin ON orders USING gin (attrs jsonb_path_ops);
+
+-- Huge append-only audit table queried by time range: BRIN is kilobytes, not gigabytes
+CREATE TABLE order_events (
+    order_id   uuid NOT NULL,
+    occurred_at timestamptz NOT NULL,
+    payload    jsonb NOT NULL
+);
+CREATE INDEX order_events_time_brin ON order_events USING brin (occurred_at);
+
+-- No double-booking: exclusion constraint on overlapping ranges (GiST)
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+CREATE TABLE room_bookings (
+    room_id  bigint NOT NULL,
+    during   tstzrange NOT NULL,
+    EXCLUDE USING gist (room_id WITH =, during WITH &amp;&amp;)
+);
+
+-- Correlated columns: help the planner estimate combined selectivity
+CREATE STATISTICS orders_status_customer (dependencies, mcv) ON status, customer_id FROM orders;
+ANALYZE orders;</code></pre>
+  <p>In production, create indexes on large live tables with <code>CREATE INDEX CONCURRENTLY</code> (outside a transaction; Flyway needs the migration marked non-transactional, e.g. via a script config <code>executeInTransaction=false</code>) to avoid blocking writes.</p>
+
+  <h3>7.2 Reading EXPLAIN (ANALYZE, BUFFERS)</h3>
+<pre data-file="psql"><code class="language-sql">EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, status, total_cents, created_at
+FROM orders
+WHERE customer_id = 4711
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+
+-- Illustrative output (numbers vary):
+-- Limit  (cost=0.56..9.80 rows=20 width=48) (actual time=0.031..0.058 rows=20 loops=1)
+--   Buffers: shared hit=5
+--   -&gt;  Index Only Scan using orders_customer_created_idx on orders
+--         (cost=0.56..412.30 rows=890 width=48) (actual time=0.030..0.054 rows=20 loops=1)
+--         Index Cond: (customer_id = 4711)
+--         Heap Fetches: 0
+--         Buffers: shared hit=5
+-- Planning Time: 0.120 ms
+-- Execution Time: 0.075 ms</code></pre>
+  <p>How to read it: work bottom-up through nodes; compare <code>rows=</code> estimated (in the cost parentheses) with actual rows (in the actual parentheses), multiplied by <code>loops</code>; a 10x+ mismatch is the first thing to investigate. <code>Buffers: shared hit</code> are pages found in shared buffers, <code>read</code> are pages fetched from the OS/disk; high <code>read</code> counts explain slow cold queries. <code>Heap Fetches: 0</code> confirms a true index-only scan (the visibility map is up to date). Red flags: <code>Seq Scan</code> on a large table with a selective filter (missing or unusable index), <code>Rows Removed by Filter</code> far larger than rows returned (index on the wrong columns), <code>Sort Method: external merge</code> (sort spilled to disk; raise <code>work_mem</code> for that query or add an index providing the order), <code>Hash Batches</code> &gt; 1 (hash join spilled), and nested loops with high <code>loops</code> counts caused by underestimated outer rows.</p>
+
+  <h3>7.3 N+1 in Spring Data JPA, and four fixes</h3>
+<pre data-file="Order.java"><code class="language-java">package com.example.orders;
+
+import jakarta.persistence.*;
+import org.hibernate.annotations.BatchSize;
+
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+
+@Entity
+@Table(name = "orders")
+public class Order {
+    @Id
+    private UUID id;
+
+    @ManyToOne(fetch = FetchType.LAZY)              // always make to-one associations LAZY
+    @JoinColumn(name = "customer_id")
+    private Customer customer;
+
+    @OneToMany(mappedBy = "order", fetch = FetchType.LAZY)
+    @BatchSize(size = 50)                           // fix 3: load lines for up to 50 orders per query
+    private List&lt;OrderLine&gt; lines = new ArrayList&lt;&gt;();
+
+    private String status;
+    private long totalCents;
+    private Instant createdAt;
+
+    @Version
+    private long version;                           // optimistic locking against lost updates
+
+    public Customer getCustomer() { return customer; }
+    public List&lt;OrderLine&gt; getLines() { return lines; }
+    public UUID getId() { return id; }
+    public String getStatus() { return status; }
+    public long getTotalCents() { return totalCents; }
+    public Instant getCreatedAt() { return createdAt; }
+}</code></pre>
+<pre data-file="OrderRepository.java"><code class="language-java">package com.example.orders;
+
+import org.springframework.data.domain.Limit;
+import org.springframework.data.domain.ScrollPosition;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.domain.Window;
+import org.springframework.data.jpa.repository.EntityGraph;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.UUID;
+
+public interface OrderRepository extends JpaRepository&lt;Order, UUID&gt; {
+
+    // N+1 source: touching o.getCustomer() / o.getLines() later issues one query per order
+    List&lt;Order&gt; findByStatus(String status);
+
+    // Fix 1: fetch join (one query). Avoid fetch-joining collections together with pagination:
+    // Hibernate would paginate in memory.
+    @Query("select o from Order o join fetch o.customer where o.status = :status")
+    List&lt;Order&gt; findWithCustomerByStatus(@Param("status") String status);
+
+    // Fix 2: entity graph, declarative equivalent of a fetch join
+    @EntityGraph(attributePaths = {"customer"})
+    List&lt;Order&gt; findTop100ByStatusOrderByCreatedAtDesc(String status);
+
+    // Fix 4: DTO projection, fetch exactly the columns needed, no entities, no dirty checking
+    @Query("""
+           select new com.example.orders.OrderSummary(o.id, c.email, o.status, o.totalCents, o.createdAt)
+           from Order o join o.customer c
+           where o.customer.id = :customerId and o.createdAt &gt;= :since
+           order by o.createdAt desc, o.id desc
+           """)
+    List&lt;OrderSummary&gt; summaries(@Param("customerId") long customerId,
+                                 @Param("since") Instant since, Limit limit);
+
+    // Keyset scrolling (Spring Data 3.1+): stable, constant cost per page
+    Window&lt;OrderSummaryView&gt; findByCustomerId(long customerId, ScrollPosition position,
+                                              Sort sort, Limit limit);
+}
+
+record OrderSummary(UUID id, String email, String status, long totalCents, Instant createdAt) {}
+
+interface OrderSummaryView {   // interface projection, selects only these columns
+    UUID getId();
+    String getStatus();
+    long getTotalCents();
+    Instant getCreatedAt();
+}</code></pre>
+<pre data-file="OrderQueryService.java"><code class="language-java">package com.example.orders;
+
+import org.springframework.data.domain.Limit;
+import org.springframework.data.domain.ScrollPosition;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.domain.Window;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.ArrayList;
+import java.util.List;
+
+@Service
+@Transactional(readOnly = true)   // read-only: Hibernate skips dirty checking; driver may route to replica
+public class OrderQueryService {
+
+    private final OrderRepository repo;
+
+    public OrderQueryService(OrderRepository repo) { this.repo = repo; }
+
+    /** Streams all of a customer's orders page by page with keyset scrolling. */
+    public List&lt;OrderSummaryView&gt; allFor(long customerId) {
+        var sort = Sort.by(Sort.Order.desc("createdAt"), Sort.Order.desc("id"));
+        ScrollPosition position = ScrollPosition.keyset();
+        List&lt;OrderSummaryView&gt; out = new ArrayList&lt;&gt;();
+        Window&lt;OrderSummaryView&gt; window;
+        do {
+            window = repo.findByCustomerId(customerId, position, sort, Limit.of(100));
+            out.addAll(window.getContent());
+            if (!window.isEmpty()) position = window.positionAt(window.size() - 1);
+        } while (window.hasNext());
+        return out;
+    }
+}</code></pre>
+  <p>To catch N+1 regressions in tests, enable Hibernate statistics (<code>spring.jpa.properties.hibernate.generate_statistics=true</code>) and assert on <code>Statistics.getPrepareStatementCount()</code> for critical endpoints, or use a datasource proxy library to count queries per request. Also set <code>spring.jpa.open-in-view=false</code> so lazy loading cannot silently happen during view rendering or JSON serialisation outside the service layer.</p>
+
+  <h3>7.4 Serializable transactions with retry</h3>
+  <p>Using Serializable (or Repeatable Read in PostgreSQL) means some transactions will fail with SQLSTATE <code>40001</code> and must be retried from the beginning. The retry must wrap the transaction boundary, not run inside it.</p>
+<pre data-file="OnCallService.java"><code class="language-java">package com.example.oncall;
+
+import org.springframework.dao.ConcurrencyFailureException;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.TransactionTemplate;
+
+import java.util.concurrent.ThreadLocalRandom;
+
+@Service
+public class OnCallService {
+
+    private final JdbcTemplate jdbc;
+    private final TransactionTemplate serializable;
+
+    public OnCallService(JdbcTemplate jdbc, TransactionTemplate template) {
+        this.jdbc = jdbc;
+        this.serializable = new TransactionTemplate(template.getTransactionManager());
+        this.serializable.setIsolationLevel(TransactionDefinition.ISOLATION_SERIALIZABLE);
+    }
+
+    public void goOffCall(long doctorId, long shiftId) throws InterruptedException {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                serializable.executeWithoutResult(status -&gt; {
+                    Integer onCall = jdbc.queryForObject(
+                            "select count(*) from doctors where shift_id = ? and on_call", Integer.class, shiftId);
+                    if (onCall == null || onCall &lt; 2) throw new IllegalStateException("last doctor on call");
+                    jdbc.update("update doctors set on_call = false where id = ?", doctorId);
+                });
+                return;
+            } catch (ConcurrencyFailureException e) {   // Spring translates SQLSTATE 40001/40P01 here
+                if (attempt &gt;= 5) throw e;
+                Thread.sleep(ThreadLocalRandom.current().nextLong(5, 20L * attempt)); // jittered backoff
+            }
+        }
+    }
+}</code></pre>
+  <p>Spring Framework 7 also ships declarative retry support (<code>@Retryable</code> in <code>org.springframework.resilience.annotation</code>) <span class="tag version">Version-sensitive · checked Nov 2026</span>; if you use it, make sure the retrying proxy sits <em>outside</em> the <code>@Transactional</code> proxy so each attempt is a fresh transaction.</p>
+
+  <h3>7.5 HikariCP configuration</h3>
+<pre data-file="application.yml"><code class="language-yaml">spring:
+  datasource:
+    url: jdbc:postgresql://orders-db.internal:5432/orders?ApplicationName=orders-service
+    username: orders_app
+    hikari:
+      maximum-pool-size: 10          # derive from Little's Law and the DB's total budget
+      minimum-idle: 10               # fixed-size pool: avoids churn under bursty load
+      connection-timeout: 2000       # ms to wait for a connection; fail fast, not 30 s
+      max-lifetime: 1500000          # 25 min: below any DB/proxy/firewall idle cutoff
+      keepalive-time: 300000         # ping idle connections every 5 min
+      leak-detection-threshold: 20000
+  jpa:
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc.batch_size: 50          # batch inserts/updates
+        order_inserts: true
+        order_updates: true
+        default_batch_fetch_size: 50 # global @BatchSize for lazy associations</code></pre>
+  <p>Also set a statement timeout on the database role or per transaction (<code>SET LOCAL statement_timeout = '2s'</code>, or <code>@Transactional(timeout = 2)</code>) so a runaway query cannot hold a connection indefinitely. Watch <code>hikaricp.connections.pending</code>: any sustained value above zero means requests are queueing for connections.</p>
+
+  <h3>7.6 Keyset pagination in Python and Go</h3>
+  <div class="code-tabs">
+<pre data-lang="Python" data-file="keyset.py"><code class="language-python">"""Keyset pagination with psycopg 3.  pip install "psycopg[binary]&gt;=3.2" """
+import psycopg
+
+PAGE_SQL = """
+SELECT id, status, total_cents, created_at
+FROM orders
+WHERE customer_id = %(cid)s
+  AND (%(after_ts)s::timestamptz IS NULL OR (created_at, id) &lt; (%(after_ts)s, %(after_id)s))
+ORDER BY created_at DESC, id DESC
+LIMIT %(limit)s
+"""
+
+
+def iter_orders(conn: psycopg.Connection, customer_id: int, page_size: int = 500):
+    after_ts, after_id = None, None
+    while True:
+        with conn.cursor() as cur:
+            cur.execute(PAGE_SQL, {"cid": customer_id, "after_ts": after_ts,
+                                   "after_id": after_id, "limit": page_size})
+            rows = cur.fetchall()
+        if not rows:
+            return
+        yield from rows
+        after_id, after_ts = rows[-1][0], rows[-1][3]   # cursor = last row's sort key
+
+
+if __name__ == "__main__":
+    with psycopg.connect("postgresql://orders_app@localhost/orders") as conn:
+        conn.execute("SET statement_timeout = '5s'")
+        print(sum(1 for _ in iter_orders(conn, 4711)))</code></pre>
+<pre data-lang="Go" data-file="keyset.go"><code class="language-go">// go get github.com/jackc/pgx/v5
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type Order struct {
+	ID         uuid.UUID
+	Status     string
+	TotalCents int64
+	CreatedAt  time.Time
+}
+
+const pageSQL = `
+SELECT id, status, total_cents, created_at
+FROM orders
+WHERE customer_id = $1 AND (created_at, id) &lt; ($2, $3)
+ORDER BY created_at DESC, id DESC
+LIMIT $4`
+
+func main() {
+	ctx := context.Background()
+	cfg, err := pgxpool.ParseConfig("postgres://orders_app@localhost:5432/orders")
+	if err != nil {
+		panic(err)
+	}
+	cfg.MaxConns = 10 // same sizing logic as HikariCP
+	cfg.MaxConnLifetime = 25 * time.Minute
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		panic(err)
+	}
+	defer pool.Close()
+
+	// Start "after" the largest possible key.
+	afterTS := time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+	afterID := uuid.Max
+	total := 0
+	for {
+		rows, err := pool.Query(ctx, pageSQL, 4711, afterTS, afterID, 500)
+		if err != nil {
+			panic(err)
+		}
+		n := 0
+		for rows.Next() {
+			var o Order
+			if err := rows.Scan(&amp;o.ID, &amp;o.Status, &amp;o.TotalCents, &amp;o.CreatedAt); err != nil {
+				panic(err)
+			}
+			afterTS, afterID = o.CreatedAt, o.ID
+			n++
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			panic(err)
+		}
+		total += n
+		if n &lt; 500 {
+			break
+		}
+	}
+	fmt.Println("orders:", total)
+}</code></pre>
+  </div>
+  <p>All three implementations rely on the composite index <code>(customer_id, created_at DESC, id DESC)</code> from §7.1; the row-value comparison <code>(created_at, id) &lt; (…)</code> is served by a single index range scan in PostgreSQL. (MySQL's optimizer historically handled row-value comparisons less well; there, the expanded form <code>created_at &lt; ? OR (created_at = ? AND id &lt; ?)</code> is commonly used.)</p>
+</section>
+
+<section id="applications">
+  <h2>8. Real-World Applications</h2>
+  <ul>
+    <li><strong>Systems of record</strong> (orders, payments, accounts, entitlements) on PostgreSQL or MySQL with strict constraints, optimistic locking and carefully chosen isolation; financial invariants enforced by atomic SQL updates or Serializable transactions with retries.</li>
+    <li><strong>Polyglot read models</strong>: the relational store feeds, via CDC and Kafka, a search index (OpenSearch), a cache (Redis), a warehouse (BigQuery, Snowflake, ClickHouse) and a vector index for RAG. Each derived store is optimised for one access pattern and can be rebuilt from the log.</li>
+    <li><strong>Messaging and activity data</strong> on wide-column stores partitioned by conversation or entity and clustered by time (Discord, §9.2).</li>
+    <li><strong>Queue-like tables</strong> in PostgreSQL using partial indexes and <code>SELECT ... FOR UPDATE SKIP LOCKED</code> to let many workers claim jobs without blocking each other; a pragmatic alternative to a broker at moderate volume.</li>
+    <li><strong>Time-series and logs</strong> in partitioned tables with BRIN indexes or TimescaleDB hypertables, with partitions dropped for retention instead of mass <code>DELETE</code>.</li>
+    <li><strong>Multi-tenant SaaS</strong> with a <code>tenant_id</code> leading every composite index and row-level security policies enforcing isolation in the database.</li>
+    <li><strong>AI retrieval</strong>: pgvector HNSW indexes on embedding columns next to relational metadata, enabling filtered similarity search in one SQL query; or a dedicated vector store when scale demands it.</li>
+    <li><strong>Performance engineering</strong>: teams run weekly reviews of <code>pg_stat_statements</code> top queries by total time, track index usage (<code>pg_stat_user_indexes.idx_scan</code>) to drop unused indexes, and gate migrations with <code>EXPLAIN</code> checks in CI against production-like statistics.</li>
+  </ul>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+
+  <h3>9.1 Uber: storage-engine internals decide a migration</h3>
+  <p><span class="tag fact">Verified</span> Uber's 2016 post <a href="https://www.uber.com/blog/postgres-to-mysql-migration/"><em>Why Uber Engineering Switched from Postgres to MySQL</em></a> attributes the move to properties of PostgreSQL's on-disk design as of the 9.2 series: because every index points directly at physical tuple locations and updates create new tuple versions, an update to a heavily indexed table rewrites entries in all indexes (write amplification); the physical WAL carried those amplified changes to replicas (replication bandwidth); replica MVCC interactions caused query cancellations; and major-version upgrades were difficult. It contrasts InnoDB's clustered primary key with secondary indexes referencing the primary key. The post itself notes it reflects an older PostgreSQL version, and many of the issues have since been mitigated (HOT updates existed already and are tunable with fillfactor; logical replication arrived in PostgreSQL 10; upgrade tooling improved). The durable lesson is the one this chapter's §4 teaches: the storage engine's representation of rows and indexes determines write amplification and replication cost, and those must be matched to the workload's update pattern.</p>
+
+  <h3>9.2 Discord: matching the store to the access pattern</h3>
+  <p><span class="tag fact">Verified</span> Discord has published two posts on message storage. The 2017 post <a href="https://discord.com/blog/how-discord-stores-billions-of-messages"><em>How Discord Stores Billions of Messages</em></a> explains moving messages from MongoDB to Cassandra, modelling messages as partitions keyed by channel and a time bucket, clustered by a Snowflake-style message ID so that reading the latest messages in a channel is a single-partition, sorted read. The 2023 post <a href="https://discord.com/blog/how-discord-stores-trillions-of-messages"><em>How Discord Stores Trillions of Messages</em></a> describes problems at larger scale (hot partitions from very busy channels, unpredictable latency, and costly maintenance such as compaction and garbage-collection pauses on a cluster of well over a hundred Cassandra nodes) and the migration to ScyllaDB fronted by Rust "data services" that coalesce concurrent requests for the same data, with a substantially smaller cluster and improved tail latency. Lessons: wide-column stores excel when the partition key matches the dominant read; partition sizing must anticipate skew; and the operational characteristics of the engine (GC, compaction) matter as much as its data model.</p>
+
+  <h3>9.3 Meta: LSM-trees for space efficiency (MyRocks)</h3>
+  <p><span class="tag fact">Verified</span> The PVLDB 2020 paper <em>MyRocks: LSM-Tree Database Storage Engine Serving Facebook's Social Graph</em> (Matsunobu, Dong and Lee) describes replacing InnoDB with a RocksDB-based storage engine for MySQL in Facebook's user database tier, motivated primarily by space and write efficiency on flash storage: LSM compression and the absence of B+tree page fragmentation substantially reduced the storage footprint, and lower write amplification extended flash endurance, while keeping MySQL's SQL layer and replication. It is the clearest published example of the amplification trade-offs in §3.7 and §6.2 driving a production engine choice at large scale.</p>
+
+  <div class="callout note"><p class="callout-title">Where the sharding stories are</p><p>Case studies about partitioning PostgreSQL and MySQL (Instagram, Notion, Figma, GitHub, Shopify) belong to <a href="p2-05-replication-sharding.html">Chapter 5</a>.</p></div>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages, Limitations and Operational Cost</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Choice</th><th>Advantages</th><th>Limitations</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>PostgreSQL</td><td>Rich SQL, extensions (PostGIS, pgvector, Timescale), strong correctness, SSI</td><td>Vacuum and bloat management; process-per-connection needs pooling; write amplification for update-heavy wide-index tables</td><td>Moderate; managed services common</td></tr>
+      <tr><td>MySQL (InnoDB)</td><td>Clustered PK, mature replication, Vitess ecosystem, predictable OLTP performance</td><td>Gap-lock surprises; fewer advanced index types; weaker SQL feature set historically</td><td>Moderate; managed services common</td></tr>
+      <tr><td>Document store</td><td>Natural aggregates, flexible schema, horizontal scale</td><td>Joins and cross-document invariants are hard; schema lives in code</td><td>Moderate</td></tr>
+      <tr><td>Wide-column</td><td>Massive write throughput, multi-DC, linear scale</td><td>Query-first modelling, no ad-hoc queries, tombstones and compaction tuning</td><td>High</td></tr>
+      <tr><td>Search engine</td><td>Relevance, facets, fuzzy search</td><td>Not a system of record; eventual consistency; resource-hungry</td><td>Moderate-high</td></tr>
+      <tr><td>Vector index</td><td>Semantic similarity search</td><td>Approximate results; recall/latency/memory trade-offs; filtered search is hard</td><td>Low (pgvector) to high (large dedicated clusters)</td></tr>
+      <tr><td>Each extra index</td><td>Faster reads for its queries</td><td>Slower writes, more WAL, more memory, more vacuum work</td><td>Ongoing; audit unused indexes</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+  <h3>11.1 B+tree or LSM?</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Workload</th><th>Prefer</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Read-heavy OLTP with point and range reads, moderate writes</td><td>B+tree</td><td>Predictable one-path reads; mature tooling</td></tr>
+      <tr><td>Write-heavy, append-mostly (events, telemetry, messages)</td><td>LSM</td><td>Sequential writes, low write amplification with tiering</td></tr>
+      <tr><td>Storage cost dominates (huge datasets on flash)</td><td>LSM (leveled + compression)</td><td>Low space amplification, compression</td></tr>
+      <tr><td>Strict, low tail read latency</td><td>B+tree (or LSM with careful tuning)</td><td>Compaction can cause latency variance</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>11.2 Isolation level choice</h3>
+  <p>Default to Read Committed (PostgreSQL) or Repeatable Read (MySQL) and protect specific invariants explicitly: optimistic locking for entity updates, atomic SQL for counters, unique and exclusion constraints for uniqueness and non-overlap, <code>SELECT ... FOR UPDATE</code> for small critical sections. Use Serializable for complex invariants that span rows and are hard to reason about, accepting retries and some throughput loss. <span class="tag opinion">Opinion</span> Serializable is under-used: correctness bugs from write skew are rare but expensive, and a retry loop is cheap.</p>
+
+  <h3>11.3 Normalise or denormalise?</h3>
+  <p>Normalise the system of record so each fact has one home; denormalise in derived read models (caches, search documents, materialised views, columns maintained by triggers or events) where a hot query needs it. Denormalising in the system of record trades read cost for update anomalies and must be justified by measured read pressure.</p>
+
+  <h3>11.4 When to add an index</h3>
+  <p>Add an index when a frequent or latency-critical query needs it and <code>EXPLAIN</code> confirms it will be used. Prefer extending an existing composite index (or adding <code>INCLUDE</code> columns) over adding a new one. On write-heavy tables, every index costs on every insert and update; measure write latency after adding. Remove indexes with zero scans over a representative period (taking care of indexes that back constraints or rare but critical queries).</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Production Failures</h2>
+  <ul>
+    <li><strong>Composite index in the wrong order.</strong> <code>(created_at, customer_id)</code> for <code>WHERE customer_id = ? ORDER BY created_at</code> forces scanning by time across all customers. Equality first, then range/sort.</li>
+    <li><strong>Functions on indexed columns.</strong> <code>WHERE lower(email) = ?</code> or <code>WHERE date(created_at) = ?</code> cannot use a plain index on the column; use an expression index or rewrite as a range.</li>
+    <li><strong>Implicit casts.</strong> Comparing a <code>varchar</code> column with a numeric parameter (common in MySQL) or mismatched types from JPA parameter binding prevents index use.</li>
+    <li><strong>Leading wildcards.</strong> <code>LIKE '%term%'</code> cannot use a B-tree; use trigram GIN or a search engine.</li>
+    <li><strong>N+1 and open-in-view.</strong> Lazy loading during JSON serialisation issues hundreds of queries per request and holds connections for the whole request.</li>
+    <li><strong>Fetch-joining collections with pagination.</strong> Hibernate warns "firstResult/maxResults specified with collection fetch; applying in memory" and loads everything.</li>
+    <li><strong>Huge pools.</strong> 100 connections × 40 pods = 4,000 PostgreSQL backends; memory exhaustion and contention. Small pools plus a server-side pooler.</li>
+    <li><strong>Remote calls inside transactions.</strong> Calling an HTTP service or LLM while holding a transaction holds locks and a connection for seconds; move remote calls outside, or use the outbox pattern (Chapter 6).</li>
+    <li><strong>Long-running transactions</strong> (including idle-in-transaction sessions from leaked connections) block vacuum/purge, causing bloat and degraded performance across the database.</li>
+    <li><strong>Assuming MySQL Repeatable Read equals PostgreSQL Repeatable Read.</strong> Locking reads in InnoDB see the latest data, not the snapshot; logic that mixes plain and locking reads can behave unexpectedly.</li>
+    <li><strong>Random UUIDv4 primary keys in InnoDB</strong> causing page splits, fragmented clustered indexes and poor buffer-pool hit ratios; prefer UUIDv7 or sequences.</li>
+    <li><strong>Mass deletes for retention.</strong> <code>DELETE FROM events WHERE created_at &lt; …</code> on billions of rows generates huge WAL, bloat and replication lag; partition by time and drop partitions.</li>
+    <li><strong>Adding indexes or columns with blocking DDL</strong> on hot tables; use <code>CONCURRENTLY</code>, online DDL, or tools like gh-ost/pt-online-schema-change for MySQL.</li>
+    <li><strong>Choosing NoSQL to avoid schema design</strong>, then discovering a need for ad-hoc queries and multi-entity invariants.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Engineering</h2>
+  <h3>13.1 Performance and monitoring</h3>
+  <ul>
+    <li>Enable <code>pg_stat_statements</code> (or MySQL Performance Schema/sys schema) and review top queries by total time, mean time and calls; set <code>auto_explain</code> with a threshold for slow queries in production.</li>
+    <li>Monitor: transactions per second, active versus idle connections, lock waits and deadlocks, replication lag, cache hit ratio of the buffer pool, checkpoint frequency, WAL generation rate, autovacuum activity, dead tuples and table bloat, oldest transaction age, and XID age (wraparound risk).</li>
+    <li>Application side: Hikari pending threads and acquisition time, query latency histograms per repository method (Micrometer observations for Spring Data), and query counts per request.</li>
+  </ul>
+  <h3>13.2 Reliability</h3>
+  <ul>
+    <li>Point-in-time recovery from continuous WAL archiving plus base backups; test restores regularly and measure RTO.</li>
+    <li>Statement and lock timeouts (<code>statement_timeout</code>, <code>lock_timeout</code>, <code>idle_in_transaction_session_timeout</code>) as guardrails; migrations set a short <code>lock_timeout</code> and retry so they never queue behind a long transaction while blocking everything behind them.</li>
+    <li>Capacity: track storage growth and IOPS headroom; plan vertical scaling or partitioning (Chapter 5) well before limits.</li>
+  </ul>
+  <h3>13.3 Security</h3>
+  <ul>
+    <li>Parameterised queries everywhere (JPA, JdbcTemplate, psycopg, pgx all parameterise by default; beware string concatenation in native queries and dynamic <code>ORDER BY</code> columns, which must be allow-listed).</li>
+    <li>Least-privilege roles: the application role cannot alter schema; migrations run with a separate role; read-only roles for replicas and analytics.</li>
+    <li>TLS to the database, encryption at rest, secrets from a vault with rotation; row-level security for multi-tenant isolation where appropriate; audit logging for sensitive tables.</li>
+  </ul>
+  <h3>13.4 Maintainability</h3>
+  <ul>
+    <li>Version all schema changes (Flyway/Liquibase), use expand-and-contract migrations for zero-downtime changes (add nullable column → backfill → switch reads → enforce constraint → drop old), and review migrations for locking behaviour.</li>
+    <li>Document access patterns next to each index so future engineers know why it exists.</li>
+  </ul>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>Given an index on <code>(tenant_id, status, created_at)</code>, which of these queries can use it efficiently as a range scan? (a) <code>WHERE tenant_id = 7</code>; (b) <code>WHERE status = 'OPEN'</code>; (c) <code>WHERE tenant_id = 7 AND created_at &gt; now() - interval '1 day'</code>; (d) <code>WHERE tenant_id = 7 AND status = 'OPEN' ORDER BY created_at DESC LIMIT 50</code>.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>(a) Yes, leftmost prefix. (b) Not efficiently (not a leftmost prefix; possibly a full index scan or, with few tenants, a skip scan in PostgreSQL 18+/MySQL 8). (c) Partially: the index narrows to tenant 7, but <code>created_at</code> follows <code>status</code>, so all statuses for the tenant are scanned and filtered by time (or skip-scanned over the few status values). An index on <code>(tenant_id, created_at)</code> would be better. (d) Yes, ideal: equality on the first two columns, then the index already provides <code>created_at</code> order, so the database reads 50 entries and stops.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>A Spring service decrements inventory with: load entity, check <code>qty &gt; 0</code>, set <code>qty = qty - 1</code>, save. Under load, inventory goes negative on PostgreSQL with default settings. Explain why and give three fixes with trade-offs.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Read Committed allows lost updates and check-then-act races: two transactions read qty = 1, both pass the check, both write 0 (lost update) or, with relative updates computed in Java, the check is stale. Fixes: (1) atomic SQL <code>UPDATE inventory SET qty = qty - 1 WHERE sku = ? AND qty &gt; 0</code> and check the affected row count: fastest, no retries, logic in SQL. (2) <code>@Version</code> optimistic locking with retry on <code>OptimisticLockException</code>: keeps logic in Java, retries under contention (bad for very hot SKUs). (3) <code>SELECT ... FOR UPDATE</code> (<code>@Lock(PESSIMISTIC_WRITE)</code>): serialises access per row, simple, but holds locks for the transaction's duration and can deadlock if rows are locked in different orders. Add a <code>CHECK (qty &gt;= 0)</code> constraint as a backstop in all cases.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>An admin endpoint lists orders with <code>Pageable</code> and is fast on page 1 but takes 9 seconds on page 4,000 (page size 50). <code>EXPLAIN ANALYZE</code> shows an index scan returning 200,050 rows into a Limit node. Explain and fix, including the count query.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Offset pagination: page 4,000 requires reading and discarding 199,950 rows. Spring Data's <code>Page</code> also runs <code>COUNT(*)</code> over the filtered set each time. Fix: switch to keyset scrolling (<code>Window</code> + <code>ScrollPosition.keyset()</code>) with a unique sort key (<code>created_at, id</code>) and a matching composite index; return <code>Slice</code>/<code>Window</code> (has-next) instead of <code>Page</code> to avoid the count, or show an approximate count from statistics (<code>pg_class.reltuples</code>) or a cached count. If deep random access is truly required, cap the maximum offset and offer filters instead.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>A query joining <code>orders</code> (50M rows) to <code>customers</code> (2M) filtered by <code>orders.status = 'DISPUTED' AND orders.region = 'EU'</code> uses a nested loop and takes 40 s. <code>EXPLAIN ANALYZE</code> shows the outer node estimated at 120 rows but actually returning 380,000. Diagnose and propose fixes.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Cardinality misestimate: the planner multiplies the selectivities of <code>status</code> and <code>region</code> as if independent, but disputes are concentrated in the EU (correlated), or statistics are stale after a bulk status change. Underestimating the outer side makes a nested loop with 380,000 inner index probes look cheap. Fixes: run <code>ANALYZE orders</code> (and check autovacuum/analyze thresholds for this table); add extended statistics <code>CREATE STATISTICS ... (dependencies, mcv) ON status, region FROM orders</code>; raise the per-column statistics target for skewed columns; consider a partial or composite index on <code>(status, region)</code>. With correct estimates the planner should choose a hash join. Avoid planner hints/disabling nested loops globally; fix the estimate.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced (design)</p>
+    <p>Choose storage for a support platform with: tickets and their state machine (strong consistency), comments (append-heavy, 2B rows/year), full-text search across tickets and comments, AI "similar tickets" suggestions, and SLA analytics dashboards. Justify each choice and how data flows between stores.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Tickets</strong>: PostgreSQL system of record, constraints for state transitions, optimistic locking. <strong>Comments</strong>: PostgreSQL table partitioned by month (2B rows/year is about 63 inserts/s average, fine for PostgreSQL), indexed on <code>(ticket_id, created_at)</code>; old partitions detached to cheaper storage. A wide-column store is only justified if write rates are orders of magnitude higher. <strong>Search</strong>: OpenSearch index fed by CDC (Debezium → Kafka → indexer), eventually consistent within seconds. <strong>Similar tickets</strong>: embeddings generated asynchronously from the same CDC stream and stored with pgvector (HNSW) alongside ticket metadata, enabling filtered similarity in SQL; move to a dedicated vector store only if scale demands. <strong>Analytics</strong>: CDC into a columnar warehouse; dashboards never query the OLTP primary. All derived stores can be rebuilt from the primary plus the log.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions and Answers</h2>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain write skew and how PostgreSQL's Serializable level prevents it.</summary><div>
+    <p>Write skew: two transactions read overlapping data, make decisions based on it, and write disjoint rows, jointly violating an invariant (two doctors both going off call). Snapshot isolation does not detect it because there is no write-write conflict. PostgreSQL's SSI tracks read-write dependencies via predicate (SIRead) locks; when it detects a pattern of two consecutive rw-antidependencies that could form a cycle, it aborts one transaction with SQLSTATE 40001. Applications must retry.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Compare B+tree and LSM-tree storage engines.</summary><div>
+    <p>B+trees update pages in place: fast, predictable reads (a few page reads), random writes and page-level write amplification. LSM-trees buffer writes in memory and flush immutable sorted files, merging them by compaction: fast sequential writes, reads may consult several files (mitigated by Bloom filters), background compaction costs I/O. Compaction strategy trades write versus read versus space amplification (leveled: low read/space, high write; tiered: the opposite). Choose B+tree for read-heavy OLTP, LSM for write-heavy or storage-sensitive workloads.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is the leftmost-prefix rule, and how do you order columns in a composite index?</summary><div>
+    <p>A B-tree on (a, b, c) is sorted lexicographically, so it efficiently supports predicates constraining a leading prefix of the columns. Put equality-filtered columns first, then the column used for a range or ORDER BY; include extra selected columns (INCLUDE or trailing) for index-only scans. A range on an early column stops later columns from narrowing the scan. Skip scan can help when a leading column has few distinct values.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Fix this N+1: an endpoint returns 100 orders with customer names and line counts.</summary><div>
+    <p>Write a DTO projection query that joins and aggregates in one statement: <code>select new OrderRow(o.id, c.name, count(l)) from Order o join o.customer c left join o.lines l where ... group by o.id, c.name order by ...</code>, with keyset pagination. Alternatively a fetch join for the to-one customer plus <code>@BatchSize</code>/<code>default_batch_fetch_size</code> for lines, giving 1 + ceil(100/50) queries. Disable open-in-view and add a test asserting the statement count.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> When would you choose Cassandra over PostgreSQL?</summary><div>
+    <p>When the workload is dominated by very high write throughput on data naturally partitioned by a key and read along that key (messages per channel, events per device), needs multi-datacenter active-active replication with tunable consistency, and does not need joins, ad-hoc queries or multi-partition transactions; and when the team can model tables per query and operate compaction and repairs. Otherwise PostgreSQL (possibly partitioned or sharded) is simpler and more flexible.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> PostgreSQL disk usage keeps growing although row count is flat, and queries slow down. What do you look for?</summary><div>
+    <p>Bloat from dead tuples: check <code>pg_stat_user_tables</code> (<code>n_dead_tup</code>, last autovacuum), the oldest running transaction (<code>pg_stat_activity</code>, especially idle in transaction), stale replication slots holding back the xmin horizon, and long-running queries on replicas with <code>hot_standby_feedback</code>. Fix the blocker, tune autovacuum per table (lower scale factors for big hot tables), and reclaim space with <code>pg_repack</code> or partition rewrites if needed (plain VACUUM does not return space to the OS except at the end of a table; VACUUM FULL locks the table).</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> After a deploy, a query that took 5 ms now takes 2 s for some customers only. Nothing in the SQL changed. What could it be?</summary><div>
+    <p>A generic-plan switch for prepared statements: after several executions, a cached generic plan chosen for average selectivity is used for all parameters, and it is terrible for large customers (skew). Or statistics changed after an analyze. Check <code>EXPLAIN (ANALYZE)</code> with the specific parameter, <code>pg_stat_statements</code> for the query, and plan_cache_mode; fixes include <code>plan_cache_mode = force_custom_plan</code> for that query/role, extended statistics, or restructuring the query.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> How do you size a HikariCP pool?</summary><div>
+    <p>From both sides: the database can usefully run about cores × 2 (+ I/O parallelism) queries at once in total, which bounds the sum of all pools; Little's Law gives per-instance needs (query rate × hold time). Use fixed-size small pools (often 5–20), short connection timeouts, statement timeouts, keep transactions short and free of remote calls, and add PgBouncer/RDS Proxy when many instances share a database. Validate with load tests watching pending threads.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How would you add semantic search to an existing PostgreSQL-backed product?</summary><div>
+    <p>Add an embedding column (pgvector) to a table or side table, populate it asynchronously from CDC or an outbox event (embedding calls are slow and fallible), create an HNSW index with the distance operator matching the embedding model, and query with metadata filters plus <code>ORDER BY embedding &lt;=&gt; :q LIMIT k</code>, ideally combined with full-text search (hybrid retrieval). Track embedding model version per row for re-embedding. Move to a dedicated vector store if scale, latency or filtering needs exceed what pgvector delivers.</p>
+  </div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Select databases from access patterns, transactional needs and scale, with a relational system of record as the default and derived specialised stores fed by CDC.</li>
+    <li>Isolation levels differ by engine: PostgreSQL defaults to Read Committed (Repeatable Read is snapshot isolation; Serializable is SSI); MySQL defaults to Repeatable Read with next-key locking. Lost updates and write skew need explicit handling.</li>
+    <li>PostgreSQL MVCC keeps versions in the heap and needs vacuum; InnoDB updates in place with undo logs and a clustered primary key.</li>
+    <li>B+trees favour reads; LSM-trees favour writes; compaction strategy trades write, read and space amplification; Bloom filters make LSM point reads cheap.</li>
+    <li>Index by query: equality columns first, then range/sort; use partial, expression, covering, GIN, GiST and BRIN indexes where they fit; verify with EXPLAIN (ANALYZE, BUFFERS).</li>
+    <li>Most slow plans are misestimates; fix statistics before forcing plans.</li>
+    <li>Eliminate N+1 with fetch joins, entity graphs, batch fetching or DTO projections; keep pools small; paginate with keysets.</li>
+  </ul>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">Which anomaly is still possible under PostgreSQL Repeatable Read?</p>
+    <ol>
+      <li data-k="a">Dirty read</li>
+      <li data-k="b">Non-repeatable read of a single row</li>
+      <li data-k="c">Write skew</li>
+      <li data-k="d">Lost update on the same row (both commit)</li>
+    </ol>
+    <div class="explain">Repeatable Read in PostgreSQL is snapshot isolation: it prevents dirty and non-repeatable reads and aborts concurrent updates to the same row (40001), but write skew across different rows requires Serializable.</div>
+  </div>
+
+  <div class="quiz" data-answer="b">
+    <p class="q">An index exists on (customer_id, created_at). Which query benefits most?</p>
+    <ol>
+      <li data-k="a">WHERE created_at &gt; now() - interval '1 hour'</li>
+      <li data-k="b">WHERE customer_id = 42 ORDER BY created_at DESC LIMIT 20</li>
+      <li data-k="c">WHERE lower(customer_name) = 'ada'</li>
+      <li data-k="d">WHERE created_at::date = current_date</li>
+    </ol>
+    <div class="explain">Equality on the leading column plus ordering by the second column is served directly by the index order, stopping after 20 entries.</div>
+  </div>
+
+  <div class="quiz" data-answer="a">
+    <p class="q">Approximately how many bits per key does a Bloom filter need for a 1% false-positive rate?</p>
+    <ol>
+      <li data-k="a">About 10</li>
+      <li data-k="b">About 1</li>
+      <li data-k="c">About 64</li>
+      <li data-k="d">It depends on the key size</li>
+    </ol>
+    <div class="explain">m/n = −ln p / (ln 2)² ≈ 9.6 bits per key, with k ≈ 7 hash functions, independent of key size.</div>
+  </div>
+
+  <div class="quiz" data-answer="d">
+    <p class="q">Which index type suits a 5 TB append-only events table queried by time range?</p>
+    <ol>
+      <li data-k="a">Hash</li>
+      <li data-k="b">GIN</li>
+      <li data-k="c">GiST</li>
+      <li data-k="d">BRIN</li>
+    </ol>
+    <div class="explain">BRIN stores min/max per block range; when values correlate with physical order (append-only timestamps), it prunes most blocks with a tiny index.</div>
+  </div>
+
+  <div class="quiz" data-answer="b">
+    <p class="q">EXPLAIN ANALYZE shows a nested loop whose outer node is estimated at 50 rows but returns 500,000. What is the most likely root cause?</p>
+    <ol>
+      <li data-k="a">The nested loop algorithm is broken</li>
+      <li data-k="b">A cardinality misestimate from stale or insufficient statistics (e.g. correlated predicates)</li>
+      <li data-k="c">The connection pool is too small</li>
+      <li data-k="d">The query lacks a LIMIT</li>
+    </ol>
+    <div class="explain">The planner chose nested loop because it believed the outer side was tiny. Refresh statistics, add extended statistics, or raise the statistics target so it can choose a hash join.</div>
+  </div>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">Why does keyset pagination outperform OFFSET for deep pages?</p>
+    <ol>
+      <li data-k="a">It caches previous pages in the database</li>
+      <li data-k="b">It avoids sorting entirely</li>
+      <li data-k="c">It seeks directly to the last-seen key in an index instead of producing and discarding all earlier rows</li>
+      <li data-k="d">It uses a hash index</li>
+    </ol>
+    <div class="explain">Each keyset page costs an index seek plus the page size; OFFSET costs grow linearly with page depth.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, O'Reilly, 2017 — ch. 2 (data models), 3 (storage and retrieval), 7 (transactions).</li>
+    <li><span class="ref-kind">Book</span> Alex Petrov, <em>Database Internals</em>, O'Reilly, 2019 — B-trees, LSM-trees, and distributed databases in depth.</li>
+    <li><span class="ref-kind">Book</span> Markus Winand, <a href="https://use-the-index-luke.com/"><em>SQL Performance Explained / Use The Index, Luke</em></a> — indexing for developers.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://www.postgresql.org/docs/current/transaction-iso.html">PostgreSQL: Transaction Isolation</a>, <a href="https://www.postgresql.org/docs/current/indexes-types.html">Index Types</a>, <a href="https://www.postgresql.org/docs/current/using-explain.html">Using EXPLAIN</a>, <a href="https://www.postgresql.org/docs/current/routine-vacuuming.html">Routine Vacuuming</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html">MySQL: InnoDB transaction isolation levels</a> and <a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-locking.html">InnoDB locking</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing">HikariCP: About Pool Sizing</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.spring.io/spring-data/jpa/reference/">Spring Data JPA reference</a> — projections, entity graphs, scrolling.</li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/pgvector/pgvector">pgvector</a> — HNSW and IVFFlat indexes for PostgreSQL.</li>
+    <li><span class="ref-kind">Paper</span> Patrick O'Neil et al., "The Log-Structured Merge-Tree (LSM-Tree)", Acta Informatica 33, 1996.</li>
+    <li><span class="ref-kind">Paper</span> Hal Berenson et al., <a href="https://arxiv.org/abs/cs/0701157">"A Critique of ANSI SQL Isolation Levels"</a>, SIGMOD 1995.</li>
+    <li><span class="ref-kind">Paper</span> Dan R. K. Ports, Kevin Grittner, <a href="https://arxiv.org/abs/1208.4179">"Serializable Snapshot Isolation in PostgreSQL"</a>, VLDB 2012.</li>
+    <li><span class="ref-kind">Paper</span> Yoshinori Matsunobu, Siying Dong, Herman Lee, "MyRocks: LSM-Tree Database Storage Engine Serving Facebook's Social Graph", PVLDB 13(12), 2020.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://www.uber.com/blog/postgres-to-mysql-migration/">Uber: Why Uber Engineering Switched from Postgres to MySQL</a>, 2016.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://discord.com/blog/how-discord-stores-trillions-of-messages">Discord: How Discord Stores Trillions of Messages</a>, 2023.</li>
+  </ul>
+  <p>Next: <a href="p2-05-replication-sharding.html">Chapter 5 — Replication, Partitioning &amp; Sharding</a>.</p>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>
