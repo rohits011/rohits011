@@ -148,3 +148,559 @@
   <p>Scores near 1 are anomalies, well below 0.5 normal, around 0.5 everywhere means no distinct anomalies. Isolation forests use small subsamples per tree (256 by default), which makes them fast (linear in m), memory-light, and resistant to "masking" by clusters of anomalies. Limitations: axis-parallel cuts struggle with anomalies defined by correlations between features (Extended Isolation Forest addresses this), and the <code>contamination</code> parameter only sets the threshold; it does not make the model smarter.</p>
   <p>Without labels, anomaly detectors are judged by the alerts they produce. Treat them as ranking systems: the top of the ranking must be dense with real issues, which you measure with precision at k on investigated alerts.</p>
 </section>
+
+<section id="internals">
+  <h2>4. Internal Working</h2>
+  <h3>4.1 Lloyd's algorithm, step by step</h3>
+  <ol>
+    <li><strong>Seed</strong> k centroids with k-means++.</li>
+    <li><strong>Assign</strong>: compute the m × k matrix of squared distances. Using ‖x − μ‖² = ‖x‖² − 2xᵀμ + ‖μ‖², the dominant cost is the matrix product XMᵀ, so this step runs at BLAS speed: O(mkn) per iteration.</li>
+    <li><strong>Update</strong>: each centroid becomes the mean of its assigned points, O(mn).</li>
+    <li><strong>Check</strong>: stop when assignments do not change or centroid movement falls below a tolerance; handle empty clusters by re-seeding them (for example at the point farthest from its centroid).</li>
+    <li><strong>Restart</strong> n_init times with different seeds and keep the lowest-inertia result.</li>
+  </ol>
+  <p>Accelerations: Elkan's algorithm uses the triangle inequality to skip distance computations whose result cannot change the assignment; <strong>mini-batch k-means</strong> updates centroids from small random batches with a per-centroid learning rate (a stochastic-gradient version), scaling to data that does not fit in memory at a small cost in quality.</p>
+  <h3>4.2 DBSCAN's region queries</h3>
+  <p>DBSCAN's cost is dominated by ε-neighbourhood queries. With a spatial index (KD-tree or ball tree) in low dimensions, average cost approaches O(m log m); in high dimensions or with large ε, it degrades towards O(m²), and memory for neighbourhood lists can explode. The algorithm itself is a graph traversal: pick an unvisited core point, BFS through ε-neighbours that are core, attach border points, mark the rest as noise. Practitioners on large data often use HDBSCAN or approximate neighbour graphs instead.</p>
+  <h3>4.3 How EM is kept numerically sane</h3>
+  <p>Gaussian densities in many dimensions underflow, so implementations compute log-densities and normalise responsibilities with log-sum-exp (Chapter 6.1). Covariance matrices can become singular when a component collapses onto a few points (likelihood goes to infinity), so a small value is added to the diagonal (<code>reg_covar</code>). Covariance structure can be restricted (<code>covariance_type</code>: full, tied, diag, spherical) to trade flexibility for stability and parameter count.</p>
+  <h3>4.4 PCA in scikit-learn</h3>
+  <p><code>PCA</code> centres X and dispatches to a solver: full LAPACK SVD for small matrices, randomised SVD (a few passes of X times random matrices, then a small exact SVD) when the requested number of components is much smaller than the dimensions, or ARPACK. <code>IncrementalPCA</code> processes mini-batches for out-of-core data; <code>TruncatedSVD</code> skips centring so it works on sparse matrices (on TF-IDF this is latent semantic analysis). Signs of components are arbitrary (v and −v are equally valid), which matters if you compare components across retrains: scikit-learn applies a deterministic sign convention, but different libraries may disagree.</p>
+  <h3>4.5 Isolation forest construction</h3>
+  <ol>
+    <li>For each of t trees (default 100): draw a subsample of ψ points (default 256) without replacement.</li>
+    <li>Recursively split: pick a random feature and a uniform random threshold between the node's min and max on that feature; stop when a node has one point or reaches depth ⌈log₂ ψ⌉ (deep paths are not needed: only short ones signal anomalies).</li>
+    <li>Scoring: for x, compute its path length in each tree (adding c(size) at a truncated leaf to estimate the remaining depth), average, and convert to s(x, ψ).</li>
+  </ol>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: Algorithms, Flows and a Live Demo</h2>
+  <figure class="diagram">
+    <div class="widget" data-widget="kmeans"></div>
+    <figcaption>Figure 6.4.1 — Interactive: k-means iterations on 2-D points.</figcaption>
+  </figure>
+  <p><strong>What to try:</strong> step through one iteration at a time and watch the two phases alternate: points recolour (assignment), then centroids jump to the mean of their colour (update). Re-run with different random initialisations and notice when two centroids start in the same blob: the result is a poor local minimum where one true cluster is split and two others are merged. Increase k beyond the visible number of blobs and observe that k-means happily splits natural groups (inertia always falls with k). If the widget lets you place points, draw a ring or two crescents: k-means cuts them with straight boundaries, which is the motivation for DBSCAN.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  I["Init centroids (k-means++)"] --> A["Assign: nearest centroid for every point"]
+  A --> U["Update: centroid = mean of its points"]
+  U --> C{"Assignments changed?"}
+  C -- yes --> A
+  C -- no --> R["Record inertia; repeat for n_init seeds; keep best"]
+</pre>
+  <figcaption>Figure 6.4.2 — Lloyd's algorithm as an alternating optimisation loop.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the loop alternates between optimising the assignments with centroids fixed and optimising centroids with assignments fixed, each step lowering the same objective, like coordinate descent. The outer "n_init" restart is how we hedge against bad local minima, the clustering equivalent of retrying with backoff from different starting states.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  P["Parameters pi, mu, Sigma"] --> E["E-step: responsibilities r_ik via Bayes rule"]
+  E --> M["M-step: weighted MLE of pi, mu, Sigma"]
+  M --> L{"Log-likelihood gain under tol?"}
+  L -- no --> E
+  L -- yes --> O["Soft clusters + density p(x)"]
+</pre>
+  <figcaption>Figure 6.4.3 — EM for a Gaussian mixture: the soft-assignment generalisation of k-means.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> information flows from the current model to per-point beliefs (E-step) and from those beliefs back to the model (M-step). Compared with Figure 6.4.2, "assign" became "compute probabilities" and "mean" became "weighted mean and covariance". The output is richer: a density usable for anomaly scoring and a likelihood for model selection with BIC.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  RAW["Raw logs / metrics / events"] --> FE["Featurise: templates, counts, embeddings; scale"]
+  FE --> RED["Reduce: PCA for compression or UMAP for viz"]
+  RED --> CL{"Goal?"}
+  CL -- segments --> KM["k-means / GMM, choose k by silhouette + business review"]
+  CL -- "arbitrary shapes + noise" --> HD["HDBSCAN"]
+  CL -- "rare events" --> IF["Isolation forest / reconstruction error"]
+  KM --> OUT["Segment table for services"]
+  HD --> OUT
+  IF --> AL["Ranked alerts with feedback loop"]
+  AL -- "analyst labels" --> SUP["Later: supervised model"]
+</pre>
+  <figcaption>Figure 6.4.4 — A production unsupervised pipeline and where each algorithm fits.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> representation comes first (featurisation and optional reduction), then the algorithm is chosen by goal. The anomaly branch has a feedback arrow: analyst verdicts on alerts become labels, and once enough accumulate, a supervised model can replace or complement the unsupervised detector. That transition is the usual maturity path for fraud and security detection.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math</h2>
+  <h3>6.1 The mean minimises squared distance (why the k-means update is optimal)</h3>
+  <p><strong>In words:</strong> the single point closest, in total squared distance, to a set of points is their average.</p>
+  <p>For points x₁…x<sub>n</sub>, f(μ) = Σ‖x<sub>i</sub> − μ‖². Gradient: −2Σ(x<sub>i</sub> − μ) = 0 ⇒ μ = (1/n)Σx<sub>i</sub>. f is convex (Hessian 2nI), so this is the global minimum. Numeric: for {1, 2, 6}, f(3) = 4 + 1 + 9 = 14 at the mean, f(2) = 1 + 0 + 16 = 17 at the median. (For absolute distance the median would be optimal: that variant is k-medians, more robust to outliers.)</p>
+  <h3>6.2 K-means is NP-hard, so local search is the norm</h3>
+  <p>Finding the global optimum of the k-means objective is NP-hard in general (even for k = 2 in high dimensions). Lloyd's algorithm is a local search that converges in practice in tens of iterations; k-means++ seeding gives an expected O(log k) approximation of the optimum before any iterations. This justifies multiple restarts.</p>
+  <h3>6.3 PCA maximises projected variance</h3>
+  <p><strong>In words:</strong> the variance of the data along a unit direction v is vᵀCv; the direction maximising it is C's top eigenvector, and the maximum variance is the top eigenvalue.</p>
+  <p>Maximise vᵀCv subject to vᵀv = 1. Lagrangian: vᵀCv − λ(vᵀv − 1). Gradient: 2Cv − 2λv = 0 ⇒ Cv = λv. So v must be an eigenvector, and the objective equals vᵀCv = λ; pick the largest. Subsequent components maximise variance subject to orthogonality with earlier ones, yielding the next eigenvectors. Equivalently, PCA minimises reconstruction error: the squared error of projecting onto the top k components equals the sum of the discarded eigenvalues (times m − 1).</p>
+  \[ \mathbf{v}_1 = \arg\max_{\|\mathbf{v}\|=1}\mathbf{v}^\top C\mathbf{v},\qquad \frac{1}{m-1}\big\|X - XV_kV_k^\top\big\|_F^2 = \sum_{j&gt;k}\lambda_j. \]
+  <p><strong>Worked 2-D example.</strong> Centred data (−1.5, −1.3), (−0.5, −0.6), (0.5, 0.6), (1.5, 1.3), from §3.8's points minus their means (2.5, 2.5). Covariance (dividing by 3): var(x) = (2.25 + 0.25 + 0.25 + 2.25)/3 = 1.667; var(y) = (1.69 + 0.36 + 0.36 + 1.69)/3 = 1.367; cov = (1.95 + 0.3 + 0.3 + 1.95)/3 = 1.5. C = [[1.667, 1.5], [1.5, 1.367]]. Eigenvalues: trace 3.033, determinant 1.667 × 1.367 − 2.25 = 0.028; λ = (3.033 ± √(9.20 − 0.111))/2 = (3.033 ± 3.015)/2 ⇒ 3.024 and 0.009. The first component explains 3.024/3.033 = 99.7% of the variance: the data are essentially one-dimensional.</p>
+  <h3>6.4 GMM log-likelihood and the EM guarantee</h3>
+  \[ \log L(\theta) = \sum_{i=1}^{m}\log\sum_{k=1}^{K}\pi_k\,\mathcal{N}(\mathbf{x}_i\mid\boldsymbol\mu_k,\Sigma_k). \]
+  <p>The log of a sum has no closed-form maximiser. EM introduces the responsibilities as a distribution q over the hidden component of each point and uses Jensen's inequality: log Σ<sub>k</sub> q<sub>k</sub>(a<sub>k</sub>/q<sub>k</sub>) ≥ Σ<sub>k</sub> q<sub>k</sub> log(a<sub>k</sub>/q<sub>k</sub>). The E-step sets q to the posterior, making the bound tight; the M-step maximises the bound, which has closed-form weighted-MLE solutions. Since the bound touches the likelihood at the current θ and is then increased, the likelihood cannot decrease. M-step formulas with N<sub>k</sub> = Σ<sub>i</sub> r<sub>ik</sub>:</p>
+  \[ \pi_k = \frac{N_k}{m},\quad \boldsymbol\mu_k = \frac{1}{N_k}\sum_i r_{ik}\mathbf{x}_i,\quad \Sigma_k = \frac{1}{N_k}\sum_i r_{ik}(\mathbf{x}_i-\boldsymbol\mu_k)(\mathbf{x}_i-\boldsymbol\mu_k)^\top. \]
+  <h3>6.5 t-SNE's objective</h3>
+  <p>High-dimensional affinities: p<sub>j|i</sub> ∝ exp(−‖x<sub>i</sub> − x<sub>j</sub>‖²/2σ<sub>i</sub>²), with σ<sub>i</sub> found by binary search so that 2<sup>H(P<sub>i</sub>)</sup> equals the perplexity; symmetrised p<sub>ij</sub> = (p<sub>j|i</sub> + p<sub>i|j</sub>)/2m. Low-dimensional affinities use a Student-t with one degree of freedom: q<sub>ij</sub> ∝ (1 + ‖y<sub>i</sub> − y<sub>j</sub>‖²)<sup>−1</sup>. Minimise</p>
+  \[ C = D_{\mathrm{KL}}(P\,\|\,Q) = \sum_{i\neq j}p_{ij}\log\frac{p_{ij}}{q_{ij}}. \]
+  <p>Because KL(P‖Q) heavily penalises small q where p is large (Chapter 6.1's asymmetry), t-SNE prioritises keeping true neighbours close, and cares little about placing non-neighbours accurately, which is exactly why global distances in the plot are unreliable.</p>
+  <h3>6.6 Isolation forest path lengths</h3>
+  <p>For n = 256, H(255) ≈ ln 255 + 0.5772 ≈ 6.119, so c(256) ≈ 2 × 6.119 − 2 × 255/256 ≈ 12.24 − 1.99 = 10.24. A point with average path length 3 scores 2<sup>−3/10.24</sup> ≈ 0.816 (anomalous); one with average path 10.24 scores exactly 0.5; one with 14 scores ≈ 0.388.</p>
+  <h3>6.7 Complexity</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Algorithm</th><th>Time</th><th>Memory</th><th>Practical scale</th></tr></thead>
+    <tbody>
+      <tr><td>k-means (Lloyd)</td><td>O(i · m · k · n)</td><td>O(mn + kn)</td><td>Millions of rows; mini-batch for more</td></tr>
+      <tr><td>Agglomerative</td><td>O(m²) to O(m³)</td><td>O(m²)</td><td>Up to ~10⁴–10⁵</td></tr>
+      <tr><td>DBSCAN</td><td>O(m log m) with index, O(m²) worst</td><td>O(m) to O(m²)</td><td>Low-dimensional data, up to millions</td></tr>
+      <tr><td>GMM (full covariance)</td><td>O(i · m · K · n²) + O(K n³)</td><td>O(K n²)</td><td>Moderate n</td></tr>
+      <tr><td>PCA (full SVD)</td><td>O(m n²) for m ≥ n</td><td>O(mn)</td><td>Randomised for large m, n</td></tr>
+      <tr><td>t-SNE (Barnes-Hut)</td><td>O(m log m) per iteration</td><td>O(m)</td><td>~10⁵ points comfortably</td></tr>
+      <tr><td>UMAP</td><td>~O(m log m) (approximate kNN)</td><td>O(m · n_neighbors)</td><td>Millions of points</td></tr>
+      <tr><td>Isolation forest</td><td>O(t · ψ log ψ) fit, O(t log ψ) per score</td><td>O(t · ψ)</td><td>Any m (subsampling)</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="code">
+  <h2>7. Code</h2>
+  <p>Environment: Python 3.11+, <code>pip install numpy pandas scikit-learn matplotlib umap-learn</code>. Outputs in comments are <span class="tag illus">Illustrative</span>; APIs are <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+
+  <h3>7.1 K-means and k-means++ from scratch</h3>
+<pre data-file="kmeans_scratch.py"><code class="language-python">import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.datasets import make_blobs
+from sklearn.metrics import adjusted_rand_score
+
+def kmeans_pp_init(X, k, rng):
+    centroids = [X[rng.integers(len(X))]]
+    for _ in range(1, k):
+        d2 = np.min(((X[:, None, :] - np.array(centroids)[None]) ** 2).sum(-1), axis=1)
+        centroids.append(X[rng.choice(len(X), p=d2 / d2.sum())])   # P proportional to D(x)^2
+    return np.array(centroids)
+
+def kmeans(X, k, n_init=10, max_iter=300, tol=1e-6, seed=0):
+    rng = np.random.default_rng(seed)
+    best = (np.inf, None, None)
+    for _ in range(n_init):
+        C = kmeans_pp_init(X, k, rng)
+        for _ in range(max_iter):
+            # squared distances via the expansion |x|^2 - 2 x.c + |c|^2 (BLAS-friendly)
+            d2 = (X ** 2).sum(1)[:, None] - 2 * X @ C.T + (C ** 2).sum(1)[None, :]
+            labels = d2.argmin(axis=1)
+            newC = np.array([X[labels == j].mean(0) if np.any(labels == j) else X[rng.integers(len(X))]
+                             for j in range(k)])
+            shift = np.abs(newC - C).max()
+            C = newC
+            if shift &lt; tol:
+                break
+        inertia = d2[np.arange(len(X)), labels].sum()
+        if inertia &lt; best[0]:
+            best = (inertia, C, labels)
+    return best
+
+X, y_true = make_blobs(n_samples=1500, centers=4, cluster_std=[1.0, 1.5, 0.5, 1.2], random_state=7)
+inertia, C, labels = kmeans(X, 4)
+sk = KMeans(n_clusters=4, n_init=10, random_state=0).fit(X)
+print("scratch inertia %.1f  sklearn inertia %.1f" % (inertia, sk.inertia_))     # nearly equal
+print("ARI vs truth: scratch %.3f  sklearn %.3f" % (adjusted_rand_score(y_true, labels),
+                                                     adjusted_rand_score(y_true, sk.labels_)))</code></pre>
+
+  <h3>7.2 Choosing k: elbow and silhouette</h3>
+<pre data-file="choose_k.py"><code class="language-python">import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.datasets import make_blobs
+from sklearn.metrics import silhouette_score, davies_bouldin_score
+
+X, _ = make_blobs(n_samples=2000, centers=5, cluster_std=1.1, random_state=3)
+for k in range(2, 10):
+    km = KMeans(n_clusters=k, n_init=10, random_state=0).fit(X)
+    sil = silhouette_score(X, km.labels_, sample_size=1000, random_state=0)
+    db = davies_bouldin_score(X, km.labels_)
+    print(f"k={k}  inertia={km.inertia_:9.1f}  silhouette={sil:.3f}  davies-bouldin={db:.3f}")
+# Illustrative: inertia drops steeply until k=5 then flattens; silhouette peaks at k=5.
+
+# Stability check: do clusterings agree across seeds / bootstrap samples?
+from sklearn.metrics import adjusted_rand_score
+rng = np.random.default_rng(0)
+base = KMeans(5, n_init=10, random_state=0).fit(X)
+scores = []
+for s in range(10):
+    idx = rng.choice(len(X), len(X), replace=True)
+    km = KMeans(5, n_init=10, random_state=s).fit(X[idx])
+    scores.append(adjusted_rand_score(base.predict(X), km.predict(X)))
+print("bootstrap ARI mean %.3f (close to 1 = stable)" % np.mean(scores))</code></pre>
+
+  <h3>7.3 Shapes and noise: k-means versus DBSCAN versus HDBSCAN versus GMM</h3>
+<pre data-file="cluster_shapes.py"><code class="language-python">import numpy as np
+from sklearn.cluster import DBSCAN, HDBSCAN, KMeans          # HDBSCAN: scikit-learn &gt;= 1.3
+from sklearn.datasets import make_moons
+from sklearn.metrics import adjusted_rand_score
+from sklearn.mixture import GaussianMixture
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
+
+rng = np.random.default_rng(0)
+X, y = make_moons(n_samples=1000, noise=0.06, random_state=0)
+X = np.vstack([X, rng.uniform(-1.5, 2.5, size=(50, 2))])        # add uniform noise points
+y = np.concatenate([y, -np.ones(50, dtype=int)])
+X = StandardScaler().fit_transform(X)
+
+# k-distance plot heuristic for eps: knee of the sorted 5th-neighbour distances
+d, _ = NearestNeighbors(n_neighbors=5).fit(X).kneighbors(X)
+print("suggested eps ~", np.round(np.percentile(d[:, -1], 90), 3))
+
+models = {
+    "kmeans": KMeans(2, n_init=10, random_state=0),
+    "gmm": GaussianMixture(2, covariance_type="full", random_state=0),
+    "dbscan": DBSCAN(eps=0.2, min_samples=5),
+    "hdbscan": HDBSCAN(min_cluster_size=30),
+}
+mask = y &gt;= 0
+for name, m in models.items():
+    labels = m.fit_predict(X)
+    n_noise = np.sum(labels == -1)
+    print(f"{name:8s} ARI on moons={adjusted_rand_score(y[mask], labels[mask]):.3f}  noise points={n_noise}")
+# Illustrative: kmeans/gmm ARI ~0.25-0.5 (straight/elliptical cuts), dbscan/hdbscan ~0.95+ with noise flagged
+
+# GMM model selection with BIC
+for k in range(1, 7):
+    g = GaussianMixture(k, covariance_type="full", random_state=0).fit(X)
+    print(k, round(g.bic(X), 1))
+# Soft assignments: probability of each component for the first 3 points
+print(models["gmm"].predict_proba(X[:3]).round(3))</code></pre>
+
+  <h3>7.4 PCA from scratch via SVD, and explained variance on real data</h3>
+<pre data-file="pca_scratch.py"><code class="language-python">import numpy as np
+from sklearn.datasets import load_breast_cancer, load_digits
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+
+def pca_svd(X, k):
+    mu = X.mean(axis=0)
+    Xc = X - mu                                   # centring is mandatory
+    U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+    components = Vt[:k]                           # principal directions (rows)
+    scores = Xc @ components.T                    # == U[:, :k] * S[:k]
+    var = S ** 2 / (len(X) - 1)
+    return components, scores, var[:k] / var.sum(), mu
+
+X = StandardScaler().fit_transform(load_breast_cancer().data)   # 30 features with different units
+comp, scores, ratio, mu = pca_svd(X, 5)
+sk = PCA(n_components=5).fit(X)
+print("explained ratio scratch:", ratio.round(3))
+print("explained ratio sklearn:", sk.explained_variance_ratio_.round(3))   # same (Illustrative ~[0.44 0.19 0.09 0.07 0.05])
+print("abs-equal components:", np.allclose(np.abs(comp), np.abs(sk.components_), atol=1e-6))  # signs may differ
+
+# How many components for 95% of variance on the digits images?
+digits = load_digits().data                       # 64 pixel features, same units: no scaling
+p = PCA(n_components=0.95, svd_solver="full").fit(digits)
+print("components for 95% variance:", p.n_components_)          # ~29 (Illustrative)
+recon = p.inverse_transform(p.transform(digits))
+print("relative reconstruction error:", np.linalg.norm(digits - recon) / np.linalg.norm(digits))
+
+# Reconstruction error as an anomaly score
+p5 = PCA(n_components=10).fit(digits)
+err = ((digits - p5.inverse_transform(p5.transform(digits))) ** 2).sum(1)
+print("most unusual digit indices:", np.argsort(-err)[:5])</code></pre>
+
+  <h3>7.5 Visualising embeddings: PCA versus t-SNE versus UMAP</h3>
+<pre data-file="embed_viz.py"><code class="language-python">import matplotlib.pyplot as plt
+import numpy as np
+import umap                                        # pip install umap-learn
+from sklearn.datasets import load_digits
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE, trustworthiness
+
+X, y = load_digits(return_X_y=True)
+X50 = PCA(n_components=50, random_state=0).fit_transform(X)   # common pre-step: PCA to ~50 dims
+
+proj = {
+    "PCA": PCA(n_components=2, random_state=0).fit_transform(X),
+    "t-SNE (perp=30)": TSNE(n_components=2, perplexity=30, init="pca", random_state=0).fit_transform(X50),
+    "UMAP (nn=15)": umap.UMAP(n_neighbors=15, min_dist=0.1, random_state=0).fit_transform(X50),
+}
+fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+for ax, (name, Z) in zip(axes, proj.items()):
+    ax.scatter(Z[:, 0], Z[:, 1], c=y, s=4, cmap="tab10")
+    ax.set_title(f"{name}  trust={trustworthiness(X, Z, n_neighbors=10):.3f}")
+    ax.set_xticks([]); ax.set_yticks([])
+plt.tight_layout(); plt.savefig("digits_projections.png", dpi=120)
+# Illustrative: PCA overlaps several digits; t-SNE and UMAP separate the 10 classes clearly.
+# Trustworthiness measures how well local neighbourhoods are preserved (1.0 = perfect).</code></pre>
+
+  <h3>7.6 Log anomaly detection with an isolation forest</h3>
+  <p>A compact version of a real pattern: parse log lines into templates (here with a deliberately simple regex masker; production systems use a parser such as Drain), count templates per service per minute, and score each minute's count vector. The data are synthetic, generated with a fixed seed, so the example is self-contained.</p>
+<pre data-file="log_anomaly.py"><code class="language-python">import re
+from collections import Counter
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+
+rng = np.random.default_rng(42)
+normal_templates = ["GET /api/orders/&lt;ID&gt; 200 in &lt;NUM&gt;ms",
+                    "Cache hit for key &lt;ID&gt;",
+                    "Published event OrderCreated &lt;ID&gt;",
+                    "DB pool active=&lt;NUM&gt; idle=&lt;NUM&gt;"]
+rare_templates = ["Timeout calling payment-service after &lt;NUM&gt;ms",
+                  "Circuit breaker OPEN for payment-service"]
+
+def mask(line: str) -&gt; str:
+    line = re.sub(r"\b[0-9a-f]{8}-[0-9a-f-]{27}\b", "&lt;ID&gt;", line)   # UUIDs
+    line = re.sub(r"\b\d+\b", "&lt;NUM&gt;", line)                       # numbers
+    return line
+
+def synth_minute(anomalous: bool):
+    lines = []
+    for t, rate in zip(normal_templates, [120, 80, 40, 10]):
+        lines += [t.replace("&lt;ID&gt;", "3f2a9c1e-1111-2222-3333-444455556666").replace("&lt;NUM&gt;", str(rng.integers(1, 500)))] * rng.poisson(rate)
+    if anomalous:
+        lines += [rare_templates[0].replace("&lt;NUM&gt;", "3000")] * rng.poisson(60)
+        lines += [rare_templates[1]] * rng.poisson(5)
+    return Counter(mask(l) for l in lines)
+
+minutes = [synth_minute(anomalous=(i in {700, 701, 702, 1200})) for i in range(1440)]
+df = pd.DataFrame(minutes).fillna(0)
+features = np.log1p(df.to_numpy())                                # counts are skewed: log
+features = StandardScaler().fit_transform(features)
+
+iso = IsolationForest(n_estimators=200, max_samples=256, contamination="auto", random_state=0)
+iso.fit(features)
+score = -iso.score_samples(features)                              # higher = more anomalous
+top = np.argsort(-score)[:6]
+print("top anomalous minutes:", sorted(top.tolist()))             # includes 700-702 and 1200 (Illustrative)
+print(df.columns.tolist())</code></pre>
+
+  <h3>7.7 Customer segmentation, end to end</h3>
+<pre data-file="rfm_segments.py"><code class="language-python">import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import FunctionTransformer, StandardScaler
+
+rng = np.random.default_rng(1)
+n = 5000
+# Synthetic RFM table (recency days, frequency orders/yr, monetary spend/yr) with 4 latent groups
+groups = rng.choice(4, size=n, p=[0.45, 0.25, 0.2, 0.1])
+rec = np.select([groups == 0, groups == 1, groups == 2, groups == 3],
+                [rng.gamma(2, 60, n), rng.gamma(2, 10, n), rng.gamma(2, 150, n), rng.gamma(2, 5, n)])
+freq = np.select([groups == 0, groups == 1, groups == 2, groups == 3],
+                 [rng.poisson(3, n), rng.poisson(12, n), rng.poisson(1, n), rng.poisson(40, n)]) + 1
+mon = freq * np.exp(rng.normal(np.log(np.array([40, 60, 30, 90])[groups]), 0.4))
+rfm = pd.DataFrame({"recency": rec, "frequency": freq, "monetary": mon})
+
+pipe = make_pipeline(FunctionTransformer(np.log1p), StandardScaler(),
+                     KMeans(n_clusters=4, n_init=20, random_state=0))
+labels = pipe.fit_predict(rfm)
+Z = pipe[:-1].transform(rfm)
+print("silhouette:", round(silhouette_score(Z, labels, sample_size=2000, random_state=0), 3))
+
+profile = rfm.assign(segment=labels).groupby("segment").agg(
+    customers=("recency", "size"), recency=("recency", "median"),
+    frequency=("frequency", "median"), monetary=("monetary", "median")).round(1)
+print(profile)
+# Name segments from the profile (e.g. "champions", "at risk", "new/occasional", "dormant")
+# and export centroids so a Java service can assign new customers:
+centroids = pipe[-1].cluster_centers_          # in scaled log space
+scaler = pipe[1]
+pd.DataFrame(centroids, columns=rfm.columns).to_json("segment_centroids.json", orient="records")
+print("scaler mean/scale for serving:", scaler.mean_.round(4), scaler.scale_.round(4))</code></pre>
+
+  <h3>7.8 Assigning segments in Java</h3>
+<pre data-file="SegmentAssigner.java"><code class="language-java">package com.example.segments;
+
+import org.springframework.stereotype.Component;
+
+/** Nearest-centroid assignment using parameters exported from the Python pipeline. */
+@Component
+public class SegmentAssigner {
+    // Loaded from a versioned config/artifact in real code; inlined here for clarity.
+    private final double[] mean;      // StandardScaler.mean_ (of log1p features)
+    private final double[] scale;     // StandardScaler.scale_
+    private final double[][] centroids;
+
+    public SegmentAssigner(double[] mean, double[] scale, double[][] centroids) {
+        this.mean = mean; this.scale = scale; this.centroids = centroids;
+    }
+
+    public int assign(double recency, double frequency, double monetary) {
+        double[] raw = {recency, frequency, monetary};
+        double[] z = new double[raw.length];
+        for (int i = 0; i &lt; raw.length; i++) {
+            z[i] = (Math.log1p(raw[i]) - mean[i]) / scale[i];   // identical transform to training
+        }
+        int best = -1;
+        double bestD = Double.MAX_VALUE;
+        for (int c = 0; c &lt; centroids.length; c++) {
+            double d = 0;
+            for (int i = 0; i &lt; z.length; i++) {
+                double diff = z[i] - centroids[c][i];
+                d += diff * diff;
+            }
+            if (d &lt; bestD) { bestD = d; best = c; }
+        }
+        return best;
+    }
+}</code></pre>
+  <p>This is one of the rare cases where reimplementing the transform in Java is reasonable: it is three lines of arithmetic. Still add a parity test against the Python pipeline's <code>predict</code> on a fixture.</p>
+</section>
+
+<section id="applications">
+  <h2>8. Applications</h2>
+  <h3>8.1 Customer segmentation</h3>
+  <p>Cluster customers on behavioural features (recency, frequency, monetary value, category mix, channel usage), name the segments from their centroids, and use them for targeting, pricing experiments or as features for supervised models. Recompute periodically and track migration between segments; sudden mass migration usually signals a data or definition change, not a behavioural revolution.</p>
+  <h3>8.2 Log and metric anomaly detection</h3>
+  <p>Log lines are parsed into templates (constant text with variable fields masked), turning unstructured text into counts per template per time window; new templates are themselves a strong signal. Metric vectors (latency, error rate, saturation across services) are scored with isolation forests, PCA reconstruction error, or seasonal baselines. The hard part is operational: suppressing duplicates, routing to owners, and learning from feedback.</p>
+  <h3>8.3 Embedding visualisation and debugging</h3>
+  <p>Projecting model embeddings (search queries, product vectors, support-ticket embeddings) to 2-D with UMAP lets you see whether semantically similar items cluster, find mislabelled examples (a point surrounded by another class), and discover topics. Clustering embeddings with HDBSCAN groups support tickets into emerging issues without predefined categories.</p>
+  <h3>8.4 Compression and preprocessing</h3>
+  <p>PCA reduces embedding dimensions (768 → 128) to cut vector-index memory and latency with measurable recall loss, decorrelates features before linear models, and compresses dashboards of hundreds of correlated metrics into a few health indicators.</p>
+  <h3>8.5 Deduplication and catalogue cleanup</h3>
+  <p>Cluster product listings or documents by embedding similarity (or MinHash on shingles) to find near-duplicates; within each cluster, choose a canonical record. This is "group by" for messy data.</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 Uber: real-time anomaly detection for observability</h3>
+  <p><span class="tag fact">Verified</span> Uber's engineering blog describes the anomaly detection platform its observability team built to flag deviations in system metrics and notify on-call engineers, using forecasting models to produce dynamic thresholds rather than static ones, and later posts describe uVitals, an unsupervised system for multi-dimensional time series. Sources: <a href="https://www.uber.com/blog/anomaly-detection/">Uber Engineering blog post on its anomaly detection platform</a>; <a href="https://www.uber.com/blog/uvitals-an-anomaly-detection-alerting-system/">Uber Engineering blog post on uVitals</a>. The lesson matches §3.11: unsupervised scoring is only useful wrapped in an alerting product with backtesting and feedback.</p>
+  <h3>9.2 Isolation forest: from paper to default tool</h3>
+  <p><span class="tag fact">Verified</span> Liu, Ting and Zhou introduced Isolation Forest at ICDM 2008, arguing that explicitly isolating anomalies (rather than profiling normal points) gives linear time complexity with small subsamples and strong detection performance. It is implemented in scikit-learn as <code>IsolationForest</code>, with subsample size 256 by default, as in the paper. Source: <a href="https://scikit-learn.org/stable/modules/outlier_detection.html#isolation-forest">scikit-learn outlier detection guide</a>, which cites the original paper.</p>
+  <h3>9.3 Log parsing benchmarks</h3>
+  <p><span class="tag fact">Verified</span> The LogPAI project maintains Loghub, a large collection of public system logs (HDFS, BGL, Spark, OpenStack and others) used to benchmark log parsing and anomaly detection, along with open implementations of parsers such as Drain. If you build log anomaly detection, these datasets are the honest way to compare approaches. Source: <a href="https://github.com/logpai/loghub">github.com/logpai/loghub</a>.</p>
+  <h3>9.4 t-SNE and UMAP misreadings</h3>
+  <p><span class="tag fact">Verified</span> The Distill article "How to Use t-SNE Effectively" demonstrates interactively that t-SNE cluster sizes and inter-cluster distances can be meaningless and that random noise can show structure at some perplexities. Source: <a href="https://distill.pub/2016/misread-tsne/">Wattenberg, Viégas, Johnson, Distill 2016</a>. <span class="tag opinion">Opinion</span> Treat every pretty embedding plot as a hypothesis to test with quantitative checks.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages and Limits</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Method</th><th>Advantages</th><th>Limitations</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>k-means</td><td>Fast, simple, scalable; centroids are interpretable and trivially servable</td><td>Needs k; spherical, equal-size assumption; outliers distort; local minima</td><td>Very low</td></tr>
+      <tr><td>Hierarchical</td><td>Dendrogram shows structure at all scales; no k up front</td><td>O(m²) memory; merges are irreversible</td><td>Limited to modest m</td></tr>
+      <tr><td>DBSCAN</td><td>Arbitrary shapes; explicit noise; no k</td><td>Single density; ε tuning; weak in high dimensions</td><td>Index-dependent</td></tr>
+      <tr><td>HDBSCAN</td><td>Variable densities; intuitive parameter; noise labels</td><td>Slower; can label many points as noise</td><td>Moderate</td></tr>
+      <tr><td>GMM</td><td>Soft assignments; elliptical clusters; density and BIC</td><td>Gaussian assumption; covariance instability in high dimensions</td><td>Moderate</td></tr>
+      <tr><td>PCA</td><td>Optimal linear compression; fast; invertible; deterministic</td><td>Linear only; variance is not always relevance; scale-sensitive</td><td>Low; one matmul to serve</td></tr>
+      <tr><td>t-SNE</td><td>Excellent local-structure visualisation</td><td>Global distances meaningless; slow; no transform; parameter-sensitive</td><td>Offline only</td></tr>
+      <tr><td>UMAP</td><td>Fast; transform for new points; more global structure than t-SNE</td><td>Still distorts distances and densities; stochastic</td><td>Moderate</td></tr>
+      <tr><td>Isolation forest</td><td>Linear time; no distance metric; works in high dimensions</td><td>Axis-aligned bias; threshold choice; no explanation by default</td><td>Low</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  Q["What do you need?"] --> V["Visualise high-dim data"]
+  Q --> G["Group items"]
+  Q --> A["Find rare items"]
+  Q --> Cm["Compress features"]
+  V --> UM["UMAP (or t-SNE) after PCA to ~50 dims"]
+  G --> K{"Know k and clusters compact?"}
+  K -- yes --> KM["k-means (mini-batch if huge)"]
+  K -- "need probabilities / ellipses" --> GM["GMM, pick K by BIC"]
+  K -- "unknown k, odd shapes, noise" --> HB["HDBSCAN"]
+  K -- "need hierarchy" --> AG["Agglomerative (Ward / average)"]
+  A --> T{"Labels available later?"}
+  T -- "no" --> IFo["Isolation forest + human review"]
+  T -- "yes, accumulating" --> SUPV["Bootstrap with unsupervised, migrate to supervised"]
+  Cm --> PC["PCA keeping 90-99% variance; validate downstream"]
+</pre>
+  <figcaption>Figure 6.4.5 — Choosing an unsupervised method by goal.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> start from the decision you need to make, not from the algorithm. Visualisation, grouping, rarity and compression are different goals with different success criteria; the same embedding matrix might flow through PCA for compression, HDBSCAN for grouping and isolation forest for rarity. The anomaly branch notes the strategic path: unsupervised now, supervised once feedback labels exist.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Decision</th><th>Trade-off</th><th>Guidance</th></tr></thead>
+    <tbody>
+      <tr><td>k-means vs HDBSCAN</td><td>Every point assigned and simple centroids vs arbitrary shapes and explicit noise</td><td>Segments for business use: k-means; discovering topics in embeddings: HDBSCAN</td></tr>
+      <tr><td>Hard vs soft assignment</td><td>Simplicity vs expressing uncertainty</td><td>GMM when boundary customers need special handling</td></tr>
+      <tr><td>PCA dimensions</td><td>Compression vs information loss</td><td>Pick k by downstream metric (recall@k, model AUC), not variance alone</td></tr>
+      <tr><td>Anomaly threshold</td><td>Recall vs alert fatigue</td><td>Set by on-call capacity (alerts per day), then tune with feedback</td></tr>
+      <tr><td>Recompute frequency</td><td>Freshness vs stability of segment IDs</td><td>Align new clusters to old ones (Hungarian matching on centroids) to keep IDs stable</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes</h2>
+  <ul>
+    <li><strong>Clustering unscaled features.</strong> The largest-unit feature defines the clusters.</li>
+    <li><strong>Treating clusters as ground truth.</strong> Algorithms always return clusters, even on uniform noise. Check stability and compare against a null (shuffled features).</li>
+    <li><strong>Choosing k by inertia alone.</strong> Inertia always decreases with k.</li>
+    <li><strong>Forgetting to centre for PCA</strong> (when implementing manually), or standardising when raw variance is meaningful.</li>
+    <li><strong>Using t-SNE coordinates as model features</strong> or interpreting inter-cluster distances on t-SNE plots.</li>
+    <li><strong>Unstable segment IDs.</strong> Cluster 3 this week is not cluster 3 next week; downstream systems keyed on IDs break. Map new clusters to old by centroid similarity.</li>
+    <li><strong>Running DBSCAN with default ε</strong> on data of a different scale; everything becomes noise or one cluster.</li>
+    <li><strong>Setting <code>contamination</code> as if it were knowledge.</strong> It only sets a score threshold; the ranking is unchanged.</li>
+    <li><strong>Fitting PCA on all data before a train/test split</strong> for a downstream supervised model: a (mild) leakage, same rule as any transformer.</li>
+    <li><strong>Euclidean k-means on embeddings that should use cosine.</strong> Normalise vectors to unit length first; then squared Euclidean distance is 2 − 2 cos, and k-means behaves like spherical k-means.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Serving</h3>
+  <p>Export centroids, scaler parameters and PCA components as data (JSON, Parquet, or ONNX). Nearest-centroid assignment and PCA projection are a few lines in any language and run in microseconds. For DBSCAN/HDBSCAN, there is no native predict for new points in scikit-learn's DBSCAN; either re-cluster in batch or assign new points to the cluster of their nearest core sample (HDBSCAN libraries offer approximate prediction).</p>
+  <h3>13.2 Drift and recomputation</h3>
+  <p>Monitor the distribution of assignments (fraction per segment), mean distance to assigned centroid (rising means the world has moved away from the centroids), and anomaly score distributions. Recompute on schedule with alignment to previous IDs, and version segment definitions like any API.</p>
+  <h3>13.3 Alerting quality</h3>
+  <p>For anomaly detection, track alert volume, precision on reviewed alerts, time-to-acknowledge, and duplicates. Deduplicate and group correlated anomalies before paging; suppress during known events (deploys, sales). An anomaly detector that pages too often is worse than none: it trains people to ignore alerts.</p>
+  <h3>13.4 Privacy and fairness</h3>
+  <p>Segments can encode protected attributes through proxies, and segment-based treatment (pricing, credit offers) can become discriminatory. Review features and outcomes per segment. Embedding plots of user data are personal data: restrict access.</p>
+  <h3>13.5 Scale</h3>
+  <p>Mini-batch k-means, IncrementalPCA and subsampled isolation forests scale to large data on one node; Spark MLlib provides distributed k-means, bisecting k-means, GMM and PCA. For embedding clustering at scale, cluster on a sample and assign the rest by nearest centroid or approximate nearest neighbour.</p>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>Run k-means by hand on 1-D points {2, 4, 5, 10, 12, 13} with k = 2 and initial centroids 2 and 4. Show each iteration and the final inertia.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Iteration 1: assign 2 → c₁ (2); 4, 5, 10, 12, 13 → c₂ (4) (note 10 is 6 from 4, 8 from 2). Update: c₁ = 2, c₂ = (4 + 5 + 10 + 12 + 13)/5 = 8.8. Iteration 2: 2 → c₁; 4 (2 vs 4.8) → c₁; 5 (3 vs 3.8) → c₁; 10, 12, 13 → c₂. Update: c₁ = 11/3 ≈ 3.667, c₂ = 35/3 ≈ 11.667. Iteration 3: assignments unchanged. Inertia = (1.667² + 0.333² + 1.333²) + (1.667² + 0.333² + 1.333²) = 2 × (2.778 + 0.111 + 1.778) = 2 × 4.667 = 9.333.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Foundational</p>
+    <p>A point has average distance 3 to members of its own cluster, and average distances 7 and 4 to the members of two other clusters. Compute its silhouette. What if its own-cluster average were 5?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>b = min(7, 4) = 4 (the nearest other cluster). s = (4 − 3)/max(3, 4) = 0.25: weakly placed. With a = 5: s = (4 − 5)/5 = −0.2: it would fit better in the third cluster.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>Covariance eigenvalues of a 10-feature standardised dataset are [5.2, 2.1, 1.0, 0.8, 0.5, 0.2, 0.1, 0.1, 0.0, 0.0]. (a) Explained variance ratio of each of the first three. (b) Smallest k for ≥ 90% cumulative. (c) Reconstruction MSE per point (summed over features) when keeping k = 3, assuming m − 1 normalisation.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Total = 10.0, as expected for 10 standardised features (the trace of a correlation matrix equals the number of features). (a) 0.52, 0.21, 0.10. (b) Cumulative: 0.52, 0.73, 0.83, 0.91 → k = 4. (c) The sum of discarded eigenvalues: 0.8 + 0.5 + 0.2 + 0.1 + 0.1 + 0 + 0 = 1.7 per point on average (squared error summed over features, with the m − 1 convention).</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Intermediate</p>
+    <p>A 1-D GMM has π = (0.7, 0.3), μ = (0, 3), σ = (1, 1). Compute the responsibilities for x = 1.5 and x = 2.5.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Unnormalised (dropping the shared 1/√(2π)): x = 1.5: 0.7 e<sup>−1.125</sup> = 0.7 × 0.3247 = 0.2273; 0.3 e<sup>−1.125</sup> = 0.0974. Responsibilities 0.7 and 0.3: at the midpoint, the likelihoods tie and the prior decides. x = 2.5: 0.7 e<sup>−3.125</sup> = 0.7 × 0.0439 = 0.0308; 0.3 e<sup>−0.125</sup> = 0.3 × 0.8825 = 0.2648. r₁ = 0.0308/0.2956 ≈ 0.104, r₂ ≈ 0.896.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>Prove that for unit-normalised vectors, k-means with squared Euclidean distance assigns points to the centroid with the highest cosine similarity when centroids are also normalised, and explain how to implement spherical k-means with scikit-learn.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>For ‖x‖ = ‖c‖ = 1: ‖x − c‖² = ‖x‖² − 2xᵀc + ‖c‖² = 2 − 2cos(x, c). Minimising distance is maximising cosine. Standard k-means centroids (means) are not unit-norm, so assignments differ slightly; spherical k-means renormalises centroids after each update. With scikit-learn, normalise X with <code>Normalizer()</code> and run KMeans (approximately spherical); for exact spherical k-means, implement the loop with a centroid renormalisation step, or normalise the fitted centroids and reassign by maximum dot product at serving time.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 6 · Advanced (design)</p>
+    <p>Design an anomaly detector for checkout latency across 300 microservices that pages at most 5 times per day. Specify features, algorithm, thresholding, suppression and how you will evaluate it without labels.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Features per service per minute: p50/p99 latency, error rate, request rate, each as a ratio to the same minute-of-week seasonal baseline (log ratio), plus deploy-in-last-15-min flag. Algorithm: per-service robust z-scores for univariate spikes, plus an isolation forest on the cross-service vector to catch correlated incidents. Thresholding: rank minutes by combined score; set the threshold so the backtest over the past 60 days yields about 5 incidents per day after grouping; require persistence (3 of 5 minutes). Suppression: group anomalies within 10 minutes and sharing dependencies into one incident; suppress during planned maintenance. Evaluation: backtest against past incident tickets (recall of known incidents), have on-call rate each page (precision), track time-to-detect versus existing alerts, and review monthly.</p>
+    </div></details>
+  </div>
+</section>

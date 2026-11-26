@@ -885,6 +885,282 @@ if __name__ == "__main__":
   <p>For a circuit breaker in Python, libraries such as <code>pybreaker</code> or <code>aiobreaker</code> implement the same closed/open/half-open machine; at the platform level, Envoy outlier detection or Istio <code>DestinationRule</code> settings provide breaker-like ejection of failing endpoints regardless of language.</p>
 </section>
 
+<section id="applications">
+  <h2>8. Applications: How Teams Apply These Patterns</h2>
+  <ul>
+    <li><strong>Strangler-fig migrations.</strong> A gateway routes selected paths to new services while the monolith keeps the rest; CDC or outbox events keep the new service's data in sync. Spring Modulith is often used first to find the seams.</li>
+    <li><strong>Platform-provided resilience.</strong> Platform teams standardise a client library or mesh policy: default timeouts, one retry with jitter for idempotent methods, outlier detection, mTLS. Application teams override per dependency with evidence.</li>
+    <li><strong>LLM and AI gateways.</strong> A model gateway service fronts several providers: per-provider circuit breakers and rate limiters (requests and tokens per minute), fallback to a secondary model or a cached answer, concurrency limits per tenant (bulkheads), priority shedding (interactive chat over batch summarisation), and long, explicit timeouts with streaming. Agent tool calls carry idempotency keys so that retries are safe.</li>
+    <li><strong>Graceful degradation in user-facing pages.</strong> Product pages render without recommendations, reviews or personalised prices when those services trip their breakers; checkout is protected by reserved capacity.</li>
+    <li><strong>Singleton jobs.</strong> Nightly billing, report generation and cache warmers run under ShedLock or a Kubernetes lease; correctness relies on idempotent job design, not on the lock alone.</li>
+    <li><strong>Leader election for stateful components.</strong> Kubernetes controllers, Kafka Connect, and custom schedulers use leases with fencing (resource versions) to ensure a single active leader.</li>
+  </ul>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 Segment: back from microservices <span class="tag fact">Verified</span></h3>
+  <p>Segment's 2018 post "Goodbye Microservices" describes splitting event delivery into a separate service and queue per destination, then struggling as the number of destinations grew into the hundreds: shared library updates had to be rolled across many repositories, load patterns differed wildly per service, and developer productivity fell. They consolidated destinations into a single service and repository with a new queuing system (Centrifuge). Lesson: microservices multiply operational and dependency-management work; fine-grained services for near-identical code paths are rarely worth it. Source: <a href="https://segment.com/blog/goodbye-microservices/">Segment, "Goodbye Microservices: From 100s of problem children to 1 superstar"</a>; coverage at <a href="https://www.infoq.com/news/2018/07/segment-microservices/">InfoQ</a>.</p>
+
+  <h3>9.2 Prime Video's monitoring service <span class="tag fact">Verified</span></h3>
+  <p>In 2023 a Prime Video team reported re-architecting its audio/video quality-monitoring tool from a distributed design built on serverless components (with heavy data transfer between steps) into a single process on EC2/ECS, citing over 90% infrastructure cost reduction for that workload. The ensuing debate (including from Adrian Cockcroft) centred on the point that this was one workload's design choice, not a verdict on microservices in general. Lesson: choose distribution granularity by data flow and cost, per workload. Source: <a href="https://www.infoq.com/news/2023/05/prime-ec2-ecs-saves-costs/">InfoQ, "Prime Video Switched from Serverless to EC2 and ECS to Save Costs"</a>.</p>
+
+  <h3>9.3 Shopify: the modular monolith <span class="tag fact">Verified</span></h3>
+  <p>Shopify's engineering blog describes keeping its large Rails application as a monolith while enforcing component boundaries, with tooling to detect and reduce cross-component dependencies, rather than splitting into microservices. Lesson: modularity is the goal; distribution is one optional means. Source: <a href="https://shopify.engineering/deconstructing-monolith-designing-software-maximizes-developer-productivity">Shopify Engineering, "Deconstructing the Monolith"</a>.</p>
+
+  <h3>9.4 Uber: domain-oriented microservice architecture <span class="tag fact">Verified</span></h3>
+  <p>With thousands of microservices, Uber described grouping services into domains behind gateways, organised into layers, to reduce the complexity of a flat service graph, an explicit move back toward coarser, bounded-context-style boundaries. Source: <a href="https://www.uber.com/blog/microservice-architecture/">Uber Engineering, "Introducing Domain-Oriented Microservice Architecture"</a>.</p>
+
+  <h3>9.5 Netflix Hystrix and the move to adaptive approaches <span class="tag fact">Verified</span></h3>
+  <p>Netflix's Hystrix popularised circuit breakers, bulkheads (thread-pool isolation) and fallbacks in the JVM world. Its repository states that it is no longer in active development and points users to Resilience4j, while Netflix itself shifted toward adaptive techniques such as adaptive concurrency limits. Sources: <a href="https://github.com/Netflix/Hystrix">Netflix/Hystrix README</a>, <a href="https://github.com/Netflix/concurrency-limits">Netflix/concurrency-limits</a>.</p>
+
+  <h3>9.6 The Redlock debate <span class="tag fact">Verified</span></h3>
+  <p>Martin Kleppmann's 2016 analysis argued that Redlock depends on bounded network delay, process pauses and clock drift, and lacks fencing tokens, so it cannot guarantee mutual exclusion for correctness. Salvatore Sanfilippo (antirez) responded defending its practical safety under stated assumptions. Reading both is the best way to understand what "safe" means for a lock. Sources: <a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">Kleppmann, "How to do distributed locking"</a>; <a href="http://antirez.com/news/101">antirez, "Is Redlock safe?"</a>; <a href="https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/">Redis docs: distributed locks</a>.</p>
+
+  <h3>9.7 AWS on timeouts, retries and jitter <span class="tag fact">Verified</span></h3>
+  <p>The Amazon Builders' Library article on timeouts, retries and backoff with jitter explains how Amazon picks timeouts from latency percentiles, retries at a single layer, uses token-bucket-style limits on retries, and adds jitter; Marc Brooker's earlier architecture-blog post compares full, equal and decorrelated jitter in simulation. Sources: <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">"Timeouts, retries, and backoff with jitter"</a>; <a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/">"Exponential Backoff And Jitter"</a>.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages, Limitations and Operational Cost</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Pattern / tool</th><th>Advantages</th><th>Limitations</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>Microservices</td><td>Team autonomy, independent deploy and scaling, fault isolation</td><td>Distributed transactions, network failures, harder debugging, data duplication</td><td>High: platform, observability, CI/CD per service</td></tr>
+      <tr><td>Modular monolith (Spring Modulith)</td><td>Simple ops, ACID, refactorable boundaries, fast local calls</td><td>Shared deploy cadence and runtime; one bad module can crash the process</td><td>Low</td></tr>
+      <tr><td>Eureka (client-side)</td><td>No proxy hop; zone-aware</td><td>JVM-centric; stale caches; extra infrastructure on Kubernetes</td><td>Registry cluster</td></tr>
+      <tr><td>Kubernetes Services</td><td>Built in, language-agnostic</td><td>Connection-level balancing; limited traffic policy</td><td>Included with the platform</td></tr>
+      <tr><td>Service mesh</td><td>mTLS, L7 policy, telemetry, traffic shifting without code</td><td>Latency and resource overhead; complex upgrades; retry duplication</td><td>Significant; often a platform team</td></tr>
+      <tr><td>Circuit breaker</td><td>Stops cascades, fast failure</td><td>Tuning; low-traffic endpoints never trip; per-instance view of a shared dependency</td><td>Dashboards, alerts per breaker</td></tr>
+      <tr><td>Retries</td><td>Mask transient faults</td><td>Amplify overload; require idempotency</td><td>Budgets and metrics</td></tr>
+      <tr><td>Bulkheads / concurrency limits</td><td>Contain saturation</td><td>Static limits misfit changing load</td><td>Tuning or adaptive limiters</td></tr>
+      <tr><td>Redis lock</td><td>Fast, simple</td><td>Unsafe for correctness (no fencing; failover loses locks)</td><td>Low</td></tr>
+      <tr><td>etcd / ZooKeeper lock</td><td>Consensus-backed, fencing token available</td><td>Higher latency; another critical cluster</td><td>Moderate</td></tr>
+      <tr><td>DB advisory lock / ShedLock</td><td>Uses existing DB, transactional</td><td>Load on primary; ShedLock is efficiency-only</td><td>Low</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A[More than about 3 teams on one codebase, blocked by each other?] -->|No| M[Modular monolith with Spring Modulith]
+  A -->|Yes| B{Clear bounded contexts with stable APIs?}
+  B -->|No| M
+  B -->|Yes| C{Different scaling, reliability or compliance needs per context?}
+  C -->|No| D{Release coupling is the main pain?}
+  D -->|No| M
+  D -->|Yes| S[Extract that context as a service]
+  C -->|Yes| S
+  S --> P["Platform ready? CI/CD, observability, discovery, on-call"]
+  P -->|No| F[Build platform first or stay modular]
+  P -->|Yes| G[Microservice with own data, events, resilience defaults]
+</pre>
+  <figcaption>Figure 8.8 — Should this context become a microservice?</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> every path to a microservice requires both a clear boundary and a concrete pain that distribution solves, plus a platform able to support it. Absent those, the modular monolith is the default. Extraction is per context, not "big bang".</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Decision</th><th>Prefer</th><th>When</th></tr></thead>
+    <tbody>
+      <tr><td>Sync vs async between contexts</td><td>Async events</td><td>Unless the user needs the answer now; then one sync hop with deadline and fallback</td></tr>
+      <tr><td>Resilience in library vs mesh</td><td>Library for business-aware logic (fallbacks, idempotency); mesh for uniform mTLS, outlier ejection, traffic shifting</td><td>Do not configure retries in both</td></tr>
+      <tr><td>Count vs time window</td><td>Time-based</td><td>Traffic varies a lot; count-based for steady high-volume calls</td></tr>
+      <tr><td>Thread-pool vs semaphore bulkhead</td><td>Semaphore (especially with virtual threads)</td><td>Thread pool only to isolate blocking calls on platform threads</td></tr>
+      <tr><td>Static vs adaptive concurrency limits</td><td>Adaptive</td><td>Latency and capacity vary; static is simpler to reason about</td></tr>
+      <tr><td>Lock technology</td><td>The strongly consistent store you already run (DB, etcd) with fencing</td><td>Redis only when duplicates are harmless</td></tr>
+      <tr><td>Lock vs redesign</td><td>Redesign to idempotent / conditional writes</td><td>Locks are a last resort for correctness</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Production Failures</h2>
+  <ol>
+    <li><strong>Distributed monolith:</strong> services that must be deployed together, share a database, or call each other synchronously in long chains. All the costs, none of the benefits.</li>
+    <li><strong>Entity services:</strong> a "Customer service" called synchronously by every other service becomes a single point of failure and a latency tax.</li>
+    <li><strong>No timeouts, or default timeouts:</strong> some HTTP clients default to infinite read timeouts. Always set connect, read and pool-acquisition timeouts explicitly.</li>
+    <li><strong>Retry storms:</strong> retries at every layer, no jitter, no budget, retrying non-idempotent POSTs.</li>
+    <li><strong>Breakers that never trip:</strong> <code>minimumNumberOfCalls</code> larger than the traffic in a window; slow-call thresholds left at defaults; counting 4xx as failures so a bad client trips the breaker for everyone.</li>
+    <li><strong>Fallbacks that call remote services</strong> or are never exercised in tests, then fail in production.</li>
+    <li><strong>Liveness probes that check dependencies:</strong> a database outage makes every pod "dead", Kubernetes restarts them all, and recovery is slower. Liveness should check the process; readiness can consider critical dependencies carefully.</li>
+    <li><strong>Unbounded queues</strong> in executors (e.g., <code>Executors.newFixedThreadPool</code> uses an unbounded queue): overload becomes memory exhaustion and multi-minute latency.</li>
+    <li><strong>Releasing a Redis lock with plain <code>DEL</code></strong>, deleting someone else's lock after your lease expired.</li>
+    <li><strong>Using a lock for correctness without fencing,</strong> then suffering rare double-processing after GC pauses or Redis failovers.</li>
+    <li><strong>Session-level advisory locks with connection pools</strong> leaking locks across requests.</li>
+    <li><strong>Mesh plus library retries</strong> multiplying attempts; mesh timeouts shorter than application timeouts producing confusing errors.</li>
+  </ol>
+  <div class="callout danger"><p class="callout-title">Production failure pattern</p><p><span class="tag illus">Illustrative</span> A recommendations service slows down. The product-page service has a 30 s default read timeout and a shared Tomcat pool of 200 threads. Within a minute all 200 threads wait on recommendations, and product pages (and checkout, served by the same instances) time out. The fix is a 300 ms timeout, a bulkhead of 20 concurrent calls for recommendations, a circuit breaker with an empty-list fallback, and reserved capacity for checkout.</p></div>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Monitoring</h3>
+  <ul>
+    <li>Per-dependency RED metrics on the client side (rate, errors, duration percentiles), since server-side metrics miss timeouts and connection failures.</li>
+    <li>Resilience4j Micrometer metrics: <code>resilience4j_circuitbreaker_state</code>, failure and slow-call rates, <code>not_permitted_calls</code>; bulkhead available permits; retry counts by outcome (successful without retry, with retry, failed). Alert on breakers stuck open and on rising retry ratios.</li>
+    <li>Shed and rejected request counts by priority class; queue time percentiles.</li>
+    <li>Distributed tracing across services to see where time goes in a call chain (Chapter 9 and <a href="p12-05-observability-otel.html">Chapter 12.5</a>).</li>
+    <li>Lock metrics: acquisition latency, contention, hold time, and lease expiries while held (a sign of pauses).</li>
+  </ul>
+  <h3>13.2 Performance</h3>
+  <ul>
+    <li>Connection pooling and keep-alive for HTTP clients; HTTP/2 or gRPC for high-volume internal calls.</li>
+    <li>Virtual threads (Java 21+) remove thread-pool exhaustion as a failure mode but not downstream exhaustion: concurrency limits move to the dependency boundary.</li>
+    <li>Mesh latency budget: measure per-hop overhead and include it in timeout budgets.</li>
+  </ul>
+  <h3>13.3 Security</h3>
+  <ul>
+    <li>mTLS between services (mesh or SPIFFE-based identities) and authorisation per service identity, not just network location.</li>
+    <li>Propagate end-user identity (signed tokens) and enforce authorisation in each service, not only at the gateway (zero trust).</li>
+    <li>Discovery registries and lock services are critical infrastructure: authenticate clients and restrict who can register or delete.</li>
+    <li>Rate limits and shedding are also abuse controls; shed unauthenticated traffic first.</li>
+  </ul>
+  <h3>13.4 Reliability and maintainability</h3>
+  <ul>
+    <li>Codify resilience defaults in a shared starter or platform config; review overrides in code review.</li>
+    <li>Test failure: fault injection (Toxiproxy, mesh fault injection, chaos experiments) verifies that timeouts, breakers and fallbacks behave as configured.</li>
+    <li>Document dependency criticality: which dependencies may degrade, which must fail closed.</li>
+    <li>Keep module and service boundary checks in CI (Modulith <code>verify()</code>, ArchUnit) so architecture does not erode.</li>
+  </ul>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>A gateway deadline is 800 ms. The order service calls pricing (p99 120 ms) and then tax (p99 200 ms) sequentially. Choose timeouts and retry policies that fit the budget, and justify them.</p>
+    <details class="solution"><summary>Solution</summary><div><p>Budget roughly: pricing timeout 200 ms, tax timeout 300 ms, leaving ~300 ms for the service's own work and network. A retry on both would need up to 2×200 + 2×300 = 1,000 ms plus backoff: too much. Allow one jittered retry on pricing only if the remaining deadline exceeds the timeout (deadline-aware retry), no retry on tax (or a fallback to a cached rate table if legally acceptable). Propagate the remaining deadline so tax does not work on a request the gateway abandoned.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>An endpoint receives about 30 calls per minute. Its Resilience4j breaker uses defaults (count-based window 100, minimum 100 calls). The dependency has been failing for 10 minutes and the breaker never opened. Explain and reconfigure.</p>
+    <details class="solution"><summary>Solution</summary><div><p>With defaults the breaker needs 100 recorded calls before evaluating; at 30/min, that takes over 3 minutes, and if traffic dropped during the outage (users gave up) it may never fill. Use a time-based window (e.g., 60 s) with <code>minimumNumberOfCalls</code> around 10, set slow-call thresholds near the timeout, and make sure timeouts are recorded as failures. Consider whether a breaker adds value at this volume at all; timeouts plus fallbacks may be enough.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>Using Little's law, size a bulkhead for an LLM provider called at 15 requests/s with median latency 2.5 s and p99 12 s, given a provider concurrency quota of 60. What happens during a provider slowdown to p50 = 8 s?</p>
+    <details class="solution"><summary>Solution</summary><div><p>Normal concurrency ≈ 15 × 2.5 = 37.5; with variance toward p99, demand spikes higher. Set the bulkhead at the quota (60) or slightly below, so you never exceed it and get throttled. At p50 = 8 s, demand ≈ 120 concurrent: the bulkhead rejects about half the requests immediately; route those to a fallback model, a queue for async completion, or a clear "busy" response, and shed low-priority (batch) traffic first.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>A nightly job aggregates invoices and writes totals to a table. It runs under a Redis lock with a 10-minute TTL. Twice a year, totals are doubled. Diagnose and design a correct solution.</p>
+    <details class="solution"><summary>Solution</summary><div><p>Likely the job sometimes runs longer than the TTL (slow DB, GC pause), the lock expires, another instance starts the same job, and both add increments to the totals. Fixes in order of preference: (1) make the job idempotent: compute totals from source data and write them as absolute values keyed by (period, customer) with upsert, so duplicate runs converge; (2) if exclusivity is still needed, use a lock that issues a fencing token (DB sequence, etcd revision) and include it in a conditional write (<code>WHERE fence &lt; :token</code>); (3) keep ShedLock/Redis only to save compute, with <code>lockAtMostFor</code> above the worst-case runtime and alerts when runtime approaches it.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>Draft the Spring Modulith module structure for an online-learning platform (courses, enrolment, payments, progress tracking, certificates). Identify which module you would extract first as a microservice and why, and what changes in its integration.</p>
+    <details class="solution"><summary>Solution</summary><div><p>Modules: <code>catalog</code> (courses), <code>enrolment</code>, <code>payment</code>, <code>progress</code>, <code>certification</code>, each with a public API package and internal sub-packages; events: <code>EnrolmentRequested</code>, <code>PaymentCompleted</code>, <code>LessonCompleted</code>, <code>CourseCompleted</code>. Extract <code>progress</code> first: it has very high write volume (video heartbeats), different scaling needs, and only consumes events (low coupling). Integration changes: events externalised to Kafka via <code>@Externalized</code>; progress gets its own datastore (possibly a time-series or wide-column store); <code>certification</code> consumes <code>CourseCompleted</code> from Kafka instead of in-process; idempotent consumers and schema governance are added. Payment might be extracted for compliance (PCI scope) rather than scale.</p></div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> When would you choose a modular monolith over microservices?</summary><div><p>When the team is small or the domain is still evolving, when strong consistency across modules is important, and when there is no platform for running many services. A modular monolith (e.g., Spring Modulith) enforces boundaries, keeps ACID and low latency, and preserves the option to extract services later along proven seams.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain the states of a circuit breaker and how Resilience4j decides to trip.</summary><div><p>CLOSED passes calls and records outcomes in a count- or time-based sliding window; once at least <code>minimumNumberOfCalls</code> are recorded, if the failure rate or slow-call rate meets its threshold, it trips to OPEN, rejecting calls with <code>CallNotPermittedException</code>. After the wait duration it goes HALF_OPEN, permits a fixed number of trial calls, and closes or reopens based on their rates. Windows are maintained incrementally in O(1) per call.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why add jitter to exponential backoff?</summary><div><p>Clients that fail at the same time otherwise retry at the same times, producing synchronised load spikes that can keep a recovering service down. Randomising the delay spreads retries across the interval; full jitter minimises contention and total work.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How do service discovery approaches differ: Eureka, Kubernetes Services, Consul, mesh?</summary><div><p>Eureka: client-side, instances self-register and clients cache the registry and choose instances; AP with self-preservation. Kubernetes Services: server-side via DNS and a virtual IP with kernel-level connection balancing, readiness-driven endpoints. Consul: Raft-backed catalog with health checks and DNS, spans VMs and Kubernetes. Mesh: proxies receive endpoints from a control plane and do request-level balancing, mTLS and policy. On Kubernetes, use native Services, adding a mesh for L7 needs.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> During a dependency incident your service's latency rises on all endpoints, not just the affected one. Why, and how do you fix it?</summary><div><p>Shared resources (thread pool, connection pool, CPU) are being consumed by calls waiting on the slow dependency. Fix: tight timeouts on that dependency, a bulkhead (concurrency limit) for it, a circuit breaker with fallback, and load shedding at ingress with priorities. Verify by fault injection.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is a fencing token and why do Redis locks need one for correctness?</summary><div><p>A monotonically increasing number issued with each lock grant and checked by the protected resource, which rejects operations carrying a token lower than one already seen. Lease-based locks can expire while a holder is paused; the paused holder then acts on stale assumptions. Redis <code>SET NX</code>/Redlock provide no such token, so they are suitable only for efficiency; consensus stores (etcd revision, ZooKeeper zxid) or database sequences provide tokens.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Write a safe Redis lock release.</summary><div><p>Acquire with <code>SET key uniqueValue NX PX ttl</code>. Release with a Lua script executed atomically: <code>if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end</code>. This prevents deleting another holder's lock after your lease expired (section 7.6).</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> What is a retry budget and why is a per-request retry limit not enough?</summary><div><p>A per-request limit of 3 still allows retries to triple load during an outage, across every client. A budget caps retries to a fraction (e.g., 10%) of recent successful or total requests, typically via a token bucket, so total load is bounded by 1.1× no matter how many requests fail. Combine both, and retry at one layer only.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> You are designing an LLM gateway used by 40 internal teams. Which resilience mechanisms do you put in?</summary><div><p>Per-provider and per-model circuit breakers; client-side rate limiters matching provider RPM/TPM quotas; per-team concurrency limits (bulkheads) and quotas to prevent noisy neighbours; priority-based load shedding; explicit, long but bounded timeouts with streaming and deadline propagation; budgeted retries with jitter only for idempotent requests or with idempotency keys; fallbacks to alternate models or cached answers where acceptable; and metrics per team, model and outcome.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> Tell me about a time you decided not to split a service.</summary><div><p>Good answers show the decision criteria (team topology, coupling, data consistency needs, platform maturity), the alternative chosen (modularisation, clearer interfaces, async events inside the monolith), and how you measured the outcome (deployment frequency, incident rate, lead time).</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Microservices are an organisational scaling tool with a distributed-systems price; a Spring Modulith modular monolith is the right default until a concrete need appears.</li>
+    <li>Draw boundaries by bounded context, give each service its own data, prefer async events, and keep synchronous chains short with deadlines.</li>
+    <li>Discovery: client-side (Eureka) vs server-side (Kubernetes Services, load balancers); a mesh adds mTLS, L7 balancing and policy at a cost.</li>
+    <li>Every remote call needs timeouts; retries need idempotency, jitter, a single layer and a budget.</li>
+    <li>Circuit breakers turn slow failure into fast failure; tune windows and minimum calls to real traffic. Bulkheads and load shedding contain saturation; backpressure prevents unbounded buffering.</li>
+    <li>Distributed locks are efficiency tools unless paired with fencing tokens checked by the resource; prefer idempotent or conditional writes.</li>
+  </ul>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">In Resilience4j's default Spring aspect order, which is outermost?</p>
+    <ol>
+      <li data-k="a">CircuitBreaker</li>
+      <li data-k="b">Bulkhead</li>
+      <li data-k="c">Retry</li>
+      <li data-k="d">TimeLimiter</li>
+    </ol>
+    <div class="explain">Retry wraps CircuitBreaker, RateLimiter, TimeLimiter and Bulkhead, so each attempt is recorded by the breaker and bounded by the time limiter.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">Five services in a synchronous chain each have 99.9% availability. Approximately what is the chain's availability?</p>
+    <ol>
+      <li data-k="a">99.5%</li>
+      <li data-k="b">99.9%</li>
+      <li data-k="c">99.99%</li>
+      <li data-k="d">95%</li>
+    </ol>
+    <div class="explain">0.999^5 ≈ 0.995. Serial dependencies multiply unavailability.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">What prevents a lock holder that was paused past its lease from corrupting data?</p>
+    <ol>
+      <li data-k="a">A longer TTL</li>
+      <li data-k="b">Releasing with a compare-and-delete script</li>
+      <li data-k="c">Using Redlock across five Redis masters</li>
+      <li data-k="d">A fencing token checked by the storage on every write</li>
+    </ol>
+    <div class="explain">Only the resource can reject the stale holder's write. TTLs and Redlock rely on timing assumptions; safe release only prevents deleting another's lock.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">Which retry policy is most appropriate for <code>POST /payments</code> without an idempotency key?</p>
+    <ol>
+      <li data-k="a">3 retries with full jitter</li>
+      <li data-k="b">No automatic retries</li>
+      <li data-k="c">Retries only on 500 responses</li>
+      <li data-k="d">Retries only on read timeouts</li>
+    </ol>
+    <div class="explain">A non-idempotent operation may have succeeded when a timeout or 500 is returned; retrying can double-charge. Add an idempotency key first.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Why can a gRPC client pinned to a Kubernetes ClusterIP send all requests to one pod?</p>
+    <ol>
+      <li data-k="a">CoreDNS always returns the same pod IP</li>
+      <li data-k="b">Readiness probes disable other pods</li>
+      <li data-k="c">kube-proxy balances per connection, and HTTP/2 multiplexes all requests over one long-lived connection</li>
+      <li data-k="d">gRPC does not support load balancing</li>
+    </ol>
+    <div class="explain">Connection-level balancing cannot spread requests within one connection. Use headless services with client-side balancing, a mesh, or connection max-age.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">What is the main purpose of load shedding?</p>
+    <ol>
+      <li data-k="a">Reject excess work early and cheaply so admitted requests complete within their deadlines</li>
+      <li data-k="b">Retry failed requests later</li>
+      <li data-k="c">Balance load evenly across instances</li>
+      <li data-k="d">Cache responses for overloaded endpoints</li>
+    </ol>
+    <div class="explain">Without shedding, overload makes every request slow, wasting work on requests whose clients have already timed out.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Sam Newman, <em>Building Microservices</em>, 2nd ed., O'Reilly, 2021; and <em>Monolith to Microservices</em>, O'Reilly, 2019.</li>
+    <li><span class="ref-kind">Book</span> Michael T. Nygard, <em>Release It!</em>, 2nd ed., Pragmatic Bookshelf, 2018 — stability patterns.</li>
+    <li><span class="ref-kind">Book</span> Eric Evans, <em>Domain-Driven Design</em>, Addison-Wesley, 2003; Vaughn Vernon, <em>Implementing Domain-Driven Design</em>, 2013.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://martinfowler.com/articles/microservices.html">James Lewis &amp; Martin Fowler, "Microservices"</a> and <a href="https://martinfowler.com/bliki/CircuitBreaker.html">Fowler, "CircuitBreaker"</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.spring.io/spring-modulith/reference/">Spring Modulith reference</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://resilience4j.readme.io/docs/circuitbreaker">Resilience4j CircuitBreaker documentation</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.spring.io/spring-framework/reference/core/resilience.html">Spring Framework: resilience features</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://kubernetes.io/docs/concepts/services-networking/service/">Kubernetes Services</a>; <a href="https://istio.io/latest/docs/">Istio docs</a>; <a href="https://linkerd.io/docs/">Linkerd docs</a>.</li>
+    <li><span class="ref-kind">Book</span> <a href="https://sre.google/sre-book/handling-overload/">Google SRE book, "Handling Overload"</a> and <a href="https://sre.google/sre-book/addressing-cascading-failures/">"Addressing Cascading Failures"</a>.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">Amazon Builders' Library: timeouts, retries and backoff with jitter</a>.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">Martin Kleppmann, "How to do distributed locking"</a>.</li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/lukas-krecan/ShedLock">ShedLock</a>; <a href="https://github.com/Netflix/concurrency-limits">Netflix concurrency-limits</a>.</li>
+  </ul>
+  <p>Next: <a href="p2-09-ha-dr-multiregion.html">Chapter 9: Observability, High Availability, Disaster Recovery &amp; Multi-Region</a>.</p>
+</section>
+
 </article>
 <script src="../assets/js/toc.js"></script>
 <script src="../assets/js/widgets.js"></script>

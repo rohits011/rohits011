@@ -715,3 +715,536 @@ assert anagram_starts("cbaebabacd", "abc") == [0, 6]</code></pre>
   </div>
   <p>Comparing two <code>Counter</code>s each step costs O(σ); for large alphabets maintain a single "number of characters whose count matches" variable instead, which makes each step O(1).</p>
 </section>
+
+<section id="applications">
+  <h2>8. Applications in Backend Engineering</h2>
+  <h3>8.1 Sorting</h3>
+  <ul>
+    <li><strong>Databases</strong>: <code>ORDER BY</code>, <code>DISTINCT</code>, <code>GROUP BY</code> and sort-merge joins sort data; when it does not fit in memory they write sorted runs to disk and merge them (external merge sort). <code>EXPLAIN ANALYZE</code> in PostgreSQL reports "Sort Method: quicksort Memory" versus "external merge Disk". A <code>LIMIT k</code> with <code>ORDER BY</code> becomes a top-k heap sort.</li>
+    <li><strong>LSM-tree storage</strong> (RocksDB, Cassandra): memtables are sorted in memory and flushed as sorted SSTables; compaction is a k-way merge.</li>
+    <li><strong>MapReduce/Spark shuffles</strong> sort by key so reducers see grouped keys; Spark's sort-based shuffle and Hadoop's spill-and-merge are external sorts.</li>
+    <li><strong>Deterministic output</strong>: sorting keys before serialising (stable JSON for signatures/ETags, reproducible builds).</li>
+  </ul>
+  <h3>8.2 Binary search</h3>
+  <ul>
+    <li><strong>Index lookups</strong>: B-tree pages and SSTable index blocks are sorted arrays searched with binary search; Kafka locates an offset in a segment's sparse <code>.index</code> file by binary search, then scans forward.</li>
+    <li><strong><code>git bisect</code></strong> binary-searches commit history for the first bad commit — a predicate search over an ordered history.</li>
+    <li><strong>Capacity and tuning</strong>: binary search on load (requests/s) to find the highest rate meeting a p99 SLO; on a configuration value (batch size, pool size) where a metric is monotone.</li>
+    <li><strong>Time-series and logs</strong>: find the first entry after a timestamp in sorted files or in-memory arrays of events; keyset pagination (<code>WHERE created_at &gt; ?</code>) is the database version.</li>
+    <li><strong>Consistent hashing</strong>: find the first ring position ≥ hash(key) with binary search or <code>TreeMap.ceilingEntry</code>.</li>
+  </ul>
+  <h3>8.3 Two pointers and windows</h3>
+  <ul>
+    <li><strong>Merging sorted streams</strong>: posting-list intersection in search engines (Lucene's conjunction iterators "leapfrog" with <code>advance(target)</code>), merging sorted event streams, diffing two sorted snapshots for reconciliation.</li>
+    <li><strong>Rate limiting</strong>: sliding-window log and sliding-window counter algorithms (see the rate-limiter chapter in Part 2).</li>
+    <li><strong>Streaming aggregation</strong>: tumbling (fixed, non-overlapping) and sliding (overlapping) windows in Kafka Streams and Flink; moving averages and anomaly detection on metrics.</li>
+    <li><strong>Session detection</strong>: group user events into sessions by gaps, a two-pointer scan over time-sorted events.</li>
+  </ul>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 "Nearly all binary searches are broken" (2006) <span class="tag fact">Verified</span></h3>
+  <p>Joshua Bloch wrote on the Google Research blog that the JDK's <code>Arrays.binarySearch</code> — and the binary search in Jon Bentley's <em>Programming Pearls</em> — computed <code>mid = (low + high) / 2</code>, which overflows to a negative index when low + high exceeds 2³¹ − 1. It surfaced only once arrays of over a billion elements became practical. The fix (<code>(low + high) &gt;&gt;&gt; 1</code>) shipped in the JDK. The lesson he drew: even a "proved" algorithm can fail when the proof's model (unbounded integers) differs from the machine. We hit the same class of bug in §7.2's <code>isqrt</code>.</p>
+
+  <h3>9.2 Breaking and fixing Java's TimSort (2015) <span class="tag fact">Verified</span></h3>
+  <p>De Gouw, Rot, de Boer, Bubel and Hähnle tried to verify OpenJDK's TimSort with the KeY theorem prover and discovered that the code maintaining the run-length invariant checked only the top three runs on the stack, so the invariant could break deeper, and the preallocated run stack could overflow — they constructed an input that throws <code>ArrayIndexOutOfBoundsException</code>. The same flaw existed in CPython's original implementation, which was fixed by correcting the invariant check; OpenJDK increased the stack size. Formal methods found a bug that years of production use had not.</p>
+
+  <h3>9.3 Python 3.11 adopts powersort <span class="tag fact">Verified</span></h3>
+  <p>In September 2021 (bpo-34561), Tim Peters replaced Timsort's merge-collapse heuristics with the powersort merge policy of Munro and Wild, which is provably within a small constant of the optimal merge cost given the run lengths. The commit and <code>listsort.txt</code> describe the change; it shipped in Python 3.11. The merge step itself (with galloping) is unchanged.</p>
+
+  <h3>9.4 Go 1.19 switches to pdqsort <span class="tag fact">Verified</span></h3>
+  <p>The Go 1.19 release notes state that the sort package's unstable sort is now pattern-defeating quicksort, faster for several common patterns, with an O(n log n) worst case. A good example of the "hybrid, adaptive, guaranteed" design that every modern standard library has converged on.</p>
+
+  <h3>9.5 git bisect <span class="tag fact">Verified</span></h3>
+  <p><code>git bisect</code> performs binary search over commit history: you mark a good and a bad commit, git checks out the midpoint, you (or <code>git bisect run &lt;script&gt;</code>) mark it, and in about log₂(n) steps it reports the first bad commit. Over 1,000 commits that is about 10 test runs. The predicate must be monotone — flaky tests or a bug that appears and disappears break the assumption, exactly as a non-monotone predicate breaks binary search on arrays.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Strengths and Limits</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Algorithm</th><th>Best</th><th>Average</th><th>Worst</th><th>Extra space</th><th>Stable</th><th>Adaptive</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Insertion</td><td>Θ(n)</td><td>Θ(n²)</td><td>Θ(n²)</td><td>Θ(1)</td><td>yes</td><td>yes</td><td>small n, nearly sorted, online</td></tr>
+      <tr><td>Merge</td><td>Θ(n log n)*</td><td>Θ(n log n)</td><td>Θ(n log n)</td><td>Θ(n)</td><td>yes</td><td>with run checks</td><td>linked lists, external sorting</td></tr>
+      <tr><td>Quick (random)</td><td>Θ(n log n)</td><td>Θ(n log n)</td><td>Θ(n²)</td><td>Θ(log n)</td><td>no</td><td>no</td><td>fastest in-memory in practice</td></tr>
+      <tr><td>Heap</td><td>Θ(n log n)</td><td>Θ(n log n)</td><td>Θ(n log n)</td><td>Θ(1)</td><td>no</td><td>no</td><td>guaranteed, cache-unfriendly</td></tr>
+      <tr><td>Timsort / powersort</td><td>Θ(n)</td><td>Θ(n log n)</td><td>Θ(n log n)</td><td>Θ(n)</td><td>yes</td><td>very</td><td>Java objects, Python</td></tr>
+      <tr><td>Introsort / pdqsort</td><td>Θ(n)**</td><td>Θ(n log n)</td><td>Θ(n log n)</td><td>Θ(log n)</td><td>no</td><td>partly</td><td>C++, Rust unstable, Go</td></tr>
+      <tr><td>Counting</td><td>Θ(n+k)</td><td>Θ(n+k)</td><td>Θ(n+k)</td><td>Θ(n+k)</td><td>yes</td><td>—</td><td>small integer keys</td></tr>
+      <tr><td>Radix (LSD)</td><td>Θ(d(n+b))</td><td>Θ(d(n+b))</td><td>Θ(d(n+b))</td><td>Θ(n+b)</td><td>yes</td><td>—</td><td>fixed-width keys</td></tr>
+    </tbody>
+  </table></div>
+  <p>* with the "already ordered halves" shortcut, sorted input is Θ(n). ** pdqsort detects sorted and some patterned inputs.</p>
+  <p>Limits of the search patterns: binary search requires random access and a monotone predicate; it is pointless on linked lists and wrong on non-monotone predicates. Sliding windows require monotone window validity. Two pointers on pairs require sorted input or a monotone relationship — sorting first costs Θ(n log n) and destroys original indices (store index pairs if you need them).</p>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+  <h3>11.1 Sort once vs hash</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Problem</th><th>Sort-based</th><th>Hash-based</th><th>Prefer</th></tr></thead>
+    <tbody>
+      <tr><td>Duplicates</td><td>Θ(n log n), Θ(1) extra</td><td>Θ(n) expected, Θ(n) extra</td><td>hash unless memory-bound</td></tr>
+      <tr><td>Two Sum (return indices)</td><td>sort pairs + two pointers</td><td>one-pass map</td><td>hash</td></tr>
+      <tr><td>3Sum (unique triplets)</td><td>sort + two pointers, easy dedupe</td><td>awkward dedupe</td><td>sort</td></tr>
+      <tr><td>Join two large datasets</td><td>sort-merge join (streams, pre-sorted inputs)</td><td>hash join (fits in memory)</td><td>depends: DBs choose by statistics</td></tr>
+      <tr><td>Range / k-th / percentile queries</td><td>sorted array + binary search</td><td>not possible</td><td>sort</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>11.2 Window vs prefix sums vs deque</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A["Contiguous subarray or substring question"] --> B{"Validity monotone when growing or shrinking?"}
+  B -- yes --> C{"Need window max or min?"}
+  C -- yes --> D["Sliding window + monotonic deque"]
+  C -- no --> E["Sliding window with counts or sum"]
+  B -- no --> F{"Sum or count condition?"}
+  F -- yes --> G["Prefix sums + hash map (or monotonic deque on prefixes)"]
+  F -- no --> H["Consider DP or brute force with pruning"]
+  B -- "exactly k" --> I["atMost(k) minus atMost(k-1)"]
+</pre>
+    <figcaption>Figure 3.12 — Choosing among window, prefix-sum and deque techniques.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> start from monotonicity; the "exactly k" branch converts a non-monotone requirement into two monotone ones. If neither windows nor prefix sums fit, the problem often needs dynamic programming (Chapter 7).</p>
+
+  <h3>11.3 Closed vs half-open binary search</h3>
+  <p>Half-open [lo, hi) with "first true" is the most reusable; closed [lo, hi] with early return suits exact-match searches like the rotated-array search. <span class="tag opinion">Opinion</span> Use one template for boundaries and one for exact matches, and never improvise mid-interview.</p>
+
+  <h3>11.4 Library sort vs hand-written</h3>
+  <p>Always use the library in production: it is adaptive, guarded against worst cases, and tuned. Hand-write only distribution sorts for specialised keys (e.g. radix-sorting 10⁸ 64-bit IDs where profiling shows sort dominates), or when you need partial results (top-k with a heap, selection with quickselect).</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes</h2>
+  <ul>
+    <li><strong>Comparator overflow</strong>: <code>(a, b) -&gt; a - b</code> overflows for large magnitudes (e.g. <code>Integer.MIN_VALUE - 1</code>), producing wrong orders and "Comparison method violates its general contract!". Use <code>Integer.compare</code> or <code>Comparator.comparingInt</code>.</li>
+    <li><strong>Inconsistent comparators</strong>: comparing doubles with <code>&lt;</code> while NaNs exist, or random tie-breakers, break transitivity.</li>
+    <li><strong>Assuming stability</strong> from a quicksort-based sort (Go's <code>sort.Slice</code>, C++ <code>std::sort</code>), then seeing equal-key records shuffle.</li>
+    <li><strong>Binary search loops that never terminate</strong>: <code>lo = mid</code> with <code>mid = (lo + hi) / 2</code> when hi = lo + 1. If you must use <code>lo = mid</code>, round mid up.</li>
+    <li><strong>Midpoint overflow</strong> and <strong>predicate overflow</strong> (§7.2: <code>r * r</code>), and summing capacities into an <code>int</code> in feasibility checks.</li>
+    <li><strong>Non-monotone predicates</strong> on answer-space search (e.g. "can split into exactly k parts") — reformulate as "at most k parts".</li>
+    <li><strong>Wrong search bounds</strong>: for minimum ship capacity, lo must be max(weight) (each package must fit), not 1; hi is sum(weights).</li>
+    <li><strong>Sliding window with negatives</strong>: shrinking assumes removing an element lowers the sum.</li>
+    <li><strong>Not updating the answer at the right moment</strong>: longest problems update after shrinking; shortest problems update inside the shrink loop.</li>
+    <li><strong>Losing original indices</strong> after sorting in problems that ask for positions.</li>
+    <li><strong>3Sum duplicate handling</strong>: skip equal values for the fixed element and after each found triple, or results repeat.</li>
+    <li><strong>Python <code>key</code> vs <code>cmp</code></strong>: Python 3 has no <code>cmp=</code>; use <code>functools.cmp_to_key</code> for pairwise comparisons such as "largest number" ordering.</li>
+    <li><strong>Sorting inside loops</strong>: re-sorting a list on every insertion is Θ(n² log n); use a heap, <code>TreeMap</code>, or <code>bisect.insort</code>.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <ul>
+    <li><strong>Sort in the database when you can</strong> — with an index, the database returns rows in order without sorting at all. If you must sort in the app, page through data with keyset pagination rather than loading everything.</li>
+    <li><strong>Memory</strong>: TimSort needs up to n/2 extra references; sorting a 50-million-element <code>List</code> allocates hundreds of MB transiently. Sort primitive arrays or IDs where possible.</li>
+    <li><strong>Parallel sorting</strong>: <code>Arrays.parallelSort</code> and parallel streams' <code>sorted()</code> use the common ForkJoinPool; in a server, that pool is shared with other work — measure before adopting.</li>
+    <li><strong>Algorithmic complexity attacks</strong>: deterministic-pivot quicksorts can be driven quadratic by adversarial input; standard libraries guard with introsort/heapsort fallbacks, hand-rolled code often does not. Regex-based windowed scans have similar ReDoS risks.</li>
+    <li><strong>Locale-aware string sorting</strong>: <code>String.compareTo</code> compares UTF-16 code units, not human collation. Use <code>java.text.Collator</code> (or ICU4J) for user-facing ordering, and keep database collations consistent with application sorting.</li>
+    <li><strong>Time windows in distributed systems</strong>: event-time vs processing-time windows, late data and watermarks (Flink, Kafka Streams grace periods) — sliding windows on clocks you do not control.</li>
+    <li><strong>Monitoring</strong>: log and alert on slow queries with external sorts (PostgreSQL <code>log_temp_files</code>), track batch job durations against input size to catch complexity regressions.</li>
+  </ul>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises: Problem Ladders</h2>
+  <p>Paraphrased problems with common names. Each solution is a full Java class with self-checks.</p>
+
+  <h3>14.1 Ladder A — Binary search</h3>
+  <div class="callout insight"><p class="callout-title">How to recognise binary search</p>
+  <ul>
+    <li>Sorted (or rotated-sorted) input and a target, a first/last position, or an insertion point.</li>
+    <li>"Minimum X such that…" / "maximum X such that…" where checking a given X is easy and the condition is monotone in X.</li>
+    <li>Constraints with huge value ranges (10⁹, 10¹⁸) but a cheap check — log(range) ≈ 30–60 iterations.</li>
+    <li>"k-th smallest" in a structured space (sorted matrix, pair distances, multiplication table) → binary search the value and count elements ≤ it.</li>
+    <li>Requirement of O(log n) time.</li>
+  </ul></div>
+
+  <div class="exercise">
+    <p class="exercise-title">A1 · Easy — "Search Insert Position"</p>
+    <p>Return the index of a target in a sorted array of distinct integers, or where it would be inserted.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> this is exactly lower_bound. Θ(log n).</p>
+<pre data-file="BA1SearchInsert.java"><code class="language-java">class BA1SearchInsert {
+    static int searchInsert(int[] a, int x) {
+        int lo = 0, hi = a.length;
+        while (lo &lt; hi) { int mid = (lo + hi) &gt;&gt;&gt; 1; if (a[mid] &gt;= x) hi = mid; else lo = mid + 1; }
+        return lo;
+    }
+    public static void main(String[] args) {
+        int[] a = {1, 3, 5, 6};
+        if (searchInsert(a, 5) != 2 || searchInsert(a, 2) != 1 || searchInsert(a, 7) != 4 || searchInsert(a, 0) != 0) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">A2 · Medium — "Find First and Last Position of Element"</p>
+    <p>In a sorted array with duplicates, return [first, last] index of a target or [−1, −1], in O(log n).</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> first = lowerBound(x); last = upperBound(x) − 1; check presence. Two searches, Θ(log n). A linear expansion from any found index is Θ(n) for arrays full of the target — the trap the problem sets.</p>
+<pre data-file="BA2FirstLast.java"><code class="language-java">import java.util.Arrays;
+
+class BA2FirstLast {
+    static int bound(int[] a, int x, boolean strict) {          // strict: first &gt; x, else first &gt;= x
+        int lo = 0, hi = a.length;
+        while (lo &lt; hi) {
+            int mid = (lo + hi) &gt;&gt;&gt; 1;
+            if (strict ? a[mid] &gt; x : a[mid] &gt;= x) hi = mid; else lo = mid + 1;
+        }
+        return lo;
+    }
+    static int[] range(int[] a, int x) {
+        int first = bound(a, x, false);
+        if (first == a.length || a[first] != x) return new int[]{-1, -1};
+        return new int[]{first, bound(a, x, true) - 1};
+    }
+    public static void main(String[] args) {
+        if (!Arrays.equals(range(new int[]{5, 7, 7, 8, 8, 10}, 8), new int[]{3, 4})) throw new AssertionError();
+        if (!Arrays.equals(range(new int[]{5, 7, 7, 8, 8, 10}, 6), new int[]{-1, -1})) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">A3 · Medium — "Search in Rotated Sorted Array" and "Find Minimum in Rotated Sorted Array"</p>
+    <p>Both are implemented in §7.2 (<code>searchRotated</code>, <code>rotatedMin</code>). Re-derive them, then solve the duplicates variant of find-minimum and state its worst case.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> with duplicates, when a[mid] == a[hi] you cannot tell which side holds the minimum (e.g. [1,1,1,0,1] vs [1,0,1,1,1]); decrement hi, which is safe because a[hi] has a copy at mid. Worst case Θ(n) (all equal but one) — no algorithm can do better in the worst case, since every element might be the unique smaller one.</p>
+<pre data-file="BA3RotatedMinDup.java"><code class="language-java">class BA3RotatedMinDup {
+    static int findMin(int[] a) {
+        int lo = 0, hi = a.length - 1;
+        while (lo &lt; hi) {
+            int mid = (lo + hi) &gt;&gt;&gt; 1;
+            if (a[mid] &gt; a[hi]) lo = mid + 1;
+            else if (a[mid] &lt; a[hi]) hi = mid;
+            else hi--;                                     // ambiguous: drop a duplicate
+        }
+        return a[lo];
+    }
+    public static void main(String[] args) {
+        if (findMin(new int[]{2, 2, 2, 0, 1}) != 0 || findMin(new int[]{1, 1, 1, 0, 1}) != 0 || findMin(new int[]{1, 0, 1, 1, 1}) != 0 || findMin(new int[]{3}) != 3)
+            throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">A4 · Medium — "Find Peak Element"</p>
+    <p>In an array where adjacent values differ (and out-of-bounds counts as −∞), return the index of any element larger than its neighbours, in O(log n).</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> if a[mid] &lt; a[mid + 1], a peak exists to the right (climbing must stop before −∞); else at mid or to the left. The predicate "a[i] &gt; a[i+1]" is not monotone over the whole array, but the <em>invariant</em> "[lo, hi] contains a peak" is preserved — binary search works on invariants, not only on sorted data.</p>
+<pre data-file="BA4PeakElement.java"><code class="language-java">class BA4PeakElement {
+    static int peak(int[] a) {
+        int lo = 0, hi = a.length - 1;
+        while (lo &lt; hi) {
+            int mid = (lo + hi) &gt;&gt;&gt; 1;
+            if (a[mid] &lt; a[mid + 1]) lo = mid + 1; else hi = mid;
+        }
+        return lo;
+    }
+    public static void main(String[] args) {
+        int p = peak(new int[]{1, 2, 1, 3, 5, 6, 4});
+        if (p != 1 &amp;&amp; p != 5) throw new AssertionError(p);
+        if (peak(new int[]{1, 2, 3}) != 2) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">A5 · Medium — "Capacity To Ship Packages Within D Days"</p>
+    <p>Packages with given weights must ship in order; each day the ship carries a contiguous prefix of the remaining packages up to its capacity. Find the minimum capacity to finish within D days.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> binary search capacity in [max(w), sum(w)]. Feasibility is a greedy pass: fill each day until the next package would overflow. Monotone: a larger ship never needs more days. Θ(n log(sum)).</p>
+<pre data-file="BA5ShipCapacity.java"><code class="language-java">import java.util.stream.IntStream;
+
+class BA5ShipCapacity {
+    static boolean feasible(int[] w, int days, long cap) {
+        int used = 1; long load = 0;
+        for (int x : w) {
+            if (load + x &gt; cap) { used++; load = 0; }
+            load += x;
+        }
+        return used &lt;= days;
+    }
+    static long minCapacity(int[] w, int days) {
+        long lo = IntStream.of(w).max().orElse(0), hi = IntStream.of(w).asLongStream().sum();
+        while (lo &lt; hi) {
+            long mid = lo + (hi - lo) / 2;
+            if (feasible(w, days, mid)) hi = mid; else lo = mid + 1;
+        }
+        return lo;
+    }
+    public static void main(String[] args) {
+        if (minCapacity(new int[]{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, 5) != 15 || minCapacity(new int[]{3, 2, 2, 4, 1, 4}, 3) != 6) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">A6 · Medium — "Magnetic Force Between Two Balls" (maximise the minimum gap)</p>
+    <p>Place m balls in given basket positions to maximise the minimum distance between any two balls.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> "maximise the minimum" → binary search the answer d, last true of "can place m balls with all gaps ≥ d" (greedy: sort positions, place a ball whenever the gap from the last one is ≥ d). Monotone decreasing in d. Θ(n log n + n log range).</p>
+<pre data-file="BA6MaxMinGap.java"><code class="language-java">import java.util.Arrays;
+
+class BA6MaxMinGap {
+    static int maxDistance(int[] pos, int m) {
+        int[] p = pos.clone();
+        Arrays.sort(p);
+        int lo = 1, hi = p[p.length - 1] - p[0];
+        while (lo &lt; hi) {                                   // last d with canPlace true
+            int mid = lo + (hi - lo + 1) / 2;               // round up because lo = mid
+            if (canPlace(p, m, mid)) lo = mid; else hi = mid - 1;
+        }
+        return lo;
+    }
+    static boolean canPlace(int[] p, int m, int d) {
+        int count = 1, last = p[0];
+        for (int i = 1; i &lt; p.length &amp;&amp; count &lt; m; i++) if (p[i] - last &gt;= d) { count++; last = p[i]; }
+        return count &gt;= m;
+    }
+    public static void main(String[] args) {
+        if (maxDistance(new int[]{1, 2, 3, 4, 7}, 3) != 3 || maxDistance(new int[]{5, 4, 3, 2, 1, 1000000000}, 2) != 999999999) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">A7 · Hard — "Split Array Largest Sum"</p>
+    <p>Split an array of non-negative integers into k non-empty contiguous parts to minimise the largest part sum.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> identical structure to A5: binary search the largest sum S in [max, total], greedy-count how many parts are needed with cap S, feasible iff parts ≤ k (fewer parts can always be split further because every element is a valid part on its own). Θ(n log total). A DP solution exists (Θ(k n²)) — knowing both and why binary search wins is a senior signal.</p>
+<pre data-file="BA7SplitArray.java"><code class="language-java">class BA7SplitArray {
+    static long splitArray(int[] a, int k) {
+        long lo = 0, hi = 0;
+        for (int x : a) { lo = Math.max(lo, x); hi += x; }
+        while (lo &lt; hi) {
+            long mid = lo + (hi - lo) / 2;
+            int parts = 1; long cur = 0;
+            for (int x : a) { if (cur + x &gt; mid) { parts++; cur = 0; } cur += x; }
+            if (parts &lt;= k) hi = mid; else lo = mid + 1;
+        }
+        return lo;
+    }
+    public static void main(String[] args) {
+        if (splitArray(new int[]{7, 2, 5, 10, 8}, 2) != 18 || splitArray(new int[]{1, 2, 3, 4, 5}, 2) != 9 || splitArray(new int[]{1, 4, 4}, 3) != 4) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">A8 · Hard — "Median of Two Sorted Arrays"</p>
+    <p>Find the median of the union of two sorted arrays in O(log(min(m, n))).</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> binary search a partition i of the shorter array A; the partition of B is j = (m + n + 1)/2 − i so the left side holds half the elements. The partition is correct when A[i−1] ≤ B[j] and B[j−1] ≤ A[i] (treat out-of-range as ±∞). If A[i−1] &gt; B[j], i is too large; else too small. The median comes from max(left) and min(right). Θ(log min(m, n)), Θ(1) space.</p>
+<pre data-file="BA8MedianTwoArrays.java"><code class="language-java">class BA8MedianTwoArrays {
+    static double median(int[] a, int[] b) {
+        if (a.length &gt; b.length) return median(b, a);
+        int m = a.length, n = b.length, half = (m + n + 1) / 2, lo = 0, hi = m;
+        while (true) {
+            int i = (lo + hi) &gt;&gt;&gt; 1, j = half - i;
+            long aL = i == 0 ? Long.MIN_VALUE : a[i - 1], aR = i == m ? Long.MAX_VALUE : a[i];
+            long bL = j == 0 ? Long.MIN_VALUE : b[j - 1], bR = j == n ? Long.MAX_VALUE : b[j];
+            if (aL &gt; bR) hi = i - 1;
+            else if (bL &gt; aR) lo = i + 1;
+            else {
+                long leftMax = Math.max(aL, bL);
+                if ((m + n) % 2 == 1) return leftMax;
+                return (leftMax + Math.min(aR, bR)) / 2.0;
+            }
+        }
+    }
+    public static void main(String[] args) {
+        if (median(new int[]{1, 3}, new int[]{2}) != 2.0 || median(new int[]{1, 2}, new int[]{3, 4}) != 2.5 || median(new int[]{}, new int[]{1}) != 1.0) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <h3>14.2 Ladder B — Two pointers</h3>
+  <div class="callout insight"><p class="callout-title">How to recognise two pointers</p>
+  <ul>
+    <li>Sorted input (or you may sort) and a pair/triplet condition on sums or differences.</li>
+    <li>"In place", "O(1) extra space" filtering or compaction of an array.</li>
+    <li>Symmetric checks (palindromes) or "move the worse end" optimisations (container with most water).</li>
+    <li>Merging or intersecting two sorted sequences.</li>
+    <li>Partitioning into classes (Dutch national flag, odd/even, quickselect).</li>
+  </ul></div>
+
+  <div class="exercise">
+    <p class="exercise-title">B1 · Easy — "Move Zeroes"</p>
+    <p>Move all zeros to the end in place, preserving the relative order of non-zero elements.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> write pointer w; copy each non-zero to a[w++]; fill the rest with zeros. One pass, Θ(1) space, stable for non-zeros.</p>
+<pre data-file="TB1MoveZeroes.java"><code class="language-java">import java.util.Arrays;
+
+class TB1MoveZeroes {
+    static void moveZeroes(int[] a) {
+        int w = 0;
+        for (int x : a) if (x != 0) a[w++] = x;
+        Arrays.fill(a, w, a.length, 0);
+    }
+    public static void main(String[] args) {
+        int[] a = {0, 1, 0, 3, 12};
+        moveZeroes(a);
+        if (!Arrays.equals(a, new int[]{1, 3, 12, 0, 0})) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">B2 · Easy — "Squares of a Sorted Array"</p>
+    <p>Given a sorted array (with negatives), return the sorted squares in Θ(n).</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> the largest square is at one of the ends; fill the output from the back with pointers at both ends.</p>
+<pre data-file="TB2SortedSquares.java"><code class="language-java">import java.util.Arrays;
+
+class TB2SortedSquares {
+    static int[] squares(int[] a) {
+        int n = a.length, i = 0, j = n - 1;
+        int[] out = new int[n];
+        for (int k = n - 1; k &gt;= 0; k--) {
+            if (Math.abs(a[i]) &gt; Math.abs(a[j])) { out[k] = a[i] * a[i]; i++; }
+            else { out[k] = a[j] * a[j]; j--; }
+        }
+        return out;
+    }
+    public static void main(String[] args) {
+        if (!Arrays.equals(squares(new int[]{-4, -1, 0, 3, 10}), new int[]{0, 1, 9, 16, 100})) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">B3 · Medium — "3Sum"</p>
+    <p>Return all unique triplets that sum to zero.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> sort; for each i (skipping duplicate values), two-pointer search for −a[i] in the suffix, skipping duplicates after each hit. Early exit when a[i] &gt; 0. Θ(n²) time, Θ(log n)–Θ(n) sort space.</p>
+<pre data-file="TB3ThreeSum.java"><code class="language-java">import java.util.*;
+
+class TB3ThreeSum {
+    static List&lt;List&lt;Integer&gt;&gt; threeSum(int[] nums) {
+        int[] a = nums.clone();
+        Arrays.sort(a);
+        List&lt;List&lt;Integer&gt;&gt; out = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; a.length - 2 &amp;&amp; a[i] &lt;= 0; i++) {
+            if (i &gt; 0 &amp;&amp; a[i] == a[i - 1]) continue;
+            int l = i + 1, r = a.length - 1;
+            while (l &lt; r) {
+                int s = a[i] + a[l] + a[r];
+                if (s &lt; 0) l++;
+                else if (s &gt; 0) r--;
+                else {
+                    out.add(List.of(a[i], a[l], a[r]));
+                    while (l &lt; r &amp;&amp; a[l] == a[l + 1]) l++;
+                    while (l &lt; r &amp;&amp; a[r] == a[r - 1]) r--;
+                    l++; r--;
+                }
+            }
+        }
+        return out;
+    }
+    public static void main(String[] args) {
+        var res = threeSum(new int[]{-1, 0, 1, 2, -1, -4});
+        if (!res.equals(List.of(List.of(-1, -1, 2), List.of(-1, 0, 1)))) throw new AssertionError(res);
+        if (!threeSum(new int[]{0, 0, 0, 0}).equals(List.of(List.of(0, 0, 0)))) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">B4 · Medium — "Container With Most Water"</p>
+    <p>Choose two vertical lines to hold the most water (area = width × shorter height).</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> start at both ends; move the shorter line inward. Exchange argument: any container using the shorter line with a closer partner has smaller width and height ≤ the shorter line, so it cannot beat the current one — the shorter line is "done". Θ(n).</p>
+<pre data-file="TB4MostWater.java"><code class="language-java">class TB4MostWater {
+    static int maxArea(int[] h) {
+        int i = 0, j = h.length - 1, best = 0;
+        while (i &lt; j) {
+            best = Math.max(best, Math.min(h[i], h[j]) * (j - i));
+            if (h[i] &lt; h[j]) i++; else j--;
+        }
+        return best;
+    }
+    public static void main(String[] args) {
+        if (maxArea(new int[]{1, 8, 6, 2, 5, 4, 8, 3, 7}) != 49) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">B5 · Medium — "Sort Colors" (Dutch national flag)</p>
+    <p>Sort an array of 0s, 1s and 2s in one pass and constant space.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> regions [0, lo) = 0, [lo, i) = 1, (hi, n) = 2, [i, hi] unknown. A 0 swaps to lo (both advance); a 2 swaps to hi (only hi moves — the swapped-in value is unexamined); a 1 advances i. This is the 3-way partition from quicksort.</p>
+<pre data-file="TB5SortColors.java"><code class="language-java">import java.util.Arrays;
+
+class TB5SortColors {
+    static void sortColors(int[] a) {
+        int lo = 0, i = 0, hi = a.length - 1;
+        while (i &lt;= hi) {
+            if (a[i] == 0) { int t = a[lo]; a[lo++] = a[i]; a[i++] = t; }
+            else if (a[i] == 2) { int t = a[hi]; a[hi--] = a[i]; a[i] = t; }
+            else i++;
+        }
+    }
+    public static void main(String[] args) {
+        int[] a = {2, 0, 2, 1, 1, 0};
+        sortColors(a);
+        if (!Arrays.equals(a, new int[]{0, 0, 1, 1, 2, 2})) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">B6 · Hard — "Trapping Rain Water" with O(1) space</p>
+    <p>Same problem as Chapter 2's stack version; now use two pointers and constant memory.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> water at i = min(maxLeft, maxRight) − h[i]. Keep running maxima from both ends; whichever side has the smaller running max is the binding constraint for its pointer (the other side is guaranteed to have a wall at least that high), so settle that pointer and move it. Θ(n), Θ(1).</p>
+<pre data-file="TB6TrapTwoPointers.java"><code class="language-java">class TB6TrapTwoPointers {
+    static int trap(int[] h) {
+        int i = 0, j = h.length - 1, leftMax = 0, rightMax = 0, water = 0;
+        while (i &lt; j) {
+            leftMax = Math.max(leftMax, h[i]);
+            rightMax = Math.max(rightMax, h[j]);
+            if (leftMax &lt; rightMax) water += leftMax - h[i++];
+            else water += rightMax - h[j--];
+        }
+        return water;
+    }
+    public static void main(String[] args) {
+        if (trap(new int[]{0, 1, 0, 2, 1, 0, 1, 3, 2, 1, 2, 1}) != 6 || trap(new int[]{4, 2, 0, 3, 2, 5}) != 9) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>

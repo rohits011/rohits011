@@ -99,3 +99,640 @@
     <li><strong>Time-to-first-value</strong> for new tenants: sign-up to first AI result &lt; 5 minutes.</li>
   </ul>
 </section>
+
+<section id="internals">
+  <h2>4. Internals: Key Flows</h2>
+  <h3>4.1 Tenant context propagation</h3>
+  <p>Every request carries a tenant identity from the edge to the database:</p>
+  <ol>
+    <li>The edge (API gateway) authenticates either a user JWT (issued by Lumen's IdP, which federates with the tenant's SSO) or an API key. Both resolve to <code>tenant_id</code>, <code>principal_id</code> and the plan. API keys are stored as hashes with a prefix for lookup (<code>lmn_live_ab12…</code>) and map to a tenant and scopes.</li>
+    <li>The edge forwards a signed internal token (short-lived JWT with the <code>tid</code>, <code>sub</code>, <code>plan</code> and <code>scopes</code> claims). Services trust only this token, never a raw <code>X-Tenant-Id</code> header.</li>
+    <li>Each Spring Boot service puts the tenant into a <code>TenantContext</code> (a request-scoped bean; a <code>ScopedValue</code> where available) and into the MDC for logs. OpenTelemetry baggage carries <code>tenant.id</code> to downstream spans.</li>
+    <li>When a database connection is checked out for a transaction, the service runs <code>SET LOCAL app.tenant_id = '…'</code>. PostgreSQL <strong>row-level security</strong> policies compare every row's <code>tenant_id</code> with that setting. A query that forgot its <code>WHERE</code> clause returns only the current tenant's rows, and a query without the setting returns nothing.</li>
+  </ol>
+
+  <h3>4.2 An AI request through the gateway</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant App as workflow-service
+  participant GW as llm-gateway (Go)
+  participant RL as Redis (limits, budgets)
+  participant PC as Plan cache
+  participant P as Provider (primary)
+  participant P2 as Provider (fallback)
+  participant K as Kafka usage topic
+  App->>GW: POST /v1/messages (internal JWT: tid, plan, feature)
+  GW->>PC: entitlements(tid) (cached 60s)
+  GW->>RL: EVAL token_bucket(tid:rpm), reserve(tid:credits, estimate)
+  RL-->>GW: allowed, reservation r-91
+  GW->>P: forward (tenant-safe headers, org key from vault)
+  alt 429 or 5xx from primary
+    GW->>P2: retry on fallback model per plan policy
+    P2-->>GW: stream
+  else ok
+    P-->>GW: stream (SSE)
+  end
+  GW-->>App: stream passthrough
+  GW->>GW: on end: read usage (input, output, cache tokens)
+  GW->>RL: settle(r-91, actual credits)
+  GW->>K: UsageEvent(id=requestId, tid, model, tokens, credits, feature)
+</pre>
+  <figcaption>Figure 13.1.1 — A model call: entitlement lookup, rate-limit and credit reservation, forward with fallback, settlement and metering.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the gateway <em>reserves</em> an estimated number of credits before calling the provider (based on input token count and <code>max_tokens</code>) and <em>settles</em> to the actual amount afterwards. Without the reservation, 50 concurrent requests from one tenant would all pass a "balance &gt; 0" check and overspend. The usage event is emitted after the stream ends, keyed by a request ID, so a retried emission is deduplicated downstream. The fallback is a plan-level policy. Enterprise tenants with residency requirements never fall back to a provider or region outside their allowed set, so the routing table is part of the tenant's entitlements.</p>
+
+  <h3>4.3 Quotas: two kinds of limit</h3>
+  <ul>
+    <li><strong>Rate limits</strong> (requests per minute, tokens per minute) protect the platform and provide fairness. They use token buckets in Redis, keyed per tenant and per API key, with plan-dependent capacity and refill. Exceeding one returns HTTP 429 with <code>Retry-After</code>.</li>
+    <li><strong>Budget limits</strong> (credits per billing period) protect revenue. They use a balance with reservations. Exceeding one returns an "insufficient credits" error, or allows overage if the plan permits it, in which case it is billed.</li>
+  </ul>
+  <p>Global fairness is a third layer. The gateway holds the provider-side capacity (for example, tokens per minute for each model on the organisation's account) and divides it among plans with weighted fair queuing: Enterprise traffic gets reserved headroom and Free traffic is shed first under pressure.</p>
+
+  <h3>4.4 The metering pipeline</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  GW["llm-gateway"] -->|UsageEvent| K1[("Kafka usage.raw")]
+  DOC["doc-processor"] -->|UsageEvent| K1
+  STO["storage sampler (hourly)"] -->|UsageEvent| K1
+  K1 --> DD["dedupe + enrich (Kafka Streams, EOS)"]
+  DD --> K2[("usage.clean")]
+  K2 --> AGG["hourly aggregates per tenant, meter"]
+  AGG --> PG[("Postgres usage_hourly")]
+  K2 --> LAKE[("Iceberg usage lake")]
+  PG --> BILL["billing-sync (Spring Boot)"]
+  BILL -->|meter events, idempotent| STRIPE["Billing provider"]
+  PG --> DASH["tenant usage dashboards"]
+  LAKE --> FIN["finance: margin and reconciliation"]
+</pre>
+  <figcaption>Figure 13.1.2 — Usage events flow from producers through deduplication to aggregates, billing and the lake.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> raw events are append-only and never mutated. The dedupe stage uses a state store keyed by event ID, with exactly-once semantics in Kafka Streams, so producer retries do not double-bill. Aggregates are written as upserts keyed by <code>(tenant, meter, hour)</code>, so re-processing produces the same numbers. Billing sync sends meter events to the billing provider with an <code>identifier</code> per tenant, meter and hour, which the provider uses for idempotency. The lake copy supports finance analytics and reconciliation against provider invoices. The reconciliation job compares our token totals per model per day with the provider's usage API.</p>
+
+  <h3>4.5 Tenant provisioning</h3>
+  <p>Provisioning is a saga run by the control plane: create the tenant record → create the IdP organisation (SSO connection for Enterprise) → create the billing customer and subscription → allocate the data plane (pooled: insert a row; bridge: create a schema and run migrations; silo: trigger a GitOps pipeline that renders a tenant overlay and waits for health) → seed defaults → mark the tenant <code>ACTIVE</code>. Each step is idempotent and has a compensation (delete the billing customer, and so on). Pooled provisioning finishes in seconds. Silo provisioning can take tens of minutes and is tracked as a long-running operation in the console.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture</h2>
+  <h3>5.1 Control plane and data planes</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  subgraph CP["Control plane (global, Spring Boot)"]
+    TR["tenant-registry"]
+    PL["plans and entitlements"]
+    BS["billing-sync"]
+    IDF["identity federation (OIDC/SAML, SCIM)"]
+    PROV["provisioner (saga + GitOps)"]
+  end
+  subgraph DPEU["Data plane EU (pooled)"]
+    EDGE1["API edge"]
+    SVC1["app services"]
+    GW1["llm-gateway"]
+    PG1[("Postgres pooled + RLS")]
+    R1[("Redis limits")]
+  end
+  subgraph DPUS["Data plane US (pooled + bridge)"]
+    EDGE2["API edge"]
+    SVC2["app services"]
+    GW2["llm-gateway"]
+    PG2[("Postgres pooled")]
+    PG3[("Postgres bridge: schema per tenant")]
+  end
+  subgraph SILO["Silo: tenant acme-bank (dedicated namespace + DB + KMS key)"]
+    SVC3["app services"]
+    GW3["llm-gateway (residency-locked routes)"]
+    PG4[("Postgres dedicated")]
+  end
+  K[("Kafka usage")]
+  CP --> DPEU
+  CP --> DPUS
+  CP --> SILO
+  GW1 --> K
+  GW2 --> K
+  GW3 --> K
+  K --> BS
+</pre>
+  <figcaption>Figure 13.1.3 — One control plane managing pooled, bridged and siloed data planes across regions.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the control plane holds no customer content. It holds tenant metadata, plans and billing state, so it can be global while data planes are regional. A silo runs the same images and charts as the pooled plane with different values (dedicated DB endpoint, KMS key, routing table), which keeps the code path identical. Usage events from every plane converge on one metering pipeline. Events carry the data-plane ID and contain no customer content, only counts.</p>
+
+  <h3>5.2 Data model</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+erDiagram
+  TENANT ||--o{ SUBSCRIPTION : has
+  PLAN ||--o{ SUBSCRIPTION : "priced by"
+  PLAN ||--o{ ENTITLEMENT : grants
+  TENANT ||--o{ API_KEY : issues
+  TENANT ||--o{ USAGE_HOURLY : accrues
+  TENANT ||--o{ CREDIT_LEDGER : "balance from"
+  TENANT {
+    uuid id PK
+    text slug
+    text tenancy_model
+    text data_plane
+    text region
+    text status
+  }
+  PLAN {
+    text code PK
+    int included_credits
+    int rpm
+    int tpm
+    text allowed_models
+  }
+  ENTITLEMENT {
+    text plan_code FK
+    text feature
+    jsonb limits
+  }
+  API_KEY {
+    uuid id PK
+    uuid tenant_id FK
+    text prefix
+    text hash
+    text scopes
+  }
+  USAGE_HOURLY {
+    uuid tenant_id FK
+    text meter
+    timestamptz hour
+    numeric quantity
+  }
+  CREDIT_LEDGER {
+    uuid id PK
+    uuid tenant_id FK
+    text kind
+    numeric amount
+    text reference
+  }
+</pre>
+  <figcaption>Figure 13.1.4 — Control-plane entities for plans, keys, usage and credits.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> credits are a <strong>ledger</strong> (grants, purchases, consumption, adjustments), not a mutable balance column. The balance is a sum, and every change has a reference: an invoice, a usage hour or a support ticket. Redis holds the <em>real-time</em> balance for enforcement and is periodically reconciled against the ledger, which is the source of truth.</p>
+
+  <h3>5.3 Try the rate limiter</h3>
+  <figure class="diagram">
+    <div class="widget" data-widget="rate-limiter"></div>
+    <figcaption>Figure 13.1.5 — Interactive: token bucket vs fixed window vs sliding-window log under bursts.</figcaption>
+  </figure>
+  <p>Set a burst larger than the bucket capacity and compare the algorithms. The token bucket allows a short burst up to its capacity and then a steady rate. That suits AI requests, where a user often fires a few in a row and then pauses. Fixed windows let through up to twice the limit at window edges. The gateway uses token buckets for requests and tokens per minute, and a reservation ledger (not a bucket) for monthly credits.</p>
+
+  <h3>5.4 Technology selection</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Concern</th><th>Choice</th><th>Why</th><th>Alternatives</th></tr></thead>
+    <tbody>
+      <tr><td>Control plane</td><td>Spring Boot 4 services + PostgreSQL</td><td>Transactions, integrations (billing, IdP), team skills</td><td>—</td></tr>
+      <tr><td>Tenant isolation (pooled)</td><td>PostgreSQL RLS with <code>SET LOCAL app.tenant_id</code></td><td>Defence in depth; enforced even for ad-hoc queries</td><td>Hibernate <code>@TenantId</code>/filters only (app-layer only); schema-per-tenant (migration fan-out at scale)</td></tr>
+      <tr><td>LLM gateway</td><td>Custom Go service (or LiteLLM/Envoy AI Gateway extended)</td><td>Streaming proxy performance; custom budget/reservation logic</td><td>Commercial AI gateways; Kong/Envoy with plugins</td></tr>
+      <tr><td>Rate-limit state</td><td>Redis Cluster with Lua scripts, keys hash-tagged by tenant</td><td>Atomic check-and-decrement in one round trip</td><td>In-memory per-node limits (inaccurate under scaling); Envoy global rate-limit service</td></tr>
+      <tr><td>Usage pipeline</td><td>Kafka + Kafka Streams (EOS) + PostgreSQL aggregates + Iceberg</td><td>Replayable, deduplicated, auditable</td><td>Managed metering (OpenMeter, Metronome, Stripe meters directly from producers)</td></tr>
+      <tr><td>Billing</td><td>Stripe Billing with usage meters <span class="tag version">Version-sensitive · checked Nov 2026</span></td><td>Invoices, tax, dunning, credit grants</td><td>Chargebee, Orb, Metronome, Lago (OSS)</td></tr>
+      <tr><td>Identity</td><td>OIDC IdP with organisations (Keycloak, Auth0/Okta CIC, Entra External ID)</td><td>Per-tenant SSO federation and SCIM</td><td>Build your own (don't)</td></tr>
+      <tr><td>Silo provisioning</td><td>Argo CD ApplicationSet + Crossplane/Terraform for DB and KMS</td><td>GitOps audit trail; same charts for all tiers</td><td>Custom operator</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="math">
+  <h2>6. Math: Pricing, Margins and Capacity</h2>
+  <p>All values are <span class="tag illus">Illustrative</span>. Model prices are as listed for the Claude 5.5 family at the time of writing <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+  <h3>6.1 Defining a credit</h3>
+  <p>Customers should not have to understand per-model token prices. Define one <strong>credit</strong> as a fixed amount of COGS plus margin, and convert each request's tokens into credits with per-model weights:</p>
+  \[ \text{credits}(r) = \frac{T_{in}^{\text{uncached}} p_{in} + T_{in}^{\text{cached}} p_{cr} + T_{out} p_{out}}{u} \]
+  <p>where \(u\) is the COGS value of one credit. If a credit sells for $0.01 and the target gross margin on usage is 70%, then \(u = \$0.003\). A typical RAG answer on Sonnet 5.5 (7,000 input tokens, 400 output) costs \(7{,}000 \cdot 2/10^6 + 400 \cdot 10/10^6 = \$0.018\), which is 6 credits. The same answer on Haiku 5.5 costs about \(7{,}000 \cdot 0.1/10^6 + 400 \cdot 0.5/10^6 = \$0.0009\), or 0.3 credits. Publish the per-model credit rates so customers can choose cheaper models, and round up per request to whole tenths of a credit.</p>
+  <h3>6.2 Plan margin under a heavy-tailed workload</h3>
+  <p>Usage per seat is heavy-tailed: a few power users dominate. Suppose a Team plan costs $30 per seat per month and includes 1,500 credits ($4.50 of COGS at \(u\)). If seat usage follows a distribution with mean 900 credits and a 99th percentile of 9,000, then the <em>expected</em> COGS per seat is \(900 \cdot u = \$2.70\), a 91% margin on the seat fee before infrastructure. Without a cap, a 99th-percentile seat costs \(9{,}000 \cdot u = \$27\), nearly the entire fee. Included credits plus metered overage (charged at the credit price) bound the downside: the overage revenue on that seat is \((9{,}000 - 1{,}500) \cdot \$0.01 = \$75\) against \$22.50 of extra COGS.</p>
+  <h3>6.3 Rate-limit sizing</h3>
+  <p>A token bucket has capacity \(b\) (burst) and refill rate \(r\). Over any interval \(t\), a tenant can send at most \(b + rt\) requests. Choose \(r\) from plan throughput and \(b\) from the burst you want to tolerate. For tokens-per-minute limits, charge the bucket with an <em>estimate</em> on admission (input tokens + <code>max_tokens</code>) and refund the difference on completion. Otherwise a tenant that sets <code>max_tokens=64000</code> on many concurrent streams bypasses the limit.</p>
+  <p>Provider capacity allocation: if the organisation's limit on a model is \(C\) tokens per minute and plans have weights \(w_p\) with current demand \(d_p\), weighted max-min fairness allocates \(a_p = \min(d_p, \frac{w_p}{\sum_{q \in A} w_q} C_{\text{remaining}})\), iterating over unsatisfied plans \(A\). In practice, a reserved fraction for Enterprise (say 40%) plus weighted sharing of the remainder is simpler and almost as good.</p>
+  <h3>6.4 Redis and metering capacity</h3>
+  <p>At 2M AI requests per day with a peak factor of 4, peak rate is about \(2{,}000{,}000 / 86{,}400 \cdot 4 \approx 93\) requests/s. Each request makes about 3 Redis script calls (bucket check, reserve, settle), so around 280 ops/s, trivial for Redis. The tighter constraint is <em>hot keys</em>: one large tenant's keys live on one shard. Hash-tag keys by tenant so a tenant's scripts are atomic on one shard, and give very large tenants per-key-type sub-buckets if needed.</p>
+  <p>Usage events: about 2M per day plus storage and document events, around 3M events at about 400 bytes, or 1.2 GB/day raw. Over 13 months of retention in the lake (compressed roughly 5×), that is about 100 GB. Billing aggregates: 20,000 tenants × 5 meters × 24 hours ≈ 2.4M rows per day, which is easy for PostgreSQL with monthly partitions.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code: Source Structure and Key Implementations</h2>
+  <h3>7.1 Source tree</h3>
+<pre class="ascii">
+lumen-platform/
+├── control-plane/
+│   ├── tenant-registry/        (Spring Boot)  TenantController, ProvisioningSaga, EntitlementsApi
+│   ├── billing-sync/           (Spring Boot)  MeterPublisher, CreditLedgerService, WebhookController
+│   └── db/migrations/          V1__tenants.sql V2__plans.sql V3__credit_ledger.sql
+├── data-plane/
+│   ├── platform-starter/       (Spring Boot starter used by every app service)
+│   │   └── TenantContext, TenantFilter, TenantAwareDataSource, TenantBaggage
+│   ├── workflow-service/       (Spring Boot)  AI features calling the gateway
+│   ├── llm-gateway/            (Go)  cmd/gateway, internal/{auth,limits,route,meter,proxy}
+│   └── db/migrations/          V1__pooled_rls.sql
+├── metering/
+│   └── usage-dedupe/           (Kafka Streams, Java)
+├── deploy/
+│   ├── charts/{gateway,workflow-service,...}
+│   ├── tenants/                # GitOps overlays: pooled defaults, bridge/, silo/acme-bank/
+│   └── crossplane/             # Postgres + KMS key compositions for silos
+├── tests/
+│   ├── isolation/              # cross-tenant test suite (runs against every data plane)
+│   └── load/                   # k6: noisy-neighbour scenarios
+└── .github/workflows/
+</pre>
+
+  <h3>7.2 Row-level security in the pooled database</h3>
+<pre data-file="data-plane/db/migrations/V1__pooled_rls.sql"><code class="language-sql">CREATE TABLE workspace_document (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id   uuid NOT NULL,
+  title       text NOT NULL,
+  storage_key text NOT NULL,
+  created_by  uuid NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX ON workspace_document (tenant_id, created_at DESC);   -- tenant_id first in every index
+
+ALTER TABLE workspace_document ENABLE ROW LEVEL SECURITY;
+ALTER TABLE workspace_document FORCE ROW LEVEL SECURITY;           -- applies to the table owner too
+
+-- current_setting(..., true) returns NULL when unset, so unset context matches no rows (fail closed).
+CREATE POLICY tenant_isolation ON workspace_document
+  USING      (tenant_id = current_setting('app.tenant_id', true)::uuid)
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid);
+
+-- The application role cannot bypass RLS; migrations run as a separate owner role.
+CREATE ROLE lumen_app NOLOGIN NOBYPASSRLS;
+GRANT SELECT, INSERT, UPDATE, DELETE ON workspace_document TO lumen_app;</code></pre>
+
+<pre data-file="data-plane/platform-starter/src/main/java/com/lumen/platform/TenantAwareDataSource.java"><code class="language-java">package com.lumen.platform;
+
+import java.lang.reflect.Proxy;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.sql.Statement;
+import javax.sql.DataSource;
+import org.springframework.jdbc.datasource.DelegatingDataSource;
+
+/**
+ * Sets app.tenant_id on every connection checkout and resets it on return to the pool,
+ * so PostgreSQL RLS policies see the current tenant. Missing tenant = no rows (fail closed).
+ */
+public class TenantAwareDataSource extends DelegatingDataSource {
+
+  public TenantAwareDataSource(DataSource target) {
+    super(target);
+  }
+
+  @Override
+  public Connection getConnection() throws SQLException {
+    Connection c = super.getConnection();
+    String tenant = TenantContext.currentOrNull();     // null for system jobs: they use a separate DataSource
+    try (PreparedStatement ps = c.prepareStatement("SELECT set_config('app.tenant_id', ?, false)")) {
+      ps.setString(1, tenant == null ? "" : tenant);
+      ps.execute();
+    }
+    return (Connection) Proxy.newProxyInstance(getClass().getClassLoader(), new Class&lt;?&gt;[]{Connection.class},
+        (proxy, method, args) -&gt; {
+          if (method.getName().equals("close")) {
+            try (Statement s = c.createStatement()) { s.execute("RESET app.tenant_id"); }
+            catch (SQLException ignored) { /* connection is broken; pool will evict it */ }
+          }
+          return method.invoke(c, args);
+        });
+  }
+}</code></pre>
+  <p>An empty string cast to <code>uuid</code> raises an error, so any query without a tenant fails loudly rather than returning data. That is what we want: a background job that forgot to set a tenant is a bug to surface. Jobs that legitimately span tenants (billing aggregation, for example) use a separate DataSource with a role that has its own explicit, audited policies.</p>
+
+<pre data-file="data-plane/platform-starter/src/main/java/com/lumen/platform/TenantFilter.java"><code class="language-java">package com.lumen.platform;
+
+import io.opentelemetry.api.baggage.Baggage;
+import io.opentelemetry.context.Scope;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.slf4j.MDC;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+/** Runs after Spring Security: takes the tenant ONLY from the verified internal JWT. */
+public class TenantFilter extends OncePerRequestFilter {
+  @Override
+  protected void doFilterInternal(HttpServletRequest req, HttpServletResponse res, FilterChain chain)
+      throws java.io.IOException, jakarta.servlet.ServletException {
+    var auth = SecurityContextHolder.getContext().getAuthentication();
+    if (!(auth instanceof JwtAuthenticationToken jwt) || jwt.getToken().getClaimAsString("tid") == null) {
+      res.sendError(401);
+      return;
+    }
+    String tid = jwt.getToken().getClaimAsString("tid");
+    try (var ignored = TenantContext.open(tid);
+         Scope s = Baggage.current().toBuilder().put("tenant.id", tid).build().makeCurrent()) {
+      MDC.put("tenant_id", tid);
+      chain.doFilter(req, res);
+    } finally {
+      MDC.remove("tenant_id");
+    }
+  }
+}</code></pre>
+
+  <h3>7.3 LLM gateway: limits, reservation, proxy and metering (Go)</h3>
+<pre data-file="data-plane/llm-gateway/internal/limits/limits.lua"><code class="language-plaintext">-- KEYS[1] = {tid}:bucket:rpm   KEYS[2] = {tid}:credits   KEYS[3] = {tid}:resv:{requestId}
+-- ARGV: now_ms, capacity, refill_per_ms, est_millicredits, allow_overage(0/1), resv_ttl_s
+local b = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(b[1]) or tonumber(ARGV[2])
+local ts = tonumber(b[2]) or tonumber(ARGV[1])
+tokens = math.min(tonumber(ARGV[2]), tokens + (tonumber(ARGV[1]) - ts) * tonumber(ARGV[3]))
+if tokens &lt; 1 then
+  return {0, 'rate_limited', math.ceil((1 - tokens) / tonumber(ARGV[3]))}
+end
+local balance = tonumber(redis.call('GET', KEYS[2]) or '0')
+local est = tonumber(ARGV[4])
+if balance &lt; est and ARGV[5] == '0' then
+  return {0, 'insufficient_credits', 0}
+end
+redis.call('HSET', KEYS[1], 'tokens', tokens - 1, 'ts', ARGV[1])
+redis.call('PEXPIRE', KEYS[1], 120000)
+redis.call('DECRBY', KEYS[2], est)                       -- reserve; integer milli-credits (may go negative with overage)
+redis.call('SET', KEYS[3], est, 'EX', tonumber(ARGV[6]))  -- remember reservation for settlement
+return {1, 'ok', 0}</code></pre>
+  <p>Credits are stored as integer milli-credits to avoid floating-point drift. The keys share the hash tag <code>{tid}</code>, so the script runs atomically on one Redis Cluster shard. The settle script (omitted) reads the reservation key, applies <code>INCRBY</code> with the difference between estimate and actual, and deletes the key. An expired reservation (gateway crash) is reconciled later from the usage events. The Redis balance itself is periodically re-derived from the credit ledger.</p>
+
+<pre data-file="data-plane/llm-gateway/internal/proxy/handler.go"><code class="language-go">package proxy
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"time"
+
+	"lumen/gateway/internal/auth"
+	"lumen/gateway/internal/limits"
+	"lumen/gateway/internal/meter"
+	"lumen/gateway/internal/route"
+)
+
+type Handler struct {
+	Limits *limits.Limiter
+	Routes *route.Table
+	Meter  *meter.Producer
+	Client *http.Client
+}
+
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	claims, err := auth.InternalClaims(r) // verified internal JWT: tid, plan, feature, sub
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 10&lt;&lt;20))
+	var req struct {
+		Model     string `json:"model"`
+		MaxTokens int    `json:"max_tokens"`
+	}
+	if err := json.Unmarshal(body, &amp;req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	ent := h.Routes.Entitlements(claims.TenantID)
+	if !ent.ModelAllowed(req.Model) {
+		http.Error(w, `{"error":"model_not_in_plan"}`, http.StatusForbidden)
+		return
+	}
+	requestID := r.Header.Get("X-Request-Id")
+	est := ent.EstimateCredits(req.Model, len(body)/4, req.MaxTokens) // rough input estimate; refined on settle
+	dec, err := h.Limits.Admit(r.Context(), claims.TenantID, requestID, ent, est)
+	if err != nil || !dec.Allowed {
+		writeLimitError(w, dec)
+		return
+	}
+
+	start := time.Now()
+	var usage meter.Usage
+	var upstream route.Target
+	for _, target := range h.Routes.Candidates(claims.TenantID, req.Model) { // primary, then plan-approved fallbacks
+		upstream = target
+		resp, err := h.forward(r, target, body)
+		if err != nil || resp.StatusCode == 429 || resp.StatusCode &gt;= 500 {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			slog.WarnContext(r.Context(), "upstream failed, trying fallback", "target", target.Name)
+			continue
+		}
+		usage = streamAndCount(w, resp) // copies SSE to client, parses usage from message_start / message_delta
+		resp.Body.Close()
+		break
+	}
+	credits := ent.Credits(upstream.Model, usage)
+	h.Limits.Settle(r.Context(), claims.TenantID, requestID, est, credits) // refund or charge the difference
+	h.Meter.Emit(meter.Event{
+		ID: requestID, TenantID: claims.TenantID, Principal: claims.Subject, Feature: claims.Feature,
+		Model: upstream.Model, Provider: upstream.Provider, InputTokens: usage.Input,
+		CacheReadTokens: usage.CacheRead, CacheWriteTokens: usage.CacheWrite, OutputTokens: usage.Output,
+		Credits: credits, LatencyMs: time.Since(start).Milliseconds(), At: time.Now().UTC(),
+	})
+}
+
+// streamAndCount relays SSE lines unchanged and extracts token usage from the provider's events.
+func streamAndCount(w http.ResponseWriter, resp *http.Response) meter.Usage {
+	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+	w.WriteHeader(resp.StatusCode)
+	flusher, _ := w.(http.Flusher)
+	var u meter.Usage
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 0, 64*1024), 1&lt;&lt;20)
+	for sc.Scan() {
+		line := sc.Bytes()
+		w.Write(line)
+		w.Write([]byte("\n"))
+		if bytes.HasPrefix(line, []byte("data: ")) {
+			u.Observe(line[6:]) // reads usage fields if present
+		}
+		if len(line) == 0 &amp;&amp; flusher != nil {
+			flusher.Flush()
+		}
+	}
+	return u
+}</code></pre>
+  <p>Omitted for brevity: <code>forward</code> (sets the provider API key from a secret, removes tenant headers, applies timeouts), non-streaming responses, and <code>writeLimitError</code> (429 with <code>Retry-After</code>, or 402-style JSON). One subtlety: if the client disconnects mid-stream, the provider may still bill the generated tokens. The gateway should cancel the upstream request when the client context is cancelled, and meter what the provider reports. <span class="tag version">Version-sensitive · checked Nov 2026</span>: usage fields in streaming events differ between providers, so implement <code>Usage.Observe</code> per provider adapter.</p>
+
+<pre data-file="data-plane/llm-gateway/internal/meter/producer.go"><code class="language-go">package meter
+
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+
+	"github.com/twmb/franz-go/pkg/kgo"
+)
+
+type Producer struct{ cl *kgo.Client }
+
+func NewProducer(brokers []string) (*Producer, error) {
+	cl, err := kgo.NewClient(
+		kgo.SeedBrokers(brokers...),
+		kgo.DefaultProduceTopic("usage.raw"),
+		kgo.RequiredAcks(kgo.AllISRAcks()), // idempotent producer is the franz-go default with acks=all
+		kgo.ProducerLinger(20e6),           // 20ms batching
+	)
+	return &amp;Producer{cl}, err
+}
+
+func (p *Producer) Emit(e Event) {
+	b, _ := json.Marshal(e)
+	rec := &amp;kgo.Record{Key: []byte(e.TenantID), Value: b,
+		Headers: []kgo.RecordHeader{{Key: "event-id", Value: []byte(e.ID)}}}
+	p.cl.Produce(context.Background(), rec, func(r *kgo.Record, err error) {
+		if err != nil {
+			// Never drop usage: spill to a local WAL file and replay on recovery (omitted).
+			slog.Error("usage emit failed; spilling to WAL", "id", e.ID, "err", err)
+		}
+	})
+}</code></pre>
+
+  <h3>7.4 Deduplication with Kafka Streams (exactly-once)</h3>
+<pre data-file="metering/usage-dedupe/src/main/java/com/lumen/metering/DedupeTopology.java"><code class="language-java">package com.lumen.metering;
+
+import java.time.Duration;
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.Topology;
+import org.apache.kafka.streams.kstream.*;
+import org.apache.kafka.streams.processor.api.*;
+import org.apache.kafka.streams.state.*;
+
+public final class DedupeTopology {
+  static final String STORE = "seen-event-ids";
+
+  public static Topology build() {
+    StreamsBuilder b = new StreamsBuilder();
+    b.addStateStore(Stores.windowStoreBuilder(
+        Stores.persistentWindowStore(STORE, Duration.ofDays(7), Duration.ofDays(7), false),
+        Serdes.String(), Serdes.Long()));
+
+    b.stream("usage.raw", Consumed.with(Serdes.String(), UsageSerde.INSTANCE))   // key = tenantId
+        .process(() -&gt; new Processor&lt;String, UsageEvent, String, UsageEvent&gt;() {
+          private WindowStore&lt;String, Long&gt; seen;
+          private ProcessorContext&lt;String, UsageEvent&gt; ctx;
+
+          @Override public void init(ProcessorContext&lt;String, UsageEvent&gt; c) {
+            ctx = c;
+            seen = c.getStateStore(STORE);
+          }
+
+          @Override public void process(Record&lt;String, UsageEvent&gt; rec) {
+            String id = rec.value().id();
+            long now = rec.timestamp();
+            try (var it = seen.fetch(id, now - Duration.ofDays(7).toMillis(), now)) {
+              if (it.hasNext()) return;                    // duplicate within 7 days: drop
+            }
+            seen.put(id, now, now);
+            ctx.forward(rec.withValue(Enrich.withPriceVersion(rec.value())));
+          }
+        }, STORE)
+        .to("usage.clean", Produced.with(Serdes.String(), UsageSerde.INSTANCE));
+    return b.build();
+  }
+}
+// application config: processing.guarantee=exactly_once_v2 so store updates and output commit atomically</code></pre>
+  <p>Because the stream is keyed by tenant, duplicates of one event land in the same partition and therefore the same state store instance. This is why the producer keys by tenant and not by request ID. <code>exactly_once_v2</code> makes "mark as seen" and "emit downstream" atomic, so a crash between them cannot lose or duplicate an event.</p>
+
+  <h3>7.5 Billing sync to the billing provider</h3>
+<pre data-file="control-plane/billing-sync/src/main/java/com/lumen/billing/MeterPublisher.java"><code class="language-java">package com.lumen.billing;
+
+import com.stripe.StripeClient;
+import com.stripe.param.billing.MeterEventCreateParams;
+import java.time.Instant;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+@Component
+class MeterPublisher {
+  private final StripeClient stripe;           // API key from Vault; version-sensitive SDK
+  private final UsageHourlyRepository usage;
+  private final TenantBillingRepository tenants;
+
+  MeterPublisher(StripeClient stripe, UsageHourlyRepository usage, TenantBillingRepository tenants) {
+    this.stripe = stripe; this.usage = usage; this.tenants = tenants;
+  }
+
+  /** Publishes closed hours (now - 2h, to allow late events) that have not been published yet. */
+  @Scheduled(cron = "0 7 * * * *")
+  void publishClosedHours() throws Exception {
+    for (var row : usage.unpublishedClosedHours(Instant.now().minusSeconds(7200))) {
+      var customer = tenants.stripeCustomerId(row.tenantId());
+      var params = MeterEventCreateParams.builder()
+          .setEventName("ai_credits")
+          .putPayload("stripe_customer_id", customer)
+          .putPayload("value", row.quantity().toPlainString())
+          .setTimestamp(row.hour().getEpochSecond())
+          .setIdentifier(row.tenantId() + ":ai_credits:" + row.hour())   // provider-side idempotency
+          .build();
+      stripe.billing().meterEvents().create(params);
+      usage.markPublished(row);                    // same identifier on retry -&gt; provider dedupes
+    }
+  }
+}</code></pre>
+  <p>Late events (arriving after an hour was published) are handled by publishing a separate <em>adjustment</em> event with its own identifier rather than mutating a published hour. The audit trail then reads as an append-only history, which accountants appreciate.</p>
+
+  <h3>7.6 Testing strategy</h3>
+<pre data-file="tests/isolation/src/test/java/com/lumen/isolation/CrossTenantIT.java"><code class="language-java">package com.lumen.isolation;
+
+import static org.assertj.core.api.Assertions.*;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.postgresql.PostgreSQLContainer;   // Testcontainers 2.x package
+
+@SpringBootTest
+@Testcontainers
+class CrossTenantIT {
+  @Container @ServiceConnection
+  static PostgreSQLContainer pg = new PostgreSQLContainer("postgres:17");
+
+  @Autowired JdbcClient jdbc;            // backed by TenantAwareDataSource, role lumen_app
+
+  @Test
+  void tenantSeesOnlyItsRowsEvenWithoutWhereClause() {
+    Fixtures.insertDocs("tenant-a", 3);
+    Fixtures.insertDocs("tenant-b", 5);
+    try (var t = TenantContext.open(Fixtures.id("tenant-a"))) {
+      assertThat(jdbc.sql("SELECT count(*) FROM workspace_document").query(Long.class).single()).isEqualTo(3);
+    }
+  }
+
+  @Test
+  void cannotInsertRowForAnotherTenant() {
+    try (var t = TenantContext.open(Fixtures.id("tenant-a"))) {
+      assertThatThrownBy(() -&gt; jdbc.sql("INSERT INTO workspace_document(tenant_id,title,storage_key,created_by) " +
+              "VALUES (?::uuid,'x','k',gen_random_uuid())").param(Fixtures.id("tenant-b")).update())
+          .hasMessageContaining("row-level security");
+    }
+  }
+
+  @Test
+  void noTenantContextFailsClosed() {
+    assertThatThrownBy(() -&gt; jdbc.sql("SELECT count(*) FROM workspace_document").query(Long.class).single())
+        .isInstanceOf(Exception.class);
+  }
+}</code></pre>
+  <ul>
+    <li><strong>Unit:</strong> credit calculation per model (table-driven, including cache tokens); entitlement checks; Lua script behaviour via Redis Testcontainers (concurrent admits never overspend: fire 200 parallel admits against a balance of 100 and assert ≤ 100 are allowed).</li>
+    <li><strong>Integration (Testcontainers):</strong> the RLS suite above for every table (generated from the schema: any table with <code>tenant_id</code> lacking a policy fails the build); Kafka Streams with <code>TopologyTestDriver</code> for dedupe; billing sync against stripe-mock.</li>
+    <li><strong>Contract:</strong> the usage event schema (Avro in Schema Registry, compatibility BACKWARD) shared by the Go producer and Java consumers; Pact between workflow-service and the gateway.</li>
+    <li><strong>End-to-end:</strong> nightly synthetic tenants on each plan run scripted workloads. A reconciliation check asserts that metered credits equal expected credits computed independently from the requests sent.</li>
+    <li><strong>Load and fairness:</strong> a k6 scenario where tenant A bursts at 20× its limit while 50 small tenants run steady traffic. Assert that small tenants' p95 is within 10% of baseline and A receives 429s.</li>
+    <li><strong>LLM evals:</strong> feature-level eval sets (as in Chapters 8.7 and 8.8) run per model route, including fallback routes, so failover does not silently drop quality.</li>
+  </ul>
+</section>

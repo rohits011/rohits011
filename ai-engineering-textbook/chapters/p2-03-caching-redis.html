@@ -1,0 +1,1124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Caching Strategies &amp; Redis Internals — AI-Era Software Engineering</title>
+<meta name="description" content="Caching layers and patterns, invalidation, stampedes, hot keys, penetration and avalanche, eviction policies, Spring Cache with Caffeine two-level caching, and Redis internals: event loop, encodings, persistence, replication, Sentinel, Cluster, scripting, transactions, streams, eviction and the Valkey fork.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p2-03-caching-redis" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 2 · Chapter 3</p>
+  <h1>Caching Strategies &amp; Redis Internals</h1>
+  <p class="lede">A cache is the cheapest capacity you will ever buy and the most expensive bug you will ever debug. This chapter covers both halves: the strategy (which layer, which pattern, how to invalidate, how to survive stampedes, hot keys, penetration and avalanches) and the machine (how Redis actually stores, expires, evicts, persists, replicates and shards your data), so that your <code>@Cacheable</code> annotations are backed by an engineering argument rather than hope.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> <a href="p2-01-system-design-foundations.html">Chapter 1</a> (latency numbers, percentiles), <a href="p2-02-scaling-traffic.html">Chapter 2</a> (stateless services, Redis + Lua). You have used Spring's <code>@Cacheable</code> and Spring Data Redis.</li>
+    <li><strong>You will be able to:</strong> pick the right caching layer and pattern for a workload; reason about consistency between cache and database including race conditions; prevent stampedes with locking, coalescing and probabilistic early expiration; handle hot keys, penetration and avalanches; choose eviction policies from workload shape; build a Caffeine + Redis two-level cache in Spring with cross-instance invalidation; and explain Redis's threading model, encodings, persistence, replication, Sentinel and Cluster at interview depth.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: Why Caching Is a Design Decision, Not an Annotation</h2>
+  <p>Caching exploits a simple asymmetry: data is read far more often than it changes, and reading it from somewhere close and fast is orders of magnitude cheaper than recomputing or refetching it. From Chapter 1's latency table: a local memory read costs ~100 ns, a Redis round trip in the same zone ~0.3–1 ms, an indexed Postgres query 1–5 ms, a cross-region call ~70 ms, an LLM completion seconds. Every layer you can short-circuit saves the cost of every layer behind it, and also protects those layers from load. In many production systems the database survives only because 95–99% of reads never reach it.</p>
+  <p>That protection is precisely what makes caches dangerous. Once a system depends on a 98% hit ratio, the cache is no longer an optimisation; it is load-bearing. A cache restart, a mass expiry, a deploy that changes key formats, or a single viral key can expose the database to 50x its normal read load in seconds. And because a cache is a second copy of data, every write raises the question of how and when the copy is corrected, which is where most caching bugs live.</p>
+  <p>This chapter is in two halves. The first covers caching as architecture: layers, read and write patterns, invalidation, consistency, and the failure modes (stampede, hot keys, penetration, avalanche) together with their standard mitigations, ending in Spring's cache abstraction and a two-level Caffeine + Redis design. The second half opens Redis: its threading model, internal encodings, expiry and eviction algorithms, persistence, replication, Sentinel, Cluster, scripting, transactions, pub/sub versus streams, and the 2024 licensing change that produced the Valkey fork.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd><code>@EnableCaching</code>, <code>@Cacheable</code>, <code>@CacheEvict</code>, <code>@CachePut</code>; perhaps <code>spring.cache.type=redis</code> with a <code>RedisCacheConfiguration</code> TTL, or Caffeine with <code>spring.cache.caffeine.spec</code>; Hibernate's second-level cache; Spring Data Redis with Lettuce; <code>RedisTemplate</code> and <code>StringRedisTemplate</code>.</dd>
+      <dt>Why that is not enough</dt><dd>The abstraction hides the decisions that matter: what happens on a concurrent miss (100 threads all loading the same key), what happens when a write and a read race around an eviction, how stale is acceptable, whether the cache is per-instance or shared, what the eviction policy does on your access distribution, and how Redis behaves under memory pressure, failover, or resharding. These are the questions asked in design reviews and interviews, and the ones that cause incidents.</dd>
+      <dt>The modern approach</dt><dd>Cache deliberately per data type with explicit staleness budgets; use cache-aside with delete-on-write as the default; protect against stampedes (single-flight loading, early refresh, jittered TTLs); combine a small in-process Caffeine L1 for the hottest keys with a shared Redis/Valkey L2; invalidate from change data capture or events when correctness matters; size and monitor hit ratio, evictions and memory; and treat Redis as a distributed system with its own replication and failure semantics.</dd>
+      <dt>Where Python and Go fit</dt><dd>Go's <code>golang.org/x/sync/singleflight</code> is the canonical request-coalescing primitive and <code>go-redis</code> a widely used client; Python's <code>redis-py</code> (with asyncio support) and <code>functools.lru_cache</code>/<code>cachetools</code> cover the same ground. The patterns are language-independent; §7 shows all three.</dd>
+      <dt>In production</dt><dd>CDN for static and cacheable API responses; Caffeine in each Spring Boot pod; managed Redis or Valkey (ElastiCache, Memorystore, Azure Cache, or self-hosted with Sentinel/Cluster) as a shared tier; invalidation via Kafka/CDC; dashboards for hit ratio, latency, evictions, memory fragmentation and replication lag.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Cache when reads dominate writes, the data tolerates bounded staleness, and recomputation or refetching is expensive. Avoid (or bypass) caching for data that must be strongly consistent per read (balances, inventory at checkout), data with no reuse (unique per request), and as a substitute for fixing an inefficient query you could index.</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="history">
+  <h2>2. History: From CPU Caches to Valkey</h2>
+  <p>Caching is as old as computing: CPU caches (the IBM System/360 Model 85 in 1968 is usually cited as the first commercial machine with a cache), operating-system page caches, and database buffer pools all predate the web. Laszlo Belady's 1966 paper described the optimal (clairvoyant) replacement policy that every practical eviction algorithm approximates.</p>
+  <h3>2.1 Web caches and CDNs (1990s)</h3>
+  <p>HTTP/1.1 (RFC 2068 in 1997, then RFC 2616 in 1999) introduced <code>Cache-Control</code>, <code>ETag</code> and conditional requests, which still govern browser and CDN caching (now specified in RFC 9111, 2022). Akamai, founded in 1998, commercialised content delivery networks: geographically distributed caches that move content close to users.</p>
+  <h3>2.2 Memcached and the cache-aside era (2003–2013)</h3>
+  <p>Brad Fitzpatrick wrote memcached in 2003 for LiveJournal: a simple, multi-threaded, in-memory key-value store with LRU eviction, sharded by clients using hashing. It defined the cache-aside pattern for a generation of web applications and was adopted at enormous scale; Facebook's 2013 NSDI paper <em>Scaling Memcache at Facebook</em> remains the best public account of operating cache-aside across regions, including leases to prevent stampedes and stale sets.</p>
+  <h3>2.3 Redis (2009–2023)</h3>
+  <p>Salvatore Sanfilippo released Redis in 2009: an in-memory data structure server with lists, sets, sorted sets and hashes, optional persistence and replication. Milestones relevant to this chapter: Redis Sentinel for high availability (stable in 2.8, 2013); Redis Cluster with 16,384 hash slots (3.0, 2015); modules and LFU eviction (4.0, 2017); Streams (5.0, 2018); ACLs, TLS and threaded I/O (6.0, 2020); Redis Functions, multi-part AOF and listpack replacing ziplist everywhere (7.0, 2022).</p>
+  <h3>2.4 Licensing change, Valkey and Redis 8 (2024–present)</h3>
+  <p>In March 2024 Redis Ltd. moved Redis from the BSD-3-Clause license to a dual source-available license (RSALv2 and SSPLv1) starting with 7.4; 7.2.4 was the last BSD-licensed release. Within weeks, a group of former contributors and cloud vendors forked 7.2.4 under the Linux Foundation as <strong>Valkey</strong>, keeping the BSD license. Valkey 8.0 (2024) substantially reworked I/O threading, and Valkey 9.0 (GA October 2025) added features such as atomic slot migration, hash field expiration and multiple databases in cluster mode. Major cloud providers now offer managed Valkey (for example, Amazon ElastiCache announced Valkey 9.0 support in May 2026). In May 2025, Redis 8 added the OSI-approved AGPLv3 as a third licensing option alongside RSALv2 and SSPLv1, and folded the previous Redis Stack modules (JSON, search, time series, probabilistic) and a new vector set type into the core distribution; Redis 8.4 (November 2025) and later releases continued that line. <span class="tag version">Version-sensitive · checked Nov 2026</span> For the purposes of this chapter, the internals described apply to both projects unless noted, since they share the 7.2 codebase lineage.</p>
+  <h3>2.5 JVM caches</h3>
+  <p>Ehcache (2003) and Guava's cache (2011) dominated in-process JVM caching until Ben Manes's Caffeine (first released around 2015), whose Window TinyLFU admission policy delivers near-optimal hit ratios. Spring's cache abstraction (Spring 3.1, 2011) made swapping providers a configuration change; Spring Boot auto-configures Caffeine and Redis cache managers.</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals of Caching</h2>
+
+  <h3>3.1 Hit ratio, locality and what makes data cacheable</h3>
+  <p>A cache is worthwhile when the <strong>hit ratio</strong> (fraction of lookups served from cache) is high enough that the saved cost exceeds the cache's own cost and the consistency risk it introduces. Hit ratio depends on <strong>temporal locality</strong> (recently used items are likely to be used again), <strong>popularity skew</strong> (a small fraction of items receives most requests; real workloads are often approximately Zipf-distributed), the <strong>cache size relative to the working set</strong>, the <strong>TTL relative to the re-access interval</strong>, and the <strong>eviction policy</strong>.</p>
+  <p>Data is cacheable when it is read much more often than written, when staleness is tolerable for some bounded time, when it is expensive to produce, and when the same value is requested by many requests (shared) or repeatedly by the same user (per-user, cached closer to them). Personalised responses, rapidly changing counters and one-off queries are poor candidates. A good design review question: "what is the staleness budget for this data, and who decided it?"</p>
+
+  <h3>3.2 The caching layers</h3>
+  <p>Requests pass through several potential caches. Each layer has different scope, latency, capacity and invalidation characteristics.</p>
+  <ul>
+    <li><strong>Client cache</strong> (browser HTTP cache, mobile app storage, SDK memoisation). Controlled by <code>Cache-Control</code> (<code>max-age</code>, <code>no-cache</code>, <code>private</code>, <code>stale-while-revalidate</code>) and validators (<code>ETag</code>/<code>If-None-Match</code> returning 304). Zero network cost on a hit, but you cannot reliably invalidate it: once a response is cached on a device with <code>max-age=3600</code>, it will be used for an hour. Use content-hashed URLs for static assets so new versions get new URLs.</li>
+    <li><strong>CDN / edge cache</strong>. Shared across users in a region, close to them. Excellent for static assets, media and public API responses (product catalogue, public profiles). Supports purge APIs and surrogate keys (tag-based purge) for invalidation. Keys must include everything that varies the response (<code>Vary</code> headers, query parameters, locale); getting this wrong serves one user's content to another.</li>
+    <li><strong>Gateway / reverse-proxy cache</strong> (NGINX <code>proxy_cache</code>, Varnish, Envoy cache filter). Inside your network, shared by all clients; useful for expensive, shared, read-heavy endpoints, and for micro-caching (caching for one or a few seconds) to absorb spikes.</li>
+    <li><strong>Application in-process cache</strong> (Caffeine, Guava, a <code>ConcurrentHashMap</code>). Nanosecond-to-microsecond access, no serialisation, no network. Limited by heap size and duplicated in every instance; each instance has its own copy, so invalidation across instances needs a broadcast, and hit ratio per instance is lower than a shared cache when traffic is spread across many instances.</li>
+    <li><strong>Distributed cache</strong> (Redis, Valkey, Memcached, Hazelcast). Shared by all instances, so one fill serves everyone; scales by sharding; survives application deploys. Costs a network round trip and serialisation, and is itself a system to operate.</li>
+    <li><strong>Database caches</strong>: the buffer pool (PostgreSQL <code>shared_buffers</code> plus the OS page cache; InnoDB buffer pool) caches pages; plan caches and materialised views cache computation. They are automatic and always consistent, which is why adding RAM to a database is often the simplest "cache". MySQL's old query cache was removed in 8.0 precisely because invalidating it on every write to a table scaled poorly.</li>
+  </ul>
+
+  <h3>3.3 Read and write patterns</h3>
+  <p><strong>Cache-aside (lazy loading).</strong> The application checks the cache; on a miss it reads the database and populates the cache; on a write it updates the database and then <em>deletes</em> (invalidates) the cache entry. The cache is a passive store. This is the default for Redis and what Spring's <code>@Cacheable</code>/<code>@CacheEvict</code> implement. Strengths: only requested data is cached; a cache outage degrades to database reads rather than failure; simple. Weaknesses: every miss costs three steps; stale data is possible in races (§3.5); a cold cache sends all traffic to the database.</p>
+  <p><strong>Read-through.</strong> The application asks the cache, and the cache itself loads from the data source on a miss using a configured loader. Caffeine's <code>LoadingCache</code> is read-through; so are some managed caching proxies. The application code is simpler and loading can be coalesced inside the cache. The cache must know how to reach the data source.</p>
+  <p><strong>Write-through.</strong> Writes go to the cache, which synchronously writes to the data source before acknowledging. The cache is always populated with fresh data for written keys. Costs write latency (two writes per write) and caches data that may never be read. Useful when reads immediately follow writes.</p>
+  <p><strong>Write-behind (write-back).</strong> Writes go to the cache and are acknowledged immediately; the cache flushes to the data source asynchronously, often batched and coalesced (ten updates to a counter become one database write). Very low write latency and reduced database load, at the cost of durability risk (writes in the cache are lost if it fails before flushing) and eventual consistency for anyone reading the database directly. Suitable for counters, analytics, view counts, rate-limit state; dangerous for orders and payments.</p>
+  <p><strong>Refresh-ahead.</strong> The cache proactively reloads entries that are about to expire if they are still being accessed, so popular keys never experience a miss. Caffeine's <code>refreshAfterWrite</code> does this: after the refresh interval, the next read returns the current (slightly stale) value immediately and triggers an asynchronous reload. Reduces latency spikes and stampedes on hot keys; wastes work if the prediction is wrong.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Pattern</th><th>Who loads on miss</th><th>Write path</th><th>Staleness</th><th>Failure mode</th></tr></thead>
+    <tbody>
+      <tr><td>Cache-aside</td><td>Application</td><td>DB then delete key</td><td>Brief, race-dependent</td><td>Cache down → DB load spike</td></tr>
+      <tr><td>Read-through</td><td>Cache (loader)</td><td>Usually combined with write-through or invalidation</td><td>Same as cache-aside</td><td>Loader failure surfaces through cache</td></tr>
+      <tr><td>Write-through</td><td>Cache</td><td>Cache and DB synchronously</td><td>Low for written keys</td><td>Higher write latency; partial failure handling</td></tr>
+      <tr><td>Write-behind</td><td>Cache</td><td>Cache now, DB later (batched)</td><td>DB lags cache</td><td>Data loss if cache fails before flush</td></tr>
+      <tr><td>Refresh-ahead</td><td>Cache, proactively</td><td>Independent</td><td>Bounded by refresh interval</td><td>Wasted loads on cold keys</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>3.4 Invalidation and TTLs</h3>
+  <p>There are three ways to keep a cache acceptably fresh:</p>
+  <ul>
+    <li><strong>Time-based expiry (TTL).</strong> Every entry expires after a fixed time. Simple, self-healing (any inconsistency disappears within one TTL), but a trade-off: a short TTL means more misses; a long TTL means more staleness. Pick the TTL from the staleness budget, not from the hit ratio you would like.</li>
+    <li><strong>Explicit invalidation on write.</strong> The writer deletes or updates the cache entry after changing the source of truth. Fresh data quickly, but every write path must remember to invalidate (including batch jobs, admin tools and manual SQL), and multi-key dependencies (a product change affects category pages, search results, recommendation lists) are hard to enumerate.</li>
+    <li><strong>Event-driven / CDC invalidation.</strong> A change-data-capture stream (Debezium reading the database's WAL/binlog, or the database's own CDC) publishes every committed change; a consumer invalidates or updates affected cache keys. Catches all writers, including those that bypass the application, and orders invalidations by commit order. This is how Facebook (via its commit log), Uber's CacheFront and many others keep large caches consistent.</li>
+  </ul>
+  <p>Combine them: explicit or CDC invalidation for freshness, plus a TTL as a safety net so that a missed invalidation heals eventually. Prefer <strong>delete</strong> over <strong>update</strong> on write: deleting is idempotent and avoids writing a value computed from a possibly stale read; the next reader repopulates from the source of truth.</p>
+
+  <h3>3.5 Consistency: the races you must know</h3>
+  <p>A cache plus a database is a tiny distributed system without transactions spanning both, so interleavings matter. Two classic races under cache-aside:</p>
+  <ul>
+    <li><strong>Stale set after delete.</strong> Reader R misses and reads value v1 from the database. Writer W updates the database to v2 and deletes the cache key. R, delayed (GC pause, slow network), now writes v1 into the cache. The cache holds stale v1 until TTL expiry, indefinitely if there is no TTL.</li>
+    <li><strong>Update-cache-then-DB ordering.</strong> If a writer updates the cache before the database and the database write fails or a concurrent writer interleaves, the cache can hold a value that never committed.</li>
+  </ul>
+  <p>Mitigations: always write the database first, then delete the cache; keep TTLs as a backstop; use <strong>leases</strong> or versioned sets (the cache issues a token on a miss, and a later <code>set</code> is accepted only if no delete happened in between; Facebook's memcache leases work this way); use <strong>delayed double delete</strong> (delete, and delete again after a short delay longer than a typical read-populate cycle) as a pragmatic approximation; or set values with a version and use a compare-and-set in Lua that only accepts newer versions. For data that must be linearizable, do not serve it from a cache at all.</p>
+
+  <h3>3.6 Stampede (thundering herd / dog-piling)</h3>
+  <p>When a popular key expires or is evicted, every concurrent request misses at the same moment and all of them go to the database to recompute the same value. For a key read 5,000 times per second whose recomputation takes 200 ms, about 1,000 identical queries hit the database before the first one repopulates the cache (Little's Law again). If the recomputation is expensive, the database slows, recomputation takes longer, and more requests pile up. Three defences:</p>
+  <ul>
+    <li><strong>Locking / single-flight.</strong> Only one caller recomputes; others wait for its result or serve stale. In-process: Caffeine's <code>LoadingCache</code> and <code>@Cacheable(sync = true)</code> ensure one load per key per JVM; Go's <code>singleflight</code> does the same. Across instances: a short Redis lock (<code>SET lock:key token NX PX 5000</code>); losers either wait briefly and re-read or serve a stale copy.</li>
+    <li><strong>Request coalescing at the proxy</strong>. NGINX <code>proxy_cache_lock</code> and CDN "collapsed forwarding" send one request to the origin and make the others wait for its response.</li>
+    <li><strong>Probabilistic early expiration</strong> (also called XFetch, from Vattani, Chierichetti and Lowenstein, VLDB 2015). Each reader, before the actual expiry, decides randomly whether to recompute early, with probability rising as expiry approaches and with how long recomputation takes (§6.4). One reader almost always refreshes a little before expiry, so the herd never forms, with no locks. Serving stale while revalidating (soft TTL plus hard TTL) has a similar effect.</li>
+  </ul>
+
+  <h3>3.7 Hot keys</h3>
+  <p>In a sharded cache, a single key lives on one shard. If one key (a celebrity's profile, a flash-sale product, a global config) receives a large fraction of traffic, its shard saturates (CPU or network) while others idle, and adding shards does not help. Mitigations: an in-process L1 cache in front of Redis for the hottest keys (often the single most effective fix, since it removes network traffic entirely); <strong>key replication</strong> (store <code>product:42#0</code> … <code>product:42#7</code> on different shards and have readers pick one at random; writers update or delete all copies); reading from replicas for hot read-only keys; and detection (Redis <code>--hotkeys</code> scanning with LFU policy, client-side sampling, proxy metrics). Writes to a hot key (a global counter) are a different problem: shard the counter into N sub-counters and sum on read.</p>
+
+  <h3>3.8 Penetration, breakdown and avalanche</h3>
+  <p>Three failure modes are often grouped together, especially in Chinese-language engineering literature where the terms originated:</p>
+  <ul>
+    <li><strong>Cache penetration</strong>: requests for keys that do not exist in the database (random IDs from a scraper or attacker, or a bug) always miss the cache and always hit the database. Fixes: <strong>negative caching</strong> (cache "not found" with a short TTL, e.g. 30–60 s); a <strong>Bloom filter</strong> of all valid IDs checked before the cache (a "definitely not present" answer skips both cache and database; Redis 8 and Valkey both offer Bloom filters, or keep one in memory); input validation and rate limiting.</li>
+    <li><strong>Cache breakdown</strong>: a single hot key expires and the stampede of §3.6 follows. Fixes: as in §3.6, plus never expiring the hottest keys and refreshing them proactively.</li>
+    <li><strong>Cache avalanche</strong>: many keys expire at once (all loaded at startup with the same TTL, or a bulk import), or the whole cache becomes unavailable (node failure, flush, restart), so the database receives a large fraction of all reads simultaneously. Fixes: <strong>TTL jitter</strong> (TTL = base ± random 10–20%); highly available cache tiers (replicas, Cluster); circuit breakers and load shedding in front of the database; gradual warm-up (pre-populate the hottest keys before taking traffic); and capacity planning that knows what the database can serve with a cold cache.</li>
+  </ul>
+
+  <h3>3.9 Eviction policies</h3>
+  <p>When the cache is full, the eviction policy decides what to remove. Belady's optimal policy evicts the item whose next use is furthest in the future; real policies estimate that from history.</p>
+  <ul>
+    <li><strong>FIFO</strong>: evict the oldest inserted. Simple, scan-resistant in a weak sense, ignores popularity. Surprisingly competitive in some recent research variants (e.g. S3-FIFO) that add small probationary queues.</li>
+    <li><strong>LRU</strong> (least recently used): evict the item accessed longest ago. Captures recency; implemented with a hash map plus doubly linked list (Java's <code>LinkedHashMap</code> with access order). Vulnerable to <em>scans</em>: a one-off pass over many items (a report job) flushes the hot set.</li>
+    <li><strong>LFU</strong> (least frequently used): evict the item with the lowest access count. Captures popularity, resists scans, but must <em>age</em> counts or yesterday's hits keep stale items forever, and new items start with low counts and are evicted before they can prove themselves.</li>
+    <li><strong>TinyLFU and W-TinyLFU</strong> (Caffeine): a compact frequency sketch (count-min sketch with periodic halving) acts as an <em>admission</em> filter: a new item replaces the eviction candidate only if it is estimated to be more frequent. A small LRU "window" admits new items so recency bursts still work. Achieves near-optimal hit ratios across many workloads.</li>
+    <li><strong>ARC / 2Q / SLRU</strong>: split the cache into recency and frequency segments and adapt their sizes; widely used in databases and file systems.</li>
+    <li><strong>Random</strong>: evict a random item. No metadata; within a few percent of LRU on many workloads with large caches.</li>
+    <li><strong>TTL-based</strong> (Redis <code>volatile-ttl</code>): evict the key with the nearest expiry first.</li>
+  </ul>
+  <p>Redis implements <em>approximations</em> of LRU and LFU by sampling (§4.4), with policies <code>noeviction</code>, <code>allkeys-lru</code>, <code>allkeys-lfu</code>, <code>allkeys-random</code>, <code>volatile-lru</code>, <code>volatile-lfu</code>, <code>volatile-random</code> and <code>volatile-ttl</code> (the <code>volatile-*</code> ones only evict keys that have a TTL). Use the widget in §5 to compare policies on a Zipf workload.</p>
+
+  <h3>3.10 Spring's cache abstraction and two-level caching</h3>
+  <p>Spring's abstraction intercepts annotated methods via AOP: <code>@Cacheable</code> returns the cached value or invokes and caches; <code>@CachePut</code> always invokes and updates; <code>@CacheEvict</code> removes (optionally <code>allEntries</code> or <code>beforeInvocation</code>); <code>@Caching</code> combines them. Keys are SpEL expressions (<code>key = "#id"</code>), with <code>condition</code> and <code>unless</code> to control what is cached (e.g. <code>unless = "#result == null"</code>, which disables negative caching, often not what you want against penetration). <code>sync = true</code> makes concurrent misses for the same key in one JVM wait for a single load. Because it is proxy-based, self-invocation (calling a <code>@Cacheable</code> method from the same bean) bypasses the cache, and <code>@CacheEvict</code> on a method in a transaction runs when the method returns, possibly <em>before</em> the transaction commits; use <code>TransactionAwareCacheManagerProxy</code> or evict in an <code>@TransactionalEventListener(phase = AFTER_COMMIT)</code> to avoid repopulating from uncommitted state.</p>
+  <p>A <strong>two-level cache</strong> puts a small, short-TTL Caffeine cache (L1) in each instance in front of a shared Redis cache (L2). Reads try L1 (nanoseconds), then L2 (sub-millisecond), then the database. L1 absorbs hot keys and removes most network traffic; L2 provides a shared, larger, deploy-surviving tier. The cost is a new consistency problem: when a value changes, every instance's L1 must be invalidated. The standard solution publishes invalidation messages (Redis pub/sub, Kafka, or Redis client-side caching's tracking invalidations) that each instance subscribes to, with a short L1 TTL (seconds) as a backstop for lost messages. §7 builds this in Spring.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Redis Internals</h2>
+  <p>Redis (and Valkey) is worth understanding at the level of its implementation because most of its operational behaviour (latency spikes, memory surprises, failover data loss, Cluster errors) follows directly from a handful of design choices.</p>
+
+  <h3>4.1 The event loop and I/O threads</h3>
+  <p>Redis executes commands on a <strong>single main thread</strong> running an event loop (its own small library, <code>ae</code>, over epoll/kqueue). The loop waits for readable sockets, reads and parses commands, executes each one to completion against in-memory data structures, buffers replies, and writes them back. Because only one thread touches the data, there are no locks, every command is atomic, and the execution of a command is extremely fast (most are O(1) or O(log n) on in-memory structures, taking microseconds). The consequence is equally direct: <strong>one slow command blocks everybody</strong>. <code>KEYS *</code> on a large database, <code>HGETALL</code> on a million-field hash, <code>SMEMBERS</code> on a huge set, <code>DEL</code> on a huge key, a long Lua script, or a large <code>SORT</code> stalls every other client of that node for its duration. Use <code>SCAN</code>/<code>HSCAN</code>/<code>SSCAN</code> iteration, <code>UNLINK</code> (asynchronous freeing) instead of <code>DEL</code> for large keys, and watch the slow log.</p>
+  <p>For years network I/O (reading sockets, parsing, writing replies) was also on the main thread and became the bottleneck before CPU for command execution did. Redis 6.0 added optional <strong>I/O threads</strong> (<code>io-threads</code>) that parallelise socket reads/writes and protocol parsing while command execution stays single-threaded. Valkey 8.0 redesigned this into an asynchronous model where the main thread hands I/O jobs to I/O threads, with reported throughput improvements on many-core machines, and Redis 8 also reworked its threaded I/O <span class="tag version">Version-sensitive · checked Nov 2026</span>. Background threads (<code>bio</code>) handle lazy freeing, AOF fsync and file closing. Persistence snapshots and AOF rewrites use a <code>fork()</code>ed child process (§4.5).</p>
+  <p>Practical implications: a single Redis process scales to on the order of 100k+ simple operations per second on one core, more with pipelining and I/O threads; to use many cores you run multiple shards (Cluster) rather than one big instance; and latency is excellent until something blocks the loop.</p>
+
+  <h3>4.2 Data structures and their encodings</h3>
+  <p>Every value is a <code>redisObject</code> with a type (string, list, hash, set, sorted set, stream, plus module types) and an <strong>encoding</strong> that Redis chooses and changes transparently to save memory. Small collections use compact, cache-friendly, sequential encodings; once they exceed thresholds they convert to pointer-based structures with better asymptotic complexity. <code>OBJECT ENCODING key</code> shows the current one.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Type</th><th>Compact encoding (small)</th><th>Large encoding</th><th>Conversion thresholds (defaults)</th></tr></thead>
+    <tbody>
+      <tr><td>String</td><td><code>int</code> (64-bit integer stored in the pointer), <code>embstr</code> (object and SDS in one allocation, ≤44 bytes)</td><td><code>raw</code> (separate SDS buffer)</td><td>Length &gt; 44 bytes or modification of an embstr</td></tr>
+      <tr><td>List</td><td><code>listpack</code> (7.2+)</td><td><code>quicklist</code>: doubly linked list of listpack nodes</td><td><code>list-max-listpack-size</code> (default -2 = 8 KB per node)</td></tr>
+      <tr><td>Hash</td><td><code>listpack</code></td><td><code>hashtable</code></td><td><code>hash-max-listpack-entries</code> 128, <code>hash-max-listpack-value</code> 64 bytes</td></tr>
+      <tr><td>Set</td><td><code>intset</code> (all integers), <code>listpack</code> (small, 7.2+)</td><td><code>hashtable</code></td><td><code>set-max-intset-entries</code> 512, <code>set-max-listpack-entries</code> 128</td></tr>
+      <tr><td>Sorted set</td><td><code>listpack</code></td><td><code>skiplist</code> + <code>hashtable</code></td><td><code>zset-max-listpack-entries</code> 128, <code>zset-max-listpack-value</code> 64 bytes</td></tr>
+      <tr><td>Stream</td><td colspan="2">Radix tree (<code>rax</code>) of listpacks holding entries</td><td><code>stream-node-max-bytes</code>, <code>stream-node-max-entries</code></td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li><strong>SDS</strong> (simple dynamic string): Redis's binary-safe string with a header storing length and allocated capacity, so length is O(1) and appends amortise reallocations.</li>
+    <li><strong>listpack</strong>: a single contiguous byte array of variable-length entries, each recording its own length so the list can be walked in both directions. It replaced the older <strong>ziplist</strong>, whose "previous entry length" field could trigger <em>cascading updates</em> (one insertion changing the size of every following entry's header). Lookup in a listpack is O(n), which is fine for 128 small entries because a linear scan of contiguous memory is fast; beyond that the conversion to a hash table or skiplist kicks in.</li>
+    <li><strong>intset</strong>: a sorted array of integers using the smallest width (16, 32 or 64 bits) that fits all members, upgraded when a larger value is inserted; membership by binary search.</li>
+    <li><strong>quicklist</strong>: a linked list of listpack nodes, giving O(1) push/pop at both ends with compact storage; optional LZF compression of interior nodes (<code>list-compress-depth</code>).</li>
+    <li><strong>skiplist</strong>: the sorted-set structure. A probabilistic multi-level linked list where each node is promoted to the next level with probability 1/4 (max 32 levels), giving O(log n) expected insert, delete and rank/range operations; each node also stores span counts so <code>ZRANK</code> is O(log n). A companion hash table maps member to score for O(1) <code>ZSCORE</code>. Redis chose a skiplist over a balanced tree for simpler code and natural range iteration.</li>
+    <li><strong>hashtable</strong> (<code>dict</code>): chained hash table with <em>incremental rehashing</em>: when it grows, Redis keeps two tables and migrates a few buckets on each operation (and in the background cron), so resizing never blocks for long. (Valkey 8.1 replaced the main dictionary implementation with a new, more memory-efficient hash table design <span class="tag version">Version-sensitive · checked Nov 2026</span>.)</li>
+  </ul>
+  <div class="callout tip"><p class="callout-title">Tip: the small-hash memory trick</p><p>Storing millions of tiny objects as individual keys costs per-key overhead (the key's SDS, the <code>redisObject</code>, the dictionary entry, and expiry entry if any; often 50–100 bytes before the value). Bucketing them into hashes that stay within the listpack thresholds (e.g. <code>user:1234</code> → hash <code>users:12</code>, field <code>34</code>) can reduce memory several-fold. The trade-off: per-field TTLs require hash field expiration (available in Redis 7.4+ and Valkey 9.0+), and the bucket hash becomes the unit of cluster placement.</p></div>
+
+  <h3>4.3 Expiry: lazy plus active</h3>
+  <p>Keys with a TTL are recorded in a separate <code>expires</code> dictionary (key → absolute expiry time in milliseconds). Expiry is enforced two ways. <strong>Lazy</strong>: every access checks whether the key has expired and deletes it if so, so an expired key is never returned. <strong>Active</strong>: a periodic cycle (driven by <code>hz</code>, default 10 times per second) samples random keys with TTLs from each database, deletes the expired ones, and repeats while more than a threshold fraction of the sample was expired, bounded by a time budget so it never hogs the loop. Consequence: expired keys that are never accessed are removed gradually and probabilistically, so memory used by expired-but-not-yet-collected keys can be noticeable after mass expiry. Replicas do not expire keys independently; they wait for the primary to send <code>DEL</code> (while hiding logically expired keys from reads), so all replicas converge.</p>
+
+  <h3>4.4 Memory management and approximated LRU/LFU</h3>
+  <p>Redis allocates with jemalloc by default. <code>maxmemory</code> caps the dataset; when a write would exceed it, the <code>maxmemory-policy</code> decides: <code>noeviction</code> returns errors for writes (right for a primary datastore or a rate-limit store), the others evict (§3.9). <strong>Memory fragmentation</strong> (<code>mem_fragmentation_ratio</code> in <code>INFO memory</code> = RSS / used memory) grows when many values of varying sizes are created and freed; <code>activedefrag yes</code> enables online defragmentation with jemalloc.</p>
+  <p>True LRU would need a linked list touched on every access, costing memory and CPU. Redis instead stores a 24-bit clock value in each object (the <code>lru</code> field) and, when it must evict, <strong>samples</strong> <code>maxmemory-samples</code> keys (default 5), adds them to a small <strong>eviction pool</strong> of the best candidates seen so far (16 entries) sorted by idle time, and evicts the best candidate. Larger samples approach true LRU at more CPU cost; with 10 samples the approximation is very close.</p>
+  <p>For LFU (Redis 4.0+), the same 24 bits are split into a 16-bit last-decrement time (minutes) and an 8-bit <strong>logarithmic counter</strong>. The counter is a Morris-style probabilistic counter: on access it increments with probability \(1 / ((\text{counter} - 5) \times \text{lfu-log-factor} + 1)\), so it can represent millions of hits in 8 bits (with the default factor of 10, reaching the maximum of 255 takes on the order of a million accesses). New keys start at 5 so they are not instantly evicted. The counter is decremented over time according to <code>lfu-decay-time</code> (minutes per decrement), so popularity ages. Eviction then samples and evicts the lowest counter. With an LFU policy, <code>redis-cli --hotkeys</code> can report the most frequently accessed keys.</p>
+
+  <h3>4.5 Persistence: RDB, AOF and hybrid</h3>
+  <p><strong>RDB snapshots.</strong> On <code>BGSAVE</code> (or <code>save</code> rules such as "after 3600 s if at least 1 change"), Redis calls <code>fork()</code>. The child process inherits a copy-on-write view of memory and writes a compact binary snapshot to disk while the parent keeps serving. Pages the parent modifies during the snapshot are copied by the kernel, so peak memory can approach double the dataset under heavy writes (plan memory headroom and disable transparent huge pages, which inflate the copy granularity from 4 KB to 2 MB). <code>fork()</code> itself must copy page tables, which can stall the main thread for tens to hundreds of milliseconds on very large instances; this is a classic source of periodic latency spikes. RDB loses everything since the last snapshot on a crash.</p>
+  <p><strong>AOF (append-only file).</strong> Every write command is appended to a log. <code>appendfsync</code> controls durability: <code>always</code> (fsync every write: safest, slowest), <code>everysec</code> (fsync once per second in a background thread: lose up to about a second, the usual choice), <code>no</code> (let the OS decide). The log grows unboundedly, so Redis periodically <strong>rewrites</strong> it (again via fork) into the minimal set of commands that recreate the current state. Since Redis 7.0 AOF is <strong>multi-part</strong>: a base file plus incremental files tracked by a manifest, which avoids the old double-buffering of writes during rewrite.</p>
+  <p><strong>Hybrid.</strong> With <code>aof-use-rdb-preamble yes</code> (the default), the AOF base file is written in RDB format and followed by AOF increments, combining fast restarts with fine-grained durability. For a pure cache, persistence is often disabled entirely (and replicas provide availability); for a datastore, enable AOF <code>everysec</code> plus periodic RDB for backups.</p>
+  <div class="callout warn"><p class="callout-title">Redis is not a durable database by default</p><p>Even with AOF <code>everysec</code>, a primary crash loses up to about one second of acknowledged writes, and asynchronous replication means a failover can lose more (§4.6). If losing acknowledged writes is unacceptable, use a database with synchronous replication, or use <code>WAIT</code>/<code>WAITAOF</code> to block until replicas or local AOF have the write, understanding that this is still not a consensus protocol.</p></div>
+
+  <h3>4.6 Replication</h3>
+  <p>Replication is <strong>asynchronous</strong> primary → replica. A replica connects and sends <code>PSYNC replid offset</code>. Each primary has a replication ID and a monotonically increasing byte offset into its replication stream, and keeps a circular <strong>replication backlog</strong> buffer (<code>repl-backlog-size</code>, default 1 MB; usually far too small for busy primaries). If the replica's offset is still within the backlog, it receives only the missing bytes (<em>partial resync</em>). Otherwise it requires a <em>full resync</em>: the primary forks, produces an RDB (to disk or streamed directly over the socket with <code>repl-diskless-sync</code>), sends it, then streams buffered commands. Full resyncs of large datasets are expensive (fork, bandwidth, replica load time), so size the backlog to cover realistic disconnections: backlog ≥ write throughput × outage duration.</p>
+  <p>Because acknowledgement to the client happens before replicas receive the write, a primary failure can lose writes that clients saw succeed. <code>WAIT numreplicas timeout</code> blocks the client until N replicas acknowledge the offset, narrowing but not closing the window. <code>min-replicas-to-write</code> / <code>min-replicas-max-lag</code> make a primary refuse writes when it cannot see enough up-to-date replicas, bounding how much a partitioned old primary can accept (a split-brain mitigation). Replicas are read-only by default and can serve stale reads.</p>
+
+  <h3>4.7 Sentinel</h3>
+  <p>Redis Sentinel provides high availability for non-clustered deployments. A set of Sentinel processes (at least three, on separate failure domains) monitor a primary and its replicas. When a Sentinel cannot reach the primary for <code>down-after-milliseconds</code>, it marks it <em>subjectively down</em>; when a <em>quorum</em> of Sentinels agree, it is <em>objectively down</em>. The Sentinels then elect a leader among themselves (a Raft-like election by epoch), and the leader promotes the best replica (by priority, replication offset, then run ID), reconfigures the other replicas to follow it, and publishes the new primary address. Clients ask Sentinels for the current primary (Lettuce and Jedis support this natively; Spring Boot via <code>spring.data.redis.sentinel.*</code>). Sentinel cannot prevent loss of asynchronously replicated writes during failover.</p>
+
+  <h3>4.8 Redis Cluster</h3>
+  <p>Redis Cluster shards data across multiple primaries, each with replicas, without a proxy. The keyspace is divided into <strong>16,384 hash slots</strong>; a key's slot is <code>CRC16(key) mod 16384</code>. If the key contains a <strong>hash tag</strong> (<code>{...}</code>), only the substring inside the first braces is hashed, so <code>cart:{user42}</code> and <code>orders:{user42}</code> land in the same slot, enabling multi-key commands, transactions and scripts across them. Each primary owns a set of slots. Nodes exchange state over a <strong>cluster bus</strong> (a separate TCP port) using a gossip protocol: heartbeats carry each node's view of slot ownership and node health; nodes flag peers as <em>PFAIL</em> (possibly failed) and, when a majority of primaries agree, as <em>FAIL</em>, triggering replica promotion by an election among the failed primary's replicas, approved by a majority of primaries using a configuration epoch.</p>
+  <p>Clients are <strong>cluster-aware</strong>: they fetch the slot map (<code>CLUSTER SHARDS</code>, or <code>CLUSTER SLOTS</code> in older versions), compute the slot locally and send each command directly to the owning node. If the map is stale, the node replies with a redirect:</p>
+  <ul>
+    <li><code>-MOVED 3999 10.0.0.12:6379</code>: slot 3999 permanently lives elsewhere now. The client updates its slot map and retries there.</li>
+    <li><code>-ASK 3999 10.0.0.12:6379</code>: slot 3999 is <em>being migrated</em> and this particular key has already moved. The client sends <code>ASKING</code> followed by the command to the target node, once, <em>without</em> updating its map (other keys of that slot may still be on the source).</li>
+  </ul>
+  <p><strong>Resharding</strong> moves slots between nodes: the slot is marked <code>MIGRATING</code> on the source and <code>IMPORTING</code> on the target, keys are moved in batches with <code>MIGRATE</code> (atomic per key, blocking for large keys), and finally slot ownership is reassigned. Recent versions introduced <strong>atomic slot migration</strong> (Valkey 9.0; Redis 8.4's <code>CLUSTER MIGRATION</code>) that moves a whole slot's data using replication-style streaming and switches ownership atomically, avoiding the per-key ASK dance <span class="tag version">Version-sensitive · checked Nov 2026</span>. Limitations of Cluster: multi-key operations only within a slot; one database (DB 0) historically (Valkey 9.0 added multiple databases in cluster mode); asynchronous replication means acknowledged writes can be lost on failover; and a minority partition stops accepting writes after <code>cluster-node-timeout</code>.</p>
+
+  <h3>4.9 Scripting with Lua and Functions</h3>
+  <p><code>EVAL</code>/<code>EVALSHA</code> run a Lua script atomically on the main thread (Chapter 2 used this for rate limiting). Scripts must declare the keys they touch in <code>KEYS</code> (required for Cluster routing). Since 7.0, <strong>Redis Functions</strong> (<code>FUNCTION LOAD</code>, <code>FCALL</code>) let you load named libraries that are persisted and replicated like data, rather than relying on each client to send script bodies or cached SHAs. Keep scripts short; <code>busy-reply-threshold</code> (formerly <code>lua-time-limit</code>, default 5 s) only makes the server start answering <code>BUSY</code> to others; it does not stop the script.</p>
+
+  <h3>4.10 Pipelining and transactions</h3>
+  <p><strong>Pipelining</strong> sends many commands without waiting for each reply, then reads all replies. It removes per-command round-trip latency (100 commands become one RTT instead of 100) and reduces syscalls; it provides <em>no</em> atomicity, since other clients' commands may interleave. Lettuce pipelines automatically because it is asynchronous and multiplexes many in-flight commands on one connection.</p>
+  <p><strong>Transactions</strong>: <code>MULTI</code> starts queuing commands; <code>EXEC</code> executes them all sequentially with no interleaving. There is no rollback: if a command fails at runtime (e.g. wrong type), the others still execute. <code>WATCH key</code> before <code>MULTI</code> gives <strong>optimistic concurrency</strong>: if a watched key is modified by anyone before <code>EXEC</code>, <code>EXEC</code> returns null and nothing runs, and the client retries. For read-modify-write logic, a Lua script is usually simpler and faster than <code>WATCH</code> loops.</p>
+
+  <h3>4.11 Pub/Sub versus Streams</h3>
+  <p><strong>Pub/Sub</strong> is fire-and-forget fan-out: messages published to a channel are pushed to currently connected subscribers and then forgotten. A subscriber that is disconnected, slow (its output buffer exceeds <code>client-output-buffer-limit pubsub</code>, after which it is disconnected) or not yet started misses messages. In Cluster, classic pub/sub broadcasts every message to every node; <strong>sharded pub/sub</strong> (7.0+, <code>SPUBLISH</code>/<code>SSUBSCRIBE</code>) routes channels by slot instead. Good for cache invalidation broadcasts (where a missed message is backstopped by TTL) and ephemeral notifications.</p>
+  <p><strong>Streams</strong> (5.0+) are an append-only log data type: entries with IDs (<code>millisecondsTime-sequence</code>) stored in a radix tree of listpacks. Consumers read by ID (<code>XREAD</code>), can block for new entries, and <strong>consumer groups</strong> (<code>XREADGROUP</code>) distribute entries among consumers with per-consumer pending entries lists, explicit acknowledgement (<code>XACK</code>), and reclaiming of stuck messages (<code>XAUTOCLAIM</code>). Streams are persistent (subject to Redis persistence) and replayable, with length caps (<code>XADD ... MAXLEN ~ 1000000</code>). They are a lightweight alternative to Kafka for modest volumes within one Redis node's memory; Chapter 7 compares them properly.</p>
+
+  <h3>4.12 Client-side caching (tracking)</h3>
+  <p>Redis 6 added server-assisted client-side caching: with <code>CLIENT TRACKING ON</code>, the server remembers which keys a client has read and sends it invalidation messages (over RESP3 push or a redirect connection) when those keys change. This lets a client maintain an L1 cache that is invalidated precisely by the server, which is exactly the two-level design of §3.10 with the invalidation plumbing built in. Lettuce supports it via its client-side caching API; adoption in Spring abstractions is limited, so many teams still use explicit pub/sub invalidation.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture</h2>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  B["Browser / app cache"] --> CDN["CDN edge cache"]
+  CDN --> GW["Gateway micro-cache"]
+  GW --> APP["Spring Boot pod"]
+  APP --> L1["L1: Caffeine (per pod)"]
+  APP --> L2["L2: Redis / Valkey cluster"]
+  APP --> DB[("Database")]
+  DB --> BP["Buffer pool + OS page cache"]
+  DB -. "CDC (WAL / binlog)" .-> INV["Invalidation consumer"]
+  INV -. "DEL keys" .-> L2
+  INV -. "pub/sub broadcast" .-> L1
+  INV -. "purge by surrogate key" .-> CDN
+</pre>
+  <figcaption>Figure 3.1 — Caching layers from client to database, with CDC-driven invalidation.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> each layer is closer to the user (faster, cheaper per hit) but harder to invalidate than the one behind it. The database buffer pool is always consistent; Redis can be invalidated precisely; per-pod Caffeine caches require a broadcast; CDN entries require a purge API; browser caches cannot be invalidated at all once served. The dotted path shows the robust invalidation design: the database's change stream, not application code, drives invalidation, so every writer (including batch jobs and manual fixes) triggers it. Choose for each data type the outermost layer whose invalidation characteristics match its staleness budget.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant R as Reader
+  participant C as Redis
+  participant D as Database
+  participant W as Writer
+  R->>C: GET product:42
+  C-->>R: miss
+  R->>D: SELECT ... id=42
+  D-->>R: v1
+  Note over R: reader pauses (GC, network)
+  W->>D: UPDATE id=42 to v2 (commit)
+  W->>C: DEL product:42
+  R->>C: SET product:42 v1 EX 300
+  Note over C: stale v1 cached until TTL
+</pre>
+  <figcaption>Figure 3.2 — The stale-set race in cache-aside.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the writer did everything right (database first, then delete), yet the cache ends up stale because a slow reader's <code>SET</code> landed after the delete. The window is small but at high traffic it happens. A TTL bounds the damage; leases or version-checked sets eliminate it: on a miss, the reader obtains a token (or reads the row version); the delete invalidates outstanding tokens; the reader's later <code>SET</code> is rejected if its token is invalid or its version is older than the cached one.</p>
+
+  <figure class="diagram">
+  <div class="widget" data-widget="cache-eviction"></div>
+  <figcaption>Figure 3.3 — Interactive: LRU vs LFU vs FIFO hit ratio on a Zipf workload.</figcaption>
+  </figure>
+  <p><strong>What to try:</strong> start with a cache of about 10% of the key space and a strongly skewed (high exponent) Zipf distribution: all policies do well because a few keys dominate, and LFU edges ahead because it protects the most popular keys. Reduce the skew toward uniform: hit ratios fall toward cache size / key space for every policy, showing that no policy can create locality that is not there. Then shrink the cache: the gap between LFU and LRU/FIFO widens, because when space is scarce, keeping the genuinely popular items matters most. Mentally add a scan (a burst of one-off keys): LRU and FIFO would flush the hot set while LFU (and Caffeine's TinyLFU admission) would not, which is why frequency-aware admission is the modern default.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  subgraph Cluster["Redis Cluster: 16384 slots"]
+    P1["Primary A: slots 0-5460"] --- R1["Replica A1"]
+    P2["Primary B: slots 5461-10922"] --- R2["Replica B1"]
+    P3["Primary C: slots 10923-16383"] --- R3["Replica C1"]
+    P1 -. "gossip bus" .- P2
+    P2 -. "gossip bus" .- P3
+    P3 -. "gossip bus" .- P1
+  end
+  CL["Cluster-aware client (slot map cache)"] -- "CRC16(key) mod 16384" --> P2
+  P1 -- "MOVED / ASK redirect" --> CL
+</pre>
+  <figcaption>Figure 3.4 — Redis Cluster topology, slot ownership and client redirection.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> there is no proxy; each client caches the slot-to-node map and talks directly to the owning primary. Primaries gossip health and slot ownership over the cluster bus. When ownership changes (failover or resharding), the first request to the wrong node receives <code>MOVED</code> (update the map) or <code>ASK</code> (one-off redirect during migration). A replica is promoted when a majority of primaries agree its primary has failed, which is why production clusters need at least three primaries: with two, losing one leaves no majority.</p>
+
+  <figure class="diagram">
+  <div class="widget" data-widget="consistent-hashing"></div>
+  <figcaption>Figure 3.5 — Interactive: a hash ring with virtual nodes; keys moved on node add/remove.</figcaption>
+  </figure>
+  <p><strong>What to try:</strong> client-sharded caches (classic memcached deployments, Redis without Cluster behind a client or a proxy such as twemproxy or Envoy's Redis proxy) use consistent hashing to map keys to nodes. Add a node with one virtual node each and observe that only a fraction of keys move, but the load is uneven. Increase virtual nodes to 100+ per server: the distribution evens out and removing a node spreads its keys across all survivors rather than dumping them on one neighbour. Compare with naive <code>hash(key) mod N</code>, where changing N remaps nearly every key and causes a cache-wide miss storm. Redis Cluster's fixed 16,384 slots solve the same problem differently: the key-to-slot mapping never changes, only slot-to-node assignments move.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A["Request for key K"] --> B{"In L1 (Caffeine)?"}
+  B -- "hit" --> Z["Return"]
+  B -- "miss" --> C{"In L2 (Redis)?"}
+  C -- "hit" --> C1["Populate L1"] --> Z
+  C -- "miss" --> D{"Acquire per-key load (single-flight)"}
+  D -- "winner" --> E["Load from DB"]
+  E --> F{"Found?"}
+  F -- "yes" --> G["SET L2 with TTL + jitter, populate L1"] --> Z
+  F -- "no" --> H["Cache negative marker, short TTL"] --> Z
+  D -- "waiter" --> W["Wait for winner's result or serve stale"] --> Z
+</pre>
+  <figcaption>Figure 3.6 — A defensive read path: two levels, single-flight, jitter and negative caching.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> this read path combines the mitigations of §3.6–3.8. L1 absorbs hot keys; single-flight collapses concurrent misses so the database sees one query per key; jittered TTLs prevent synchronised expiry (avalanche); negative caching stops penetration by non-existent IDs. The "serve stale" branch requires keeping a stale copy (soft TTL) beyond the logical expiry; it is the most user-friendly option when the database is struggling.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math of Caching</h2>
+
+  <h3>6.1 Effective latency and load</h3>
+  <p>With hit ratio \(h\), cache latency \(t_c\) and miss latency \(t_m\) (cache check plus backend):</p>
+  \[ \bar{t} = h\,t_c + (1-h)\,t_m \qquad \lambda_{\text{db}} = (1-h)\,\lambda \]
+  <p>With \(t_c = 0.5\) ms, \(t_m = 10\) ms: at \(h = 0.90\), \(\bar t = 1.45\) ms; at \(h = 0.99\), \(\bar t = 0.6\) ms. Database load is what matters more: going from 90% to 99% hit ratio reduces database reads <em>tenfold</em>. Conversely, a drop from 99% to 90% (e.g. after a deploy changes key formats) multiplies database read load by ten. Always ask "what is the miss rate", not "what is the hit rate".</p>
+  <p>Two-level caching: with L1 hit ratio \(h_1\) and L2 hit ratio \(h_2\) (of L1 misses), database traffic is \((1-h_1)(1-h_2)\lambda\) and Redis traffic is \((1-h_1)\lambda\). An L1 with only 50% hit ratio halves Redis traffic and network bandwidth.</p>
+
+  <h3>6.2 Zipf popularity and cache sizing</h3>
+  <p>Under a Zipf distribution with exponent \(s\) over \(N\) items, the \(k\)-th most popular item has probability \(p_k = \frac{k^{-s}}{H_{N,s}}\), where \(H_{N,s} = \sum_{i=1}^{N} i^{-s}\). An ideal cache holding the top \(C\) items has hit ratio</p>
+  \[ h(C) = \frac{H_{C,s}}{H_{N,s}} \]
+  <p>For \(s = 1\), \(H_{n,1} \approx \ln n + 0.577\). With \(N = 10^7\) items and \(C = 10^5\) (1%): \(h \approx \frac{\ln 10^5 + 0.577}{\ln 10^7 + 0.577} \approx \frac{12.09}{16.69} \approx 0.72\). Ten times the cache (10%) gives \(\approx 0.86\). This logarithmic shape is the reason the last few percent of hit ratio are so expensive: each doubling of cache size buys a roughly constant increment of hit ratio.</p>
+
+  <h3>6.3 Stampede size</h3>
+  <p>When a key read at rate \(\lambda_k\) expires and recomputation takes \(T_r\), without protection the expected number of concurrent recomputations is about \(\lambda_k T_r\) (Little's Law). For \(\lambda_k = 2{,}000\)/s and \(T_r = 0.3\) s: 600 identical database queries. With single-flight per instance across \(n\) instances: at most \(n\). With a distributed lock: 1.</p>
+
+  <h3>6.4 Probabilistic early expiration (XFetch)</h3>
+  <p>Store with each value the time \(\delta\) its last recomputation took and its expiry \(t_{exp}\). On each read at time \(t\), recompute early if</p>
+  \[ t - \delta\,\beta \ln(U) \ge t_{exp}, \qquad U \sim \text{Uniform}(0,1] \]
+  <p>Since \(\ln U \le 0\), \(-\delta\beta\ln U\) is a non-negative random "head start", exponentially distributed with mean \(\delta\beta\). Far from expiry, the condition almost never holds; as \(t\) approaches \(t_{exp}\), it becomes likely; and expensive values (large \(\delta\)) start refreshing earlier. \(\beta = 1\) is the default; \(\beta &gt; 1\) refreshes earlier. The result is that, with high probability, exactly one reader refreshes slightly before expiry and no herd forms, with no coordination.</p>
+
+  <h3>6.5 TTL jitter</h3>
+  <p>If \(K\) keys are loaded at once with identical TTL \(T\), they expire in the same instant, producing \(K\) misses at once. With TTL uniform in \([T(1-j), T(1+j)]\), expirations spread over a window of \(2jT\), so the peak miss rate is about \(\frac{K}{2jT}\). For \(K = 10^6\), \(T = 3{,}600\) s, \(j = 0.1\): about 1,400 misses per second instead of a million in one instant.</p>
+
+  <h3>6.6 Redis memory sizing</h3>
+  <p><span class="tag illus">Illustrative</span> 50 million session-like string keys, key ~30 bytes, value ~200 bytes, all with TTL. Per-key overhead (dictionary entry, <code>redisObject</code>, key SDS, expires entry, allocator rounding) is commonly in the range of 50–100 bytes; assume 80. Total ≈ \(5\times10^7 \times (30 + 200 + 80) \approx 15.5\) GB. Add 20–30% for fragmentation and replication/client buffers, and, if persistence uses fork, headroom for copy-on-write under write load. Plan ~22–25 GB of memory per copy; across 3 Cluster shards that is ~8 GB per primary. Measure with <code>MEMORY USAGE key</code> on real data before committing; encoding choices can halve this.</p>
+
+  <h3>6.7 Consistent hashing movement</h3>
+  <p>With \(n\) nodes and well-spread virtual nodes, adding one node moves about \(\frac{1}{n+1}\) of keys (only those that the new node now owns); removing one moves about \(\frac{1}{n}\). Naive modulo hashing moves about \(1 - \frac{1}{n+1}\) of keys when going from \(n\) to \(n+1\) nodes (e.g. 90% for 9 → 10). With \(v\) virtual nodes per server, the standard deviation of load per server is roughly proportional to \(1/\sqrt{v}\), so going from 1 to 100 virtual nodes reduces imbalance about tenfold.</p>
+
+  <h3>6.8 Replication backlog sizing</h3>
+  <p>To allow partial resync after a replica disconnects for up to \(T_d\) seconds while the primary writes \(w\) bytes per second of replication stream: backlog \(\ge w\,T_d\). At 20 MB/s and a 60 s tolerance, at least 1.2 GB. The default 1 MB covers only 50 ms of such a stream, guaranteeing full resyncs on any blip.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code</h2>
+
+  <h3>7.1 Spring Boot: Redis cache with per-cache TTLs, jitter and JSON</h3>
+  <p>Spring Boot 3.2+/4.x with Spring Data Redis 3.2+ supports a TTL function, which we use to add jitter <span class="tag version">Version-sensitive · checked Nov 2026</span>. The example uses the Jackson 2 based <code>GenericJackson2JsonRedisSerializer</code>; Spring Data Redis 4.x (Spring Boot 4) also ships Jackson 3 based serializers and deprecates some Jackson 2 classes, so check the reference documentation for the variant matching your Jackson version.</p>
+<pre data-file="CacheConfig.java"><code class="language-java">package com.example.catalog.cache;
+
+import com.github.benmanes.caffeine.cache.Caffeine;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.cache.RedisCacheConfiguration;
+import org.springframework.data.redis.cache.RedisCacheManager;
+import org.springframework.data.redis.cache.RedisCacheWriter;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.listener.ChannelTopic;
+import org.springframework.data.redis.listener.RedisMessageListenerContainer;
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.RedisSerializationContext.SerializationPair;
+
+import java.time.Duration;
+import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
+
+@Configuration
+@EnableCaching
+public class CacheConfig {
+
+    static final String INVALIDATION_CHANNEL = "cache:invalidate";
+
+    /** TTL = base +/- 10% so keys loaded together do not expire together (avalanche). */
+    static RedisCacheConfiguration withJitteredTtl(Duration base) {
+        return RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl((key, value) -&gt; {
+                    long ms = base.toMillis();
+                    long jitter = (long) (ms * 0.1);
+                    return Duration.ofMillis(ms + ThreadLocalRandom.current().nextLong(-jitter, jitter + 1));
+                })
+                .prefixCacheNameWith("catalog:v3:")         // bump version on incompatible changes
+                .serializeValuesWith(SerializationPair.fromSerializer(new GenericJackson2JsonRedisSerializer()));
+        // Null values are cached by default (as a marker): this is negative caching against penetration.
+    }
+
+    @Bean
+    RedisCacheManager redisCacheManager(RedisConnectionFactory cf) {
+        return RedisCacheManager.builder(RedisCacheWriter.nonLockingRedisCacheWriter(cf))
+                .cacheDefaults(withJitteredTtl(Duration.ofMinutes(10)))
+                .withInitialCacheConfigurations(Map.of(
+                        "products", withJitteredTtl(Duration.ofMinutes(30)),
+                        "prices",   withJitteredTtl(Duration.ofSeconds(60))))
+                .transactionAware()                           // puts/evicts happen after commit
+                .build();
+    }
+
+    @Bean
+    CacheManager cacheManager(RedisCacheManager redis, StringRedisTemplate template) {
+        // Two-level: small, short-lived Caffeine L1 in front of Redis L2
+        return new TwoLevelCacheManager(redis, template,
+                Caffeine.newBuilder().maximumSize(10_000).expireAfterWrite(Duration.ofSeconds(20)));
+    }
+
+    @Bean
+    RedisMessageListenerContainer invalidationListener(RedisConnectionFactory cf, CacheManager cm) {
+        var container = new RedisMessageListenerContainer();
+        container.setConnectionFactory(cf);
+        container.addMessageListener((message, pattern) -&gt;
+                ((TwoLevelCacheManager) cm).onRemoteInvalidation(new String(message.getBody())),
+                new ChannelTopic(INVALIDATION_CHANNEL));
+        return container;
+    }
+}</code></pre>
+
+  <h3>7.2 A two-level cache with cross-instance invalidation</h3>
+<pre data-file="TwoLevelCacheManager.java"><code class="language-java">package com.example.catalog.cache;
+
+import com.github.benmanes.caffeine.cache.Caffeine;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.support.NullValue;
+import org.springframework.cache.support.SimpleValueWrapper;
+import org.springframework.data.redis.cache.RedisCacheManager;
+import org.springframework.data.redis.core.StringRedisTemplate;
+
+import java.util.Collection;
+import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class TwoLevelCacheManager implements CacheManager {
+
+    private final RedisCacheManager l2Manager;
+    private final StringRedisTemplate redis;
+    private final Caffeine&lt;Object, Object&gt; l1Spec;
+    private final Map&lt;String, TwoLevelCache&gt; caches = new ConcurrentHashMap&lt;&gt;();
+
+    public TwoLevelCacheManager(RedisCacheManager l2Manager, StringRedisTemplate redis,
+                                Caffeine&lt;Object, Object&gt; l1Spec) {
+        this.l2Manager = l2Manager;
+        this.redis = redis;
+        this.l1Spec = l1Spec;
+    }
+
+    @Override
+    public Cache getCache(String name) {
+        return caches.computeIfAbsent(name, n -&gt; new TwoLevelCache(n, l1Spec.build(), l2Manager.getCache(n)));
+    }
+
+    @Override
+    public Collection&lt;String&gt; getCacheNames() { return caches.keySet(); }
+
+    /** Message format: cacheName|key  (or cacheName|* to clear). */
+    void onRemoteInvalidation(String msg) {
+        int i = msg.indexOf('|');
+        TwoLevelCache c = caches.get(msg.substring(0, i));
+        if (c == null) return;
+        String key = msg.substring(i + 1);
+        if ("*".equals(key)) c.l1.invalidateAll(); else c.l1.invalidate(key);
+    }
+
+    final class TwoLevelCache implements Cache {
+        private final String name;
+        final com.github.benmanes.caffeine.cache.Cache&lt;Object, Object&gt; l1;
+        private final Cache l2;
+
+        TwoLevelCache(String name, com.github.benmanes.caffeine.cache.Cache&lt;Object, Object&gt; l1, Cache l2) {
+            this.name = name; this.l1 = l1; this.l2 = l2;
+        }
+
+        // Keys are normalised to String so that local and remote invalidation agree.
+        private static String k(Object key) { return String.valueOf(key); }
+
+        @Override public String getName() { return name; }
+        @Override public Object getNativeCache() { return l1; }
+
+        @Override
+        public ValueWrapper get(Object key) {
+            Object v = l1.getIfPresent(k(key));
+            if (v != null) return new SimpleValueWrapper(fromStore(v));
+            ValueWrapper w = l2.get(key);
+            if (w != null) l1.put(k(key), toStore(w.get()));
+            return w;
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public &lt;T&gt; T get(Object key, Class&lt;T&gt; type) {
+            ValueWrapper w = get(key);
+            return w == null ? null : (T) w.get();
+        }
+
+        /** Used by @Cacheable(sync = true): Caffeine coalesces concurrent loads per key in this JVM. */
+        @Override
+        @SuppressWarnings("unchecked")
+        public &lt;T&gt; T get(Object key, Callable&lt;T&gt; loader) {
+            Object v = l1.get(k(key), kk -&gt; toStore(l2.get(key, loader)));
+            return (T) fromStore(v);
+        }
+
+        @Override
+        public void put(Object key, Object value) {
+            l2.put(key, value);
+            l1.put(k(key), toStore(value));
+            publish(k(key));
+        }
+
+        @Override
+        public void evict(Object key) {
+            l2.evict(key);              // L2 first: other pods refilling L1 will now miss through to DB
+            l1.invalidate(k(key));
+            publish(k(key));            // tell other pods to drop their L1 copy
+        }
+
+        @Override
+        public void clear() {
+            l2.clear();
+            l1.invalidateAll();
+            publish("*");
+        }
+
+        private void publish(String key) {
+            redis.convertAndSend(CacheConfig.INVALIDATION_CHANNEL, name + "|" + key);
+        }
+
+        private static Object toStore(Object v) { return v == null ? NullValue.INSTANCE : v; }
+        private static Object fromStore(Object v) { return v == NullValue.INSTANCE ? null : v; }
+    }
+}</code></pre>
+<pre data-file="ProductService.java"><code class="language-java">package com.example.catalog;
+
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class ProductService {
+
+    private final ProductRepository repo;
+
+    public ProductService(ProductRepository repo) { this.repo = repo; }
+
+    // sync = true: one load per key per JVM on concurrent misses (stampede protection)
+    @Cacheable(cacheNames = "products", key = "#id", sync = true)
+    public ProductView find(long id) {
+        return repo.findById(id).map(ProductView::from).orElse(null); // null is cached as a negative entry
+    }
+
+    @Transactional
+    @CacheEvict(cacheNames = "products", key = "#cmd.id()")   // DB first; evict happens after the method
+    public void update(UpdateProduct cmd) {
+        var p = repo.findById(cmd.id()).orElseThrow();
+        p.rename(cmd.name());
+        p.reprice(cmd.price());
+    }
+}</code></pre>
+  <div class="callout java"><p class="callout-title">Spring angle: eviction timing and transactions</p><p><code>@CacheEvict</code> runs after the method returns, but if the transaction commits later (an outer <code>@Transactional</code>), another request could re-populate the cache from the old row in between. The <code>transactionAware()</code> setting on the Redis cache manager defers puts and evicts until after commit for caches it manages directly; for the custom L1 above, or for evictions driven by domain events, use <code>@TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)</code>. For complete coverage of all writers, drive eviction from CDC (Debezium → Kafka → an invalidation consumer).</p></div>
+
+  <h3>7.3 Distributed single-flight with a Redis lock</h3>
+  <p>When recomputation is expensive (a report, an LLM-generated summary, an aggregation over millions of rows), even one recomputation per instance is too many. Use a short lock so only one instance recomputes; others briefly wait and re-read, or serve stale.</p>
+<pre data-file="SingleFlight.java"><code class="language-java">package com.example.catalog.cache;
+
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
+import org.springframework.stereotype.Component;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.UUID;
+import java.util.function.Supplier;
+
+@Component
+public class SingleFlight {
+
+    // Release only if we still own the lock (compare-and-delete must be atomic)
+    private static final RedisScript&lt;Long&gt; RELEASE = RedisScript.of(
+            "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end",
+            Long.class);
+
+    private final StringRedisTemplate redis;
+
+    public SingleFlight(StringRedisTemplate redis) { this.redis = redis; }
+
+    public String getOrCompute(String key, Duration ttl, Duration lockTtl, Supplier&lt;String&gt; compute)
+            throws InterruptedException {
+        for (int attempt = 0; attempt &lt; 50; attempt++) {
+            String cached = redis.opsForValue().get(key);
+            if (cached != null) return cached;
+
+            String lockKey = "lock:" + key;
+            String token = UUID.randomUUID().toString();
+            Boolean won = redis.opsForValue().setIfAbsent(lockKey, token, lockTtl); // SET NX PX
+            if (Boolean.TRUE.equals(won)) {
+                try {
+                    String value = compute.get();
+                    redis.opsForValue().set(key, value, ttl);
+                    return value;
+                } finally {
+                    redis.execute(RELEASE, List.of(lockKey), token);
+                }
+            }
+            Thread.sleep(50 + (long) (Math.random() * 50)); // jittered wait for the winner
+        }
+        return compute.get(); // give up coalescing rather than fail the request
+    }
+}</code></pre>
+  <p>This lock is an <em>efficiency</em> lock (preventing duplicate work), not a <em>correctness</em> lock: if the holder pauses past <code>lockTtl</code>, two computations may run, which is harmless here. Chapter 8 discusses why correctness locks need fencing tokens.</p>
+
+  <h3>7.4 Python: probabilistic early expiration · Go: singleflight with negative caching</h3>
+  <div class="code-tabs">
+<pre data-lang="Python" data-file="xfetch.py"><code class="language-python">"""XFetch (probabilistic early recomputation) on Redis. pip install redis&gt;=5"""
+import json
+import math
+import random
+import time
+from typing import Callable
+
+import redis
+
+r = redis.Redis(decode_responses=True)
+
+
+def xfetch(key: str, ttl_s: int, recompute: Callable[[], object], beta: float = 1.0) -&gt; object:
+    raw = r.get(key)
+    now = time.time()
+    if raw is not None:
+        entry = json.loads(raw)
+        delta, expiry = entry["delta"], entry["expiry"]
+        # -delta*beta*ln(U) is a random head start; ln(U) &lt;= 0
+        if now - delta * beta * math.log(random.random() or 1e-12) &lt; expiry:
+            return entry["value"]
+    start = time.time()
+    value = recompute()
+    delta = time.time() - start
+    entry = {"value": value, "delta": delta, "expiry": time.time() + ttl_s}
+    # keep the physical key a bit longer than the logical expiry so readers still see delta/expiry
+    r.set(key, json.dumps(entry), ex=ttl_s + 60)
+    return value
+
+
+if __name__ == "__main__":
+    def slow_report():
+        time.sleep(0.5)
+        return {"total": 42}
+
+    for _ in range(3):
+        print(xfetch("report:daily", ttl_s=5, recompute=slow_report))</code></pre>
+<pre data-lang="Go" data-file="cache.go"><code class="language-go">// go get github.com/redis/go-redis/v9 golang.org/x/sync/singleflight
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math/rand"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/singleflight"
+)
+
+const notFound = "\x00nf" // negative-cache marker
+
+type Store struct {
+	rdb   *redis.Client
+	group singleflight.Group
+	load  func(ctx context.Context, id string) (string, bool, error) // value, found, err
+}
+
+func jitter(base time.Duration) time.Duration {
+	j := int64(base) / 10
+	return time.Duration(int64(base) + rand.Int63n(2*j+1) - j)
+}
+
+func (s *Store) Get(ctx context.Context, id string) (string, bool, error) {
+	key := "product:" + id
+	if v, err := s.rdb.Get(ctx, key).Result(); err == nil {
+		if v == notFound {
+			return "", false, nil
+		}
+		return v, true, nil
+	} else if !errors.Is(err, redis.Nil) {
+		// Redis down: fall through to the loader (degraded, but available)
+	}
+	// Collapse concurrent misses for the same key in this process into one load.
+	res, err, _ := s.group.Do(key, func() (any, error) {
+		v, found, err := s.load(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			s.rdb.Set(ctx, key, notFound, 30*time.Second) // short negative TTL
+			return "", nil
+		}
+		s.rdb.Set(ctx, key, v, jitter(10*time.Minute))
+		return v, nil
+	})
+	if err != nil {
+		return "", false, err
+	}
+	v := res.(string)
+	return v, v != "", nil
+}
+
+func main() {
+	s := &amp;Store{
+		rdb: redis.NewClient(&amp;redis.Options{Addr: "localhost:6379"}),
+		load: func(ctx context.Context, id string) (string, bool, error) {
+			time.Sleep(100 * time.Millisecond) // pretend DB
+			if id == "missing" {
+				return "", false, nil
+			}
+			return `{"id":"` + id + `","name":"Widget"}`, true, nil
+		},
+	}
+	ctx := context.Background()
+	fmt.Println(s.Get(ctx, "42"))
+	fmt.Println(s.Get(ctx, "missing"))
+}</code></pre>
+  </div>
+
+  <h3>7.5 Looking inside Redis with redis-cli</h3>
+<pre data-file="redis-cli session"><code class="language-bash"># Encodings change with size
+127.0.0.1:6379&gt; HSET user:1 name ada lang java
+127.0.0.1:6379&gt; OBJECT ENCODING user:1
+"listpack"
+127.0.0.1:6379&gt; SADD ids 1 2 3
+127.0.0.1:6379&gt; OBJECT ENCODING ids
+"intset"
+127.0.0.1:6379&gt; MEMORY USAGE user:1
+(integer) 72                      # bytes, including overhead; varies by version
+
+# Cluster slot of a key; hash tags pin related keys together
+127.0.0.1:6379&gt; CLUSTER KEYSLOT cart:{user42}
+127.0.0.1:6379&gt; CLUSTER KEYSLOT orders:{user42}       # same slot as above
+
+# Optimistic transaction: retry if balance changes between WATCH and EXEC
+127.0.0.1:6379&gt; WATCH credits:{t1}
+127.0.0.1:6379&gt; GET credits:{t1}
+"100"
+127.0.0.1:6379&gt; MULTI
+127.0.0.1:6379(TX)&gt; DECRBY credits:{t1} 30
+127.0.0.1:6379(TX)&gt; XADD ledger:{t1} * op debit amount 30
+127.0.0.1:6379(TX)&gt; EXEC          # (nil) if credits:{t1} was modified by someone else
+
+# Diagnostics
+127.0.0.1:6379&gt; INFO memory        # used_memory, mem_fragmentation_ratio, maxmemory_policy
+127.0.0.1:6379&gt; INFO stats         # keyspace_hits, keyspace_misses, evicted_keys, expired_keys
+127.0.0.1:6379&gt; SLOWLOG GET 10
+127.0.0.1:6379&gt; LATENCY DOCTOR
+
+# Pipelining from the shell: 100k SETs in a few round trips
+$ for i in $(seq 1 100000); do echo "SET k:$i v"; done | redis-cli --pipe
+
+# Find big and hot keys without blocking (uses SCAN)
+$ redis-cli --bigkeys
+$ redis-cli --hotkeys               # requires an LFU maxmemory-policy</code></pre>
+
+  <h3>7.6 Configuration: cache node versus datastore node</h3>
+  <div class="code-tabs">
+<pre data-lang="Cache node" data-file="redis-cache.conf"><code class="language-plaintext"># Pure cache: lose everything on restart is acceptable; replicas give availability
+maxmemory 12gb
+maxmemory-policy allkeys-lfu       # popularity-aware eviction for skewed workloads
+maxmemory-samples 10               # closer approximation, slightly more CPU
+save ""                            # no RDB snapshots
+appendonly no
+lazyfree-lazy-eviction yes         # free evicted values in a background thread
+lazyfree-lazy-expire yes
+io-threads 4                       # parallel socket I/O on multi-core hosts
+activedefrag yes</code></pre>
+<pre data-lang="Datastore node" data-file="redis-store.conf"><code class="language-plaintext"># Rate-limit state, sessions, queues: must not silently drop keys
+maxmemory 12gb
+maxmemory-policy noeviction        # errors instead of losing data; alert on memory
+appendonly yes
+appendfsync everysec               # lose at most ~1 s on crash
+aof-use-rdb-preamble yes           # hybrid: fast restart
+save 3600 1 300 100                # periodic RDB for backups
+repl-backlog-size 512mb            # allow partial resync after short disconnects
+min-replicas-to-write 1            # refuse writes if no replica is within lag bound
+min-replicas-max-lag 10</code></pre>
+  </div>
+</section>
+
+<section id="applications">
+  <h2>8. Real-World Applications</h2>
+  <ul>
+    <li><strong>Read-heavy catalogues and profiles</strong>: product pages, user profiles and configuration are cached with cache-aside in Redis, plus Caffeine for the hottest items; CDN caching for anonymous traffic.</li>
+    <li><strong>Session and token stores</strong>: Spring Session, OAuth token introspection results and JWKS keys cached in Redis or locally.</li>
+    <li><strong>Rate limiting, counters and leaderboards</strong>: Redis's atomic <code>INCR</code>, Lua scripts and sorted sets (<code>ZADD</code>/<code>ZREVRANGE</code> with <code>WITHSCORES</code>) make it the default for limiters (Chapter 2), real-time counters and rankings.</li>
+    <li><strong>Feeds and timelines</strong>: precomputed (fan-out-on-write) timelines stored as capped Redis lists or sorted sets per user, with hybrid fan-out-on-read for accounts with huge follower counts (Chapter 5's celebrity problem).</li>
+    <li><strong>Lightweight queues and streams</strong>: Redis Streams with consumer groups for modest-volume job queues and event fan-out within one service domain.</li>
+    <li><strong>Distributed coordination</strong>: short-lived locks for deduplicating work, idempotency-key stores with TTL for API requests, and feature-flag caches.</li>
+    <li><strong>AI systems</strong>: caching LLM responses for identical prompts (exact-match caches keyed by a hash of model + parameters + prompt), <em>semantic caches</em> keyed by embedding similarity (with care: a semantically similar question may need a different answer), embedding caches to avoid recomputing vectors, and vector search inside Redis 8/Valkey modules for small to medium corpora. Part 8 covers these in depth.</li>
+    <li><strong>Database offload during migrations</strong>: caches absorb read traffic while a database is being resharded or upgraded, buying time and headroom.</li>
+  </ul>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+
+  <h3>9.1 Facebook: scaling memcache with leases and invalidation streams</h3>
+  <p><span class="tag fact">Verified</span> <a href="https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala"><em>Scaling Memcache at Facebook</em></a> (NSDI 2013) describes a demand-filled look-aside (cache-aside) design where web servers, after writing to the database, delete the corresponding memcache keys. Notable mechanisms map directly onto §3: <strong>leases</strong> issued on a miss, which (a) prevent stale sets because a delete invalidates the outstanding lease, and (b) mitigate thundering herds by letting only one client per key fetch from the database within a short interval while others wait or accept slightly stale data; a <strong>mcrouter</strong>-style routing layer and client-side request batching to cut round trips; a pool of spare "gutter" servers that temporarily take over for failed cache servers so their load does not cascade to databases; and <strong>invalidation daemons that tail the database commit log</strong> and broadcast deletes to cache clusters across regions, so cache consistency is driven by committed data rather than by application code. The paper is the canonical reference for cache-aside at scale.</p>
+
+  <h3>9.2 Uber: CacheFront, an integrated cache with CDC invalidation</h3>
+  <p><span class="tag fact">Verified</span> Uber's February 2024 post <a href="https://www.uber.com/blog/how-uber-serves-over-40-million-reads-per-second-using-an-integrated-cache/"><em>How Uber Serves Over 40 Million Reads Per Second from Online Storage Using an Integrated Cache</em></a> describes CacheFront, a Redis-based cache integrated into the stateless query engine of Docstore (Uber's MySQL-based distributed database). Reads use cache-aside inside the query engine; invalidation is driven by Docstore's change data capture, so committed updates update or invalidate cached rows; and services can enable caching per database, per table, or per request, bypassing it for flows that need strong consistency. The post reports large reductions in P75 and P99.9 latency. A later Uber post describes growing the system further with stronger consistency guarantees. The design lesson: put the cache in the data-access layer and drive invalidation from the commit stream, so application teams get caching without each implementing invalidation correctly.</p>
+
+  <h3>9.3 Figma: a Redis proxy for connection scalability</h3>
+  <p><span class="tag fact">Verified</span> Figma's 2026 post <a href="https://www.figma.com/blog/figmas-next-generation-data-caching-platform/"><em>Figma's next-generation data caching platform</em></a> describes FigCache, an in-house proxy placed between application clients and Redis clusters on Amazon ElastiCache. Its primary purpose is connection multiplexing: decoupling the number of client connections (which grows with the application fleet) from the number of connections Redis must handle, together with centralised routing. Secondary coverage (e.g. <a href="https://www.infoq.com/news/2026/05/figma-redis-figcache">InfoQ</a>) summarises the reliability results Figma reported. The lesson: at large fleet sizes, Redis's per-connection costs and connection storms during deploys or failovers become a scaling limit in their own right, and a proxy tier (Envoy's Redis proxy, twemproxy, or a bespoke one) is a common answer.</p>
+
+  <h3>9.4 The Redis license change and the Valkey fork</h3>
+  <p><span class="tag fact">Verified</span> In March 2024 Redis Ltd. relicensed Redis from BSD-3-Clause to RSALv2/SSPLv1; the Linux Foundation announced Valkey, a BSD-licensed fork of Redis 7.2.4, shortly after, backed by several cloud providers. Valkey 9.0 reached GA in October 2025 (<a href="https://www.linuxfoundation.org/press/valkey-9.0-delivers-performance-and-resiliency-for-real-time-workloads">Linux Foundation press release</a>), and Redis 8 added AGPLv3 as an additional license option in May 2025 (<a href="https://redis.io/blog/redis-8-ga/">Redis 8 GA announcement</a>). <span class="tag version">Version-sensitive · checked Nov 2026</span> For engineering teams this is a supply-chain decision: managed services from several clouds now default to or strongly promote Valkey; organisations embedding Redis in distributed products must review AGPL/SSPL/RSAL obligations; and the projects are beginning to diverge in features (Valkey's atomic slot migration and multi-database clusters; Redis 8's integrated search, JSON, time series and vector sets). Spring Data Redis, Lettuce and Jedis work with both for the shared command set. <span class="tag opinion">Opinion</span> Pin the engine and version explicitly in infrastructure code and test against it, rather than assuming "Redis" means one thing.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages, Limitations and Operational Cost</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Option</th><th>Advantages</th><th>Limitations</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>In-process (Caffeine)</td><td>Fastest; no network; W-TinyLFU hit ratios; built-in coalescing and refresh</td><td>Per-instance duplication; heap/GC pressure; cross-instance invalidation needed</td><td>Very low</td></tr>
+      <tr><td>Redis / Valkey (single primary + replicas)</td><td>Shared; rich data structures; atomic scripts; persistence options</td><td>Single-threaded execution per node; memory-bound; async replication can lose writes</td><td>Moderate; managed services reduce it</td></tr>
+      <tr><td>Redis / Valkey Cluster</td><td>Horizontal scale of memory and throughput; automatic failover</td><td>Multi-key ops only within a slot; cluster-aware clients; resharding operations</td><td>Moderate-high</td></tr>
+      <tr><td>Memcached</td><td>Simple, multi-threaded, very efficient for plain key-value caching</td><td>No persistence, replication or rich types; client-side sharding</td><td>Low-moderate</td></tr>
+      <tr><td>CDN</td><td>Global latency reduction; massive offload; DDoS absorption</td><td>Invalidation latency; key/Vary mistakes leak data; mainly for public content</td><td>Low ops, bandwidth cost</td></tr>
+      <tr><td>Database buffer pool (more RAM)</td><td>Always consistent; zero code</td><td>Bounded by one machine; still pays query execution cost</td><td>Low</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+  <h3>11.1 Choosing a caching strategy</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A["Data type to cache"] --> B{"Must every read see the latest committed write?"}
+  B -- "Yes" --> NC["Do not cache; optimise the query or replicate"]
+  B -- "No" --> C{"Public and identical for many users?"}
+  C -- "Yes" --> CDN["CDN / HTTP caching with surrogate-key purge"]
+  C -- "No" --> D{"Extremely hot, small, tolerant of seconds of staleness?"}
+  D -- "Yes" --> L1["Caffeine L1 (+ Redis L2), short TTL, broadcast invalidation"]
+  D -- "No" --> E{"Written often and read immediately after write?"}
+  E -- "Yes" --> WT["Write-through or update-on-write with version check"]
+  E -- "No" --> CA["Cache-aside in Redis, delete on write, TTL + jitter"]
+  CA --> F{"Many writers or bypassing writers (batch, SQL)?"}
+  F -- "Yes" --> CDC["Drive invalidation from CDC"]
+  F -- "No" --> APPINV["Invalidate in application after commit"]
+</pre>
+  <figcaption>Figure 3.7 — Choosing a caching strategy per data type.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the first question eliminates caching for data that needs linearizable reads. Public content goes to the edge. Hot, small, staleness-tolerant data earns an in-process layer. Cache-aside with delete-on-write is the default for everything else, and the number and type of writers decides whether application-level invalidation is enough or CDC is needed. Note that this is a per-data-type decision; one service will typically use several branches.</p>
+
+  <h3>11.2 Delete versus update on write</h3>
+  <p>Deleting is idempotent, cheap, and avoids caching values that might be computed from stale state or that nobody will read. Updating keeps the cache warm for read-after-write and avoids a miss, but risks writing an older value over a newer one when writers race (two writers, out-of-order cache updates). Default to delete; update only with version-checked writes (a Lua script that compares a version field).</p>
+
+  <h3>11.3 TTL length</h3>
+  <p>Short TTLs bound staleness and self-heal inconsistencies but raise miss rates; long TTLs maximise hit ratio but rely on invalidation being correct. A common compromise: long TTL with reliable invalidation, plus a soft TTL for refresh-ahead, plus jitter. For data without any invalidation path, the TTL <em>is</em> the staleness budget.</p>
+
+  <h3>11.4 Redis versus Memcached versus local</h3>
+  <p>Memcached is a fine choice for a pure, large, simple key-value cache: multi-threaded, predictable, slab-allocated memory. Redis/Valkey win when you need data structures (sorted sets, hashes, streams), atomic scripts, replication with failover, or persistence. A local cache wins for the hottest keys whatever the shared tier. Many large systems run both a shared tier and local caches.</p>
+
+  <h3>11.5 Redis versus Valkey</h3>
+  <p>For new deployments, the choice is now mostly about licensing, managed-service availability, and divergent features. Both speak RESP and support the classic command set. If you depend on Redis 8's integrated query engine and vector sets, choose Redis; if you require a permissive license or your cloud's managed default is Valkey, choose Valkey. <span class="tag opinion">Opinion</span></p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Production Failures</h2>
+  <ul>
+    <li><strong>Caching without a staleness budget.</strong> Nobody decided how stale prices may be; a 24-hour TTL ships; customers see yesterday's prices.</li>
+    <li><strong>Evicting before commit.</strong> <code>@CacheEvict</code> inside a transaction that commits later lets a concurrent reader repopulate from old data (§7.2).</li>
+    <li><strong>Updating cache before database.</strong> If the database write fails, the cache holds a value that never existed.</li>
+    <li><strong>No TTL at all.</strong> A single missed invalidation leaves wrong data forever.</li>
+    <li><strong>Same TTL for everything loaded at once.</strong> Avalanche one TTL after every deploy or warm-up.</li>
+    <li><strong>Unbounded local caches.</strong> A <code>ConcurrentHashMap</code> used as a cache with no eviction is a memory leak with extra steps.</li>
+    <li><strong>Blocking commands in production.</strong> <code>KEYS *</code>, <code>FLUSHALL</code> without <code>ASYNC</code>, <code>DEL</code> of a 10-million-member set, <code>HGETALL</code> on giant hashes, long Lua scripts. Each stalls the single execution thread.</li>
+    <li><strong>Big keys and hot keys.</strong> A 500 MB hash or a single key receiving 30% of traffic defeats sharding and causes latency spikes during migration (<code>MIGRATE</code> blocks per key).</li>
+    <li><strong>Treating Redis as durable by default.</strong> Async replication plus <code>everysec</code> AOF can lose acknowledged writes on failover; queues and ledgers in Redis need that risk accepted explicitly.</li>
+    <li><strong>Using an evicting policy on a datastore.</strong> Rate-limit or session data silently evicted under memory pressure; use <code>noeviction</code> and alerts for such instances, and keep caches on separate instances.</li>
+    <li><strong>Default 1 MB replication backlog.</strong> Every replica hiccup triggers a full resync, fork and multi-gigabyte transfer, often cascading into latency spikes and memory pressure on the primary.</li>
+    <li><strong>Key schema changes on deploy.</strong> New code uses <code>v2</code> keys; the hit ratio drops to zero; the database melts. Roll out key changes gradually, pre-warm, or read-through from the old key format during transition.</li>
+    <li><strong>Caching personalised responses at the CDN</strong> without <code>private</code> or correct <code>Vary</code>: one user's data served to others. This is a security incident, not a performance bug.</li>
+    <li><strong>Java serialisation of cached objects.</strong> Class changes break deserialisation across a rolling deploy; JDK serialisation of untrusted data is also a deserialisation-attack vector. Use JSON or another explicit format.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Engineering</h2>
+  <h3>13.1 Monitoring</h3>
+  <ul>
+    <li>Hit ratio per cache name (Micrometer exposes <code>cache.gets{result=hit|miss}</code>, <code>cache.evictions</code>, <code>cache.puts</code> for Caffeine with <code>recordStats()</code> and for Redis caches with statistics enabled).</li>
+    <li>Redis: <code>keyspace_hits</code>/<code>keyspace_misses</code>, <code>evicted_keys</code>, <code>expired_keys</code>, <code>used_memory</code> vs <code>maxmemory</code>, <code>mem_fragmentation_ratio</code>, <code>connected_clients</code>, <code>instantaneous_ops_per_sec</code>, <code>latest_fork_usec</code>, replication offset lag, <code>rejected_connections</code>, and the slow log.</li>
+    <li>Client-side command latency histograms (Lettuce publishes command latency metrics via Micrometer), because server-side metrics miss network and client queueing.</li>
+    <li>Database read QPS correlated with cache hit ratio: the alert that matters is "database load rising because hit ratio dropped".</li>
+  </ul>
+  <h3>13.2 Performance</h3>
+  <ul>
+    <li>Use Lettuce's single shared, multiplexed connection for most workloads; add a pool only for blocking commands (<code>BLPOP</code>, <code>XREAD BLOCK</code>) or transactions.</li>
+    <li>Batch with <code>MGET</code>/pipelining; avoid N+1 round trips to Redis just as you avoid them to the database.</li>
+    <li>Keep values small (compress large JSON; store only what the read path needs); large values increase network time and block the event loop during transfer.</li>
+  </ul>
+  <h3>13.3 Reliability</h3>
+  <ul>
+    <li>Design the cold-cache path: can the database survive a full cache loss at peak? If not, have load shedding and warm-up procedures, and run caches with replicas across zones.</li>
+    <li>Set client timeouts (command timeout in the tens of milliseconds for cache reads) and treat cache errors as misses where possible, with a circuit breaker so a dead cache does not add latency to every request.</li>
+    <li>Run at least three primaries in Cluster mode, spread across zones, with replicas in different zones from their primaries.</li>
+    <li>Test failover regularly; measure how long clients take to discover the new primary (topology refresh settings in Lettuce: periodic and adaptive refresh).</li>
+  </ul>
+  <h3>13.4 Security</h3>
+  <ul>
+    <li>Never expose Redis to the internet; enable TLS, ACL users with least privilege (separate users for application, replication, and administration), and disable or rename dangerous commands (<code>FLUSHALL</code>, <code>CONFIG</code>, <code>DEBUG</code>) for application users via ACLs.</li>
+    <li>Do not cache secrets or sensitive personal data unless required; if you must, encrypt values and set short TTLs; remember that RDB/AOF files and backups contain everything.</li>
+    <li>Patch promptly: Redis and Valkey have had remotely exploitable vulnerabilities, including issues in the Lua scripting engine; restrict <code>EVAL</code> via ACLs where not needed.</li>
+  </ul>
+  <h3>13.5 Maintainability</h3>
+  <ul>
+    <li>Document a key schema (prefix, version, hash tags, TTL, owner) per cache, and version prefixes so incompatible changes can roll out side by side.</li>
+    <li>Keep caches on separate Redis instances from datastore-like uses (rate limits, queues, sessions), so eviction policies and failure impact differ appropriately.</li>
+  </ul>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>A service handles 20,000 reads/s. Cache hit ratio is 95%, cache latency 0.6 ms, miss latency 12 ms. (a) Mean latency? (b) Database read QPS? (c) If a deploy drops the hit ratio to 80%, what happens to database load?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>(a) \(0.95 \times 0.6 + 0.05 \times 12 = 0.57 + 0.6 = 1.17\) ms. (b) \(0.05 \times 20{,}000 = 1{,}000\)/s. (c) \(0.2 \times 20{,}000 = 4{,}000\)/s: four times the database load, which may exceed capacity; mean latency rises to \(0.48 + 2.4 = 2.88\) ms even before the database slows.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Explain step by step how a stale value can end up in the cache when a service does "update DB, then delete cache" under cache-aside, and design a fix using Redis that does not require distributed transactions.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>See Figure 3.2: reader misses, reads old row, stalls; writer commits and deletes; reader sets old value. Fix with versioned sets: store the row's version (an <code>updated_at</code> or monotonically increasing <code>version</code> column) with the cached value; populate via a Lua script that writes only if no cached entry exists with a higher version, and on write, instead of deleting, write a <em>tombstone</em> carrying the new version with a short TTL. A stale reader's set (lower version) is then rejected by the script. Alternatives: leases (store a lease token on miss; delete clears it; set only succeeds if the token matches), or delayed double delete as a cheaper approximation. Keep a TTL as a backstop either way.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>An attacker requests <code>/products/{random-uuid}</code> at 3,000 requests/s. Each misses the cache and runs a database query. Propose a layered defence and quantify the database load after each layer.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>(1) Validate input format (reject malformed IDs): no change for valid-looking UUIDs. (2) Rate limit per IP/API key at the edge: if the attacker uses 30 IPs limited to 10/s, load drops to 300/s. (3) Negative caching: random UUIDs never repeat, so this alone does not help against random keys (it helps against repeated invalid IDs). (4) Bloom filter of existing product IDs in memory (or a Redis Bloom filter): with a 1% false-positive rate, only ~3 of the 300/s reach the database. (5) Monitor the 404 rate per client to block persistent offenders. Combined: ~3 queries/s.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>Your Redis primary (40 GB dataset, AOF everysec, RDB every hour) shows p99 latency spikes of ~300 ms every hour and occasional OOM kills of the container during peak traffic. Diagnose and fix.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Hourly spikes align with <code>BGSAVE</code>: <code>fork()</code> of a 40 GB process copies page tables (check <code>latest_fork_usec</code>), stalling the main thread; transparent huge pages make it worse. OOM during peak: copy-on-write during the snapshot duplicates pages modified under heavy writes, pushing RSS toward 2x, exceeding the container limit. Fixes: disable THP; take RDB snapshots on a replica instead of the primary; leave memory headroom (container limit well above <code>maxmemory</code>); split the dataset into Cluster shards so each fork is smaller (e.g. 4 × 10 GB); with the hybrid AOF, AOF rewrites also fork, so schedule and monitor them; consider whether the workload needs persistence at all if it is a cache.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced (design)</p>
+    <p>Design caching for an "AI answer" feature: users ask questions about a product's documentation; generation costs ~2 s and $0.01. 40% of questions are exact duplicates (same normalised text) within a day; documentation changes weekly. Cover keys, TTLs, invalidation, stampede protection and risks.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Key</strong>: hash of (normalised question, product ID, documentation version, model ID, prompt template version, relevant parameters such as temperature). Including the documentation version makes invalidation automatic: when docs change, the version increments and old keys are simply never read again (they expire via TTL). <strong>TTL</strong>: e.g. 7 days with jitter, as an upper bound. <strong>Stampede</strong>: a popular question asked by many users at once triggers one generation via a Redis single-flight lock (§7.3); waiters poll briefly or stream the in-progress answer from a shared stream key. <strong>Personalisation</strong>: only cache when the answer does not depend on user-specific data or permissions; otherwise include tenant/role in the key. <strong>Risks</strong>: caching a harmful or wrong answer amplifies it, so allow invalidation by key on user reports and record which cached answers were served; avoid semantic (similarity-based) caching unless you validate that similar questions truly have the same answer. Savings: at 40% duplicates, generation cost and latency drop by ~40% for that traffic.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions and Answers</h2>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Compare cache-aside, read-through, write-through and write-behind.</summary><div>
+    <p>Cache-aside: application loads on miss and deletes on write; simple, resilient to cache failure, risk of stale-set races. Read-through: the cache loads on miss via a loader; simpler callers, coalescing inside the cache. Write-through: writes go synchronously through the cache to the store; fresh cache, higher write latency. Write-behind: writes acknowledged by the cache and flushed asynchronously; lowest latency and batching, but risk of data loss and inconsistency. Choose cache-aside by default, write-behind only for loss-tolerant data such as counters.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Redis is single-threaded. How is it so fast, and what are the consequences?</summary><div>
+    <p>Command execution is single-threaded over in-memory data structures with O(1)/O(log n) operations, so there are no locks or context switches; network I/O is multiplexed with epoll and, since 6.0, optionally parallelised by I/O threads. Each command takes microseconds, so one core handles 100k+ ops/s. Consequences: every command is atomic; one slow command (large <code>KEYS</code>, <code>DEL</code> of a huge key, a long script) blocks all clients; and scaling across cores requires multiple shards.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain MOVED versus ASK in Redis Cluster.</summary><div>
+    <p><code>MOVED</code> means the slot is permanently owned by another node: the client updates its slot map and retries there. <code>ASK</code> occurs during migration of a slot: the specific key has already moved to the target, but the slot is not yet reassigned; the client sends <code>ASKING</code> plus the command to the target once, without updating its map, because other keys of the slot may still be on the source.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> How does Redis implement LRU and LFU eviction?</summary><div>
+    <p>Approximately. Each object stores a 24-bit field. For LRU it is a coarse access clock; on eviction Redis samples <code>maxmemory-samples</code> keys, maintains a 16-entry pool of best candidates by idle time, and evicts the best. For LFU the field holds an 8-bit logarithmic (Morris) counter plus a 16-bit decay timestamp; increments are probabilistic so 8 bits can represent about a million accesses, counters decay over time, and new keys start at 5. Sampling avoids the memory and CPU cost of exact structures.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Design a cache for product pages serving 200k reads/s with prices that must not be more than 5 s stale.</summary><div>
+    <p>Split the data: static product content (description, images) cached aggressively (CDN plus Redis, long TTL, CDC invalidation); prices cached separately with a ≤5 s budget: Caffeine L1 with 2–3 s TTL per pod plus Redis L2 updated by a price-change consumer, so the page composes cached content with fresh price. Hot products get L1 hits, so Redis traffic is far below 200k/s. Stampede protection with Caffeine loading and refresh-ahead; TTL jitter; negative caching for invalid IDs; Redis Cluster across zones; database sized for a cold-L2 scenario with load shedding. At checkout, read the authoritative price from the database, never from cache.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> After a Redis failover, some users see data they had already changed. Why?</summary><div>
+    <p>Replication is asynchronous: writes acknowledged by the old primary that had not reached the replica were lost at promotion, including invalidations (deletes) and updates; the cache now holds older values. Also, clients may have continued writing to the old primary during a partition. Mitigations: TTLs bound the staleness; for cache invalidations, replay recent invalidations from the CDC stream after failover (or flush affected key ranges); for datastore uses, <code>WAIT</code>/<code>min-replicas-to-write</code> narrow the window; for data that cannot tolerate this, use a strongly consistent store.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> A single key receives 40% of all cache traffic and its Redis shard is at 100% CPU. What do you do?</summary><div>
+    <p>Immediately: add an in-process L1 for that key (even a 1-second TTL removes almost all its Redis traffic); or replicate the key into N copies with suffixes on different slots and read a random copy. Longer term: detect hot keys (LFU + <code>--hotkeys</code>, client sampling), apply L1 generally for hot keys, and for hot <em>write</em> keys (counters) split into sub-counters. Adding shards does not help because one key lives on one shard.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Implement an LRU cache with O(1) get and put.</summary><div>
+    <p>Hash map from key to node in a doubly linked list ordered by recency; <code>get</code> moves the node to the head; <code>put</code> inserts at the head and, if over capacity, removes the tail node and its map entry. In Java the compact version is a <code>LinkedHashMap</code> with <code>accessOrder = true</code> overriding <code>removeEldestEntry</code>:</p>
+<pre><code class="language-java">class Lru&lt;K, V&gt; extends java.util.LinkedHashMap&lt;K, V&gt; {
+    private final int capacity;
+    Lru(int capacity) { super(16, 0.75f, true); this.capacity = capacity; }
+    @Override protected boolean removeEldestEntry(java.util.Map.Entry&lt;K, V&gt; e) { return size() &gt; capacity; }
+}</code></pre>
+    <p>Mention that it is not thread-safe (wrap or use Caffeine in production) and that an interviewer may expect the explicit list-plus-map implementation.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Pub/Sub or Streams for cache invalidation and for job processing?</summary><div>
+    <p>Cache invalidation: Pub/Sub is acceptable because messages are ephemeral and a missed message is backstopped by a short TTL. Job processing: Streams, because they persist entries, support consumer groups, acknowledgements and reclaiming of unacknowledged messages, and allow replay; Pub/Sub would lose jobs whenever a worker is disconnected.</p>
+  </div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Think in miss rate: moving from 99% to 90% hit ratio is a tenfold increase in backend load.</li>
+    <li>Default to cache-aside with database-first writes, delete-on-write, TTL as a backstop, and CDC-driven invalidation when there are many writers.</li>
+    <li>Stampedes are prevented by single-flight loading, probabilistic early refresh and serving stale; avalanches by jitter and HA caches; penetration by negative caching and Bloom filters; hot keys by L1 caches and key replication.</li>
+    <li>Eviction policy matters most when the cache is small relative to the working set; frequency-aware admission (TinyLFU) resists scans.</li>
+    <li>Redis executes commands on one thread: atomic and fast, but one slow command blocks everyone. Compact encodings (listpack, intset) save memory for small collections.</li>
+    <li>RDB uses fork and copy-on-write; AOF everysec loses about a second; replication is asynchronous, so failover can lose acknowledged writes.</li>
+    <li>Redis Cluster uses 16,384 slots via CRC16, hash tags for co-location, and MOVED/ASK redirects; Valkey and Redis now diverge in licensing and features.</li>
+  </ul>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">Under cache-aside, which write sequence is the recommended default?</p>
+    <ol>
+      <li data-k="a">Update cache, then update database</li>
+      <li data-k="b">Delete cache, then update database, and never use TTLs</li>
+      <li data-k="c">Update database, then delete the cache key, with a TTL as backstop</li>
+      <li data-k="d">Update database, then set the cache to the new value without TTL</li>
+    </ol>
+    <div class="explain">Writing the database first avoids caching uncommitted values; deleting is idempotent and avoids racing updates; the TTL heals the residual stale-set race.</div>
+  </div>
+
+  <div class="quiz" data-answer="b">
+    <p class="q">How many hash slots does Redis Cluster use, and how is a key mapped?</p>
+    <ol>
+      <li data-k="a">1,024; MD5(key) mod 1024</li>
+      <li data-k="b">16,384; CRC16(key) mod 16384, hashing only the hash-tag substring if present</li>
+      <li data-k="c">65,536; consistent hashing ring with virtual nodes</li>
+      <li data-k="d">It depends on the number of primaries</li>
+    </ol>
+    <div class="explain">The key-to-slot mapping is fixed; only slot ownership changes. Hash tags like {user42} co-locate related keys.</div>
+  </div>
+
+  <div class="quiz" data-answer="a">
+    <p class="q">Which technique prevents a cache stampede without any locking?</p>
+    <ol>
+      <li data-k="a">Probabilistic early expiration (XFetch)</li>
+      <li data-k="b">Increasing maxmemory</li>
+      <li data-k="c">Switching from LRU to FIFO</li>
+      <li data-k="d">Disabling AOF</li>
+    </ol>
+    <div class="explain">Each reader independently decides to refresh early with probability rising toward expiry, so one reader almost always refreshes before the key expires.</div>
+  </div>
+
+  <div class="quiz" data-answer="d">
+    <p class="q">Why can Redis lose acknowledged writes during a Sentinel failover?</p>
+    <ol>
+      <li data-k="a">Sentinel deletes the AOF file</li>
+      <li data-k="b">Replicas expire keys independently</li>
+      <li data-k="c">RDB snapshots are taken only on replicas</li>
+      <li data-k="d">Replication is asynchronous, so the promoted replica may not have received the latest writes</li>
+    </ol>
+    <div class="explain">The primary acknowledges before replicas receive the write. WAIT and min-replicas-to-write narrow but do not eliminate the window.</div>
+  </div>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">A Redis node intended as a rate-limit store should usually use which maxmemory-policy?</p>
+    <ol>
+      <li data-k="a">allkeys-lru</li>
+      <li data-k="b">allkeys-random</li>
+      <li data-k="c">noeviction</li>
+      <li data-k="d">volatile-ttl</li>
+    </ol>
+    <div class="explain">Evicting limiter state silently resets limits. noeviction surfaces memory problems as errors you can alert on; keep caches on separate instances with an evicting policy.</div>
+  </div>
+
+  <div class="quiz" data-answer="b">
+    <p class="q">Under a Zipf workload, what generally happens to hit ratio as you keep doubling cache size?</p>
+    <ol>
+      <li data-k="a">It doubles each time</li>
+      <li data-k="b">It increases by roughly constant increments (diminishing returns)</li>
+      <li data-k="c">It stays constant</li>
+      <li data-k="d">It reaches 100% at 10% of the key space</li>
+    </ol>
+    <div class="explain">For s ≈ 1 the ideal hit ratio grows with the logarithm of cache size, so each doubling buys a similar small increment.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Paper</span> Rajesh Nishtala et al., <a href="https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala">"Scaling Memcache at Facebook"</a>, NSDI 2013.</li>
+    <li><span class="ref-kind">Paper</span> Andrea Vattani, Flavio Chierichetti, Keegan Lowenstein, "Optimal Probabilistic Cache Stampede Prevention", PVLDB 8(8), 2015.</li>
+    <li><span class="ref-kind">Paper</span> Gil Einziger, Roy Friedman, Ben Manes, <a href="https://arxiv.org/abs/1512.00727">"TinyLFU: A Highly Efficient Cache Admission Policy"</a>, ACM TOS 2017.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://redis.io/docs/latest/operate/oss_and_stack/management/scaling/">Redis: scale with Redis Cluster</a> and <a href="https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/">Redis Cluster specification</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://redis.io/docs/latest/develop/reference/eviction/">Redis key eviction</a> — approximated LRU and LFU details.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/">Redis persistence</a> and <a href="https://redis.io/docs/latest/operate/oss_and_stack/management/replication/">replication</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://valkey.io/docs/">Valkey documentation</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.spring.io/spring-framework/reference/integration/cache.html">Spring Framework: cache abstraction</a> and <a href="https://docs.spring.io/spring-data/redis/reference/redis/redis-cache.html">Spring Data Redis: Redis cache</a>.</li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/ben-manes/caffeine">Caffeine</a> — see its wiki for W-TinyLFU design and efficiency benchmarks.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://www.uber.com/blog/how-uber-serves-over-40-million-reads-per-second-using-an-integrated-cache/">Uber: How Uber serves over 40 million reads per second using an integrated cache</a>, 2024.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://www.rfc-editor.org/rfc/rfc9111">RFC 9111: HTTP Caching</a>.</li>
+    <li><span class="ref-kind">Book</span> Josiah L. Carlson, <em>Redis in Action</em>, Manning, 2013 — dated on versions, still useful on data-structure modelling.</li>
+  </ul>
+  <p>Next: <a href="p2-04-databases-indexing.html">Chapter 4 — Database Selection, SQL vs NoSQL, Indexing &amp; Query Optimization</a>.</p>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

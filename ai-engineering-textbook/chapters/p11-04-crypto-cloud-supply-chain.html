@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Secrets, Encryption, TLS, IAM, Cloud, Kubernetes &amp; Supply-Chain Security — AI-Era Software Engineering</title>
+<meta name="description" content="Secrets management, applied cryptography (AEAD, hashing, MACs, KMS envelope encryption, post-quantum readiness), TLS 1.3 and PKI, IAM and workload identity, cloud and container security, Kubernetes hardening, and software supply-chain security with SBOM, SLSA and Sigstore.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p11-04-crypto-cloud-supply-chain" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 11 · Chapter 4</p>
+  <h1>Secrets, Encryption, TLS, IAM, Cloud, Container, Kubernetes &amp; Supply-Chain Security</h1>
+  <p class="lede">Application code is only one layer of your attack surface. The rest is the platform underneath it: where secrets live, how data is encrypted, how services prove who they are, what your cloud roles can do, what is inside your container image, how the cluster is configured, and whether the artifact you deploy is really the one you built. This chapter gives a backend engineer enough depth in each to make sound decisions and to hold a credible conversation with platform and security teams.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Chapters 11.1–11.3; working knowledge of Docker, Kubernetes Deployments/Services, a cloud provider (examples use AWS, with GCP/Azure equivalents named), and CI pipelines.</li>
+    <li><strong>You will be able to:</strong> keep secrets out of code and rotate them; choose the right cryptographic primitive and use it correctly; implement KMS envelope encryption; explain the TLS 1.3 handshake, certificate chains and mTLS; write least-privilege IAM policies and use workload identity; harden container images and Kubernetes workloads; generate SBOMs, produce SLSA provenance and verify Sigstore signatures; learn the right lessons from Log4Shell and the xz backdoor.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: The Platform Is Part of Your Application</h2>
+  <p>In a cloud-native estate, the question "is the order service secure?" includes: Is its database password in Git? Is customer data encrypted at rest with keys we control and can rotate? Do clients verify the server certificate, and does the server verify clients? Can its pod's cloud role delete every bucket? Does its image ship a shell, a package manager and 300 unused libraries with known CVEs? Can a compromised pod in another namespace reach it? Was the JAR built from the reviewed commit, or from something a compromised CI runner injected?</p>
+  <p>These questions span teams, which is precisely why they fall through gaps. This chapter equips you to own your service's answers.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>You have encrypted a property with Jasypt (<code>ENC(...)</code>) or pulled one from Vault with Spring Cloud Vault; configured <code>server.ssl.*</code> or SSL bundles; used the JCA (<code>Cipher</code>, <code>MessageDigest</code>, <code>KeyStore</code>); built images with Jib or Buildpacks; written Helm values for a Deployment; added an IAM policy so your service could read from S3.</dd>
+      <dt>Why that is not enough</dt><dd>Jasypt with a master password in an environment variable moves the secret rather than managing it — no rotation, no audit, no revocation. The JCA lets you pick <code>AES/ECB/PKCS5Padding</code> without complaint. Buildpack images run as non-root, but a hand-written Dockerfile may not. A Helm chart without a <code>securityContext</code> runs privileged-ish defaults. An IAM policy with <code>"Resource": "*"</code> works on the first try — that is the problem.</dd>
+      <dt>The modern approach</dt><dd>Secrets in a manager (Vault, AWS Secrets Manager, GCP Secret Manager, Azure Key Vault) fetched at runtime with workload identity, rotated automatically, detected if leaked; AEAD encryption via high-level libraries (Tink) and KMS envelope encryption; TLS 1.3 everywhere with automated certificate management and mTLS between services; least-privilege IAM per workload; distroless/non-root images scanned and signed; Kubernetes with Pod Security Standards "restricted", default-deny NetworkPolicies and admission policies; SBOMs, SLSA provenance and signature verification at deploy time; and crypto agility to prepare for post-quantum migration.</dd>
+      <dt>Where Python and Go fit</dt><dd>Python's <code>cryptography</code> package and Go's standard <code>crypto/*</code> packages offer AEADs and TLS with good defaults (Go's TLS stack in particular is excellent, and Go supports hybrid post-quantum key exchange by default in recent versions). Go's static binaries make distroless or <code>scratch</code> images natural; Python images are larger and need more care. Supply-chain tooling (Syft, Grype, cosign) is itself written in Go.</dd>
+      <dt>In production</dt><dd>Platform teams provide the paved road: secret-store CSI driver or External Secrets Operator, cert-manager, a service mesh or SPIFFE for mTLS, IRSA/Pod Identity, admission policies (Kyverno/Gatekeeper), image signing in CI and verification at admission, CSPM for cloud posture, and centralised audit logs (CloudTrail, Kubernetes audit) feeding a SIEM.</dd>
+      <dt>Use it when / avoid it when</dt><dd>All of this applies to anything handling production data. Avoid inventing cryptography, building your own secret store, or adopting every tool at once — sequence the work by risk (secrets and IAM first, supply chain verification next, runtime security after).</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="history">
+  <h2>2. History</h2>
+  <h3>2.1 Cryptography</h3>
+  <p>DES was standardised in 1977; its 56-bit key was publicly brute-forced by the EFF's "Deep Crack" machine in 1998. Diffie and Hellman published public-key key exchange in 1976; RSA followed in 1977. AES (Rijndael) was selected by NIST in 2001. GCM mode was standardised in NIST SP 800-38D (2007); ChaCha20-Poly1305 was specified for IETF protocols in RFC 7539 (2015, updated by RFC 8439). SHA-1 collisions became practical with the SHAttered attack (Google and CWI, 2017). In August 2024 NIST published the first post-quantum standards: FIPS 203 (ML-KEM, from Kyber), FIPS 204 (ML-DSA, from Dilithium) and FIPS 205 (SLH-DSA, from SPHINCS+).</p>
+  <h3>2.2 TLS and PKI</h3>
+  <p>Netscape created SSL in the mid-1990s; TLS 1.0 (RFC 2246) followed in 1999, TLS 1.2 (RFC 5246) in 2008 and TLS 1.3 (RFC 8446) in August 2018, which removed static RSA key exchange, CBC-mode cipher suites and renegotiation, and cut the handshake to one round trip. TLS 1.0 and 1.1 were formally deprecated by RFC 8996 (2021). Heartbleed (2014) in OpenSSL leaked server memory, including private keys. Let's Encrypt began issuing free certificates in 2015 with the ACME protocol (RFC 8555, 2019), making automated certificate management normal. Certificate Transparency (RFC 6962, 2013) made mis-issuance publicly detectable. <span class="tag version">Version-sensitive · checked Nov 2026</span> In 2025 the CA/Browser Forum approved a schedule to shrink maximum public TLS certificate validity in steps, reaching 47 days by 2029 — making automation mandatory.</p>
+  <h3>2.3 Secrets and identity in the cloud</h3>
+  <p>HashiCorp Vault was released in 2015, introducing dynamic secrets (credentials generated on demand with leases). AWS Secrets Manager launched in 2018. AWS IAM Roles for Service Accounts (IRSA) arrived for EKS in 2019, followed by EKS Pod Identity in 2023; GCP and Azure offer workload identity equivalents. SPIFFE/SPIRE (CNCF) standardised workload identities for service-to-service mTLS. Kubernetes Secrets have existed since 1.0 (2015), stored base64-encoded (not encrypted) in etcd unless encryption at rest is configured.</p>
+  <h3>2.4 Containers and Kubernetes</h3>
+  <p>Docker (2013) made containers mainstream; Kubernetes 1.0 shipped in 2015. PodSecurityPolicy was deprecated in 1.21 and removed in 1.25 (2022), replaced by Pod Security Admission enforcing the Pod Security Standards (privileged, baseline, restricted). Google's distroless images (2017) popularised minimal runtime images. Runtime security tools such as Falco (CNCF, graduated 2024) detect suspicious behaviour via syscalls/eBPF.</p>
+  <h3>2.5 Supply chain</h3>
+  <p>The SolarWinds Orion compromise (disclosed December 2020) inserted a backdoor through the vendor's build system. In February 2021 Alex Birsan demonstrated "dependency confusion" against major companies' internal package names. US Executive Order 14028 (May 2021) pushed SBOMs into procurement. Log4Shell (CVE-2021-44228, December 2021) showed the cost of not knowing what is inside your software. Sigstore (2021, Linux Foundation/OpenSSF) made keyless signing practical; SLSA (Supply-chain Levels for Software Artifacts) reached v1.0 in April 2023 and <span class="tag version">Version-sensitive · checked Nov 2026</span> v1.2 in November 2025, which added a Source track. In March 2024 Andres Freund discovered the xz-utils backdoor (CVE-2024-3094) while investigating SSH latency — the product of a multi-year social-engineering campaign against a maintainer.</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 Secrets management</h3>
+  <p>A <strong>secret</strong> is any value that grants access: database passwords, API keys, OAuth client secrets, signing keys, TLS private keys, webhook HMAC keys, cloud access keys. The lifecycle has five stages, and most teams handle only the first:</p>
+  <ol>
+    <li><strong>Storage</strong> — in a dedicated secret manager with encryption, access policy and audit: HashiCorp Vault / OpenBao, AWS Secrets Manager or SSM Parameter Store (SecureString), GCP Secret Manager, Azure Key Vault. Not in Git, not in container images, not in Helm values files, not in CI variables that every job can read.</li>
+    <li><strong>Delivery</strong> — the workload authenticates with its <em>platform identity</em> (Kubernetes service account → IRSA/Pod Identity/Workload Identity, or Vault's Kubernetes auth) and fetches only its own secrets. Delivery mechanisms: application SDK at startup (Spring Cloud Vault, Spring Cloud AWS), a sidecar/agent writing files (Vault Agent), the Secrets Store CSI Driver mounting files, or the External Secrets Operator syncing into Kubernetes Secrets.</li>
+    <li><strong>Rotation</strong> — scheduled and on-demand (after an incident or staff departure). Rotation must be designed: dual credentials (two active DB users, swap), or dynamic secrets that expire on their own.</li>
+    <li><strong>Revocation</strong> — ability to kill a credential immediately, and to know who used it.</li>
+    <li><strong>Detection</strong> — pre-commit hooks and CI scanning (gitleaks, TruffleHog, GitHub secret scanning with push protection), plus monitoring for leaked credentials in public places. A leaked secret must be <em>rotated</em>, not just deleted from Git history — assume it was copied the moment it was pushed.</li>
+  </ol>
+  <p><strong>Dynamic secrets</strong> (Vault's database secrets engine, AWS IAM temporary credentials, Cloud SQL IAM authentication) generate a unique credential per workload instance with a short lease. A leaked dynamic credential expires by itself, and audit logs attribute every query to a specific instance. They are the gold standard where supported.</p>
+  <p><strong>Kubernetes Secrets</strong> are base64-encoded objects in etcd. They are only as safe as (a) etcd encryption at rest (EncryptionConfiguration, ideally with a KMS v2 provider), (b) RBAC on <code>get/list/watch secrets</code> — note that anyone who can create a pod in a namespace can mount any secret in it — and (c) node security. External Secrets Operator keeps the source of truth in a cloud secret manager and syncs; the Secrets Store CSI Driver can avoid creating Kubernetes Secret objects altogether.</p>
+  <p>About Jasypt: encrypting properties with a master password is better than plaintext in Git, but the master password becomes the secret you must manage, rotation means re-encrypting and redeploying, and there is no per-access audit. Treat it as a stepping stone to a secret manager.</p>
+
+  <h3>3.2 Cryptographic primitives — what each one is for</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Need</th><th>Primitive</th><th>Use</th><th>Avoid</th></tr></thead>
+    <tbody>
+      <tr><td>Confidentiality + integrity of data</td><td>AEAD (authenticated encryption with associated data)</td><td>AES-256-GCM, ChaCha20-Poly1305, AES-GCM-SIV (nonce-misuse resistant), XChaCha20-Poly1305 (random nonces)</td><td>ECB; CBC without MAC; unauthenticated CTR</td></tr>
+      <tr><td>Integrity/authenticity with a shared key</td><td>MAC</td><td>HMAC-SHA-256, KMAC</td><td>Plain hash of (key || message) — length-extension prone with SHA-2</td></tr>
+      <tr><td>Fingerprint / integrity without a key</td><td>Cryptographic hash</td><td>SHA-256/384/512, SHA-3, BLAKE2/BLAKE3</td><td>MD5, SHA-1 (collisions)</td></tr>
+      <tr><td>Password storage</td><td>Password hash (slow, salted)</td><td>Argon2id, scrypt, bcrypt (Chapter 11.2)</td><td>Any fast hash</td></tr>
+      <tr><td>Derive keys from a secret</td><td>KDF</td><td>HKDF (from high-entropy secrets)</td><td>Using a raw shared secret as a key</td></tr>
+      <tr><td>Signatures (anyone verifies)</td><td>Digital signature</td><td>Ed25519, ECDSA P-256, RSA-PSS 3072; ML-DSA (post-quantum)</td><td>RSA PKCS#1 v1.5 for new designs where avoidable; DSA</td></tr>
+      <tr><td>Key agreement</td><td>KEM / DH</td><td>X25519, ECDH P-256; hybrid X25519+ML-KEM-768</td><td>Static RSA key transport</td></tr>
+      <tr><td>Randomness</td><td>CSPRNG</td><td><code>SecureRandom</code>, <code>crypto/rand</code>, <code>secrets</code></td><td><code>java.util.Random</code>, <code>math/rand</code>, <code>random</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>3.3 Symmetric AEAD in practice</h3>
+  <p>An AEAD takes a key, a <strong>nonce</strong> (number used once), plaintext and optional <em>associated data</em> (authenticated but not encrypted — e.g. a record ID or tenant ID so ciphertext cannot be swapped between records), and produces ciphertext plus a tag. Decryption verifies the tag and fails on any modification. The critical rule for AES-GCM: <strong>never reuse a nonce with the same key</strong>. Reuse reveals the XOR of plaintexts and lets an attacker forge tags. With 96-bit random nonces, NIST guidance limits a single key to about 2<sup>32</sup> encryptions to keep collision probability negligible (see §6). Envelope encryption with per-object data keys keeps you far below that limit. ChaCha20-Poly1305 is fast in software without AES hardware instructions; XChaCha20's 192-bit nonce makes random nonces safe at any realistic volume.</p>
+
+  <h3>3.4 Asymmetric cryptography</h3>
+  <p>Public-key cryptography solves key distribution: anyone can verify a signature or encrypt to a public key; only the private-key holder can sign or decrypt. It is slow and size-limited, so real systems use it to <em>agree on or wrap</em> symmetric keys (hybrid encryption, TLS key exchange) and to <em>sign</em> hashes. Choose elliptic-curve algorithms (X25519/Ed25519, P-256) for new designs; RSA remains ubiquitous in PKI and JWT.</p>
+
+  <h3>3.5 Key management, KMS and envelope encryption</h3>
+  <p>A <strong>KMS</strong> (AWS KMS, Google Cloud KMS, Azure Key Vault, or an HSM) holds <em>key-encryption keys</em> (KEKs) that never leave it in plaintext. <strong>Envelope encryption</strong>: for each object (or batch), ask the KMS to generate a <em>data-encryption key</em> (DEK); it returns the DEK in plaintext and encrypted under the KEK. Encrypt data locally with the DEK (AES-GCM), discard the plaintext DEK, and store the encrypted DEK next to the ciphertext. To decrypt, send the encrypted DEK to KMS (which checks IAM policy and logs the call), get the plaintext DEK back, decrypt locally. Benefits: bulk data never travels to the KMS; every decryption is authorised and audited; rotating the KEK does not require re-encrypting data (KMS keeps old key versions to unwrap old DEKs); crypto-shredding (destroy a KEK to make all data under it unrecoverable) supports deletion requirements.</p>
+  <p><strong>Encryption context</strong> (AWS) / associated data binds the DEK to metadata such as tenant ID; decrypt fails if the context differs, and the context appears in CloudTrail — useful for audits and for preventing confused-deputy reuse of encrypted blobs across tenants.</p>
+
+  <h3>3.6 Key rotation and crypto agility</h3>
+  <p>Rotation limits the data exposed by one key compromise and the amount of data encrypted under one key. Design rotation in from day one: store a key ID/version with every ciphertext (Tink does this automatically with its keyset prefix), support decrypting with old versions while encrypting with the current one, and re-encrypt lazily or in background jobs when you must retire old keys. <strong>Crypto agility</strong> is the broader property of being able to change <em>algorithms</em> — not just keys — without redesign: algorithm identifiers in formats, abstraction layers (Tink primitives, JCA providers), inventories of where each algorithm is used. It is the prerequisite for post-quantum migration.</p>
+
+  <h3>3.7 Post-quantum readiness</h3>
+  <p>A sufficiently large quantum computer running Shor's algorithm would break RSA and elliptic-curve cryptography (key exchange and signatures). Symmetric crypto and hashes are only weakened modestly by Grover's algorithm (AES-256 remains comfortable). The urgent threat today is <strong>harvest now, decrypt later</strong>: traffic recorded today could be decrypted in future, so long-lived confidential data in transit needs quantum-resistant key exchange now. The industry response is <strong>hybrid key exchange</strong> combining a classical algorithm with ML-KEM, so security holds if either is unbroken. <span class="tag version">Version-sensitive · checked Nov 2026</span> <span class="tag fact">Verified</span> Chrome has negotiated X25519MLKEM768 by default since late 2024 (Chrome 131), and Cloudflare reports that a majority of human-initiated HTTPS traffic to its network is now post-quantum protected. Go's <code>crypto/tls</code> enables X25519MLKEM768 by default from Go 1.24; OpenSSL 3.5 (April 2025) added ML-KEM, ML-DSA and SLH-DSA. JDK support is arriving via JEPs (ML-KEM and ML-DSA APIs landed in JDK 24); hybrid TLS in the JDK's own TLS stack lags behind — terminating TLS at a PQ-capable proxy or mesh is the pragmatic route for Java services. Post-quantum <em>signatures</em> in the Web PKI are further away. Actions now: inventory cryptography, prefer hybrid key exchange at edges you control, and build agility.</p>
+
+  <h3>3.8 TLS 1.3 essentials</h3>
+  <p>TLS provides server authentication (via certificates), confidentiality and integrity for a connection. TLS 1.3 mandates forward secrecy (ephemeral (EC)DHE or KEM key exchange — a later theft of the server's private key does not decrypt recorded sessions), allows only AEAD cipher suites (TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256), encrypts most of the handshake including the certificate, and completes in one round trip (1-RTT), with optional 0-RTT resumption whose early data can be replayed — only use 0-RTT for idempotent requests. TLS 1.2 remains acceptable with ECDHE + AEAD suites; disable TLS 1.0/1.1.</p>
+
+  <h3>3.9 Certificates and PKI</h3>
+  <p>An X.509 certificate binds a public key to names (Subject Alternative Names — DNS names, IPs, URIs such as SPIFFE IDs) and is signed by a certificate authority. Verification builds a <strong>chain</strong>: leaf → intermediate(s) → a root in the client's trust store, checking each signature, validity dates, key usage/extended key usage, name constraints, and the hostname against SANs. Revocation (CRLs, OCSP) is unreliable in practice — browsers rely on short lifetimes and their own mechanisms; Let's Encrypt has ended OCSP in favour of CRLs and shorter-lived certificates. <span class="tag version">Version-sensitive · checked Nov 2026</span> Hence the industry move toward automation and short validity. Internal services use a private CA (Vault PKI, AWS Private CA, cert-manager with a CA issuer, SPIRE, or the mesh's built-in CA) with lifetimes of hours to days.</p>
+
+  <h3>3.10 Mutual TLS</h3>
+  <p>In mTLS the server also requests and verifies a client certificate, so both ends are authenticated at the transport layer. It is the standard for service-to-service authentication in zero-trust networks (service meshes such as Istio and Linkerd do it transparently; SPIFFE IDs like <code>spiffe://prod.example.com/ns/orders/sa/orders-api</code> become the principal). mTLS authenticates the <em>workload</em>; it does not replace user-level authorization or per-request tokens. RFC 8705 also uses mTLS to bind OAuth tokens to client certificates.</p>
+
+  <h3>3.11 IAM fundamentals</h3>
+  <p>Cloud IAM answers "may principal P perform action A on resource R under conditions C?". <strong>Principals</strong>: human users (ideally federated via SSO, not IAM users with long-lived keys), roles assumed by workloads, service accounts. <strong>Policies</strong>: JSON documents of statements with Effect (Allow/Deny), Action, Resource and Condition. Policy types in AWS: identity-based (attached to roles/users), resource-based (bucket policies, KMS key policies), permission boundaries (cap on what identity policies can grant), Organizations SCPs and RCPs (account/organisation-wide guardrails), and session policies.</p>
+  <p><strong>AWS policy evaluation</strong>, simplified: start with implicit deny; any applicable explicit <code>Deny</code> anywhere wins; then the request must be allowed by every applicable guardrail (SCPs, RCPs, permission boundary, session policy); and it must be allowed by an identity-based or resource-based policy (for same-account access, either suffices in most cases; cross-account access needs both sides). This is why "I added an Allow and it still fails" usually means an SCP, a boundary or a KMS key policy is missing an allow.</p>
+  <p><strong>Least privilege in IAM</strong>: specific actions (not <code>s3:*</code>), specific resource ARNs (not <code>*</code>), conditions (source VPC, encryption context, tags, <code>aws:PrincipalOrgID</code>), separate roles per workload, no long-lived access keys, IAM Access Analyzer to generate policies from observed usage and to find external access.</p>
+
+  <h3>3.12 Workload identity</h3>
+  <p>Instead of distributing static cloud credentials, the platform issues a signed identity token to the workload (the Kubernetes service account token projected into the pod, or a CI provider's OIDC token), and the cloud exchanges it for short-lived credentials for a specific role. AWS: IRSA (OIDC federation, annotate the service account with a role ARN) or EKS Pod Identity (agent-based association); GCP: Workload Identity Federation for GKE; Azure: Microsoft Entra Workload ID. CI: GitHub Actions OIDC → AWS <code>AssumeRoleWithWebIdentity</code>, with trust policy conditions on repository and branch (<code>token.actions.githubusercontent.com:sub</code>). The result: no secrets to leak, credentials that expire in about an hour, and audit trails naming the workload.</p>
+
+  <h3>3.13 Shared responsibility, misconfiguration and CSPM</h3>
+  <p>Cloud providers secure the infrastructure (physical, hypervisor, managed-service internals); customers secure what they configure: identities, network exposure, data protection settings, and their workloads. The more managed the service, the more the provider handles — but configuration is always yours. Industry reports have long found that most cloud security failures stem from customer misconfiguration: public buckets, overly permissive security groups (0.0.0.0/0 on SSH or databases), unencrypted snapshots shared publicly, disabled logging, wildcard IAM. <strong>CSPM</strong> (cloud security posture management — AWS Security Hub, Microsoft Defender for Cloud, Google Security Command Center, or open-source Prowler/ScoutSuite) continuously evaluates configurations against benchmarks such as the CIS Foundations Benchmarks. Preventive guardrails (SCPs denying public bucket ACLs, policy-as-code checks on Terraform with Checkov/tfsec/OPA Conftest) beat detective ones.</p>
+
+  <h3>3.14 Container image security</h3>
+  <ul>
+    <li><strong>Minimal base images</strong>: distroless (no shell, no package manager), Chainguard/Wolfi images, or <code>scratch</code> for static Go binaries. Fewer packages, fewer CVEs, fewer tools for an attacker.</li>
+    <li><strong>Non-root</strong>: <code>USER 65532</code> (or any non-zero UID); never require root at runtime.</li>
+    <li><strong>Multi-stage builds</strong>: build tools stay in the builder stage.</li>
+    <li><strong>Pin by digest</strong>: <code>FROM image@sha256:...</code> so builds are reproducible and cannot silently change.</li>
+    <li><strong>No secrets in layers</strong>: use BuildKit secret mounts; anything written in a layer is in the image forever even if deleted later.</li>
+    <li><strong>Scan</strong>: Trivy, Grype, Docker Scout, cloud registry scanning — in CI and continuously in the registry (new CVEs appear for old images).</li>
+    <li><strong>Sign and attest</strong>: cosign signatures and SBOM/provenance attestations (§3.17–3.18).</li>
+  </ul>
+
+  <h3>3.15 Kubernetes security</h3>
+  <ul>
+    <li><strong>API access and RBAC</strong>: authenticate humans via OIDC; grant namespace-scoped Roles rather than ClusterRoles; avoid wildcards; watch for dangerous verbs (<code>create pods</code>, <code>get secrets</code>, <code>escalate</code>, <code>bind</code>, <code>impersonate</code>, <code>nodes/proxy</code>). Disable automounting of service-account tokens for pods that do not call the API.</li>
+    <li><strong>Pod Security Standards</strong>: three levels — <em>privileged</em> (unrestricted), <em>baseline</em> (prevents known privilege escalations: no privileged containers, host namespaces, hostPath, added dangerous capabilities), <em>restricted</em> (hardened: must run as non-root, drop ALL capabilities, no privilege escalation, seccomp RuntimeDefault, restricted volume types). Enforced per namespace by the built-in Pod Security Admission controller via labels.</li>
+    <li><strong>NetworkPolicies</strong>: by default all pods can talk to all pods. Apply default-deny ingress and egress per namespace, then allow specific flows (including DNS). Requires a CNI that enforces them (Calico, Cilium, cloud CNIs with policy support).</li>
+    <li><strong>Admission control</strong>: validating/mutating policies with Kyverno, OPA Gatekeeper, or the built-in ValidatingAdmissionPolicy (CEL, GA in 1.30): require signed images from approved registries, resource limits, labels, no <code>latest</code> tags.</li>
+    <li><strong>Secrets</strong>: encryption at rest with KMS; external secret stores; tight RBAC.</li>
+    <li><strong>Runtime security</strong>: detect anomalous behaviour (shell spawned in a container, unexpected outbound connections, writes to sensitive paths) with Falco, Tetragon or commercial agents; read-only root filesystems make tampering visible.</li>
+    <li><strong>Node and control plane</strong>: managed control planes, patched node images, restricted node IAM roles, IMDS hop limit, CIS Kubernetes Benchmark checks (kube-bench).</li>
+    <li><strong>Audit logging</strong>: Kubernetes API audit logs to the SIEM.</li>
+  </ul>
+
+  <h3>3.16 Software supply-chain threats</h3>
+  <p>Threats exist at every step from source to running workload: compromised developer accounts and source repositories; malicious or compromised dependencies (typosquatting, account takeover of maintainers, protestware, the xz-style long con); <strong>dependency confusion</strong> (a public package with the same name as your internal one and a higher version gets resolved by a misconfigured package manager); compromised build systems (SolarWinds); tampered artifacts in transit or in registries; and deployment of unverified artifacts. Defences map onto these steps: branch protection and signed commits; dependency pinning, lockfiles, private registries with scoped namespaces (and claiming your internal names publicly), and review of new dependencies; isolated, ephemeral, hermetic builds with provenance; signing; and verification at admission.</p>
+
+  <h3>3.17 SBOMs</h3>
+  <p>A Software Bill of Materials lists the components (with versions, package URLs, hashes, licences) in an artifact. Two main formats: <strong>CycloneDX</strong> (OWASP; also covers services, ML models, and VEX — vulnerability exploitability exchange statements saying "not affected because…") and <strong>SPDX</strong> (Linux Foundation, ISO/IEC 5962:2021; version 3.0 released 2024). Generate them at build time from the build tool's resolved graph (CycloneDX Maven/Gradle plugins) or from images (Syft), store them with the artifact (as attestations), and query them when the next Log4Shell lands.</p>
+
+  <h3>3.18 SLSA and Sigstore</h3>
+  <p><strong>SLSA</strong> is a framework of incrementally adoptable levels describing how trustworthy an artifact's production was. The Build track levels: <em>L1</em> — provenance exists (a document stating how the artifact was built: builder, source, parameters); <em>L2</em> — provenance is generated and signed by a hosted build platform; <em>L3</em> — the build platform is hardened so that builds are isolated from each other and signing material is inaccessible to user-defined build steps, making provenance unforgeable by tenants. v1.2 adds a Source track about the integrity of source history. Provenance uses the in-toto attestation format.</p>
+  <p><strong>Sigstore</strong> provides free signing infrastructure: <strong>cosign</strong> signs and verifies container images and other artifacts; <strong>Fulcio</strong> is a CA that issues short-lived certificates binding a signing key to an OIDC identity (e.g. "this GitHub Actions workflow in this repository"); <strong>Rekor</strong> is a transparency log recording signatures so they can be audited. "Keyless" signing means no long-lived private key to protect: the CI job's OIDC identity is the signer. Verification checks the signature, the certificate identity and issuer, and the Rekor inclusion proof.</p>
+
+  <h3>3.19 Security logging, audit and SIEM at the platform level</h3>
+  <p>Collect: cloud control-plane audit logs (AWS CloudTrail including data events for sensitive buckets, GCP Cloud Audit Logs, Azure Activity Logs), KMS and secret-manager access logs, Kubernetes audit logs, VPC flow logs or equivalent, identity provider logs, CI/CD logs, and application security events (Chapter 11.1). Centralise in a SIEM, protect log integrity (separate account, object lock), correlate on identities, and write detections for high-signal events: root account use, IAM policy changes, disabling of logging, new access keys, secret reads by unexpected principals, KMS key deletion scheduled, privileged pods created, exec into production pods.</p>
+</section>

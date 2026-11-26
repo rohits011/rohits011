@@ -45,3 +45,246 @@
   <p><strong>AWS Lambda</strong> was announced at re:Invent in November 2014 and started the "serverless" era; API Gateway (2015), Step Functions (2016), EventBridge (2019, evolved from CloudWatch Events) and Fargate (2017) completed the picture. Containers on AWS came via ECS (2014–2015) and <strong>EKS</strong> (GA June 2018). Networking evolved with PrivateLink (2017), Transit Gateway (2018) and VPC Lattice (GA 2023). In December 2020 S3 became strongly consistent for all operations and Lambda moved to 1 ms billing granularity and container image packaging. <strong>Lambda SnapStart</strong> for Java was launched at re:Invent 2022 and extended to Python and .NET in November 2024 and to container image functions in 2026; <strong>EKS Auto Mode</strong>, which runs Karpenter-based node management, storage and load balancing as a managed capability, was announced in December 2024 <span class="tag version">Version-sensitive · checked Nov 2026</span>. In 2025 AWS raised the maximum SQS message size and Lambda asynchronous payload size from 256 KB to 1 MiB/1 MB.</p>
   <p>The history of outages matters as much as the history of launches: major us-east-1 events in 2011 (EBS), 2017 (S3 in us-east-1, triggered by a mistyped command), December 2021 (internal network congestion) and October 2025 (a DNS race condition in DynamoDB's automation) shaped how both AWS and its customers think about blast radius — see §9.</p>
 </section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 Regions, Availability Zones and edge locations</h3>
+  <p>A <strong>Region</strong> (e.g., <code>eu-west-1</code>, Ireland) is a separate geographic area with its own control planes for most services; Regions are isolated from each other by design, and data does not leave a Region unless you move it. Each Region has multiple <strong>Availability Zones</strong> (typically three or more): one or more discrete data centres with independent power, cooling and networking, connected by low-latency links (single-digit milliseconds or less). AZ names like <code>eu-west-1a</code> are mapped per account; the stable identifier is the AZ ID (<code>euw1-az1</code>). <strong>Edge locations</strong> host CloudFront and Route 53 close to users. The design rule: <em>every production workload survives the loss of one AZ</em>; surviving the loss of a Region is a business decision with real cost.</p>
+
+  <h3>3.2 IAM: every API call is authorised</h3>
+  <p>Identity and Access Management decides whether a <em>principal</em> (an IAM user, a role session, an AWS service) may perform an <em>action</em> (<code>s3:GetObject</code>) on a <em>resource</em> (<code>arn:aws:s3:::lumen-docs/*</code>) under <em>conditions</em> (source VPC endpoint, tags, MFA). Key concepts:</p>
+  <ul>
+    <li><strong>Roles</strong> are identities without long-term credentials; they are <em>assumed</em> via STS to obtain temporary credentials. EC2 instance profiles, ECS task roles, Lambda execution roles, EKS Pod Identity and GitHub OIDC (Chapter 3) are all role assumption.</li>
+    <li><strong>Policies</strong>: identity-based (attached to a role), resource-based (bucket policies, SQS queue policies, KMS key policies), permission boundaries, session policies, and organisation-level <strong>Service Control Policies</strong> and resource control policies that cap what any principal in an account can do.</li>
+    <li><strong>Evaluation</strong>: an explicit <code>Deny</code> anywhere wins; otherwise access requires an <code>Allow</code> (and for cross-account access, allows on both sides); everything else is implicitly denied.</li>
+    <li><strong>Least privilege</strong>: scope actions and resources tightly; use IAM Access Analyzer to generate policies from CloudTrail activity and to find unintended external access.</li>
+  </ul>
+  <div class="callout java"><p class="callout-title">Java angle: the default credentials provider chain</p><p>The AWS SDK for Java v2 resolves credentials through a chain: system properties, environment variables, web identity token file (used by IRSA), the shared credentials file, the container credentials endpoint (used by ECS task roles and EKS Pod Identity), and the EC2 instance metadata service. In production you should configure <em>nothing</em> in code: the platform injects a role, and the chain finds it. If you see <code>AWS_ACCESS_KEY_ID</code> in a Deployment manifest, that is a finding.</p></div>
+
+  <h3>3.3 Compute: EC2, containers and functions</h3>
+  <p><strong>EC2</strong> instances are virtual machines on the Nitro hypervisor, chosen by family (general purpose <code>m</code>, compute <code>c</code>, memory <code>r</code>, GPU <code>g</code>/<code>p</code>, ARM-based Graviton variants suffixed <code>g</code>), size and purchase option (On-Demand, Savings Plans/Reserved, Spot at steep discounts with two-minute interruption notices). Auto Scaling groups keep a fleet at the desired size across AZs. <strong>ECS</strong> is AWS's own container orchestrator (tasks and services, simpler than Kubernetes, deeply integrated with IAM and ALB); <strong>EKS</strong> is managed Kubernetes; both run containers on EC2 or on <strong>Fargate</strong> (serverless per-task VMs). <strong>Lambda</strong> runs functions in response to events with per-millisecond billing.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th></th><th>ECS</th><th>EKS</th></tr></thead>
+    <tbody>
+      <tr><td>API</td><td>AWS-specific (task definitions, services)</td><td>Kubernetes API (portable, huge ecosystem)</td></tr>
+      <tr><td>Control plane cost</td><td>None</td><td>Per-cluster hourly fee</td></tr>
+      <tr><td>Operational complexity</td><td>Low</td><td>Medium–high (add-ons, upgrades), reduced by Auto Mode</td></tr>
+      <tr><td>Extensibility</td><td>Limited</td><td>CRDs, operators, Argo CD, KEDA, service meshes</td></tr>
+      <tr><td>Best for</td><td>AWS-only teams wanting simplicity</td><td>Platform teams, many services, portability, GPU/AI scheduling</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>3.4 Storage: S3, EBS and EFS</h3>
+  <p><strong>S3</strong> is object storage: buckets of objects addressed by key, eleven nines of designed durability, strong read-after-write consistency, storage classes from Standard to Glacier Deep Archive, lifecycle rules, versioning, object lock, event notifications and presigned URLs. It is the backbone for data lakes, backups, Terraform state and — for Lumen — the source documents that <code>assist-service</code> indexes. <strong>EBS</strong> volumes are block devices attached to one instance in one AZ (the reason a StatefulSet Pod with an EBS volume cannot move to another AZ). <strong>EFS</strong> is a regional NFS file system mountable by many instances across AZs.</p>
+
+  <h3>3.5 Databases: RDS, Aurora and DynamoDB</h3>
+  <p><strong>RDS</strong> runs PostgreSQL, MySQL, MariaDB, Oracle, SQL Server and Db2 with automated backups, patching and <strong>Multi-AZ</strong> deployments (a synchronous standby in another AZ, automatic failover by DNS flip typically within one to two minutes). <strong>Aurora</strong> (PostgreSQL- and MySQL-compatible) separates compute from a distributed storage layer that keeps six copies across three AZs; replicas share storage, so failover is faster and read replicas lag less; Aurora Serverless v2 scales capacity in fine increments. <strong>DynamoDB</strong> is a serverless key-value and document store with single-digit-millisecond latency at any scale, partitioned by key, priced per request or provisioned capacity, with Streams for change data capture and global tables for multi-region replication. Choose relational for rich queries and transactions (Lumen's orders), DynamoDB for known access patterns at very high scale (session state, idempotency keys, rate-limit counters).</p>
+
+  <h3>3.6 Messaging: SQS, SNS and EventBridge</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Service</th><th>Model</th><th>Key properties</th><th>Lumen use</th></tr></thead>
+    <tbody>
+      <tr><td><strong>SQS</strong></td><td>Queue (point-to-point, consumers poll)</td><td>Standard: at-least-once, best-effort order, nearly unlimited throughput. FIFO: ordered per message group, exactly-once processing within a deduplication window. Visibility timeout, dead-letter queues, messages up to 1 MiB</td><td>Order events to notification and re-embedding workers</td></tr>
+      <tr><td><strong>SNS</strong></td><td>Pub/sub topic (push)</td><td>Fan-out to SQS, Lambda, HTTP, email/SMS; message filtering</td><td>Fan-out of "order placed" to several queues</td></tr>
+      <tr><td><strong>EventBridge</strong></td><td>Event bus with content-based routing rules</td><td>Schema registry, SaaS integrations, archive and replay, Scheduler, Pipes</td><td>Domain events across teams; scheduled jobs</td></tr>
+      <tr><td><strong>Kinesis / MSK</strong></td><td>Ordered, replayable log (Kafka model)</td><td>Partitions/shards, retention, consumer offsets</td><td>Clickstream, high-volume analytics (Part 2, Kafka chapter)</td></tr>
+    </tbody>
+  </table></div>
+  <p>Coming from Spring, SQS maps to <code>@SqsListener</code> with the important differences that delivery is at-least-once (consumers must be idempotent) and that a message not deleted before its <em>visibility timeout</em> becomes visible again and is redelivered.</p>
+
+  <h3>3.7 The VPC</h3>
+  <p>A <strong>Virtual Private Cloud</strong> is a logically isolated network in one Region with a primary IPv4 CIDR (from /16 to /28; secondary CIDRs can be added) and optionally IPv6. A <strong>subnet</strong> lives in exactly one AZ and has a CIDR carved from the VPC's. Subnets are not "public" or "private" by any flag — the difference is entirely their <strong>route table</strong>: a public subnet's route table sends <code>0.0.0.0/0</code> to an <strong>Internet Gateway (IGW)</strong>; a private subnet's sends it to a <strong>NAT gateway</strong> (or nowhere). Every route table also has an implicit <code>local</code> route for the VPC CIDR, so all subnets in a VPC can reach each other unless security groups or NACLs block it.</p>
+
+  <h3>3.8 Internet Gateway and NAT gateway</h3>
+  <p>The IGW performs 1:1 translation between an instance's private IP and its public or Elastic IP, enabling both inbound and outbound internet traffic for resources that have public IPs. A <strong>NAT gateway</strong> sits in a public subnet with an Elastic IP and lets resources in private subnets initiate outbound connections (to pull images, call LLM APIs, reach SaaS) while remaining unreachable from the internet — SNAT, exactly as in Chapter 1 §3.16. NAT gateways are zonal: deploy one per AZ and route each private subnet to its own AZ's NAT, or an AZ failure takes down egress everywhere. NAT options evolve, so check the current VPC documentation for newer deployment modes <span class="tag version">Version-sensitive · checked Nov 2026</span>. NAT gateways charge per hour and per GB processed — often a surprise cost.</p>
+
+  <h3>3.9 Security groups vs network ACLs</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th></th><th>Security group</th><th>Network ACL</th></tr></thead>
+    <tbody>
+      <tr><td>Attached to</td><td>Elastic network interfaces (instances, pods with VPC CNI security groups for pods, RDS, LBs, endpoints)</td><td>Subnets</td></tr>
+      <tr><td>State</td><td><strong>Stateful</strong>: return traffic automatically allowed</td><td><strong>Stateless</strong>: must allow return traffic (ephemeral ports) explicitly</td></tr>
+      <tr><td>Rules</td><td>Allow only</td><td>Allow and deny, evaluated in number order</td></tr>
+      <tr><td>Sources</td><td>CIDRs, prefix lists, <em>other security groups</em></td><td>CIDRs only</td></tr>
+      <tr><td>Typical use</td><td>Primary micro-segmentation: "RDS accepts 5432 only from the EKS node/pod SG"</td><td>Coarse guardrails: block a CIDR, enforce subnet tiers</td></tr>
+    </tbody>
+  </table></div>
+  <p>Referencing security groups by ID instead of CIDRs is the key idiom: rules follow workloads as IPs change. When a connection hangs (SYN_SENT, Chapter 1) between two AWS resources, check both sides' security groups, the NACLs, and the route tables, in that order.</p>
+
+  <h3>3.10 VPC endpoints and PrivateLink</h3>
+  <p>Without endpoints, a pod in a private subnet reaches S3 or ECR through the NAT gateway — paying NAT processing for every byte and depending on internet egress. <strong>Gateway endpoints</strong> (S3 and DynamoDB only, free) add routes in your route tables to the service's prefix list. <strong>Interface endpoints</strong> (AWS PrivateLink) place an ENI with a private IP in your subnets for a service (ECR API and DKR, STS, Secrets Manager, SQS, CloudWatch Logs, Bedrock Runtime, and thousands of partner/SaaS services), with private DNS so the normal hostname resolves to the private IP. They cost per hour per AZ plus per GB, but remove NAT dependency and let you restrict access with endpoint policies and <code>aws:SourceVpce</code> conditions. PrivateLink also lets you expose your own service (behind an NLB) to other VPCs and accounts without peering.</p>
+
+  <h3>3.11 Connecting VPCs: peering, Transit Gateway and VPC Lattice</h3>
+  <p><strong>VPC peering</strong> is a non-transitive one-to-one link (no overlapping CIDRs); fine for a few VPCs, unmanageable at dozens. <strong>Transit Gateway</strong> is a regional hub router: VPCs, VPNs and Direct Connect attach to it, with route tables controlling who reaches whom, inter-region peering, and per-attachment and per-GB charges. <strong>VPC Lattice</strong> is an application-layer service network: you register services (EKS, ECS, EC2, Lambda) and Lattice handles service discovery, L7 routing, authentication with IAM policies and cross-VPC/cross-account connectivity, even with overlapping CIDRs — a managed alternative to parts of a service mesh.</p>
+
+  <h3>3.12 Route 53</h3>
+  <p>Route 53 is AWS's DNS service: public and private hosted zones (private zones resolve only inside associated VPCs), the <strong>ALIAS</strong> record that points apex domains at AWS resources (ALB, CloudFront, S3 website) without a CNAME, routing policies (simple, weighted for canaries, latency-based, geolocation, failover with health checks, multivalue), and Route 53 Resolver for hybrid DNS (inbound/outbound endpoints, forwarding rules) and DNS Firewall. The VPC's built-in resolver lives at the VPC CIDR base + 2.</p>
+
+  <h3>3.13 Elastic Load Balancing: ALB and NLB</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th></th><th>Application Load Balancer</th><th>Network Load Balancer</th></tr></thead>
+    <tbody>
+      <tr><td>Layer</td><td>L7 (HTTP/1.1, HTTP/2, gRPC, WebSocket)</td><td>L4 (TCP, UDP, TLS)</td></tr>
+      <tr><td>Routing</td><td>Host, path, header, query, method; weighted target groups</td><td>Per-flow hash to targets</td></tr>
+      <tr><td>TLS</td><td>Terminates (ACM certificates), optional re-encryption</td><td>Pass-through or terminate</td></tr>
+      <tr><td>IPs</td><td>Dynamic (use DNS name)</td><td>Static IP per AZ, Elastic IPs possible</td></tr>
+      <tr><td>Extras</td><td>WAF, OIDC/Cognito auth, sticky sessions, slow start</td><td>Preserves client IP, PrivateLink services, extreme scale</td></tr>
+      <tr><td>Kubernetes integration</td><td>Ingress or Gateway API via AWS Load Balancer Controller</td><td>Service <code>type: LoadBalancer</code> or Gateway API</td></tr>
+    </tbody>
+  </table></div>
+  <p>Both support <strong>IP targets</strong> so that EKS pods are registered directly (no NodePort hop). Key settings you will tune: health check path and thresholds (point them at readiness, not liveness), idle timeout (ALB default 60 s — remember Chapter 1 §4.6), deregistration delay (connection draining, default 300 s — usually lower it to 30–60 s for stateless APIs), and cross-zone load balancing.</p>
+
+  <h3>3.14 CloudFront</h3>
+  <p>CloudFront is AWS's CDN: hundreds of edge locations terminate TLS (and HTTP/3) close to users, cache static and cacheable dynamic content, and forward misses to origins (S3 with Origin Access Control, ALBs, custom origins) over AWS's backbone. It integrates with AWS WAF and Shield for DDoS protection, and CloudFront Functions/Lambda@Edge run small pieces of code at the edge (header rewrites, auth checks). For Lumen, CloudFront serves the web app from S3 and fronts the API ALB for TLS and DDoS protection.</p>
+
+  <h3>3.15 Serverless and the Lambda execution model</h3>
+  <p>A Lambda function is code plus configuration (runtime, memory 128 MB–10,240 MB, timeout up to 900 s, ephemeral <code>/tmp</code> up to 10 GB, environment variables, VPC attachment, execution role) <span class="tag version">Version-sensitive · checked Nov 2026</span>. CPU is allocated proportionally to memory (about one vCPU at 1,769 MB, up to six vCPUs at the maximum). Lambda runs each function instance in a Firecracker microVM <em>execution environment</em>. Each environment processes <strong>one invocation at a time</strong>; concurrency is achieved by running many environments in parallel. The lifecycle has three phases:</p>
+  <ol>
+    <li><strong>Init</strong> — download code, start the runtime, run static initialisers and the handler class constructor (for Java: JVM start, class loading, Spring context if you use one). This is the <strong>cold start</strong>.</li>
+    <li><strong>Invoke</strong> — run the handler for one event. The environment is then frozen and kept warm for reuse; subsequent invocations skip Init.</li>
+    <li><strong>Shutdown</strong> — environments are reclaimed after an idle period or for maintenance.</li>
+  </ol>
+  <p>Invocation types: <strong>synchronous</strong> (API Gateway, function URLs, SDK <code>RequestResponse</code>; caller waits; payload up to 6 MB), <strong>asynchronous</strong> (S3, SNS, EventBridge; Lambda queues the event and retries twice by default, with destinations or DLQs for failures; payload up to 1 MB since late 2025), and <strong>event source mappings</strong> (Lambda polls SQS, Kinesis, DynamoDB Streams, Kafka and invokes with batches) <span class="tag version">Version-sensitive · checked Nov 2026</span>. Concurrency is governed by an account-level regional limit and per-function reserved concurrency; provisioned concurrency keeps environments pre-initialised.</p>
+
+  <h3>3.16 Cold starts, SnapStart and native images</h3>
+  <p>A plain Java 21 function with a few SDK clients typically cold-starts in roughly 1–3 seconds, and a full Spring Boot application longer, while Go and Python functions usually start in tens to a few hundred milliseconds <span class="tag illus">Illustrative</span>. Remedies for Java:</p>
+  <ul>
+    <li><strong>SnapStart</strong> (Java 11+, also Python 3.12+ and .NET 8+): when you publish a version, Lambda runs Init once, takes a Firecracker snapshot of the initialised memory and disk, caches it, and resumes new environments from the snapshot. Cold starts drop dramatically. Caveats: code that assumes uniqueness after init (random seeds, generated IDs, cached credentials, open network connections) must re-initialise using CRaC runtime hooks (<code>beforeCheckpoint</code>/<code>afterRestore</code>); SnapStart applies to published versions/aliases, and does not combine with provisioned concurrency or EFS.</li>
+    <li><strong>GraalVM native image</strong> (via Spring Boot AOT or Quarkus/Micronaut): compile ahead of time to a native executable on a custom runtime (<code>provided.al2023</code>); starts in tens of milliseconds with lower memory, at the cost of build complexity and reflection configuration.</li>
+    <li><strong>Lean handlers</strong>: avoid a full Spring context; use the SDK's lightweight HTTP client (<code>UrlConnectionHttpClient</code> or AWS CRT), initialise clients once in static fields, and tune <code>-XX:TieredStopAtLevel=1</code> (via <code>JAVA_TOOL_OPTIONS</code>) for short-lived work.</li>
+    <li><strong>Provisioned concurrency</strong>: pay to keep N environments warm; predictable but costs money even when idle.</li>
+  </ul>
+
+  <h3>3.17 Step Functions and event-driven serverless design</h3>
+  <p><strong>Step Functions</strong> orchestrates workflows as state machines defined in Amazon States Language: tasks (Lambda, ECS, 200+ direct SDK integrations), choices, parallel and map states, retries with backoff, catch blocks, and wait states up to a year (Standard workflows, exactly-once, auditable history) or high-volume short workflows (Express, at-least-once). It is the serverless implementation of the saga pattern (Part 2). Event-driven serverless design composes small functions through queues and events: <em>producers</em> emit facts ("OrderPlaced") to EventBridge or SNS; <em>consumers</em> subscribe via SQS queues (which buffer, retry and dead-letter); functions are idempotent and stateless; state lives in DynamoDB/S3; orchestration that needs visibility uses Step Functions.</p>
+
+  <h3>3.18 When not to use serverless</h3>
+  <ul>
+    <li>Steady, high-throughput traffic (e.g., hundreds of requests per second around the clock): containers on reserved/Spot capacity are usually cheaper.</li>
+    <li>Strict low-latency p99 requirements where any cold start is unacceptable and provisioned concurrency is not cost-effective.</li>
+    <li>Long-running work beyond 15 minutes, or large in-memory state, GPUs, or persistent connections (WebSocket servers, database connection-heavy workloads without RDS Proxy).</li>
+    <li>Heavy frameworks you cannot slim, or when portability requirements rule out provider-specific event models.</li>
+  </ul>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working</h2>
+  <h3>4.1 A request from a user to an orders Pod</h3>
+  <ol>
+    <li><strong>DNS.</strong> The client resolves <code>api.lumen.example.com</code>. Route 53 holds an ALIAS record pointing at the CloudFront distribution, which returns IPs of a nearby edge location.</li>
+    <li><strong>Edge.</strong> CloudFront terminates TLS (HTTP/3 or HTTP/2), applies AWS WAF rules, and forwards the request (not cacheable: <code>POST</code>) to its origin — the public ALB — over AWS's network, adding a secret header that the ALB checks so it cannot be bypassed.</li>
+    <li><strong>ALB.</strong> The ALB's nodes live in the public subnets of three AZs. It terminates TLS again (ACM certificate), evaluates listener rules (<code>/api/*</code> → target group <code>edge-gateway</code>), picks a healthy target with its algorithm (round robin or least outstanding requests) and opens or reuses a connection to the target's <em>pod IP</em>.</li>
+    <li><strong>VPC fabric.</strong> With the VPC CNI, pod IPs are secondary IPs (or prefixes) on node ENIs in private subnets, so the ALB's packet is routed by the VPC's <code>local</code> route straight to the node; the security group attached to the node (or to the pod, with security groups for pods) must allow the ALB's security group on the target port.</li>
+    <li><strong>In-cluster.</strong> The Go gateway authenticates, then calls <code>orders</code> through the Kubernetes Service (Chapter 2 §4.2).</li>
+    <li><strong>Database.</strong> <code>orders-service</code> connects to the RDS endpoint DNS name, which resolves (via the VPC resolver) to the primary instance's private IP in a data subnet; the RDS security group allows 5432 only from the EKS pod/node security group.</li>
+  </ol>
+
+  <h3>4.2 A request from a Pod to AWS APIs and the internet</h3>
+  <p>When <code>assist-service</code> reads a document from S3, the SDK resolves <code>s3.eu-west-1.amazonaws.com</code> to public S3 IPs. The private subnet's route table contains a route for the S3 <em>prefix list</em> pointing at the gateway endpoint, which is more specific than <code>0.0.0.0/0</code>, so the traffic goes to S3 privately without touching the NAT gateway. When it calls Secrets Manager or Bedrock Runtime, private DNS on the interface endpoint makes the regular hostname resolve to the endpoint ENI's private IP in the same AZ. When it calls an external LLM API, the packet matches <code>0.0.0.0/0 → nat-xxxx</code> in its AZ; the NAT gateway rewrites the source to its Elastic IP and forwards through the IGW. Each of these paths has different cost, failure modes and security controls — the reason to know which one your traffic takes.</p>
+
+  <h3>4.3 How credentials reach a Pod (EKS Pod Identity)</h3>
+  <p>You create an association between a Kubernetes ServiceAccount (<code>lumen/orders</code>) and an IAM role. The EKS Pod Identity Agent runs as a DaemonSet on each node. When a Pod using that ServiceAccount starts, EKS injects environment variables (<code>AWS_CONTAINER_CREDENTIALS_FULL_URI</code> and an authorisation token file) into its containers. The SDK's container credentials provider calls the agent on a link-local address; the agent exchanges the Pod's projected service account token with the EKS Auth API for temporary role credentials, which the SDK caches and refreshes. No keys are stored anywhere, and the role's trust policy is managed by EKS rather than per-cluster OIDC providers (the older IRSA mechanism, still widely used, works similarly with a web identity token and an IAM OIDC provider per cluster).</p>
+
+  <h3>4.4 Lambda invocation internals</h3>
+  <p>For an SQS event source mapping, Lambda's pollers long-poll the queue, accumulate a batch (up to the batch size or batching window), and invoke the function synchronously. The Lambda frontend authorises the call and routes it to the placement service, which finds a warm execution environment for that function version or creates one on a worker host: a Firecracker microVM is started (or restored from a SnapStart snapshot), the runtime and code are loaded, Init runs, then Invoke. The runtime fetches events from the Runtime API (<code>/runtime/invocation/next</code>) and posts results. If the function returns partial batch failures (<code>batchItemFailures</code>), only those messages become visible again after the visibility timeout; on full failure the whole batch returns to the queue; after <code>maxReceiveCount</code> attempts SQS moves messages to the dead-letter queue. The poller scales concurrency up as the queue backs up, bounded by the function's maximum concurrency setting.</p>
+
+  <h3>4.5 How an RDS Multi-AZ failover works</h3>
+  <p>RDS keeps a synchronous standby in another AZ (or, in Multi-AZ DB clusters, two readable standbys). If the primary's host, storage or AZ fails — or during patching — RDS promotes the standby and updates the endpoint's DNS record to the new primary's IP. Clients see connection errors until they reconnect and re-resolve DNS. That is why the JVM's DNS cache TTL (Chapter 1 §3.11) and HikariCP's validation and <code>max-lifetime</code> settings matter, and why the AWS Advanced JDBC Wrapper (which tracks cluster topology for faster failover) or RDS Proxy (which holds client connections across failover) are worth considering.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture Diagrams</h2>
+  <h3>5.1 Lumen VPC layout</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  INET(("Internet")) --> CF["CloudFront + WAF"]
+  CF --> IGW["Internet Gateway"]
+  subgraph VPC["VPC 10.40.0.0/16 (eu-west-1)"]
+    subgraph AZA["AZ a"]
+      PUBA["public 10.40.0.0/24: ALB node, NAT GW a"]
+      PRIA["private 10.40.32.0/19: EKS nodes and pods"]
+      DATA_A["data 10.40.10.0/24: RDS primary"]
+    end
+    subgraph AZB["AZ b"]
+      PUBB["public 10.40.1.0/24: ALB node, NAT GW b"]
+      PRIB["private 10.40.64.0/19: EKS nodes and pods"]
+      DATA_B["data 10.40.11.0/24: RDS standby"]
+    end
+    EPS["Gateway endpoints: S3, DynamoDB"]
+    EPI["Interface endpoints: ECR, STS, SQS, Secrets Manager, Bedrock"]
+  end
+  IGW --> PUBA
+  IGW --> PUBB
+  PUBA --> PRIA
+  PUBB --> PRIB
+  PRIA -->|"0.0.0.0/0"| PUBA
+  PRIB -->|"0.0.0.0/0"| PUBB
+  PRIA --> DATA_A
+  PRIB --> DATA_A
+  PRIA --> EPS
+  PRIA --> EPI
+</pre>
+<figcaption>Figure 12.18 — Three subnet tiers per AZ (two AZs shown; production uses three). Each tier's route table defines what it can reach.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> public subnets hold only things that must face the internet — ALB nodes and NAT gateways — and are small (/24). Private subnets are large (/19, 8,187 usable addresses each) because the VPC CNI gives every pod a VPC IP. Data subnets have no route to the internet at all; RDS is reachable only from inside the VPC. Each private subnet's default route goes to the NAT gateway in its own AZ, so losing AZ a does not break egress in AZ b. Endpoint traffic to S3, ECR and other AWS APIs bypasses NAT entirely. This is the network that the Terraform module in Chapter 3 §7.7 creates.</p>
+
+  <h3>5.2 Packet path through security controls</h3>
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant U as User
+  participant CF as CloudFront
+  participant ALB as ALB (sg-alb)
+  participant N as EKS pod (sg-pods)
+  participant DB as RDS (sg-db)
+  U->>CF: HTTPS POST /api/orders
+  CF->>ALB: HTTPS + origin secret header (sg-alb allows CloudFront prefix list on 443)
+  ALB->>N: HTTP to pod IP :8080 (sg-pods allows sg-alb on 8080)
+  N->>DB: TCP 5432 (sg-db allows sg-pods on 5432)
+  DB-->>N: result (stateful SG: return allowed)
+  N-->>ALB: 201 Created
+  ALB-->>CF: 201 Created
+  CF-->>U: 201 Created
+</pre>
+<figcaption>Figure 12.19 — Each hop is permitted by a security-group rule that references the previous hop's security group.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> no rule mentions an IP address except the CloudFront managed prefix list on the ALB. The pods accept traffic only from the ALB's security group, and the database only from the pods' security group. Because security groups are stateful, responses need no rules. If any arrow fails, the symptom is a timeout (packets silently dropped), not a refusal — the clue that points at security groups rather than at the application.</p>
+
+  <h3>5.3 Event-driven serverless flow</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  ORD["orders-service (EKS)"] -->|"PutEvents OrderPlaced"| EB["EventBridge bus lumen"]
+  EB -->|"rule: detail-type OrderPlaced"| Q1["SQS notify-queue"]
+  EB -->|"rule: total over 1000"| SF["Step Functions: fraud-review"]
+  EB -->|"rule: has attachments"| Q2["SQS embed-queue"]
+  Q1 --> L1["Lambda notify (Java 21 + SnapStart)"]
+  Q2 --> KEDA["assist-embedder pods (KEDA on EKS)"]
+  L1 --> SES["Amazon SES email"]
+  Q1 -.->|"after 5 failed receives"| DLQ["notify-dlq"]
+  SF --> L2["Lambda score (Python)"]
+  SF --> HUMAN["Task token: human approval"]
+</pre>
+<figcaption>Figure 12.20 — Lumen publishes domain events once; consumers subscribe through rules and queues.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> the orders service knows nothing about notifications, fraud review or embedding — it emits facts. EventBridge rules route by content; SQS queues buffer each consumer independently so a slow consumer does not affect others, and dead-letter queues capture poison messages. Short, spiky work (sending emails) is a natural Lambda; heavy GPU-backed embedding runs as KEDA-scaled pods; multi-step processes with waiting and human approval run in Step Functions. Choosing the compute per consumer is the essence of pragmatic serverless.</p>
+
+  <h3>5.4 Lambda execution environment lifecycle</h3>
+<figure class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> Init: first request or scale-out (cold start)
+  [*] --> Restore: SnapStart version (resume from snapshot)
+  Restore --> Ready: afterRestore hooks run
+  Init --> Ready: runtime + static init + handler constructor
+  Ready --> Invoking: event arrives
+  Invoking --> Ready: response returned, environment frozen
+  Ready --> Shutdown: idle timeout or platform maintenance
+  Shutdown --> [*]
+</pre>
+<figcaption>Figure 12.21 — Cold starts happen on the Init or Restore path; warm invocations loop between Ready and Invoking.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> everything in Init is paid once per environment, so put expensive setup (SDK clients, connection pools sized to 1, configuration loading) there, not in the handler. With SnapStart, Init happens at publish time and new environments take the Restore path; any state that must be unique per environment (random seeds, network connections, credentials) must be refreshed in <code>afterRestore</code>. Because each environment handles one request at a time, concurrency equals the number of environments, and each environment with a database connection is one more connection on your database — hence RDS Proxy.</p>
+</section>

@@ -165,3 +165,668 @@
   <h3>3.17 Dagster and Prefect</h3>
   <p><strong>Dagster</strong> is asset-centric: you declare <em>software-defined assets</em> (a table, a model, a file) as Python functions with their upstream assets, and Dagster derives the graph, tracks materializations, partitions, freshness policies and lineage, and integrates deeply with dbt (each dbt model becomes an asset). It suits teams who think in terms of datasets rather than tasks. <strong>Prefect</strong> is flow-centric and Pythonic: decorate functions as <code>@flow</code> and <code>@task</code>, run them anywhere, with dynamic control flow, retries, caching, and a server or cloud API that coordinates work pools and workers. It suits dynamic, code-heavy workflows and teams that want minimal framework. Airflow remains the most widely deployed, with the largest provider ecosystem and managed offerings (Amazon MWAA, Google Cloud Composer, Astronomer).</p>
 </section>
+
+<section id="internals">
+  <h2>4. Internal Working</h2>
+
+  <h3>4.1 Airflow 3's components</h3>
+  <ul>
+    <li><strong>Metadata database</strong> (Postgres or MySQL): DAG runs, task instances, serialized DAGs and their versions, assets and asset events, connections, variables. It is the system of record; size and back it up like any production database.</li>
+    <li><strong>DAG processor</strong>: a separate process (mandatory and standalone in Airflow 3) that parses DAG files from <em>DAG bundles</em> (a local folder or a Git repository), executes their top-level Python, serializes each DAG to JSON and stores it, with a version, in the metadata database. Parsing runs in a loop; slow top-level code slows every DAG.</li>
+    <li><strong>Scheduler</strong>: reads serialized DAGs, creates DAG runs when schedules or asset events demand, evaluates dependencies and trigger rules, and sends ready task instances to the <strong>executor</strong>, respecting pools, concurrency and priority. Multiple schedulers can run for high availability, coordinating through row-level locks (<code>SELECT ... FOR UPDATE SKIP LOCKED</code>) in the database.</li>
+    <li><strong>Executor</strong>: a pluggable component inside the scheduler that decides how tasks run: <code>LocalExecutor</code> (subprocesses), <code>CeleryExecutor</code> (a queue and a fleet of workers), <code>KubernetesExecutor</code> (one pod per task), and the Edge executor for remote sites; multiple executors can be configured at once.</li>
+    <li><strong>Workers</strong>: run task code through the <strong>Task SDK</strong>. In Airflow 3, workers no longer connect to the metadata database; they call the <strong>API server</strong>'s Task Execution API to fetch connections, variables and XComs and to report state. That isolates user code from the database (security and scalability) and enables tasks in other languages and remote environments.</li>
+    <li><strong>API server</strong>: serves the UI, the public REST API and the Task Execution API.</li>
+    <li><strong>Triggerer</strong>: an asyncio event loop running triggers for deferred tasks (thousands per process), waking tasks when conditions fire.</li>
+  </ul>
+
+  <h3>4.2 The life of a task instance</h3>
+  <ol>
+    <li>The DAG processor parses <code>trips_daily.py</code>, serializes the DAG, and stores version N.</li>
+    <li>At the end of the data interval (say 2024-01-15 00:00 to 2024-01-16 00:00), the scheduler creates a DAG run with that logical date and its tasks as <code>scheduled</code> once dependencies allow.</li>
+    <li>The scheduler checks pool slots and concurrency, marks the task <code>queued</code> and hands it to the executor.</li>
+    <li>The executor starts it (a Celery message, a Kubernetes pod). The worker's Task SDK supervisor starts the task process, which requests its context from the API server, renders templates (<code>{{ ds }}</code>, <code>{{ data_interval_start }}</code>) and runs <code>execute()</code>.</li>
+    <li>If the task is a deferrable sensor, it raises a deferral: state becomes <code>deferred</code>, the worker slot is freed, the trigger is registered and run by the triggerer, and on firing the task is rescheduled to resume.</li>
+    <li>On success the state becomes <code>success</code>, outlet asset events are recorded, and downstream tasks (and asset-scheduled DAGs) become eligible. On failure it becomes <code>up_for_retry</code> until retries are exhausted, then <code>failed</code>, firing callbacks and alerts.</li>
+  </ol>
+  <p>Because DAG runs are versioned in Airflow 3, a rerun or backfill can use the DAG version the run was created with, avoiding the 2.x surprise of an old run being re-executed with today's code.</p>
+
+  <h3>4.3 Why DAG files must be cheap to parse</h3>
+  <p>The DAG processor imports each file repeatedly (by default every few minutes per file, and on change). Top-level code that queries a database, calls an API or reads a large file runs on every parse, slowing scheduling and hammering the dependency. Keep top-level code to DAG construction; put work inside tasks; use Jinja templates or runtime context for values; and use dynamic task mapping instead of generating tasks from a database query at parse time.</p>
+
+  <h3>4.4 How dbt executes a project</h3>
+  <ol>
+    <li><strong>Parse</strong>: read <code>dbt_project.yml</code>, all models, YAML properties, macros and packages; render enough Jinja to discover <code>ref()</code>/<code>source()</code> calls and configs; build the <strong>manifest</strong> (a JSON graph of every node) and a DAG. Partial parsing reuses unchanged results. The Fusion engine additionally compiles and type-checks SQL itself, catching errors before hitting the warehouse.</li>
+    <li><strong>Select</strong>: apply selectors (<code>--select fct_trips+</code>, <code>state:modified+</code>, tags) to choose nodes.</li>
+    <li><strong>Compile</strong>: render each model's Jinja into pure SQL with resolved relation names for the target environment.</li>
+    <li><strong>Execute</strong>: walk the DAG in topological order with N threads; for each node, run the materialization macro: e.g. for <code>table</code>, create a temporary relation and atomically swap; for <code>incremental</code>, on the first run build the full table, later build only new rows into a temp relation and <code>MERGE</code>/<code>INSERT</code>/<code>DELETE+INSERT</code> according to the strategy; for tests, run the test query and count failing rows. <code>dbt build</code> interleaves models and their tests so that a failing test skips downstream models.</li>
+    <li><strong>Artifacts</strong>: write <code>manifest.json</code>, <code>run_results.json</code> and <code>catalog.json</code>, consumed by docs, CI state comparison, orchestrators and lineage tools.</li>
+  </ol>
+
+  <h3>4.5 Incremental models in detail</h3>
+  <p>Inside an incremental model, <code>is_incremental()</code> is true when the target table exists, is not being fully refreshed, and the model is configured incremental. You use it to filter source rows to those newer than the target's high-water mark. The <strong>strategy</strong> determines how new rows land: <code>append</code> (no dedup), <code>merge</code> on <code>unique_key</code> (upsert), <code>delete+insert</code> (delete target rows matching keys, insert new), <code>insert_overwrite</code> (replace whole partitions, BigQuery/Spark), and <code>microbatch</code> (dbt 1.9+: process data in time batches by an <code>event_time</code> column, each batch independently retryable and backfillable). Late-arriving data needs a lookback window (reprocess the last N days), not a strict <code>&gt; max(ts)</code> filter.</p>
+
+  <h3>4.6 How Feast builds point-in-time training data</h3>
+  <p>Given an <em>entity dataframe</em> of (entity keys, event timestamp, label) and a list of feature references, Feast's offline store generates a query per feature view that: selects feature rows whose timestamp is ≤ the entity row's timestamp and ≥ timestamp − TTL; ranks them by feature timestamp (and created timestamp as tiebreaker for corrections) descending per entity row; and keeps rank 1. The results are left-joined back so that entity rows with no valid feature value get nulls. Materialization runs the same logic for "now" and writes the latest values per entity into the online store, keyed by a serialized entity key, so that online lookups return exactly what offline retrieval would have produced for the current time.</p>
+
+  <h3>4.7 An OpenLineage event</h3>
+  <p>When an instrumented Spark job reading <code>bronze.trips</code> and writing <code>silver.trips</code> completes, the OpenLineage Spark listener sends a JSON <code>RunEvent</code> with <code>eventType: COMPLETE</code>, a <code>run.runId</code> (UUID, also linked to the parent Airflow task run via a parent-run facet), a <code>job</code> (namespace and name), <code>inputs</code> and <code>outputs</code> (dataset namespace such as <code>s3://lake</code> and name), and facets: the output schema, a <code>columnLineage</code> facet mapping each output column to the input columns it was derived from, output statistics (row count, bytes), and the SQL or logical plan. The backend stitches events from Airflow, Spark and dbt into one graph because they share dataset naming conventions.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture</h2>
+
+  <h3>5.1 Airflow 3 architecture</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  GIT["Git repo: DAG bundle"] --> DP["DAG processor"]
+  DP -->|"serialized, versioned DAGs"| DB[("Metadata DB (Postgres)")]
+  SCH["Scheduler with executors"] --- DB
+  SCH -->|"queue task"| EXE{"Executor"}
+  EXE -->|"Celery queue"| W1["Celery worker (Task SDK)"]
+  EXE -->|"pod per task"| W2["Kubernetes pod (Task SDK)"]
+  W1 -->|"Task Execution API"| API["API server"]
+  W2 -->|"Task Execution API"| API
+  API --- DB
+  TRG["Triggerer (asyncio)"] --- DB
+  UI["Users: UI and REST API"] --> API
+  W2 -->|"submit"| SPK["Spark, dbt, warehouse"]
+  W1 -->|"logs"| LOG[("Remote logs: S3 or GCS")]
+</pre>
+<figcaption>Figure 9.18 — Airflow 3: workers reach the database only through the API server; parsing, scheduling and triggering are separate processes.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> only the DAG processor executes your DAG file's top-level code; only the scheduler decides what runs; only the API server touches the database on behalf of task code. That separation is the main architectural change in Airflow 3 and is why task code can no longer import ORM models and query the metadata DB directly (a common 2.x anti-pattern). Heavy work leaves Airflow entirely: tasks submit Spark jobs, dbt runs or warehouse queries and wait for them, preferably via deferrable operators so waiting costs no worker slot.</p>
+  <div class="callout note"><p class="callout-title">Note on the edges</p><p>Undirected edges to the metadata database denote read/write access by core components; task processes never appear on those edges because the API server is their single gateway.</p></div>
+
+  <h3>5.2 Layered dbt project and its tests</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  S1[("source: raw.tlc_yellow_trips")] --> STG1["stg_tlc__trips (view)"]
+  S2[("source: raw.tlc_zones")] --> STG2["stg_tlc__zones (view)"]
+  STG2 --> SNAP["snap_zones (snapshot, SCD2)"]
+  STG1 --> INT["int_trips_enriched (ephemeral)"]
+  SNAP --> DIM["dim_zone (table, contract)"]
+  INT --> FCT["fct_trips (incremental, merge)"]
+  DIM --> FCT
+  FCT --> AGG["agg_zone_daily (incremental, microbatch)"]
+  AGG --> EXP["exposure: ops dashboard"]
+  FCT --> ML["exposure: ETA model training set"]
+  T1(["tests: unique, not_null, relationships"]) -.-> FCT
+  T2(["source freshness"]) -.-> S1
+  T3(["unit test: tip ratio logic"]) -.-> INT
+</pre>
+<figcaption>Figure 9.19 — dbt's DAG from sources to exposures, with tests attached at each layer.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> every arrow comes from a <code>ref()</code> or <code>source()</code> call, so dbt knows the order without any hand-written dependencies. Staging models are thin views, one per source. The snapshot turns the zone lookup into an SCD2 history, from which the contract-enforced <code>dim_zone</code> is built. Exposures declare who consumes the marts (a dashboard and an ML training set), so impact analysis reaches beyond the warehouse. Tests are attached where they catch problems earliest: freshness at the source, logic in unit tests, integrity on the fact.</p>
+
+  <h3>5.3 Feature store data flow</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph OFF["Offline (lakehouse)"]
+    SRC[("fct_trips and events")] --> FP["Feature pipeline: Spark or dbt"]
+    FP --> OFS[("Offline store: feature tables with timestamps")]
+  end
+  subgraph STREAM["Streaming"]
+    K[["Kafka trip events"]] --> FL["Flink or Spark streaming aggregations"]
+  end
+  REG["Feature registry (definitions in Git)"] -.-> FP
+  REG -.-> SERVE
+  OFS -->|"point-in-time join with labels"| TRAIN["Training dataset"]
+  OFS -->|"materialize latest"| ONS[("Online store: Redis or DynamoDB")]
+  FL -->|"push fresh values"| ONS
+  FL -->|"log values"| OFS
+  ONS --> SERVE["Prediction service (Spring Boot or Python)"]
+  SERVE -->|"log features and predictions"| K
+</pre>
+<figcaption>Figure 9.20 — Offline and online feature paths sharing one registry of definitions.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> one set of definitions drives both paths, which is what prevents training-serving skew. Batch features are computed in the lakehouse and materialized to the online store; streaming features are pushed directly and also logged offline so training can see the same values serving saw. Logging the features actually used at prediction time back to Kafka closes the loop: it is the most reliable source for future training data and for skew monitoring (Chapter 10.2).</p>
+
+  <h3>5.4 How DE, AE, DS and MLE interact (revisited)</h3>
+  <p>Chapter 9.1 introduced the four roles. With the tooling now in view, here is the full hand-off picture, annotated with the artifact and the tool at each interface.</p>
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant PE as Product engineer
+  participant DE as Data engineer
+  participant AE as Analytics engineer
+  participant DS as Data scientist
+  participant MLE as ML engineer
+  PE->>DE: data contract for order events (schema registry, CI check)
+  DE->>DE: CDC and ingestion to bronze, freshness SLA, Airflow DAG
+  DE->>AE: raw sources declared in dbt sources.yml with freshness tests
+  AE->>AE: staging, marts, snapshots, metrics, dbt tests and contracts
+  AE->>DS: documented marts and semantic-layer metrics in the catalog
+  DS->>DS: EDA, experiments, model prototype in notebook
+  DS->>MLE: model spec, feature definitions, evaluation report
+  MLE->>DE: feature pipeline requirements (freshness, backfill)
+  MLE->>MLE: Feast feature views, training pipeline, registry, serving
+  MLE->>PE: prediction API contract and SLOs
+  MLE->>DS: monitoring dashboards: drift, performance, skew
+  DS->>AE: request new metric or dimension
+</pre>
+<figcaption>Figure 9.21 — Hand-offs between roles, each mediated by an explicit, testable artifact.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> each message is an artifact with an owner and a test, not a conversation. Contracts flow from product engineering to data engineering; declared, freshness-tested sources flow to analytics engineering; tested marts and metric definitions flow to data science; feature definitions and evaluation evidence flow to ML engineering; prediction APIs flow back to product engineering. The feedback edges (monitoring to DS, metric requests to AE) are what make it a system rather than a conveyor belt.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Activity</th><th>Data engineer</th><th>Analytics engineer</th><th>Data scientist</th><th>ML engineer</th></tr></thead>
+    <tbody>
+      <tr><td>Ingestion, CDC, Kafka, lake storage</td><td><strong>Owns</strong></td><td>Consults</td><td>Informed</td><td>Consults</td></tr>
+      <tr><td>Orchestration platform (Airflow)</td><td><strong>Owns</strong></td><td>Uses</td><td>Uses</td><td>Uses</td></tr>
+      <tr><td>dbt models, marts, metric definitions</td><td>Supports</td><td><strong>Owns</strong></td><td>Consults</td><td>Consumes</td></tr>
+      <tr><td>Data quality tests</td><td>Owns raw/integration layer</td><td>Owns modelled layer</td><td>Reports issues</td><td>Owns feature checks</td></tr>
+      <tr><td>Experiments and analysis</td><td>Informed</td><td>Supports metrics</td><td><strong>Owns</strong></td><td>Informed</td></tr>
+      <tr><td>Feature definitions</td><td>Builds heavy pipelines</td><td>Provides marts</td><td>Proposes</td><td><strong>Owns productionization</strong></td></tr>
+      <tr><td>Training, registry, serving, monitoring</td><td>Informed</td><td>Informed</td><td>Consults on evaluation</td><td><strong>Owns</strong></td></tr>
+      <tr><td>Governance (catalog, access, retention)</td><td>Implements platform</td><td>Documents models</td><td>Follows</td><td>Follows; documents models</td></tr>
+    </tbody>
+  </table></div>
+  <p><span class="tag opinion">Opinion</span> The most common organizational failure is not a missing tool but a missing owner at an interface: nobody owns the event schema, or nobody owns the definition of "active user". Assign owners to interfaces before buying tools.</p>
+</section>
+
+<section id="math">
+  <h2>6. Mathematical Foundations</h2>
+  <h3>6.1 Freshness and quality SLOs</h3>
+  <p>Treat datasets like services. Define an SLI such as "fraction of days the <code>fct_trips</code> partition for D−1 is published and passes blocking tests by 06:00". With a 99% SLO over a quarter (~90 days), the error budget is 0.9 days: one late day per quarter. End-to-end freshness of a chain of dependent pipelines is bounded by the sum of their latencies plus scheduling gaps:</p>
+  \[ F_{\text{end}} \le \sum_{i=1}^{k} \left( L_i + G_i \right) \]
+  <p>where \( L_i \) is stage runtime and \( G_i \) the wait between an upstream finishing and the downstream starting. Time-based schedules make \( G_i \) up to a full period; data-aware (asset) scheduling drives it to near zero.</p>
+
+  <h3>6.2 Availability of chained pipelines</h3>
+  <p>If a mart depends on \( k \) independent upstream pipelines each succeeding on time with probability \( p \), the mart is on time with probability \( p^k \). <span class="tag illus">Illustrative</span> With \( p = 0.99 \) and \( k = 20 \): \( 0.99^{20} \approx 0.82 \), so the mart is late about one day in five. This is why long dependency chains need retries, slack, and SLAs on the critical path, the same reasoning as availability of synchronous microservice call chains.</p>
+
+  <h3>6.3 Anomaly thresholds for volume checks</h3>
+  <p>A simple, robust volume check compares today's row count \( x \) with the last \( n \) same-weekday counts using the median \( \tilde{m} \) and median absolute deviation (MAD):</p>
+  \[ z_{\text{robust}} = \frac{x - \tilde{m}}{1.4826 \cdot \mathrm{MAD}} \]
+  <p>The factor 1.4826 makes MAD a consistent estimator of the standard deviation for normal data. Alerting at \( |z_{\text{robust}}| &gt; 4 \) is resistant to past outliers (a holiday) contaminating the baseline, unlike a mean and standard deviation. Every threshold trades false alarms against missed incidents; tune per table tier.</p>
+
+  <h3>6.4 Point-in-time join cost</h3>
+  <p>A naive point-in-time join of \( n \) label rows against \( m \) feature rows per entity is \( O(n \cdot m) \). Sorting both by (entity, timestamp) and merging gives \( O((n + m)\log(n+m)) \), which is what <code>merge_asof</code>, <code>ASOF JOIN</code> and feature store engines do. A TTL bounds the lookback and therefore how much feature history must be scanned per label.</p>
+
+  <h3>6.5 Orchestrator throughput</h3>
+  <p>Scheduler capacity is roughly the number of task-state transitions per second the metadata database sustains. For \( D \) DAGs averaging \( t \) tasks per run and \( r \) runs per day, with about 5 state transitions per task, the load is \( 5 D t r / 86{,}400 \) transitions/s. <span class="tag illus">Illustrative</span> 2,000 DAGs × 30 tasks × 24 runs/day ≈ 83 transitions/s on average, with peaks at the top of each hour many times higher. That is why hourly DAGs cluster load at <code>:00</code> and why spreading schedules (and keeping DAG parsing cheap) matters.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code: Airflow 3, dbt, Great Expectations, Soda, Feast, OpenLineage and Access Policies</h2>
+  <p>Versions assumed: Airflow 3.x with the standard, cncf.kubernetes and amazon providers; dbt Core 1.10 (with dbt-duckdb or a warehouse adapter); GX Core 1.x; Soda Core 3.x; Feast 0.4x+; openlineage-python 1.x <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+
+  <h3>7.1 A data contract for the trip-completed event</h3>
+<pre data-file="contracts/trip_completed.v2.yaml"><code class="language-yaml"># Owned by the dispatch team; validated in their CI and enforced by the schema registry.
+id: urn:contract:dispatch:trip_completed
+version: 2.1.0
+owner: team-dispatch
+support: "#dispatch-data (Slack), on-call: dispatch-primary"
+status: active
+description: Emitted once when a trip reaches COMPLETED in the dispatch service.
+transport:
+  kafka_topic: domain.trip-events
+  key: trip_id
+  schema_registry_subject: domain.trip-events-value
+  compatibility: BACKWARD_TRANSITIVE
+schema:
+  - name: trip_id        ; type: string ; required: true ; unique: true
+  - name: pu_location_id ; type: int    ; required: true ; description: TLC taxi zone id (1-265)
+  - name: dropoff_ts     ; type: timestamp(ms, UTC) ; required: true ; description: event time
+  - name: total_amount   ; type: decimal(10,2) ; unit: USD ; required: true ; checks: [">= 0"]
+  - name: rider_id       ; type: string ; required: true ; classification: pii:pseudonymous_id
+quality:
+  - "duplicate trip_id rate &lt; 0.01% per hour (at-least-once producer)"
+  - "late events (dropoff_ts older than 1h at publish) &lt; 0.5%"
+sla:
+  freshness: "p99 publish delay &lt; 60s"
+  availability: "99.9% monthly"
+change_policy: >
+  Additive optional fields: minor version. Removing/renaming fields or changing types or
+  units: new major version on a new subject, 90-day dual-publish, consumers notified via catalog.</code></pre>
+  <p>The semicolon-separated field lines are a compact illustrative notation; ODCS and similar standards express the same information as nested YAML. What matters is that the contract lives in the producer's repository and CI fails when a code change violates it.</p>
+
+  <h3>7.2 An idiomatic Airflow 3 DAG: assets, deferrable sensor, mapping, Spark and dbt</h3>
+<pre data-file="dags/tlc_daily.py"><code class="language-python">"""Daily TLC pipeline: wait for the raw file, load bronze with Spark, run dbt, publish assets."""
+from __future__ import annotations
+
+import pendulum
+from airflow.sdk import Asset, dag, task
+from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
+from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
+
+BRONZE_TRIPS = Asset("iceberg://lake/bronze/tlc_trips")
+FCT_TRIPS = Asset("iceberg://lake/gold/fct_trips")
+
+default_args = {
+    "owner": "data-platform",
+    "retries": 3,
+    "retry_delay": pendulum.duration(minutes=5),
+    "retry_exponential_backoff": True,
+    "execution_timeout": pendulum.duration(hours=2),
+}
+
+
+@dag(
+    dag_id="tlc_daily",
+    schedule="0 5 * * *",                          # after the data interval closes
+    start_date=pendulum.datetime(2024, 1, 1, tz="UTC"),
+    catchup=False,                                  # backfill explicitly, not by accident
+    max_active_runs=3,
+    default_args=default_args,
+    tags=["tlc", "tier-1"],
+)
+def tlc_daily():
+    # Deferrable: waiting costs no worker slot; the triggerer polls S3 asynchronously.
+    wait_for_raw = S3KeySensor(
+        task_id="wait_for_raw",
+        bucket_name="raw-landing",
+        bucket_key="tlc/yellow/dt={{ ds }}/_SUCCESS",
+        deferrable=True,
+        timeout=6 * 3600,
+        poke_interval=300,
+    )
+
+    @task
+    def list_partitions(ds: str | None = None) -&gt; list[str]:
+        # Small metadata only (paths), never datasets, in XCom.
+        return [f"s3://raw-landing/tlc/yellow/dt={ds}/part-{i:02d}.parquet" for i in range(4)]
+
+    @task(pool="raw_validation", max_active_tis_per_dag=4)
+    def validate_file(path: str) -&gt; dict:
+        import pyarrow.parquet as pq
+        md = pq.ParquetFile(path).metadata                # footer only: cheap
+        if md.num_rows == 0:
+            raise ValueError(f"{path} is empty")
+        return {"path": path, "rows": md.num_rows}
+
+    load_bronze = KubernetesPodOperator(
+        task_id="load_bronze",
+        name="tlc-load-bronze",
+        namespace="data-jobs",
+        image="registry.example.com/data/spark-jobs:2026.11.3",   # pinned, immutable tag
+        cmds=["spark-submit"],
+        arguments=["--master", "k8s://https://kubernetes.default.svc",
+                   "/opt/jobs/load_bronze.py", "--run-date", "{{ ds }}"],   # logical date
+        outlets=[BRONZE_TRIPS],
+        get_logs=True,
+        on_finish_action="delete_succeeded_pod",
+    )
+
+    dbt_build = KubernetesPodOperator(
+        task_id="dbt_build",
+        name="tlc-dbt-build",
+        namespace="data-jobs",
+        image="registry.example.com/data/dbt-project:2026.11.3",
+        cmds=["dbt"],
+        arguments=["build", "--select", "+fct_trips+", "--target", "prod",
+                   "--vars", '{"run_date": "{{ ds }}"}'],
+        outlets=[FCT_TRIPS],
+    )
+
+    files = list_partitions()
+    checked = validate_file.expand(path=files)        # dynamic task mapping: one per file
+    wait_for_raw &gt;&gt; files
+    checked &gt;&gt; load_bronze &gt;&gt; dbt_build
+
+
+tlc_daily()</code></pre>
+
+<pre data-file="dags/eta_features.py"><code class="language-python">"""Data-aware scheduling: runs whenever fct_trips is updated, regardless of who updated it."""
+import pendulum
+from airflow.sdk import Asset, dag, task
+
+FCT_TRIPS = Asset("iceberg://lake/gold/fct_trips")
+
+
+@dag(schedule=[FCT_TRIPS], start_date=pendulum.datetime(2024, 1, 1, tz="UTC"), catchup=False,
+     tags=["ml", "features"])
+def eta_features():
+    @task
+    def materialize_features():
+        from datetime import datetime, timezone
+        from feast import FeatureStore
+        FeatureStore(repo_path="/opt/feature_repo").materialize_incremental(
+            end_date=datetime.now(timezone.utc))
+
+    materialize_features()
+
+
+eta_features()</code></pre>
+  <p>Note the patterns: logical dates passed into jobs, deferrable sensors, pinned images, heavy work in pods, assets for cross-DAG dependencies instead of <code>ExternalTaskSensor</code> chains, pools to protect shared resources, and <code>catchup=False</code> with explicit backfills (<code>airflow backfill create --dag-id tlc_daily --from-date 2024-01-01 --to-date 2024-03-31</code> in Airflow 3, which creates scheduler-managed backfill runs).</p>
+
+  <h3>7.3 dbt: sources, staging, incremental fact, snapshot, contract and tests</h3>
+<pre data-file="models/staging/tlc/_tlc__sources.yml"><code class="language-yaml">version: 2
+sources:
+  - name: tlc
+    schema: bronze
+    loaded_at_field: _ingested_at
+    freshness:
+      warn_after: {count: 26, period: hour}
+      error_after: {count: 36, period: hour}
+    tables:
+      - name: yellow_trips
+      - name: taxi_zones</code></pre>
+<pre data-file="models/staging/tlc/stg_tlc__trips.sql"><code class="language-sql">-- One staging model per source table: rename, cast, derive keys. No joins, no business logic.
+with source as (
+    select * from {{ source('tlc', 'yellow_trips') }}
+)
+select
+    {{ dbt_utils.generate_surrogate_key(['VendorID', 'tpep_pickup_datetime',
+                                         'tpep_dropoff_datetime', 'PULocationID',
+                                         'DOLocationID', 'total_amount']) }} as trip_id,
+    cast(VendorID as integer)                    as vendor_id,
+    cast(tpep_pickup_datetime as timestamp)      as pickup_ts,
+    cast(tpep_dropoff_datetime as timestamp)     as dropoff_ts,
+    cast(PULocationID as integer)                as pu_location_id,
+    cast(DOLocationID as integer)                as do_location_id,
+    cast(payment_type as integer)                as payment_type,
+    cast(fare_amount as decimal(10, 2))          as fare_amount,
+    cast(tip_amount as decimal(10, 2))           as tip_amount,
+    cast(total_amount as decimal(10, 2))         as total_amount,
+    trip_distance,
+    _ingested_at
+from source
+where fare_amount &gt;= 0</code></pre>
+<pre data-file="models/marts/fct_trips.sql"><code class="language-sql">{{
+  config(
+    materialized='incremental',
+    unique_key='trip_id',
+    incremental_strategy='merge',
+    on_schema_change='append_new_columns'
+  )
+}}
+
+with trips as (
+    select * from {{ ref('stg_tlc__trips') }}
+    {% if is_incremental() %}
+      -- 3-day lookback absorbs late-arriving corrections; merge on trip_id keeps it idempotent.
+      where _ingested_at &gt; (select max(_ingested_at) - interval '3 days' from {{ this }})
+    {% endif %}
+),
+zones as (
+    select * from {{ ref('dim_zone') }}
+)
+select
+    t.trip_id,
+    t.pickup_ts,
+    cast(t.pickup_ts as date)                                   as pickup_date,
+    pz.zone_key                                                 as pickup_zone_key,
+    dz.zone_key                                                 as dropoff_zone_key,
+    t.payment_type,
+    t.fare_amount,
+    t.tip_amount,
+    t.total_amount,
+    t.trip_distance,
+    datediff('second', t.pickup_ts, t.dropoff_ts)               as duration_s,
+    t._ingested_at
+from trips t
+left join zones pz
+  on pz.location_id = t.pu_location_id
+ and t.pickup_ts &gt;= pz.valid_from and t.pickup_ts &lt; pz.valid_to   -- point-in-time SCD2 join
+left join zones dz
+  on dz.location_id = t.do_location_id
+ and t.pickup_ts &gt;= dz.valid_from and t.pickup_ts &lt; dz.valid_to</code></pre>
+<pre data-file="snapshots/snap_zones.yml (dbt 1.9+ YAML snapshot)"><code class="language-yaml">snapshots:
+  - name: snap_zones
+    relation: ref('stg_tlc__zones')
+    config:
+      unique_key: location_id
+      strategy: check
+      check_cols: [borough, zone_name, service_zone]
+      dbt_valid_to_current: "cast('9999-12-31' as timestamp)"   # instead of NULL for open rows</code></pre>
+<pre data-file="models/marts/_marts.yml"><code class="language-yaml">version: 2
+models:
+  - name: dim_zone
+    config:
+      contract: {enforced: true}           # build fails if columns/types drift
+      access: public
+    columns:
+      - name: zone_key
+        data_type: varchar
+        constraints: [{type: not_null}]
+        data_tests: [unique]
+      - name: location_id
+        data_type: integer
+      - name: borough
+        data_type: varchar
+      - name: zone_name
+        data_type: varchar
+      - name: valid_from
+        data_type: timestamp
+      - name: valid_to
+        data_type: timestamp
+
+  - name: fct_trips
+    description: One row per completed yellow-taxi trip. Grain = trip.
+    columns:
+      - name: trip_id
+        data_tests: [unique, not_null]
+      - name: pickup_zone_key
+        data_tests:
+          - relationships: {to: ref('dim_zone'), field: zone_key, config: {severity: warn}}
+      - name: payment_type
+        data_tests:
+          - accepted_values: {values: [0, 1, 2, 3, 4, 5, 6], quote: false}
+      - name: total_amount
+        data_tests:
+          - dbt_utils.accepted_range: {min_value: 0, max_value: 5000}
+
+unit_tests:
+  - name: test_duration_and_zone_pit_join
+    model: fct_trips
+    overrides:
+      macros: {is_incremental: false}
+    given:
+      - input: ref('stg_tlc__trips')
+        rows:
+          - {trip_id: 't1', pickup_ts: '2024-01-15 10:00:00', dropoff_ts: '2024-01-15 10:20:00',
+             pu_location_id: 132, do_location_id: 161, payment_type: 1,
+             fare_amount: 70, tip_amount: 14, total_amount: 90, trip_distance: 17.1,
+             _ingested_at: '2024-01-16 01:00:00'}
+      - input: ref('dim_zone')
+        rows:
+          - {zone_key: 'z132_old', location_id: 132, valid_from: '1900-01-01', valid_to: '2024-01-01'}
+          - {zone_key: 'z132_new', location_id: 132, valid_from: '2024-01-01', valid_to: '9999-12-31'}
+          - {zone_key: 'z161', location_id: 161, valid_from: '1900-01-01', valid_to: '9999-12-31'}
+    expect:
+      rows:
+        - {trip_id: 't1', pickup_zone_key: 'z132_new', dropoff_zone_key: 'z161', duration_s: 1200}</code></pre>
+<pre data-file="tests/assert_total_reconciles.sql (singular test: returns failing rows)"><code class="language-sql">select trip_id, fare_amount, tip_amount, total_amount
+from {{ ref('fct_trips') }}
+where total_amount + 0.01 &lt; fare_amount + tip_amount   -- total can never be below fare + tip</code></pre>
+<pre data-file="CI (pull request)"><code class="language-bash"># Slim CI: build only modified models and their children, deferring unchanged parents to prod.
+dbt deps
+dbt build --select state:modified+ --defer --state ./prod-artifacts --target ci
+dbt source freshness --target ci   # in prod runs, before the build</code></pre>
+
+  <h3>7.4 Great Expectations (GX Core 1.x) inside a Python pipeline</h3>
+<pre data-file="quality/validate_trips.py"><code class="language-python">import great_expectations as gx
+import pandas as pd
+
+df = pd.read_parquet("https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet")
+
+context = gx.get_context(mode="ephemeral")            # or a file/cloud context for persistence
+source = context.data_sources.add_pandas("tlc")
+asset = source.add_dataframe_asset(name="yellow_trips")
+batch_def = asset.add_batch_definition_whole_dataframe("monthly")
+
+suite = context.suites.add(gx.ExpectationSuite(name="yellow_trips_suite"))
+suite.add_expectation(gx.expectations.ExpectColumnValuesToNotBeNull(column="tpep_pickup_datetime"))
+suite.add_expectation(gx.expectations.ExpectColumnValuesToBeBetween(
+    column="fare_amount", min_value=-500, max_value=5000, mostly=0.999))
+suite.add_expectation(gx.expectations.ExpectColumnValuesToBeInSet(
+    column="payment_type", value_set=[0, 1, 2, 3, 4, 5, 6]))
+suite.add_expectation(gx.expectations.ExpectTableRowCountToBeBetween(
+    min_value=2_000_000, max_value=5_000_000))
+suite.add_expectation(gx.expectations.ExpectColumnMeanToBeBetween(
+    column="trip_distance", min_value=2.0, max_value=6.0))   # distributional guard
+
+validation = context.validation_definitions.add(
+    gx.ValidationDefinition(name="yellow_trips_validation", data=batch_def, suite=suite))
+result = validation.run(batch_parameters={"dataframe": df})
+
+if not result.success:
+    failed = [r.expectation_config.type for r in result.results if not r.success]
+    raise SystemExit(f"data quality failed: {failed}")     # fails the orchestrator task
+print("all expectations passed")</code></pre>
+
+  <h3>7.5 The same checks in SodaCL</h3>
+<pre data-file="soda/checks/fct_trips.yml"><code class="language-yaml">checks for fct_trips:
+  - row_count between 2000000 and 5000000
+  - freshness(_ingested_at) &lt; 30h
+  - missing_count(pickup_ts) = 0
+  - duplicate_count(trip_id) = 0
+  - invalid_count(payment_type) = 0:
+      valid values: [0, 1, 2, 3, 4, 5, 6]
+  - avg(trip_distance) between 2 and 6
+  - anomaly detection for row_count     # learns a baseline from history (Soda feature)
+  - schema:
+      fail:
+        when required column missing: [trip_id, pickup_ts, total_amount]
+        when wrong column type:
+          total_amount: decimal</code></pre>
+<pre data-file="run"><code class="language-bash">soda scan -d lakehouse -c soda/configuration.yml soda/checks/fct_trips.yml</code></pre>
+
+  <h3>7.6 Feast: feature definitions, point-in-time training data, online serving</h3>
+<pre data-file="feature_repo/feature_store.yaml"><code class="language-yaml">project: tlc_eta
+registry: data/registry.db
+provider: local
+offline_store:
+  type: duckdb             # file/duckdb for local; bigquery, snowflake, spark, etc. in production
+online_store:
+  type: redis
+  connection_string: "redis:6379"
+entity_key_serialization_version: 3</code></pre>
+<pre data-file="feature_repo/features.py"><code class="language-python">from datetime import timedelta
+
+from feast import Entity, FeatureService, FeatureView, Field, FileSource
+from feast.types import Float32, Int64
+
+zone = Entity(name="zone", join_keys=["pu_location_id"], description="TLC pickup zone")
+
+zone_hourly_source = FileSource(
+    name="zone_hourly_stats_source",
+    path="data/zone_hourly_stats.parquet",         # produced by a Spark/dbt feature pipeline
+    timestamp_field="window_end",                   # when the value became knowable
+    created_timestamp_column="computed_at",         # tiebreaker for recomputed values
+)
+
+zone_hourly_stats = FeatureView(
+    name="zone_hourly_stats",
+    entities=[zone],
+    ttl=timedelta(hours=3),                         # older values are treated as missing
+    schema=[
+        Field(name="trips_last_hour", dtype=Int64),
+        Field(name="median_duration_s_last_hour", dtype=Float32),
+        Field(name="avg_fare_last_hour", dtype=Float32),
+    ],
+    source=zone_hourly_source,
+    online=True,
+    owner="ml-platform@example.com",
+    tags={"team": "eta", "tier": "1"},
+)
+
+eta_v1 = FeatureService(name="eta_model_v1", features=[zone_hourly_stats])</code></pre>
+<pre data-file="feature_repo/train_and_serve.py"><code class="language-python">from datetime import datetime, timezone
+
+import pandas as pd
+from feast import FeatureStore
+
+store = FeatureStore(repo_path=".")      # after: feast apply
+
+# Labels: one row per trip with the time the prediction would have been made (pickup).
+entity_df = pd.DataFrame({
+    "pu_location_id": [132, 161, 132],
+    "event_timestamp": pd.to_datetime(["2024-01-15 08:05", "2024-01-15 08:07",
+                                       "2024-01-15 17:40"], utc=True),
+    "actual_duration_s": [2900, 840, 3600],
+})
+
+# Point-in-time join: each row gets feature values with window_end &lt;= event_timestamp,
+# within the 3-hour TTL. No future leakage.
+training_df = store.get_historical_features(
+    entity_df=entity_df,
+    features=store.get_feature_service("eta_model_v1"),
+).to_df()
+print(training_df)
+
+# Copy the latest values into Redis for online inference.
+store.materialize_incremental(end_date=datetime.now(timezone.utc))
+
+online = store.get_online_features(
+    features=store.get_feature_service("eta_model_v1"),
+    entity_rows=[{"pu_location_id": 132}],
+).to_dict()
+print(online)</code></pre>
+<pre data-file="point-in-time join without a feature store (DuckDB)"><code class="language-sql">SELECT l.pu_location_id, l.event_timestamp, l.actual_duration_s,
+       f.trips_last_hour, f.median_duration_s_last_hour
+FROM labels l
+ASOF LEFT JOIN zone_hourly_stats f
+  ON l.pu_location_id = f.pu_location_id
+ AND l.event_timestamp &gt;= f.window_end;      -- latest feature row not after the label time</code></pre>
+  <p>Serving from Java: Feast exposes a feature server over HTTP (<code>feast serve</code>) and there is a Java client; many teams instead read the online store (Redis) directly from Spring Boot using the documented key format, or front it with a small Go or Java service. Whatever the path, the feature <em>definitions</em> must stay single-sourced.</p>
+
+  <h3>7.7 Emitting OpenLineage from a custom Python job</h3>
+<pre data-file="lineage/emit.py"><code class="language-python">from datetime import datetime, timezone
+from uuid import uuid4
+
+from openlineage.client import OpenLineageClient
+from openlineage.client.event_v2 import Dataset, Job, Run, RunEvent, RunState
+from openlineage.client.facet_v2 import schema_dataset
+
+client = OpenLineageClient(url="http://marquez:5000")   # or configure via openlineage.yml / env
+run = Run(runId=str(uuid4()))
+job = Job(namespace="data-platform", name="tlc.load_bronze")
+inp = Dataset(namespace="s3://raw-landing", name="tlc/yellow")
+out = Dataset(
+    namespace="iceberg://lake", name="bronze.tlc_trips",
+    facets={"schema": schema_dataset.SchemaDatasetFacet(fields=[
+        schema_dataset.SchemaDatasetFacetFields(name="trip_id", type="string"),
+        schema_dataset.SchemaDatasetFacetFields(name="total_amount", type="decimal(10,2)"),
+    ])},
+)
+
+def emit(state: RunState) -&gt; None:
+    client.emit(RunEvent(eventType=state, eventTime=datetime.now(timezone.utc).isoformat(),
+                         run=run, job=job, producer="https://example.com/tlc-jobs",
+                         inputs=[inp], outputs=[out]))
+
+emit(RunState.START)
+# ... do the work ...
+emit(RunState.COMPLETE)</code></pre>
+  <p>You rarely write this by hand: the Airflow OpenLineage provider, the Spark listener (<code>spark.extraListeners=io.openlineage.spark.agent.OpenLineageSparkListener</code>) and dbt integration emit events automatically. Hand-emission is for custom jobs, such as a Spring Boot batch exporter.</p>
+
+  <h3>7.8 Access control as code: masking and row-level security</h3>
+<div class="code-tabs">
+<pre data-lang="Snowflake"><code class="language-sql">-- Tag-based masking: every column tagged pii=email is masked unless the role is allowed.
+CREATE TAG IF NOT EXISTS governance.pii ALLOWED_VALUES 'email', 'phone', 'name';
+
+CREATE OR REPLACE MASKING POLICY governance.mask_email AS (val STRING) RETURNS STRING -&gt;
+  CASE WHEN IS_ROLE_IN_SESSION('PII_READER') THEN val
+       ELSE REGEXP_REPLACE(val, '^[^@]+', '*****') END;
+
+ALTER TAG governance.pii SET MASKING POLICY governance.mask_email;
+ALTER TABLE gold.dim_rider MODIFY COLUMN email SET TAG governance.pii = 'email';
+
+-- Row access: regional managers see only their borough.
+CREATE OR REPLACE ROW ACCESS POLICY governance.borough_rows AS (borough STRING) RETURNS BOOLEAN -&gt;
+  IS_ROLE_IN_SESSION('GLOBAL_ANALYST')
+  OR EXISTS (SELECT 1 FROM governance.user_boroughs ub
+             WHERE ub.user_name = CURRENT_USER() AND ub.borough = borough);
+ALTER TABLE gold.fct_trips_enriched ADD ROW ACCESS POLICY governance.borough_rows ON (borough);</code></pre>
+<pre data-lang="Postgres"><code class="language-sql">-- Postgres RLS for an analytics replica or a reporting schema.
+ALTER TABLE reporting.trips ENABLE ROW LEVEL SECURITY;
+CREATE POLICY borough_isolation ON reporting.trips
+  USING (borough = current_setting('app.borough', true));
+-- Masked view for broad access; base table granted only to pii_reader.
+CREATE VIEW reporting.riders_masked AS
+SELECT rider_id, regexp_replace(email, '^[^@]+', '*****') AS email, signup_date
+FROM reporting.riders;
+GRANT SELECT ON reporting.riders_masked TO analyst;
+REVOKE ALL ON reporting.riders FROM analyst;</code></pre>
+<pre data-lang="Retention (Iceberg)"><code class="language-sql">-- Enforce a 2-year retention on raw events and make deletions physical.
+DELETE FROM lake.bronze.trip_events WHERE event_date &lt; date_sub(current_date(), 730);
+CALL lake.system.expire_snapshots(table =&gt; 'bronze.trip_events',
+                                  older_than =&gt; TIMESTAMP '2026-11-19 00:00:00',
+                                  retain_last =&gt; 1);
+CALL lake.system.remove_orphan_files(table =&gt; 'bronze.trip_events');</code></pre>
+</div>
+</section>
