@@ -1343,3 +1343,414 @@ class SB6LongestValidParens {
 }</code></pre>
     </div></details>
   </div>
+
+  <h3>14.3 Ladder C — Monotonic stacks and deques</h3>
+  <div class="callout insight"><p class="callout-title">How to recognise a monotonic-structure problem</p>
+  <ul>
+    <li>"Next/previous greater/smaller element", "how many days until warmer", "span".</li>
+    <li>For each element, find how far it extends as the minimum/maximum (histograms, subarray minimum sums).</li>
+    <li>Max/min of every sliding window, or a DP transition "best value among the last k states".</li>
+    <li>A brute force that, for each i, scans left or right until something bigger/smaller appears.</li>
+    <li>Elements that become permanently useless once a better (larger and later) element arrives.</li>
+  </ul></div>
+
+  <div class="exercise">
+    <p class="exercise-title">C1 · Easy — "Next Greater Element I"</p>
+    <p>Array <code>nums1</code> is a subset of <code>nums2</code> (distinct values). For each value in <code>nums1</code>, report the first greater value to its right in <code>nums2</code>, or −1.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> run the next-greater monotonic stack over <code>nums2</code>, recording answers in a map value → next greater; answer queries by lookup. Θ(n + m).</p>
+<pre data-file="MC1NextGreaterI.java"><code class="language-java">import java.util.*;
+
+class MC1NextGreaterI {
+    static int[] nextGreater(int[] q, int[] a) {
+        Map&lt;Integer, Integer&gt; nge = new HashMap&lt;&gt;();
+        Deque&lt;Integer&gt; st = new ArrayDeque&lt;&gt;();
+        for (int x : a) {
+            while (!st.isEmpty() &amp;&amp; st.peek() &lt; x) nge.put(st.pop(), x);
+            st.push(x);
+        }
+        return Arrays.stream(q).map(x -&gt; nge.getOrDefault(x, -1)).toArray();
+    }
+    public static void main(String[] args) {
+        if (!Arrays.equals(nextGreater(new int[]{4, 1, 2}, new int[]{1, 3, 4, 2}), new int[]{-1, 3, -1})) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">C2 · Medium — "Daily Temperatures"</p>
+    <p>For each day, how many days until a strictly warmer temperature (0 if never)?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> next-greater with indices; the answer is the index difference. Θ(n). Use an <code>int[]</code> as the stack for speed.</p>
+<pre data-file="MC2DailyTemperatures.java"><code class="language-java">import java.util.*;
+
+class MC2DailyTemperatures {
+    static int[] wait(int[] t) {
+        int[] ans = new int[t.length], st = new int[t.length];
+        int top = -1;
+        for (int i = 0; i &lt; t.length; i++) {
+            while (top &gt;= 0 &amp;&amp; t[st[top]] &lt; t[i]) { int j = st[top--]; ans[j] = i - j; }
+            st[++top] = i;
+        }
+        return ans;
+    }
+    public static void main(String[] args) {
+        if (!Arrays.equals(wait(new int[]{73, 74, 75, 71, 69, 72, 76, 73}), new int[]{1, 1, 4, 2, 1, 1, 0, 0})) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">C3 · Medium — "Online Stock Span"</p>
+    <p>Prices arrive one per day. For each, return the number of consecutive days up to and including today with price ≤ today's.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> a decreasing stack of (price, span). For a new price, pop all entries with price ≤ it, adding their spans. Amortized O(1) per call — a streaming monotonic stack.</p>
+<pre data-file="MC3StockSpanner.java"><code class="language-java">import java.util.*;
+
+class MC3StockSpanner {
+    private record Entry(int price, int span) {}
+    private final Deque&lt;Entry&gt; st = new ArrayDeque&lt;&gt;();
+    int next(int price) {
+        int span = 1;
+        while (!st.isEmpty() &amp;&amp; st.peek().price() &lt;= price) span += st.pop().span();
+        st.push(new Entry(price, span));
+        return span;
+    }
+    public static void main(String[] args) {
+        var s = new MC3StockSpanner();
+        int[] in = {100, 80, 60, 70, 60, 75, 85}, want = {1, 1, 1, 2, 1, 4, 6};
+        for (int i = 0; i &lt; in.length; i++) if (s.next(in[i]) != want[i]) throw new AssertionError(i);
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">C4 · Medium — "Sum of Subarray Minimums"</p>
+    <p>Sum min(sub) over all contiguous subarrays, modulo 10⁹+7.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> contribution technique. a[i] is the minimum of left[i] × right[i] subarrays, where left[i] = distance to the previous <em>strictly smaller</em> element and right[i] = distance to the next <em>smaller-or-equal</em> element. The asymmetric strictness assigns each subarray with duplicate minima to exactly one index. One increasing-stack pass can compute both: when i pops j, i is j's right boundary and the new top is j's left boundary. Θ(n).</p>
+<pre data-file="MC4SumSubarrayMins.java"><code class="language-java">class MC4SumSubarrayMins {
+    static int sum(int[] a) {
+        final long MOD = 1_000_000_007L;
+        int n = a.length, top = -1;
+        int[] st = new int[n + 1];
+        long res = 0;
+        for (int i = 0; i &lt;= n; i++) {
+            int cur = (i == n) ? Integer.MIN_VALUE : a[i];          // flush at the end
+            while (top &gt;= 0 &amp;&amp; a[st[top]] &gt;= cur) {                 // i is next smaller-or-equal of j
+                int j = st[top--];
+                int left = (top &gt;= 0) ? st[top] : -1;                // previous strictly smaller
+                res = (res + (long) a[j] * (j - left) % MOD * (i - j)) % MOD;
+            }
+            st[++top] = i;
+        }
+        return (int) res;
+    }
+    public static void main(String[] args) {
+        if (sum(new int[]{3, 1, 2, 4}) != 17 || sum(new int[]{11, 81, 94, 43, 3}) != 444) throw new AssertionError();
+        if (sum(new int[]{2, 2}) != 6) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">C5 · Hard — "Trapping Rain Water" (stack version)</p>
+    <p>Given bar heights, compute how much water is trapped after rain.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> a decreasing stack of indices. When a taller bar i arrives, pop the bottom of a "basin"; the water above it is bounded by the new top (left wall) and i (right wall): width = i − left − 1, height = min(h[left], h[i]) − h[bottom]. Θ(n). The two-pointer version (Chapter 3) uses Θ(1) space; know both.</p>
+<pre data-file="MC5TrapRain.java"><code class="language-java">class MC5TrapRain {
+    static int trap(int[] h) {
+        int[] st = new int[h.length];
+        int top = -1, water = 0;
+        for (int i = 0; i &lt; h.length; i++) {
+            while (top &gt;= 0 &amp;&amp; h[st[top]] &lt; h[i]) {
+                int bottom = st[top--];
+                if (top &lt; 0) break;                                 // no left wall
+                int left = st[top];
+                water += (Math.min(h[left], h[i]) - h[bottom]) * (i - left - 1);
+            }
+            st[++top] = i;
+        }
+        return water;
+    }
+    public static void main(String[] args) {
+        if (trap(new int[]{0, 1, 0, 2, 1, 0, 1, 3, 2, 1, 2, 1}) != 6 || trap(new int[]{4, 2, 0, 3, 2, 5}) != 9) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">C6 · Hard — "Maximal Rectangle"</p>
+    <p>In a binary matrix, find the area of the largest rectangle containing only 1s.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> reduce to histograms. Row by row, maintain heights[j] = number of consecutive 1s ending at this row in column j; run the largest-rectangle-in-histogram stack on each row. Θ(rows × cols).</p>
+<pre data-file="MC6MaximalRectangle.java"><code class="language-java">class MC6MaximalRectangle {
+    static int largest(int[] h) {
+        int[] st = new int[h.length + 1];
+        int top = -1, best = 0;
+        for (int i = 0; i &lt;= h.length; i++) {
+            int cur = i == h.length ? 0 : h[i];
+            while (top &gt;= 0 &amp;&amp; h[st[top]] &gt;= cur) {
+                int height = h[st[top--]];
+                int left = top &gt;= 0 ? st[top] : -1;
+                best = Math.max(best, height * (i - left - 1));
+            }
+            st[++top] = i;
+        }
+        return best;
+    }
+    static int maximal(char[][] m) {
+        if (m.length == 0) return 0;
+        int[] h = new int[m[0].length];
+        int best = 0;
+        for (char[] row : m) {
+            for (int j = 0; j &lt; row.length; j++) h[j] = row[j] == '1' ? h[j] + 1 : 0;
+            best = Math.max(best, largest(h));
+        }
+        return best;
+    }
+    public static void main(String[] args) {
+        char[][] m = {"10100".toCharArray(), "10111".toCharArray(), "11111".toCharArray(), "10010".toCharArray()};
+        if (maximal(m) != 6) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">C7 · Hard — "Shortest Subarray with Sum at Least K" (negatives allowed)</p>
+    <p>Return the length of the shortest non-empty contiguous subarray with sum ≥ K, or −1. Values may be negative, so a plain sliding window fails.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> prefix sums P plus a deque of indices with <em>increasing</em> P. For each j: while P[j] − P[front] ≥ K, record j − front and pop the front (any later j would give a longer subarray with that front). Then pop from the back while P[back] ≥ P[j] (a later, smaller prefix is a strictly better start). Θ(n). This combines Chapter 1's prefix sums with this chapter's monotonic deque.</p>
+<pre data-file="MC7ShortestSubarrayK.java"><code class="language-java">import java.util.*;
+
+class MC7ShortestSubarrayK {
+    static int shortest(int[] a, int k) {
+        int n = a.length, best = Integer.MAX_VALUE;
+        long[] p = new long[n + 1];
+        for (int i = 0; i &lt; n; i++) p[i + 1] = p[i] + a[i];
+        Deque&lt;Integer&gt; dq = new ArrayDeque&lt;&gt;();
+        for (int j = 0; j &lt;= n; j++) {
+            while (!dq.isEmpty() &amp;&amp; p[j] - p[dq.peekFirst()] &gt;= k) best = Math.min(best, j - dq.pollFirst());
+            while (!dq.isEmpty() &amp;&amp; p[dq.peekLast()] &gt;= p[j]) dq.pollLast();
+            dq.offerLast(j);
+        }
+        return best == Integer.MAX_VALUE ? -1 : best;
+    }
+    public static void main(String[] args) {
+        if (shortest(new int[]{2, -1, 2}, 3) != 3 || shortest(new int[]{1, 2}, 4) != -1 || shortest(new int[]{84, -37, 32, 40, 95}, 167) != 3) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">D1 · Design — Bounded blocking queue</p>
+    <p>Implement a fixed-capacity blocking queue with <code>put</code> (blocks when full) and <code>take</code> (blocks when empty) for multiple producers and consumers, without using <code>java.util.concurrent</code> queues.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> a circular array guarded by one <code>ReentrantLock</code> with two <code>Condition</code>s (<code>notFull</code>, <code>notEmpty</code>) — the structure of <code>ArrayBlockingQueue</code>. Always wait in a <code>while</code> loop (spurious wake-ups, and another thread may win the race). Signal the opposite condition after each change.</p>
+<pre data-file="DBoundedBlockingQueue.java"><code class="language-java">import java.util.concurrent.locks.*;
+
+class DBoundedBlockingQueue&lt;E&gt; {
+    private final Object[] items;
+    private int head, tail, count;
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Condition notFull = lock.newCondition(), notEmpty = lock.newCondition();
+
+    DBoundedBlockingQueue(int capacity) { items = new Object[capacity]; }
+
+    void put(E e) throws InterruptedException {
+        lock.lockInterruptibly();
+        try {
+            while (count == items.length) notFull.await();
+            items[tail] = e; tail = (tail + 1) % items.length; count++;
+            notEmpty.signal();
+        } finally { lock.unlock(); }
+    }
+
+    @SuppressWarnings("unchecked")
+    E take() throws InterruptedException {
+        lock.lockInterruptibly();
+        try {
+            while (count == 0) notEmpty.await();
+            E e = (E) items[head]; items[head] = null; head = (head + 1) % items.length; count--;
+            notFull.signal();
+            return e;
+        } finally { lock.unlock(); }
+    }
+
+    public static void main(String[] args) throws Exception {
+        var q = new DBoundedBlockingQueue&lt;Integer&gt;(2);
+        long[] sum = new long[1];
+        Thread consumer = Thread.ofPlatform().start(() -&gt; {
+            try { for (int i = 0; i &lt; 10_000; i++) sum[0] += q.take(); } catch (InterruptedException ignored) {}
+        });
+        for (int i = 0; i &lt; 10_000; i++) q.put(i);
+        consumer.join();
+        if (sum[0] != 49_995_000L) throw new AssertionError(sum[0]);
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> When would you actually use a linked list in production Java?</summary><div>
+    <p>Rarely as <code>java.util.LinkedList</code>. Linked structures earn their place when you hold a reference to an element and need O(1) removal or reordering — LRU recency lists, intrusive lists inside caches and schedulers, lock-free queues where head and tail must be independent memory locations (Michael–Scott), or persistent/immutable lists sharing tails. For general sequences, <code>ArrayList</code>/<code>ArrayDeque</code> win on locality and memory.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Design an LRU cache with O(1) get and put. Then make it thread-safe.</summary><div>
+    <p>HashMap key → node plus a doubly linked list with head/tail sentinels; get moves the node to the MRU end; put inserts at MRU and evicts <code>head.next</code> when over capacity, removing its key from the map (code in §7.2). Thread safety, in increasing sophistication: a single lock around both operations (simple, serialises reads); <code>LinkedHashMap</code> + <code>synchronized</code> wrapper (same); lock striping by key hash with per-segment LRU (approximate global LRU, like old Guava); Caffeine's approach — a <code>ConcurrentHashMap</code> for data and lossy ring buffers that record reads, drained in batches under a try-lock onto the policy lists. Mention that exact global LRU order under concurrency is rarely worth its cost.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Prove that Floyd's algorithm finds the cycle entry.</summary><div>
+    <p>With μ nodes before the cycle and cycle length λ, the pointers meet after t steps where t is a multiple of λ (fast has gone t further than slow, and they coincide inside the cycle). Moving one pointer from the head and one from the meeting point in lockstep, after μ steps the first is at the entry and the second at position t + μ ≡ μ (mod λ) within the cycle — also the entry. Hence they meet there. O(μ + λ) time, O(1) space.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> How does ArrayDeque work, and why is it preferred over Stack and LinkedList?</summary><div>
+    <p>It is a resizable circular array with head and tail indices; both ends are O(1) amortized, no per-element node allocation, contiguous memory. <code>Stack</code> extends <code>Vector</code> (synchronised on every call, exposes index operations); <code>LinkedList</code> allocates a 24-byte node per element and chases pointers. Caveats: no nulls, not thread-safe, and iteration order of a deque used as a stack is top-to-bottom.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Sliding window maximum in O(n). Explain why it's linear.</summary><div>
+    <p>Monotonic deque of indices with decreasing values; pop smaller-or-equal values from the back before pushing i, pop the front if it left the window, the front is the max (§7.4). Each index is added once and removed at most once, so total deque operations ≤ 2n. A heap gives Θ(n log n) (or Θ(n log k) with lazy deletion); the deque is optimal.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Implement a queue with two stacks; what's the amortized and worst-case cost?</summary><div>
+    <p>Push to <code>in</code>; pop from <code>out</code>, refilling it from <code>in</code> only when empty. Each element is moved once, so amortized O(1) per operation (potential Φ = 2|in|), worst case Θ(n) for a single dequeue. If the interviewer asks for worst-case O(1), mention incremental transfer (real-time queues) or simply a circular buffer.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> After a downstream outage, your Spring Boot service ran out of memory. Heap dump shows millions of Runnable objects in a LinkedBlockingQueue. What happened, and what do you change?</summary><div>
+    <p>The executor was created with an unbounded queue (e.g. <code>Executors.newFixedThreadPool</code> or <code>ThreadPoolTaskExecutor</code> with default <code>queueCapacity</code> = <code>Integer.MAX_VALUE</code>). Workers were blocked on the slow dependency, so submissions accumulated without bound. Fix: a bounded queue sized from Little's law (acceptable wait × throughput), an explicit rejection policy mapped to 429/503, timeouts and a circuit breaker on the downstream call so workers free up, and metrics/alerts on queue depth. Consider whether the work belongs in a durable queue (Kafka/SQS) instead of memory.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Evaluate an arithmetic expression string with + - * / and parentheses.</summary><div>
+    <p>Two approaches: shunting-yard with an operand stack and operator stack (pop higher/equal precedence for left-associative operators, handle unary minus by context) or recursive descent mirroring the grammar expr/term/factor (§7.5). Both Θ(n). State edge cases: unary minus, multi-digit numbers, whitespace, integer division semantics, overflow (use long), and malformed input. Mention that you would never use <code>ScriptEngine</code>/<code>eval</code> on user input.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Why does ForkJoinPool use deques with owner-LIFO / thief-FIFO?</summary><div>
+    <p>LIFO for the owner keeps the most recently forked (smallest, cache-hot) subtasks local, giving depth-first execution and bounded memory. FIFO stealing takes the oldest task, which in divide-and-conquer is the largest unexplored chunk, so steals are rare and productive. Owner and thief operate on opposite ends, so they contend only when one element remains. The same reasoning appears in Go's scheduler and Tokio.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> Describe a time you chose a simpler data structure over a "clever" one.</summary><div>
+    <p>Good answers show measurement and trade-off reasoning: e.g. replacing a custom lock-free linked queue with <code>ArrayBlockingQueue</code> after profiling showed the queue was not the bottleneck, reducing complexity and bug risk; or choosing Caffeine over a hand-written LRU. Emphasise how you validated (benchmarks, load test), and what you would revisit if load grew.</p>
+  </div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Use dummy/sentinel nodes to remove head and tail special cases; save <code>next</code> before rewiring.</li>
+    <li>Fast/slow pointers find middles, k-th from end, cycles and cycle entries in O(1) space; Floyd's proof rests on t being a multiple of λ.</li>
+    <li>LRU = HashMap + doubly linked list (store the key in the node); <code>LinkedHashMap(accessOrder=true)</code> + <code>removeEldestEntry</code> is the library version.</li>
+    <li><code>ArrayDeque</code> is the default stack and queue in Java; <code>collections.deque</code> in Python.</li>
+    <li>Two-stack queues and monotonic structures are amortized O(1) per operation because each element moves a bounded number of times.</li>
+    <li>Monotonic stacks answer next/previous greater-smaller and span/extent questions; monotonic deques answer sliding-window extrema.</li>
+    <li>Expressions: postfix evaluation with one stack; infix via shunting-yard or recursive descent.</li>
+    <li>In production, bound queues, choose rejection policies, and monitor depth (Little's law).</li>
+  </ul>
+
+  <div class="quiz" data-answer="b">
+    <p class="q">In an LRU cache implemented with HashMap + doubly linked list, why does each list node store its key?</p>
+    <ol>
+      <li data-k="a">To compute hash codes faster</li>
+      <li data-k="b">So that when the LRU node is evicted from the list, its entry can be removed from the map</li>
+      <li data-k="c">To keep the list sorted by key</li>
+      <li data-k="d">It is not necessary</li>
+    </ol>
+    <div class="explain">Eviction starts from the list (head.next); without the key you cannot find the corresponding map entry, and the map would leak.</div>
+  </div>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">What is the time complexity of computing the next greater element for every index with a monotonic stack?</p>
+    <ol>
+      <li data-k="a">Θ(n²) because of the nested while loop</li>
+      <li data-k="b">Θ(n log n)</li>
+      <li data-k="c">Θ(n), because each index is pushed and popped at most once</li>
+      <li data-k="d">Θ(n) only if the input is sorted</li>
+    </ol>
+    <div class="explain">Aggregate analysis: total pops ≤ total pushes = n.</div>
+  </div>
+
+  <div class="quiz" data-answer="a">
+    <p class="q">Using a Java <code>Deque</code>, which pair of calls gives FIFO behaviour?</p>
+    <ol>
+      <li data-k="a"><code>offer</code> and <code>poll</code></li>
+      <li data-k="b"><code>push</code> and <code>pop</code></li>
+      <li data-k="c"><code>push</code> and <code>poll</code></li>
+      <li data-k="d"><code>offerFirst</code> and <code>pollFirst</code></li>
+    </ol>
+    <div class="explain">offer adds at the tail and poll removes from the head. push/pop and push/poll both work at the head (LIFO); offerFirst/pollFirst also both use the head.</div>
+  </div>
+
+  <div class="quiz" data-answer="d">
+    <p class="q">Fast and slow pointers start at the head; slow moves 1, fast moves 2. In a list with a cycle, which is guaranteed?</p>
+    <ol>
+      <li data-k="a">They meet at the cycle entry</li>
+      <li data-k="b">They meet after exactly λ steps</li>
+      <li data-k="c">They never meet if μ is odd</li>
+      <li data-k="d">They meet within μ + λ steps, at a step count that is a multiple of λ</li>
+    </ol>
+    <div class="explain">They meet at the first t ≥ μ with t ≡ 0 mod λ; the entry is found in a second phase.</div>
+  </div>
+
+  <div class="quiz" data-answer="b">
+    <p class="q">Your service uses <code>Executors.newFixedThreadPool(32)</code>. What is the main operational risk?</p>
+    <ol>
+      <li data-k="a">Threads are created per task</li>
+      <li data-k="b">Its LinkedBlockingQueue is unbounded, so tasks can accumulate until OOM when workers are slow</li>
+      <li data-k="c">It rejects tasks when 32 are running</li>
+      <li data-k="d">It uses a SynchronousQueue</li>
+    </ol>
+    <div class="explain">The factory uses an unbounded LinkedBlockingQueue; overload becomes memory growth and latency instead of rejections.</div>
+  </div>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">For "Sum of Subarray Minimums" with duplicate values, why use strict comparison on one side and non-strict on the other?</p>
+    <ol>
+      <li data-k="a">To make the stack decreasing</li>
+      <li data-k="b">To handle negative numbers</li>
+      <li data-k="c">So each subarray's minimum is attributed to exactly one index, avoiding double counting</li>
+      <li data-k="d">It is only a performance optimisation</li>
+    </ol>
+    <div class="explain">With equal minima, symmetric strictness either counts a subarray twice or not at all.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Cormen et al., <em>Introduction to Algorithms</em>, 4th ed., 2022 — ch. 10 (elementary data structures), 16 (amortized analysis).</li>
+    <li><span class="ref-kind">Book</span> Sedgewick &amp; Wayne, <em>Algorithms</em>, 4th ed. — §1.3 Bags, Queues and Stacks (includes Dijkstra's two-stack evaluation); <a href="https://algs4.cs.princeton.edu/13stacks/">algs4 §1.3 online</a>.</li>
+    <li><span class="ref-kind">Book</span> Chris Okasaki, <em>Purely Functional Data Structures</em>, Cambridge University Press, 1998 — amortized and real-time queues.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/Deque.html">Java SE 21 Deque Javadoc</a> (method comparison tables) and <a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/LinkedHashMap.html">LinkedHashMap</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.python.org/3/library/collections.html">Python collections: deque and OrderedDict</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://redis.io/docs/latest/develop/reference/eviction/">Redis key eviction: approximated LRU and LFU</a>.</li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/ben-manes/caffeine/wiki/Efficiency">Caffeine wiki: Efficiency (W-TinyLFU)</a> and <a href="https://github.com/ben-manes/caffeine/wiki/Design">Design</a>.</li>
+    <li><span class="ref-kind">Paper</span> <a href="https://lmax-exchange.github.io/disruptor/disruptor.html">M. Thompson et al., "Disruptor: High performance alternative to bounded queues", LMAX technical paper</a>.</li>
+    <li><span class="ref-kind">Paper</span> M. M. Michael, M. L. Scott, "Simple, Fast, and Practical Non-Blocking and Blocking Concurrent Queue Algorithms", PODC 1996 — <a href="https://doi.org/10.1145/248052.248106">doi:10.1145/248052.248106</a>.</li>
+    <li><span class="ref-kind">Paper</span> <a href="https://gee.cs.oswego.edu/dl/papers/fj.pdf">Doug Lea, "A Java Fork/Join Framework", ACM Java Grande 2000</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://cp-algorithms.com/data_structures/stack_queue_modification.html">cp-algorithms: minimum stack / minimum queue</a>.</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

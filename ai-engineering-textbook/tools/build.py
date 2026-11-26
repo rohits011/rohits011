@@ -61,6 +61,9 @@ class ChapterParser(HTMLParser):
         self.widget_count = 0
         self.words = 0
         self._quiz: dict | None = None
+        self.mermaid_src: list[tuple[int, str]] = []
+        self._msrc: list[str] = []
+        self._mline = 0
 
     # -- helpers
     def _loc(self) -> str:
@@ -91,6 +94,8 @@ class ChapterParser(HTMLParser):
         elif tag == "pre" and "mermaid" in cls:
             self.in_mermaid += 1
             self.mermaid_count += 1
+            self._msrc = []
+            self._mline = self.getpos()[0]
         elif tag in SKIP_TEXT:
             self.skip += 1
         if "bridge" in cls:
@@ -112,6 +117,7 @@ class ChapterParser(HTMLParser):
             self.in_code = max(0, self.in_code - 1)
         elif tag == "pre" and self.in_mermaid:
             self.in_mermaid = 0
+            self.mermaid_src.append((self._mline, "".join(self._msrc)))
         elif tag == "title":
             self.in_title = False
         elif tag == "h1":
@@ -142,6 +148,8 @@ class ChapterParser(HTMLParser):
             self.h1 += data
         if self.in_h2 and self.current_section:
             self.section_heading[self.current_section] += data
+        if self.in_mermaid:
+            self._msrc.append(data)
         if self.current_section and not self.in_mermaid:
             self.section_text[self.current_section].append(data)
         self.words += len(data.split())
@@ -176,6 +184,7 @@ def validate(path: Path, known: set[str]) -> tuple[ChapterParser, list[str], lis
             warnings.append(f"only {p.ref_links} external links in further-reading (want >= 4)")
         if p.words < 6000:
             warnings.append(f"only ~{p.words} words (target 9,000+)")
+    errors.extend(lint_mermaid(p.mermaid_src))
     for q in p.quizzes:
         if not q["answer"] or q["answer"] not in q["keys"]:
             errors.append(f"line {q['line']}: quiz data-answer {q['answer']!r} not among options {q['keys']}")
@@ -184,6 +193,28 @@ def validate(path: Path, known: set[str]) -> tuple[ChapterParser, list[str], lis
     if re.search(r"<style|style=\"", html):
         warnings.append("inline styles found — use components from AUTHORING.md")
     return p, errors, warnings
+
+
+def lint_mermaid(blocks: list[tuple[int, str]]) -> list[str]:
+    """Catch the Mermaid syntax mistakes that most often break rendering."""
+    errs = []
+    for start, src in blocks:
+        lines = [l for l in src.strip().splitlines()]
+        if not lines:
+            errs.append(f"line {start}: empty mermaid block")
+            continue
+        kind = lines[0].strip().split()[0] if lines[0].strip() else ""
+        for i, line in enumerate(lines[1:], 1):
+            t = line.strip()
+            if kind == "sequenceDiagram" and re.match(r"^[^%].*?(-|--)(>>|>|x|\)|\))[+-]?[^:]*:", t):
+                msg = t.split(":", 1)[1]
+                if ";" in msg:
+                    errs.append(f"line {start + i}: ';' inside a sequenceDiagram message breaks Mermaid — use ',' or ' / '")
+                if "#" in msg:
+                    errs.append(f"line {start + i}: '#' inside a sequenceDiagram message breaks Mermaid — spell it out")
+            if kind == "sequenceDiagram" and re.match(r"^(Note\b|note\b)", t) and ";" in t:
+                errs.append(f"line {start + i}: ';' inside a Note breaks Mermaid")
+    return errs
 
 
 def build_index(parsed: dict[str, ChapterParser]) -> None:

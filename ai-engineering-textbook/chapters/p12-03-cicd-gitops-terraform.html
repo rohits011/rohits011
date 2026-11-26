@@ -286,3 +286,617 @@ stateDiagram-v2
   <h3>6.5 Terraform blast radius</h3>
   <p>The expected cost of a bad apply scales with the number of resources in the state file. Splitting a 2,000-resource monolith into ten 200-resource roots reduces both plan time (refresh is roughly linear in resources, bounded by API rate limits) and the worst-case damage of a single mistaken change by an order of magnitude.</p>
 </section>
+
+<section id="code">
+  <h2>7. Code: Pipelines, GitOps and Terraform for Lumen</h2>
+
+  <h3>7.1 GitHub Actions: CI and publish for orders-service</h3>
+<pre data-file=".github/workflows/orders-ci.yaml"><code class="language-yaml">name: orders-service CI
+on:
+  pull_request:
+    paths: ["orders-service/**", ".github/workflows/orders-ci.yaml"]
+  push:
+    branches: [main]
+    paths: ["orders-service/**"]
+
+permissions:
+  contents: read            # least privilege by default; jobs widen only what they need
+
+concurrency:
+  group: orders-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  AWS_REGION: eu-west-1
+  ECR_REPO: 123456789012.dkr.ecr.eu-west-1.amazonaws.com/orders
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    defaults: {run: {working-directory: orders-service}}
+    steps:
+      - uses: actions/checkout@v4          # pin third-party actions by full commit SHA in production
+      - uses: actions/setup-java@v4
+        with: {distribution: temurin, java-version: "21", cache: maven}
+      - name: Unit and slice tests
+        run: ./mvnw -B -ntp test
+      - name: Integration tests (Testcontainers uses the runner's Docker)
+        run: ./mvnw -B -ntp verify -Pintegration
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: test-reports, path: orders-service/target/*-reports/}
+
+  publish:
+    if: github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write       # OIDC for AWS and keyless cosign signing
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/gha-orders-publish
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build once, multi-arch, push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: orders-service
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.ECR_REPO }}:${{ github.sha }}
+          cache-from: type=gha,scope=orders
+          cache-to: type=gha,mode=max,scope=orders
+          sbom: true                 # BuildKit SBOM attestation
+          provenance: mode=max       # SLSA provenance attestation
+      - name: Scan image (fail on critical vulnerabilities)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.ECR_REPO }}@${{ steps.build.outputs.digest }}
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign by digest (keyless, identity = this workflow)
+        run: cosign sign --yes "${ECR_REPO}@${{ steps.build.outputs.digest }}"
+
+  promote-dev:
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions: {contents: read}
+    steps:
+      - name: Open PR in gitops repo bumping dev digest
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_BOT_TOKEN }}   # fine-grained token scoped to lumen-gitops only
+          DIGEST: ${{ needs.publish.outputs.digest }}
+        run: |
+          gh repo clone lumen/lumen-gitops gitops -- --depth 1
+          cd gitops/apps/orders/overlays/dev
+          kustomize edit set image "orders=${ECR_REPO}@${DIGEST}"
+          git switch -c "orders-dev-${GITHUB_SHA::7}"
+          git -c user.name=lumen-bot -c user.email=bot@lumen.example.com commit -am "orders: dev -&gt; ${DIGEST}"
+          git push -u origin HEAD
+          gh pr create --fill --label auto-merge-dev</code></pre>
+  <p>Key properties: tests gate the publish job; the image is built exactly once and referenced by digest from then on; AWS access uses OIDC with a role whose trust policy allows only <code>repo:lumen/monorepo:ref:refs/heads/main</code>; the image is scanned, attested and signed; and deployment happens by Git commit. <span class="tag version">Version-sensitive · checked Nov 2026</span> action major versions shown are examples; pin full SHAs and let Dependabot/Renovate update them.</p>
+<pre data-file="iam-trust-policy.json"><code class="language-json">{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {"Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"},
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+        "token.actions.githubusercontent.com:sub": "repo:lumen/monorepo:ref:refs/heads/main"
+      }
+    }
+  }]
+}</code></pre>
+
+  <h3>7.2 The same test stage for Python and Go services</h3>
+<div class="code-tabs">
+<pre data-lang="Python" data-file=".github/workflows/assist-ci.yaml (excerpt)"><code class="language-yaml">  test:
+    runs-on: ubuntu-24.04
+    defaults: {run: {working-directory: assist-service}}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: {enable-cache: true}
+      - run: uv sync --frozen
+      - run: uv run ruff check . &amp;&amp; uv run ruff format --check .
+      - run: uv run mypy app
+      - run: uv run pytest -m "not integration" --cov=app --cov-fail-under=80
+      - name: RAG evaluation gate (fixed eval set, recorded LLM responses)
+        run: uv run python -m evals.run --suite smoke --min-groundedness 0.85 --max-p95-ms 2500</code></pre>
+<pre data-lang="Go" data-file=".github/workflows/gateway-ci.yaml (excerpt)"><code class="language-yaml">  test:
+    runs-on: ubuntu-24.04
+    defaults: {run: {working-directory: edge-gateway}}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: {go-version-file: edge-gateway/go.mod, cache-dependency-path: edge-gateway/go.sum}
+      - run: go vet ./...
+      - uses: golangci/golangci-lint-action@v6
+        with: {working-directory: edge-gateway}
+      - run: go test -race -coverprofile=cover.out ./...
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...</code></pre>
+</div>
+
+  <h3>7.3 Argo CD: Application and ApplicationSet</h3>
+<pre data-file="lumen-gitops/argocd/orders-prod.yaml"><code class="language-yaml">apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: orders-prod
+  namespace: argocd
+  finalizers: [resources-finalizer.argocd.argoproj.io]   # delete resources when the App is deleted
+spec:
+  project: lumen
+  source:
+    repoURL: https://github.com/lumen/lumen-gitops.git
+    targetRevision: main
+    path: apps/orders/overlays/prod
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: lumen
+  syncPolicy:
+    automated:
+      prune: true        # delete resources removed from Git
+      selfHeal: true     # revert manual drift
+    syncOptions:
+      - ServerSideApply=true
+      - CreateNamespace=false
+    retry:
+      limit: 5
+      backoff: {duration: 10s, factor: 2, maxDuration: 3m}
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers: [/spec/replicas]   # HPA owns replicas</code></pre>
+<pre data-file="lumen-gitops/argocd/lumen-appset.yaml"><code class="language-yaml">apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: lumen-services
+  namespace: argocd
+spec:
+  goTemplate: true
+  generators:
+    - matrix:
+        generators:
+          - list:
+              elements:
+                - {service: orders}
+                - {service: assist}
+                - {service: gateway}
+          - clusters:
+              selector:
+                matchLabels: {lumen.example.com/env-tier: nonprod}
+  template:
+    metadata:
+      name: "{{.service}}-{{.name}}"
+    spec:
+      project: lumen
+      source:
+        repoURL: https://github.com/lumen/lumen-gitops.git
+        targetRevision: main
+        path: "apps/{{.service}}/overlays/{{index .metadata.labels \"lumen.example.com/env\"}}"
+      destination:
+        server: "{{.server}}"
+        namespace: lumen
+      syncPolicy:
+        automated: {prune: true, selfHeal: true}</code></pre>
+  <p>One ApplicationSet generates an Application per service per non-production cluster, so adding a cluster with the right labels automatically deploys the whole platform to it. Production Applications are kept explicit (or generated from a separate set) so that their sync policy can differ — for instance, manual sync during a change freeze.</p>
+
+  <h3>7.4 Database migrations as a sync hook</h3>
+<pre data-file="apps/orders/base/migrate-job.yaml"><code class="language-yaml">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: orders-migrate
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: orders-migrate
+      containers:
+        - name: flyway
+          image: flyway/flyway:11
+          args: ["-connectRetries=10", "migrate"]
+          env:
+            - {name: FLYWAY_URL, valueFrom: {configMapKeyRef: {name: orders-config, key: datasource-url}}}
+            - {name: FLYWAY_USER, valueFrom: {secretKeyRef: {name: orders-db-migrator, key: username}}}
+            - {name: FLYWAY_PASSWORD, valueFrom: {secretKeyRef: {name: orders-db-migrator, key: password}}}
+          volumeMounts: [{name: sql, mountPath: /flyway/sql}]
+      volumes:
+        - name: sql
+          configMap: {name: orders-migrations}</code></pre>
+  <div class="callout java"><p class="callout-title">Migrations and rolling deploys</p><p>Running Flyway inside every Spring Boot instance at startup works on one VM but races on Kubernetes (Flyway's lock table serialises it, but every Pod start pays the check, and a failing migration crashloops the whole rollout). A single PreSync Job is cleaner. Either way, migrations must be <strong>backward compatible</strong> with the version still running: expand (add nullable column) → deploy code that writes both → migrate data → contract (drop old column) in a later release.</p></div>
+
+  <h3>7.5 Argo Rollouts canary with Prometheus analysis</h3>
+<pre data-file="apps/orders/base/rollout.yaml"><code class="language-yaml">apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: orders
+spec:
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels: {app.kubernetes.io/name: orders}
+  workloadRef:                      # reuse the pod template of an existing Deployment (scaled to 0)
+    apiVersion: apps/v1
+    kind: Deployment
+    name: orders
+    scaleDown: progressively
+  strategy:
+    canary:
+      canaryService: orders-canary
+      stableService: orders
+      trafficRouting:
+        plugins:
+          argoproj-labs/gatewayAPI:
+            httpRoute: orders
+            namespace: lumen
+      analysis:                     # background analysis for the whole rollout
+        templates: [{templateName: http-success-and-latency}]
+        startingStep: 1
+        args: [{name: service, value: orders}]
+      steps:
+        - setWeight: 10
+        - pause: {duration: 5m}
+        - setWeight: 25
+        - pause: {duration: 5m}
+        - setWeight: 50
+        - pause: {duration: 10m}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: http-success-and-latency
+spec:
+  args: [{name: service}]
+  metrics:
+    - name: error-ratio
+      interval: 1m
+      failureLimit: 2
+      successCondition: result[0] &lt; 0.01
+      provider:
+        prometheus:
+          address: http://prometheus-operated.monitoring:9090
+          query: |
+            sum(rate(http_server_requests_seconds_count{service="{{args.service}}-canary",status=~"5.."}[2m]))
+            /
+            sum(rate(http_server_requests_seconds_count{service="{{args.service}}-canary"}[2m]))
+    - name: p99-latency
+      interval: 1m
+      failureLimit: 2
+      successCondition: result[0] &lt; 0.5
+      provider:
+        prometheus:
+          address: http://prometheus-operated.monitoring:9090
+          query: |
+            histogram_quantile(0.99, sum by (le) (
+              rate(http_server_requests_seconds_bucket{service="{{args.service}}-canary"}[2m])))</code></pre>
+  <p>The metric names are Spring Boot's Micrometer HTTP server metrics as scraped by Prometheus (Chapter 5); the <code>service</code> label comes from the scrape configuration. If either metric fails twice, the rollout aborts and the Gateway API plugin returns all weight to the stable Service.</p>
+
+  <h3>7.6 Feature flags with OpenFeature in Spring Boot</h3>
+<pre data-file="PricingController.java"><code class="language-java">package com.lumen.orders.pricing;
+
+import dev.openfeature.sdk.Client;
+import dev.openfeature.sdk.MutableContext;
+import dev.openfeature.sdk.OpenFeatureAPI;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/orders/quote")
+class PricingController {
+
+    private final Client flags = OpenFeatureAPI.getInstance().getClient("orders-service");
+    private final LegacyPricing legacy;
+    private final AiAssistedPricing aiPricing;
+
+    PricingController(LegacyPricing legacy, AiAssistedPricing aiPricing) {
+        this.legacy = legacy;
+        this.aiPricing = aiPricing;
+    }
+
+    @PostMapping
+    Quote quote(@RequestBody QuoteRequest req, @RequestHeader("X-Customer-Id") String customerId) {
+        var ctx = new MutableContext(customerId).add("tier", req.customerTier());
+        // Default false: if the flag service is unreachable, fall back to the safe path.
+        boolean useAi = flags.getBooleanValue("ai-assisted-pricing", false, ctx);
+        return useAi ? aiPricing.quote(req) : legacy.quote(req);
+    }
+}
+// Provider registration (e.g., flagd, Unleash, LaunchDarkly) happens once at startup:
+// OpenFeatureAPI.getInstance().setProviderAndWait(new FlagdProvider());</code></pre>
+  <p>The flag default is the safe path, evaluation context carries targeting attributes, and the flag is a candidate for deletion once fully rolled out. The same flag can serve as a kill switch if the AI pricing path misbehaves under load.</p>
+
+  <h3>7.7 Terraform: backend, providers and a VPC module</h3>
+  <p>Chapter 4 explains the AWS networking concepts; here we focus on Terraform structure. The <code>modules/vpc</code> module creates a VPC with public and private subnets across three Availability Zones and one NAT gateway per AZ.</p>
+<div class="code-tabs">
+<pre data-lang="versions.tf" data-file="live/prod/network/versions.tf"><code class="language-hcl">terraform {
+  required_version = "&gt;= 1.10"            # also works with OpenTofu &gt;= 1.10
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~&gt; 6.0"
+    }
+  }
+  backend "s3" {
+    bucket       = "lumen-tfstate-123456789012"
+    key          = "prod/network.tfstate"
+    region       = "eu-west-1"
+    encrypt      = true
+    kms_key_id   = "alias/lumen-tfstate"
+    use_lockfile = true                    # S3-native locking (no DynamoDB table)
+  }
+}
+
+provider "aws" {
+  region = "eu-west-1"
+  default_tags {
+    tags = {
+      Project     = "lumen"
+      Environment = "prod"
+      ManagedBy   = "terraform"
+      Repo        = "lumen/infra"
+    }
+  }
+}</code></pre>
+<pre data-lang="main.tf (root)" data-file="live/prod/network/main.tf"><code class="language-hcl">module "vpc" {
+  source = "git::https://github.com/lumen/terraform-modules.git//vpc?ref=vpc-v3.2.0"
+
+  name       = "lumen-prod"
+  cidr_block = "10.40.0.0/16"
+  azs        = ["eu-west-1a", "eu-west-1b", "eu-west-1c"]
+
+  # /24 public (load balancers, NAT), /19 private (EKS nodes and pods), /24 data (RDS)
+  public_subnets  = ["10.40.0.0/24", "10.40.1.0/24", "10.40.2.0/24"]
+  private_subnets = ["10.40.32.0/19", "10.40.64.0/19", "10.40.96.0/19"]
+  data_subnets    = ["10.40.10.0/24", "10.40.11.0/24", "10.40.12.0/24"]
+
+  nat_gateway_per_az = true
+  cluster_name       = "lumen-prod"     # adds the subnet tags the AWS LB controller and Karpenter use
+}
+
+output "vpc_id"             { value = module.vpc.vpc_id }
+output "private_subnet_ids" { value = module.vpc.private_subnet_ids }
+output "data_subnet_ids"    { value = module.vpc.data_subnet_ids }</code></pre>
+<pre data-lang="modules/vpc/main.tf" data-file="modules/vpc/main.tf"><code class="language-hcl">variable "name"               { type = string }
+variable "cidr_block"         { type = string }
+variable "azs"                { type = list(string) }
+variable "public_subnets"     { type = list(string) }
+variable "private_subnets"    { type = list(string) }
+variable "data_subnets"       { type = list(string) }
+variable "nat_gateway_per_az" {
+  type    = bool
+  default = true
+}
+variable "cluster_name" {
+  type    = string
+  default = null
+}
+
+locals {
+  az_index = { for i, az in var.azs : az =&gt; i }
+}
+
+resource "aws_vpc" "this" {
+  cidr_block           = var.cidr_block
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+  tags                 = { Name = var.name }
+}
+
+resource "aws_internet_gateway" "this" {
+  vpc_id = aws_vpc.this.id
+  tags   = { Name = var.name }
+}
+
+resource "aws_subnet" "public" {
+  for_each                = local.az_index
+  vpc_id                  = aws_vpc.this.id
+  availability_zone       = each.key
+  cidr_block              = var.public_subnets[each.value]
+  map_public_ip_on_launch = false
+  tags = merge(
+    { Name = "${var.name}-public-${each.key}", "kubernetes.io/role/elb" = "1" },
+    var.cluster_name == null ? {} : { "kubernetes.io/cluster/${var.cluster_name}" = "shared" }
+  )
+}
+
+resource "aws_subnet" "private" {
+  for_each          = local.az_index
+  vpc_id            = aws_vpc.this.id
+  availability_zone = each.key
+  cidr_block        = var.private_subnets[each.value]
+  tags = merge(
+    { Name = "${var.name}-private-${each.key}", "kubernetes.io/role/internal-elb" = "1" },
+    var.cluster_name == null ? {} : { "karpenter.sh/discovery" = var.cluster_name }
+  )
+}
+
+resource "aws_subnet" "data" {
+  for_each          = local.az_index
+  vpc_id            = aws_vpc.this.id
+  availability_zone = each.key
+  cidr_block        = var.data_subnets[each.value]
+  tags              = { Name = "${var.name}-data-${each.key}" }
+}
+
+resource "aws_eip" "nat" {
+  for_each = var.nat_gateway_per_az ? local.az_index : { (var.azs[0]) = 0 }
+  domain   = "vpc"
+}
+
+resource "aws_nat_gateway" "this" {
+  for_each      = aws_eip.nat
+  allocation_id = each.value.id
+  subnet_id     = aws_subnet.public[each.key].id
+  tags          = { Name = "${var.name}-nat-${each.key}" }
+  depends_on    = [aws_internet_gateway.this]
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.this.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.this.id
+  }
+}
+
+resource "aws_route_table_association" "public" {
+  for_each       = aws_subnet.public
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.public.id
+}
+
+# One private route table per AZ so each AZ uses its own NAT gateway (no cross-AZ dependency)
+resource "aws_route_table" "private" {
+  for_each = local.az_index
+  vpc_id   = aws_vpc.this.id
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = var.nat_gateway_per_az ? aws_nat_gateway.this[each.key].id : aws_nat_gateway.this[var.azs[0]].id
+  }
+}
+
+resource "aws_route_table_association" "private" {
+  for_each       = aws_subnet.private
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.private[each.key].id
+}
+
+# Data subnets: no route to the internet at all
+resource "aws_route_table" "data" {
+  vpc_id = aws_vpc.this.id
+}
+
+resource "aws_route_table_association" "data" {
+  for_each       = aws_subnet.data
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.data.id
+}
+
+output "vpc_id"             { value = aws_vpc.this.id }
+output "private_subnet_ids" { value = [for s in aws_subnet.private : s.id] }
+output "data_subnet_ids"    { value = [for s in aws_subnet.data : s.id] }
+output "public_subnet_ids"  { value = [for s in aws_subnet.public : s.id] }</code></pre>
+</div>
+  <p>Design notes: <code>for_each</code> keyed by AZ name (not <code>count</code>) means removing an AZ does not shift every other subnet's index and trigger replacements; route tables per AZ keep each AZ's egress independent of NAT gateways in other AZs; data subnets have no internet route at all. <span class="tag version">Version-sensitive · checked Nov 2026</span> the AWS provider 6.x major line is assumed; check the provider's upgrade guide when changing majors.</p>
+
+  <h3>7.8 Testing the module with <code>terraform test</code></h3>
+<pre data-file="modules/vpc/tests/vpc.tftest.hcl"><code class="language-hcl"># Runs with: terraform test   (or: tofu test). Uses a mocked provider, so no AWS account is needed.
+mock_provider "aws" {}
+
+variables {
+  name            = "test"
+  cidr_block      = "10.99.0.0/16"
+  azs             = ["eu-west-1a", "eu-west-1b"]
+  public_subnets  = ["10.99.0.0/24", "10.99.1.0/24"]
+  private_subnets = ["10.99.32.0/19", "10.99.64.0/19"]
+  data_subnets    = ["10.99.10.0/24", "10.99.11.0/24"]
+}
+
+run "one_nat_per_az_by_default" {
+  command = plan
+  assert {
+    condition     = length(aws_nat_gateway.this) == 2
+    error_message = "Expected one NAT gateway per AZ"
+  }
+}
+
+run "single_nat_when_disabled" {
+  command = plan
+  variables { nat_gateway_per_az = false }
+  assert {
+    condition     = length(aws_nat_gateway.this) == 1
+    error_message = "Expected a single shared NAT gateway"
+  }
+}
+
+run "public_subnets_do_not_auto_assign_public_ips" {
+  command = plan
+  assert {
+    condition     = alltrue([for s in aws_subnet.public : s.map_public_ip_on_launch == false])
+    error_message = "Public subnets must not auto-assign public IPs; only load balancers and NAT live there"
+  }
+}</code></pre>
+
+  <h3>7.9 A Terraform pull-request pipeline</h3>
+<pre data-file=".github/workflows/infra.yaml"><code class="language-yaml">name: infra
+on:
+  pull_request:
+    paths: ["live/**", "modules/**"]
+  push:
+    branches: [main]
+    paths: ["live/**"]
+permissions: {contents: read, id-token: write, pull-requests: write}
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        root: [live/prod/network, live/prod/eks, live/prod/data]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: {terraform_version: "1.16.0"}      # or opentofu/setup-opentofu
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/gha-terraform-plan   # read-only + state access
+          aws-region: eu-west-1
+      - run: terraform fmt -check -recursive
+      - run: terraform -chdir=${{ matrix.root }} init -input=false
+      - run: terraform -chdir=${{ matrix.root }} validate
+      - run: terraform -chdir=${{ matrix.root }} plan -input=false -lock-timeout=5m -out=tfplan
+      - name: Policy checks on the plan
+        run: |
+          terraform -chdir=${{ matrix.root }} show -json tfplan &gt; plan.json
+          docker run --rm -v "$PWD:/src" bridgecrew/checkov -f /src/plan.json --framework terraform_plan
+      - name: Fail if the plan destroys stateful resources without a label
+        run: |
+          jq -e '[.resource_changes[] | select(.change.actions | index("delete"))
+                  | select(.type | test("aws_db_instance|aws_rds_cluster|aws_s3_bucket|aws_eks_cluster"))] | length == 0' plan.json \
+            || { echo "::error::Plan deletes a stateful resource"; exit 1; }
+# The apply job (on push to main) uses a separate role with write permissions, runs in a protected
+# GitHub environment with required reviewers, and applies the reviewed saved plan.</code></pre>
+  <p>Separate roles for plan (read) and apply (write), plan output posted to the PR for review, policy checks against the plan JSON, and an explicit guard against destroying stateful resources are the essential controls. Tools such as Atlantis, Spacelift, env0 or HCP Terraform package the same workflow with locking per pull request.</p>
+
+  <h3>7.10 Refactoring safely: moved, import and removed blocks</h3>
+<pre data-file="live/prod/data/refactor.tf"><code class="language-hcl"># Renaming a resource or moving it into a module WITHOUT destroying the database
+moved {
+  from = aws_db_instance.orders
+  to   = module.orders_db.aws_db_instance.this
+}
+
+# Adopting a bucket that was created by hand in the console
+import {
+  to = aws_s3_bucket.model_artifacts
+  id = "lumen-model-artifacts-prod"
+}
+
+# Stop managing a resource without deleting it (handing it to another team's state)
+removed {
+  from = aws_sns_topic.legacy_alerts
+  lifecycle {
+    destroy = false
+  }
+}
+
+resource "aws_db_instance" "orders_replica" {
+  # ...
+  lifecycle {
+    prevent_destroy = true        # any plan that would destroy this fails
+  }
+}</code></pre>
+</section>

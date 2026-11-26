@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Microservices, Discovery, Circuit Breakers &amp; Distributed Locks — AI-Era Software Engineering</title>
+<meta name="description" content="Microservices versus modular monoliths, bounded contexts, discovery and service mesh, timeouts, retries with jitter, retry budgets, circuit breakers, bulkheads, load shedding, backpressure, and distributed locks with fencing tokens, in Spring Boot, Go and Python.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p2-08-microservices-resilience" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 2 · Chapter 8</p>
+  <h1>Microservices, Discovery, Circuit Breakers &amp; Distributed Locks</h1>
+  <p class="lede">Splitting a system into services trades in-process method calls for network calls, and every network call can be slow, fail, or succeed without telling you. This chapter covers when the split is worth it (and when a Spring Modulith monolith is the better answer), how services find each other, and the resilience toolkit that stops one slow dependency from taking down everything: timeouts, retries with jitter and budgets, circuit breakers, bulkheads, load shedding and backpressure. It closes with the most misunderstood tool in the box, the distributed lock, and why correctness needs fencing tokens.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> <a href="p2-02-scaling-traffic.html">Chapter 2 (load balancers, gateways)</a>, <a href="p2-06-consistency-transactions.html">Chapter 6 (sagas, idempotency, consensus)</a>, <a href="p2-07-kafka-event-driven.html">Chapter 7 (event-driven integration)</a>.</li>
+    <li><strong>You will be able to:</strong> decide between a modular monolith and microservices; draw service boundaries from bounded contexts; pick sync or async integration per interaction; version APIs; compare client-side, server-side and Kubernetes discovery and decide whether you need a mesh; configure Resilience4j correctly (and explain its sliding windows and states); compute timeouts and retry budgets; design load shedding and backpressure; and implement distributed locks that remain correct under GC pauses using fencing tokens.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: The Network Is Now Part of Your Call Stack</h2>
+  <p>In a Spring Boot monolith, <code>orderService.place()</code> calling <code>inventoryService.reserve()</code> is a method call: nanoseconds, never "partially" executed, and inside the same <code>@Transactional</code>. Move <code>InventoryService</code> into its own deployable and the same line becomes an HTTP or gRPC call that can take 2 ms or 30 s, can fail with a connection reset after the inventory was reserved, and can be retried by three layers (your code, the HTTP client, the service mesh) at once. Peter Deutsch's "fallacies of distributed computing" (the network is reliable, latency is zero, bandwidth is infinite, and so on) are the checklist of assumptions that silently break.</p>
+  <p>Microservices are therefore an <em>organisational</em> scaling technique that you pay for with distributed-systems complexity. The payoff is independent deployment, team autonomy, independent scaling and technology heterogeneity. The price is everything in this chapter and in Chapters 6, 7 and 9. A good engineer can argue both sides and choose deliberately.</p>
+  <p>AI-era systems make the resilience half of this chapter more pressing, not less. An LLM provider call has p99 latencies of many seconds, rate limits measured in tokens per minute, and periodic regional outages. Agentic systems fan out to tools and other models. A gateway that does not apply timeouts, bounded retries with jitter, circuit breakers and load shedding to model calls will melt down at the first provider incident, and an agent that "locks" a resource with a naive Redis lock will eventually double-execute an action.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>Spring Cloud (Eureka, Spring Cloud LoadBalancer, OpenFeign, Spring Cloud Gateway, Config Server), perhaps Hystrix in older systems, Resilience4j annotations (<code>@CircuitBreaker</code>, <code>@Retry</code>, <code>@Bulkhead</code>), <code>RestTemplate</code>/<code>RestClient</code>/<code>WebClient</code>, and <code>@Scheduled</code> jobs that must run on only one instance.</dd>
+      <dt>Why that is not enough</dt><dd>Annotations do not tell you <em>what values</em> to use. Wrong timeouts (or none), retries without jitter or budgets, a circuit breaker whose sliding window never fills, or a Redis lock without fencing cause the outages these tools were meant to prevent. Many teams also split services along technical layers or entities instead of bounded contexts, producing a distributed monolith with all the costs and none of the benefits.</dd>
+      <dt>The modern approach</dt><dd>Start modular (Spring Modulith) and extract services when there is a clear organisational or scaling reason; align services with bounded contexts and give each its own data; prefer async events for cross-context propagation; rely on platform discovery (Kubernetes Services, optionally a mesh for mTLS and traffic policy); apply a layered resilience policy (deadline propagation, timeouts, budgeted retries with jitter, circuit breakers, bulkheads, shedding); and use locks only for efficiency, with fencing or idempotency for correctness.</dd>
+      <dt>Where Python and Go fit</dt><dd>Go is popular for gateways, sidecars and high-concurrency edge services (Envoy is C++, but Linkerd's control plane, Consul and etcd are Go); <code>context.Context</code> deadlines are the idiomatic deadline propagation. Python ML services (FastAPI) need the same timeouts and limits, typically via <code>httpx</code> timeouts, <code>tenacity</code> retries and semaphores.</dd>
+      <dt>In production</dt><dd>Kubernetes Services and DNS for discovery, an ingress or API gateway at the edge, optionally Istio or Linkerd for mTLS, retries and traffic shifting; Resilience4j (or Spring Framework 7's built-in <code>@Retryable</code>/<code>@ConcurrencyLimit</code>) in services; dashboards for circuit-breaker state, rejection counts and saturation; ShedLock or Kubernetes leases for singleton jobs.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use microservices when several teams need independent release cadences, components have very different scaling or reliability needs, or regulatory isolation is required. Avoid them for a small team, an unclear domain, or a product still searching for fit: a modular monolith gives most of the structure at a fraction of the cost.</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="history">
+  <h2>2. History: From SOA to Microservices and Back to Modularity</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Year</th><th>Milestone</th><th>Significance</th></tr></thead>
+    <tbody>
+      <tr><td>1994</td><td>Peter Deutsch (with later additions by James Gosling) lists the fallacies of distributed computing at Sun</td><td>The assumptions resilience patterns exist to counter.</td></tr>
+      <tr><td>2003</td><td>Eric Evans, <em>Domain-Driven Design</em></td><td>Bounded contexts and context maps: the best tool for drawing service boundaries.</td></tr>
+      <tr><td>Early 2000s</td><td>Service-oriented architecture, ESBs, WS-* standards</td><td>Shared ideas (services, contracts) but centralised smart pipes and shared schemas.</td></tr>
+      <tr><td>2007</td><td>Michael Nygard, <em>Release It!</em></td><td>Named circuit breaker, bulkhead and timeouts as stability patterns.</td></tr>
+      <tr><td>2011–2014</td><td>"Microservices" term emerges; Lewis and Fowler's article (March 2014)</td><td>Smart endpoints, dumb pipes; decentralised data; organised around business capabilities.</td></tr>
+      <tr><td>2012</td><td>Netflix open-sources Eureka, later Hystrix (2012) and Ribbon</td><td>Client-side discovery and circuit breaking in Java; Spring Cloud Netflix wraps them (2015).</td></tr>
+      <tr><td>2014–2015</td><td>Kubernetes released (2014, 1.0 in 2015); Consul (2014); etcd</td><td>Platform-level discovery and health checking.</td></tr>
+      <tr><td>2016–2017</td><td>Linkerd (2016), Envoy open-sourced by Lyft (2016), Istio announced (2017)</td><td>Service mesh moves retries, mTLS and routing out of application code.</td></tr>
+      <tr><td>2016</td><td>Martin Kleppmann's critique of Redlock and antirez's reply</td><td>Clarified what distributed locks can and cannot guarantee; popularised fencing tokens.</td></tr>
+      <tr><td>2018</td><td>Hystrix enters maintenance mode; Resilience4j recommended in its place</td><td>Lightweight, functional, Java 8+ resilience library; Spring Cloud Circuit Breaker abstraction follows.</td></tr>
+      <tr><td>2018–2023</td><td>Public "back to the monolith" stories: Segment (2018), Prime Video monitoring service (2023); Shopify's modular monolith</td><td>Reaction to premature decomposition; modularity without distribution.</td></tr>
+      <tr><td>2022–2025</td><td>Spring Modulith (incubating 2022, 1.0 in 2023, 2.0 GA in November 2025); Istio ambient mode GA (Istio 1.24, 2024); Spring Framework 7 adds core <code>@Retryable</code>, <code>@ConcurrencyLimit</code> and API versioning (November 2025)</td><td>First-class support for modular monoliths, sidecar-less mesh, and resilience in core Spring. <span class="tag version">Version-sensitive · checked Nov 2026</span></td></tr>
+    </tbody>
+  </table></div>
+  <p>The pendulum swung from monoliths to fine-grained microservices and has settled on a pragmatic middle: well-modularised systems that are split into services where the organisational and operational benefits clearly exceed the costs.</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 Microservices versus the modular monolith</h3>
+  <p>A <strong>microservice</strong> is independently deployable, owns its data, and is owned by one team. A <strong>modular monolith</strong> is a single deployable whose internal modules have enforced boundaries: each module has a public API and hidden internals, modules communicate through those APIs or in-process events, and dependency cycles are forbidden. The modular monolith gives you most of the design benefits (clear ownership, cohesive modules, the option to extract later) without network calls, distributed transactions or polyglot operations.</p>
+  <p><strong>Spring Modulith</strong> makes this concrete for Spring Boot. Each direct sub-package of the application's main package is an application module; types in a module's base package are its API, sub-packages are internal. <code>ApplicationModules.of(App.class).verify()</code> in a test fails the build on illegal dependencies or cycles. <code>@ApplicationModuleListener</code> handles events asynchronously after the publishing transaction commits, and the Event Publication Registry persists those events so that they survive crashes (an in-process outbox); events can be externalised to Kafka, AMQP or SQS. It also generates C4/PlantUML documentation of the module structure and supports module-scoped integration tests (<code>@ApplicationModuleTest</code>).</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Dimension</th><th>Modular monolith</th><th>Microservices</th></tr></thead>
+    <tbody>
+      <tr><td>Deployment</td><td>One artifact; coordinated releases</td><td>Independent per service</td></tr>
+      <tr><td>Consistency</td><td>Local ACID across modules possible</td><td>Sagas, outbox, eventual consistency</td></tr>
+      <tr><td>Latency</td><td>In-process calls</td><td>Network hops, serialisation</td></tr>
+      <tr><td>Scaling</td><td>Whole app scales together</td><td>Per-service scaling and resource profiles</td></tr>
+      <tr><td>Failure isolation</td><td>A memory leak takes down everything</td><td>Failures contained (if resilience patterns are applied)</td></tr>
+      <tr><td>Team autonomy</td><td>Shared codebase and pipeline</td><td>Independent stacks, cadences, on-call</td></tr>
+      <tr><td>Operational overhead</td><td>Low</td><td>High: discovery, observability, CI/CD per service, platform team</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>3.2 Decomposition by bounded context</h3>
+  <p>A <strong>bounded context</strong> is a boundary within which a domain model and its language are consistent. "Product" means a catalogue item with descriptions and images in the Catalog context, a SKU with quantities and locations in Inventory, and a price list entry in Pricing. Trying to build one shared <code>Product</code> entity for all three produces a giant, constantly contended model. Bounded contexts are the natural service (or module) boundaries because they minimise shared models and chatty cross-boundary calls.</p>
+  <p>Practical heuristics for finding them: <em>event storming</em> workshops (domain events on a timeline, grouped by the aggregates and actors that produce them); look for language changes (the same word means different things); align with business capabilities and team ownership (Conway's law: systems mirror communication structures, so design teams and boundaries together, the "inverse Conway manoeuvre"); and check transactional needs (data that must change atomically belongs together). Anti-patterns: splitting by technical layer (a "database service"), by entity (a "Customer service" that every flow calls synchronously), or so finely that a single user action requires ten synchronous hops.</p>
+  <p><strong>Context mapping</strong> describes relationships between contexts: customer/supplier, conformist, <em>anti-corruption layer</em> (a translation layer protecting your model from an upstream's model, essential when integrating a legacy system or a third-party API such as an LLM provider), shared kernel, and published language (a well-documented event schema).</p>
+
+  <h3>3.3 Data ownership</h3>
+  <p>The rule is <strong>database per service</strong>: a service's tables are private, accessible only through its API or events. Shared databases create invisible coupling: a schema migration in one service breaks another, and locks in one service's queries slow another. Physical separation can be a separate schema on a shared cluster with distinct credentials (cheap) or a separate cluster (strong isolation). When another service needs your data, give it (1) a query API, (2) events so it can maintain a local projection (ECST, Chapter 7), or (3) a CDC feed. Reporting across services uses a separate analytical store fed by events or CDC, not cross-database joins.</p>
+
+  <h3>3.4 Synchronous versus asynchronous communication</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Aspect</th><th>Synchronous (REST, gRPC)</th><th>Asynchronous (events, commands over a broker)</th></tr></thead>
+    <tbody>
+      <tr><td>Temporal coupling</td><td>Caller needs callee up now</td><td>Producer and consumer run independently</td></tr>
+      <tr><td>Availability</td><td>Product of availabilities along the chain</td><td>Broker availability; consumers catch up</td></tr>
+      <tr><td>Latency to user</td><td>Immediate answer</td><td>Eventual; needs status polling or push</td></tr>
+      <tr><td>Error handling</td><td>Immediate, in the request</td><td>Retries, DLQs, compensations</td></tr>
+      <tr><td>Best for</td><td>Queries needing fresh data; user-facing request/response; commands needing an immediate answer</td><td>State propagation, workflows, fan-out, load levelling</td></tr>
+    </tbody>
+  </table></div>
+  <p>The availability point deserves numbers: if a request synchronously traverses five services each at 99.9%, the chain is at most \( 0.999^5 \approx 99.5\% \). Long synchronous chains are an anti-pattern; aim for a user request to touch one or two services synchronously, with the rest fed by events. <strong>gRPC</strong> (HTTP/2, Protobuf, streaming, deadlines built in) is preferable to REST for internal high-volume calls; REST/JSON remains standard at public edges.</p>
+
+  <h3>3.5 API versioning</h3>
+  <p>Independent deployment requires that a service can change without breaking callers. Strategies:</p>
+  <ul>
+    <li><strong>Prefer additive, backward-compatible change:</strong> add optional fields, never remove or repurpose; follow the tolerant reader principle on the consumer side (ignore unknown fields, which Jackson does if <code>FAIL_ON_UNKNOWN_PROPERTIES</code> is disabled; Spring Boot disables it by default).</li>
+    <li><strong>Version when you must break:</strong> URI path (<code>/v2/orders</code>, explicit and cache-friendly), header (<code>API-Version: 2</code>), media type (<code>Accept: application/vnd.example.order.v2+json</code>), or query parameter. Spring Framework 7 added first-class API versioning: configure a strategy once (path, header, query or media-type parameter) and declare <code>version</code> on request mappings; <code>RestClient</code>/<code>WebClient</code> can send versions too. <span class="tag version">Version-sensitive · checked Nov 2026</span></li>
+    <li><strong>Deprecate deliberately:</strong> <code>Deprecation</code> and <code>Sunset</code> response headers (RFC 9745 and RFC 8594), usage metrics per version, and a published removal date.</li>
+    <li><strong>Consumer-driven contract tests</strong> (Spring Cloud Contract, Pact) verify in the provider's CI that changes do not break known consumers.</li>
+    <li>For gRPC/Protobuf, compatibility is by field numbers; never reuse or renumber.</li>
+  </ul>
+
+  <h3>3.6 Service discovery</h3>
+  <p>Instances come and go (autoscaling, deploys, failures), so callers need a dynamic way to find healthy endpoints.</p>
+  <ul>
+    <li><strong>Client-side discovery (Eureka + Spring Cloud LoadBalancer):</strong> instances register with a registry and renew a lease by heartbeat; clients fetch and cache the registry and choose an instance themselves (round-robin, or zone-preference). Pros: no extra hop, smart client-side balancing. Cons: every language needs a client library; stale caches during churn. Eureka is AP by design: during network problems it enters <em>self-preservation</em> and stops expiring instances, preferring stale entries over an empty registry.</li>
+    <li><strong>Server-side discovery:</strong> clients call a stable address (a load balancer or router), which knows the healthy backends: AWS ALB target groups, an API gateway, or a Kubernetes Service. Pros: language-agnostic, simple clients. Cons: extra hop (unless done in the kernel), the balancer must be highly available.</li>
+    <li><strong>Kubernetes Services and DNS:</strong> a Service selects pods by labels; the EndpointSlice controller tracks ready pod IPs (readiness probes decide readiness); <code>kube-proxy</code> programs iptables, IPVS or nftables rules (or an eBPF dataplane such as Cilium does it) so the Service's virtual ClusterIP load-balances to pods at connection level. CoreDNS resolves <code>orders.shop.svc.cluster.local</code> to the ClusterIP. A <em>headless</em> Service (<code>clusterIP: None</code>) returns pod IPs directly, used by StatefulSets and client-side balancing (e.g., gRPC). Note that connection-level balancing does not spread requests over long-lived HTTP/2 connections, which is a main reason meshes and gRPC client-side balancing exist.</li>
+    <li><strong>Consul:</strong> a Raft-backed service catalog with health checks, a DNS interface, key-value configuration and its own service mesh (Consul Connect). Common in multi-platform estates (VMs plus Kubernetes).</li>
+  </ul>
+
+  <h3>3.7 Service mesh basics</h3>
+  <p>A service mesh moves network concerns (mTLS, retries, timeouts, load balancing, traffic shifting, telemetry) from application libraries into infrastructure. A <strong>data plane</strong> of proxies intercepts traffic; a <strong>control plane</strong> configures them.</p>
+  <ul>
+    <li><strong>Istio:</strong> Envoy-based. In sidecar mode, an Envoy proxy runs in every pod; in <em>ambient</em> mode (GA since Istio 1.24), a per-node <code>ztunnel</code> provides L4 mTLS and optional per-namespace <em>waypoint</em> Envoy proxies handle L7 policy, avoiding per-pod sidecar overhead. Configured with <code>VirtualService</code>, <code>DestinationRule</code> (outlier detection is Istio's circuit breaking), <code>PeerAuthentication</code>, <code>AuthorizationPolicy</code>, and increasingly the Kubernetes Gateway API.</li>
+    <li><strong>Linkerd:</strong> a lightweight mesh with a purpose-built Rust micro-proxy; emphasises simplicity, automatic mTLS and latency-aware (EWMA) load balancing.</li>
+  </ul>
+  <p>What a mesh gives you: uniform mTLS and identity (SPIFFE IDs) between services, golden metrics per edge without code changes, canary and traffic splitting, request-level load balancing for HTTP/2 and gRPC. What it costs: added latency per hop (typically sub-millisecond to a few milliseconds), resource overhead, a complex control plane to upgrade, and a new failure domain. And the danger: mesh-level retries multiply with application-level retries unless coordinated. <span class="tag opinion">Opinion</span> Adopt a mesh when you need mTLS everywhere or fine-grained traffic management across many services; for a dozen services, Kubernetes Services plus in-app resilience is often enough.</p>
+
+  <h3>3.8 Timeouts</h3>
+  <p>A call without a timeout can hang forever, holding a thread, a connection and memory. There are several distinct timeouts: <strong>connect timeout</strong> (TCP/TLS establishment, short: 100s of ms within a data centre), <strong>read/response timeout</strong> (time to first byte or whole response), <strong>pool acquisition timeout</strong> (waiting for a free connection), and the overall <strong>deadline</strong> for the user request. Set per-call timeouts from the dependency's measured latency (e.g., slightly above its p99.9), not from guesswork, and make sure the sum along a call chain fits the caller's own deadline. <strong>Deadline propagation</strong> passes the remaining time budget downstream (gRPC does it natively; with HTTP you pass a header) so that downstream services do not keep working on requests whose callers have already given up.</p>
+
+  <h3>3.9 Retries, exponential backoff and jitter</h3>
+  <p>Retries convert transient failures into successes, but they also multiply load exactly when a dependency is struggling. Rules:</p>
+  <ul>
+    <li>Retry only <strong>idempotent</strong> operations, or non-idempotent ones carrying an idempotency key (Chapter 6).</li>
+    <li>Retry only <strong>transient</strong> errors: connection failures, 503, 429 (honouring <code>Retry-After</code>), timeouts; never 400, 401, 404 or validation errors.</li>
+    <li>Use <strong>exponential backoff</strong>: wait \( b \cdot 2^{n} \) after attempt \( n \), capped. Without randomisation, all clients that failed together retry together, producing synchronised waves.</li>
+    <li>Add <strong>jitter</strong>. "Full jitter" (sleep a uniform random time between 0 and the exponential value) spreads retries most evenly and in AWS's simulations minimised total work; "equal jitter" keeps half the backoff fixed; "decorrelated jitter" bases each sleep on the previous one.</li>
+    <li>Retry at <strong>one layer</strong>. If the mesh, the HTTP client, the service code and the caller's caller each retry 3 times, a single failure at depth 4 can produce \( 4^4 = 256 \) attempts.</li>
+  </ul>
+
+  <h3>3.10 Retry budgets</h3>
+  <p>A retry budget caps retries as a fraction of normal traffic, so that retries can never amplify an outage by more than a fixed factor. Google's SRE book describes a per-request cap (e.g., at most 3 attempts) combined with a per-client budget where retries must stay below about 10% of requests; Finagle and Linkerd implement budgets as token buckets that earn a fraction of a token per successful request and spend one per retry. When the budget is empty, fail fast. Budgets protect a recovering service from a retry storm, which per-request retry limits alone do not.</p>
+
+  <h3>3.11 Circuit breakers</h3>
+  <p>A circuit breaker wraps calls to a dependency and tracks outcomes. While the failure rate (or slow-call rate) is below a threshold, it is <strong>CLOSED</strong> and calls pass. When the threshold is exceeded over a sliding window, it trips <strong>OPEN</strong>: calls fail immediately (or go to a fallback) without touching the dependency, which frees the caller's threads and gives the dependency room to recover. After a wait duration it becomes <strong>HALF_OPEN</strong> and lets a limited number of trial calls through; if they succeed it closes, otherwise it reopens. The breaker turns slow failure into fast failure, the key to stopping cascades.</p>
+
+  <h3>3.12 Bulkheads</h3>
+  <p>Named after a ship's watertight compartments: isolate resources per dependency (or per tenant, or per request class) so that one saturated dependency cannot consume every thread or connection. Implementations: separate thread pools, semaphores (concurrency limits), separate connection pools, and at the infrastructure level separate deployments or cells. With Java 21 virtual threads, threads are no longer the scarce resource, so bulkheads become <em>concurrency limits</em> (semaphores) protecting the downstream rather than thread pools protecting the caller.</p>
+
+  <h3>3.13 Fallbacks</h3>
+  <p>When a call fails or a breaker is open, a fallback can return a cached value, a default (empty recommendations), a degraded response (static content), or queue the work for later. Fallbacks must be cheap, local and well tested; a fallback that calls another remote service just moves the failure. Some operations must not fall back (charging a card): fail clearly instead.</p>
+
+  <h3>3.14 Load shedding</h3>
+  <p>A server under overload should reject excess work early and cheaply (HTTP 503 or 429) rather than accept everything and serve everyone slowly, which leads to timeouts and wasted work (it completes requests whose clients already gave up). Techniques: concurrency limits (reject when in-flight requests exceed a limit), queue-length or queue-time limits (drop requests that waited longer than their deadline), priority-based shedding (protect checkout, shed recommendations), and adaptive limits based on latency (Netflix's concurrency-limits library adapts the limit using TCP-congestion-control-like algorithms such as Vegas and gradient). Shedding should happen as early in the stack as possible (gateway, then service ingress).</p>
+
+  <h3>3.15 Backpressure</h3>
+  <p>Backpressure is the mechanism by which a slow consumer tells a fast producer to slow down, rather than buffering unboundedly. Examples: TCP flow control, HTTP/2 stream windows, Reactive Streams <code>request(n)</code> in Project Reactor, bounded queues that block or reject producers, Kafka consumers that pull at their own pace (the log is the buffer), and 429 responses with <code>Retry-After</code>. Unbounded queues are latent outages: they convert overload into memory exhaustion and unbounded latency.</p>
+
+  <h3>3.16 Distributed locks</h3>
+  <p>A distributed lock gives one process at a time the right to do something across a cluster: run a scheduled job, refresh a cache, process a file. Kleppmann's key distinction: is the lock for <strong>efficiency</strong> (avoid doing work twice; occasional duplicates are tolerable) or for <strong>correctness</strong> (duplicates corrupt data)? For efficiency, a simple Redis lock is fine. For correctness, no lease-based lock is enough on its own, because a lock holder can pause (GC, VM migration, network delay) past its lease expiry while still believing it holds the lock. Correctness needs a <strong>fencing token</strong>: a monotonically increasing number issued with each lock grant, which the protected resource checks, rejecting writes with a token older than one it has already seen.</p>
+  <ul>
+    <li><strong>Redis <code>SET key value NX PX ttl</code>:</strong> acquire with a unique random value; release with a Lua script that deletes only if the value matches (never plain <code>DEL</code>, which could delete another holder's lock after your lease expired). Single-instance Redis loses the lock on failover if replication was asynchronous.</li>
+    <li><strong>Redlock:</strong> acquire the same key on a majority of N (typically 5) independent Redis masters within a time bound, and consider the lock held for the TTL minus elapsed time and clock drift. Kleppmann's critique: it depends on timing assumptions (bounded pauses, clock drift, network delay) that real systems violate, and it does not produce fencing tokens, so it is unsafe for correctness; antirez's reply argued the assumptions are reasonable in practice. The engineering consensus: use Redlock (or a single Redis) only for efficiency locks.</li>
+    <li><strong>ZooKeeper / etcd:</strong> consensus-backed. ZooKeeper's recipe uses ephemeral sequential znodes (the lowest sequence holds the lock; the node vanishes when the session expires); the znode's zxid or sequence number serves as a fencing token. etcd uses leases (TTL kept alive by the client) and the key's creation revision as a fencing token; its <code>concurrency</code> package provides mutexes and elections.</li>
+    <li><strong>Database locks:</strong> PostgreSQL advisory locks (<code>pg_try_advisory_lock(key)</code> session-level, or <code>pg_advisory_xact_lock</code> released at transaction end), <code>SELECT ... FOR UPDATE</code> on a lock row, or a lock table with a unique key and expiry. If you already have a strongly consistent primary database, it is often the simplest correct choice, and a version column or sequence gives you a fencing token.</li>
+    <li><strong>ShedLock:</strong> a library that makes Spring <code>@Scheduled</code> tasks run on at most one node at a time using a lock table (JDBC), Redis, Mongo, ZooKeeper and others, with <code>lockAtMostFor</code> and <code>lockAtLeastFor</code>. It is explicitly an efficiency lock, not a correctness guarantee.</li>
+    <li><strong>Kubernetes <code>Lease</code> objects:</strong> leader election for controllers and singleton workloads, backed by etcd.</li>
+  </ul>
+
+  <h3>3.17 Idempotency in service calls</h3>
+  <p>Every retry policy assumes the retried operation is safe to repeat. For synchronous service-to-service calls this means: idempotent HTTP methods used correctly (PUT/DELETE), idempotency keys on POSTs that create or charge, conditional requests (<code>If-Match</code> with ETags for optimistic concurrency), and deterministic request ids propagated through the call chain so that a downstream service can deduplicate. Chapter 6 covered the server-side mechanics in depth; here the rule is simply: <em>do not add a retry policy to a call until you have proven the operation is idempotent.</em></p>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

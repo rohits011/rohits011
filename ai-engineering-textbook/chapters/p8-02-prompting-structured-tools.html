@@ -1,0 +1,1532 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prompting, Structured Outputs &amp; Tool Use — AI-Era Software Engineering</title>
+<meta name="description" content="Prompt engineering as software engineering, structured outputs with JSON Schema and constrained decoding, the tool-use loop, LLM API mechanics (streaming, batching, rate limits, retries, token accounting), the Anthropic Python and Java SDKs, Spring AI, LangChain4j, and a resilient Spring Boot LLM client built with Resilience4j.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p8-02-prompting-structured-tools" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 8 · Chapter 2</p>
+  <h1>Prompt Engineering, Structured Outputs, Tool Use &amp; LLM APIs</h1>
+  <p class="lede">The prompt is your interface definition, the JSON schema is your response contract, tools are your RPC surface, and the HTTP API is an unreliable, rate-limited, metered remote dependency. This chapter treats each of those as an engineering problem and ends with a production-grade Spring Boot LLM client that you could put in front of real traffic.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> <a href="p8-01-llm-foundations.html">Chapter 1</a> (tokens, sampling, context); Resilience4j and Spring Boot configuration; basic JSON Schema.</li>
+    <li><strong>You will be able to:</strong> write and version prompts like code; get schema-valid JSON reliably; implement a correct tool-use loop including parallel calls and errors; stream, batch and cache requests; handle rate limits and timeouts; and choose between the raw SDKs, Spring AI and LangChain4j.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: From Chat Box to Contract</h2>
+  <p>Typing a question into a chat window and integrating an LLM into a payment-dispute workflow are different activities. In the chat window, a vague question and an approximately right answer are fine; a human reads the response and adapts. In a service, the LLM's output feeds code: a <code>switch</code> on a category, a database write, a call to another microservice. That code needs <em>contracts</em> — and LLMs, by default, offer none. The work of this chapter is to impose contracts on a probabilistic component, layer by layer:</p>
+  <ul>
+    <li><strong>Prompts</strong> define the task precisely, the way a well-written interface Javadoc does, and are versioned and tested like code.</li>
+    <li><strong>Structured outputs</strong> force responses into a JSON schema, so parsing never fails and fields are typed.</li>
+    <li><strong>Tool use</strong> (function calling) lets the model request actions — query an order, check inventory — through a typed interface you control, instead of inventing facts.</li>
+    <li><strong>The API layer</strong> handles the boring but vital concerns: streaming, rate limits, retries, timeouts, cost accounting and fallback.</li>
+  </ul>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>Thymeleaf or FreeMarker templates rendered with a model map; OpenFeign or <code>RestClient</code> calls to remote services described by OpenAPI; Jackson binding JSON to records with Bean Validation (<code>@NotNull</code>, <code>@Pattern</code>); Resilience4j <code>@Retry</code>, <code>@CircuitBreaker</code>, <code>@Bulkhead</code> and <code>@TimeLimiter</code> around flaky dependencies; RPC frameworks such as gRPC where a client calls a typed method on a server.</dd>
+      <dt>Why that is not enough</dt><dd>A prompt template looks like a Thymeleaf template, but the "renderer" on the other side interprets it with judgement: wording changes behaviour, and there is no compiler. Tool calling looks like RPC, but the <em>caller</em> is the model, which decides when to call, with which arguments, and may call the wrong tool or invent arguments. Jackson can bind the JSON, but only if the model produced valid JSON. Resilience patterns apply, but retries are not idempotent in meaning (each retry may give a different answer) and a slow call is not necessarily a failed one.</dd>
+      <dt>The modern approach</dt><dd>Version prompts as artefacts with tests; use provider-side structured outputs (constrained decoding) plus local validation; design tools like public APIs with least privilege; wrap the client with timeouts, bounded jittered retries honouring <code>retry-after</code>, circuit breakers, bulkheads and model fallbacks; stream for latency; batch for throughput; cache prefixes for cost; log every request's usage.</dd>
+      <dt>Where Python and Go fit</dt><dd>Python is the fastest place to iterate on prompts and evaluation, and the Anthropic Python SDK's Pydantic integration is excellent for schema work. Go suits the gateway in front of all model traffic (Chapter 5). Spring AI and LangChain4j bring these concepts into idiomatic Spring beans for business services.</dd>
+      <dt>In production</dt><dd>Prompts live in a repository with owners and changelogs; every response is validated; tool executions are authorised per user; and dashboards show latency percentiles, stop reasons, retry rates, circuit-breaker state and cost per feature.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use structured outputs and tools whenever code consumes the result. Avoid free-text parsing with regexes, avoid giving the model tools with more authority than the calling user, and avoid adding an agent loop where a single call with a schema suffices.</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="history">
+  <h2>2. History: How the Interface Matured</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>When</th><th>Development</th><th>Engineering consequence</th></tr></thead>
+    <tbody>
+      <tr><td>2020</td><td>GPT-3 paper shows in-context (few-shot) learning: examples in the prompt steer a base model.</td><td>"Prompt engineering" emerges, initially as trial-and-error formatting of completions.</td></tr>
+      <tr><td>2022</td><td>Chain-of-thought prompting (Wei et al.) and "let's think step by step" (Kojima et al.); ReAct (Yao et al.) interleaves reasoning with actions; InstructGPT/ChatGPT make instructions the main interface.</td><td>Prompts shift from document-continuation tricks to instructions; tool-using patterns are born in research.</td></tr>
+      <tr><td>Mar 2023</td><td>Chat-style message APIs (system/user/assistant roles) become the standard request shape.</td><td>The <code>messages</code> array replaces the single prompt string.</td></tr>
+      <tr><td>Jun 2023</td><td>OpenAI ships function calling in its chat API.</td><td>Tool use becomes a first-class API feature rather than prompt parsing.</td></tr>
+      <tr><td>Nov 2023</td><td>OpenAI introduces JSON mode.</td><td>Valid JSON, but not yet schema-conformant JSON.</td></tr>
+      <tr><td>2024</td><td>Anthropic tool use reaches general availability (May); OpenAI Structured Outputs with strict JSON Schema conformance (Aug); prompt caching appears at Anthropic (Aug, beta) and other providers; batch APIs at half price arrive (OpenAI April, Anthropic October); Anthropic open-sources the Model Context Protocol (Nov).</td><td>Schema guarantees, cost levers and a tool-integration standard become available to application engineers.</td></tr>
+      <tr><td>2025</td><td>Spring AI 1.0 and LangChain4j 1.0 reach GA (May); Anthropic ships structured outputs for Claude (Nov) with strict tool schemas; extended/adaptive thinking becomes standard in frontier APIs.</td><td>Java teams get stable, supported abstractions; reasoning becomes a per-request knob.</td></tr>
+      <tr><td>2026</td><td>Spring AI 2.0 (June) moves the tool loop into an advisor chain (<code>ToolCallingAdvisor</code>) and targets Spring Boot 4; Spring AI 2.1 GA (Nov 20); LangChain4j continues rapid 1.x releases; Anthropic's API version <code>2026-10-21</code> removes sampling parameters; several models reject forced tool choice and assistant prefill. <span class="tag version">Version-sensitive · checked Nov 2026</span></td><td>APIs are converging on "describe the contract, let the provider enforce it." Old tricks (prefilling the assistant turn with <code>{</code>, forcing a tool to get JSON, temperature 0) are being retired in favour of first-class schema features.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The trend line is clear: every hack that application engineers invented to get reliable behaviour out of free-form text has, within one or two years, become a first-class, provider-enforced API feature. Build on the first-class features; isolate anything provider-specific behind your own interface so the next shift costs you a configuration change rather than a rewrite.</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 Anatomy of a request: system, user, assistant</h3>
+  <p>A modern messages request has three kinds of content. The <strong>system prompt</strong> sets the operator's instructions: role, task, rules, output format, tool-use policy. It is the closest thing to configuration. <strong>User messages</strong> carry end-user input and attached context (documents, images, tool results). <strong>Assistant messages</strong> carry the model's previous turns, which you resend to continue a conversation — the API is stateless. A useful mental model is that the system prompt is your <code>@Service</code> code and the user message is the request payload: the former is trusted and versioned, the latter is untrusted data.</p>
+
+  <h3>3.2 Writing instructions that work</h3>
+  <p>Current frontier models follow instructions literally and well, so most prompt quality problems are specification problems. Principles that consistently help <span class="tag opinion">Opinion</span>:</p>
+  <ul>
+    <li><strong>State the goal and the audience.</strong> "Classify the support ticket so the routing service can assign it to a queue" beats "Classify this." Context about <em>why</em> lets the model handle edge cases sensibly.</li>
+    <li><strong>Define every label and boundary.</strong> If categories are <code>BILLING</code>, <code>TECHNICAL</code>, <code>ACCOUNT</code>, say what goes where and what to do with tickets that span two. Ambiguous specs produce inconsistent outputs no decoding setting can fix.</li>
+    <li><strong>Separate instructions from data with delimiters.</strong> Wrap documents in XML-style tags (<code>&lt;ticket&gt;…&lt;/ticket&gt;</code>) and refer to them by name. It improves accuracy and is a first, partial defence against injected instructions inside data.</li>
+    <li><strong>Say what to do, not only what to avoid,</strong> and give the fallback: "If the ticket does not contain enough information, return <code>UNKNOWN</code> with a one-sentence reason."</li>
+    <li><strong>Specify the output shape</strong> — ideally via a schema (§3.8) rather than prose.</li>
+    <li><strong>Avoid shouting and over-constraining.</strong> Prompts written for older models often contain capitalised warnings and long lists of prohibitions; newer models over-apply them. Remove rules that no longer earn their place, and test.</li>
+  </ul>
+
+  <h3>3.3 Few-shot examples</h3>
+  <p>Examples (input → output pairs) demonstrate format and decision boundaries more efficiently than prose. Three to five diverse examples covering edge cases usually suffice. Pitfalls: the model copies surface features of examples (length, vocabulary, even specific values), so vary them; examples consume input tokens on every request (cache them); and examples encode decisions — if an example is wrong, you have trained the wrong behaviour into every call. Keep examples in a versioned file alongside the prompt and include them in evaluation.</p>
+
+  <h3>3.4 Chain-of-thought and extended thinking</h3>
+  <p>Asking a model to reason step by step before answering improves performance on multi-step problems, because each generated reasoning token becomes context for the next (Chapter 1, §3.9). With reasoning models you no longer need to ask: the model thinks internally before responding, and you control how much via an effort or budget parameter. On Anthropic's current models, for example, thinking is <em>adaptive</em> and controlled with <code>output_config.effort</code>; the raw reasoning is not returned — you may opt into a summary. <span class="tag version">Version-sensitive · checked Nov 2026</span> Two engineering rules: thinking tokens are billed as output tokens, so set effort per route; and if code consumes the result, keep reasoning out of the parsed output — let the model think internally and return only the structured answer.</p>
+
+  <h3>3.5 Decomposition and prompt chaining</h3>
+  <p>A single prompt that extracts, validates, decides and writes a customer email is hard to debug and evaluate. Split it into a pipeline: extract fields (structured output) → validate in code → decide (small model or rules) → draft (LLM) → check (rules or a judge). Each step has a narrow contract and its own tests, can use a differently priced model, and can be retried independently. This is the same reasoning that makes you split a god-class service — and it is usually better than an autonomous agent for well-understood processes (Chapter 6).</p>
+
+  <h3>3.6 Prompt templates and versioning</h3>
+  <p>A prompt template is a text with placeholders, rendered per request — the Thymeleaf of LLM work. Spring AI's <code>PromptTemplate</code> uses StringTemplate syntax (<code>{name}</code>); LangChain4j uses <code>{{name}}</code> in <code>@UserMessage</code>; Python teams use f-strings or Jinja. Treat templates as code:</p>
+  <ul>
+    <li>Store them as files in the repository (for example <code>src/main/resources/prompts/ticket-classifier/v3.st</code>), never as string literals scattered through services.</li>
+    <li>Give each a version identifier and log it with every request, so you can correlate quality changes with prompt changes.</li>
+    <li>Escape user-provided values, keep untrusted content inside delimiters, and never interpolate user input into the system prompt.</li>
+    <li>Gate changes with an evaluation run in CI (Chapter 5), exactly as you gate code changes with tests.</li>
+    <li>Keep the static parts (instructions, examples, tool definitions) first and the variable parts last — this maximises prompt-cache hits.</li>
+  </ul>
+
+  <h3>3.7 Prompt caching</h3>
+  <p>Most requests in a feature share a long, identical prefix: system prompt, examples, tool definitions, perhaps a reference document. <strong>Prompt caching</strong> lets the provider store the KV cache for that prefix and reuse it on subsequent requests, reducing both cost and time to first token. Mechanics differ by provider: Anthropic uses explicit <code>cache_control</code> breakpoints (or a top-level automatic mode) with a default five-minute lifetime refreshed on each hit and an optional one-hour lifetime; writes cost more than normal input (1.25× for five minutes, 2× for one hour) and reads cost a small fraction of the input price (0.1× on most models, lower on some newer ones). Other providers cache matching prefixes automatically. <span class="tag version">Version-sensitive · checked Nov 2026</span></p>
+  <p>The cache is a <strong>byte-exact prefix match</strong>. Anything that varies — a timestamp in the system prompt, tool definitions serialised in a different order, a per-request ID near the top — invalidates everything after it. Design for caching: static content first, deterministic serialisation, variable content last, and verify with the usage fields (<code>cache_read_input_tokens</code>) that hits are actually happening.</p>
+
+  <h3>3.8 Structured outputs</h3>
+  <p>There are three generations of "get JSON back":</p>
+  <ol>
+    <li><strong>Prompt-only</strong>: "Respond with JSON matching this example." Works most of the time; fails occasionally with prose preambles, trailing commas, truncated output or missing fields.</li>
+    <li><strong>JSON mode</strong>: the provider guarantees syntactically valid JSON, but not that it matches your schema.</li>
+    <li><strong>Schema-constrained output</strong>: you supply a JSON Schema, and the provider uses <strong>constrained decoding</strong> so that only tokens consistent with the schema can be generated. The result always parses and has the required fields and types. Anthropic exposes this as <code>output_config.format</code> with <code>type: "json_schema"</code> (and SDK helpers like <code>messages.parse()</code> with a Pydantic model); OpenAI exposes strict JSON Schema response formats; open-model servers such as vLLM support guided decoding with JSON Schema or grammars.</li>
+  </ol>
+  <p>Constrained decoding guarantees <em>syntax and shape</em>, not <em>truth</em>. The model can still put the wrong category in a valid enum, hallucinate a plausible invoice number, or produce a string that fails your business rules. Supported schema features are also a subset of JSON Schema (for example, required <code>additionalProperties: false</code>, limits on recursion or certain formats), so check the provider's documentation. You therefore still need <strong>local validation</strong>: Pydantic validators in Python, Bean Validation annotations on Java records, plus business checks (does this order ID exist? does the total match the line items?). When validation fails, the standard pattern is a <strong>repair retry</strong>: send the validation error back to the model and ask for a corrected output, at most once or twice, then fail closed.</p>
+  <p>One more failure mode: if generation hits <code>max_tokens</code>, the JSON is truncated regardless of constraints. Check <code>stop_reason</code> before parsing and size <code>max_tokens</code> for the largest legitimate output.</p>
+
+  <h3>3.9 Function calling and tool use</h3>
+  <p>Tool use lets the model ask your code to do something. You describe tools — name, natural-language description, JSON Schema for input — in the request. The model may respond with a <code>tool_use</code> block naming a tool and arguments instead of (or as well as) text, with <code>stop_reason</code> set to <code>tool_use</code>. <strong>Your code executes the tool</strong>, then sends the result back in a <code>tool_result</code> block in the next user message, referencing the call's ID. The model then continues — perhaps calling more tools, perhaps answering. The model never executes anything itself; it only emits structured requests. Security follows from this: every tool call passes through your code, which can validate, authorise, rate-limit and audit it.</p>
+  <p>Key details of a correct loop:</p>
+  <ul>
+    <li><strong>Append the full assistant content</strong> (including <code>tool_use</code> blocks and any thinking blocks) to the history before adding tool results; the API validates that every result matches a call.</li>
+    <li><strong>Parallel tool calls</strong>: a single assistant turn may contain several <code>tool_use</code> blocks (for example, look up three orders at once). Execute them concurrently, then return <em>all</em> results in a <em>single</em> user message.</li>
+    <li><strong>Errors are results</strong>: if a tool fails, return a <code>tool_result</code> with <code>is_error: true</code> and a useful message ("order 123 not found; valid IDs look like ORD-######"). The model can recover; dropping the result breaks the conversation.</li>
+    <li><strong>Bound the loop</strong>: cap iterations and total tokens, and detect repeated identical calls, to prevent runaway costs.</li>
+    <li><strong>Strict schemas</strong>: setting <code>strict: true</code> on a tool (where supported) applies constrained decoding to the arguments, so they always validate against the schema. Still validate business rules.</li>
+    <li><strong>Tool choice</strong>: <code>auto</code> lets the model decide; <code>none</code> forbids tools; some APIs allow forcing a specific tool, but several current models reject forced tool choice — use structured outputs when you only wanted JSON. <span class="tag version">Version-sensitive · checked Nov 2026</span></li>
+  </ul>
+
+  <h3>3.10 Designing tool schemas</h3>
+  <p>Tool definitions are prompts: the model chooses tools from their names and descriptions, so write them for a reader who has never seen your codebase. Good practice <span class="tag opinion">Opinion</span>:</p>
+  <ul>
+    <li>Prefer a few well-scoped tools with clear purposes over dozens of thin CRUD wrappers. "<code>get_order_status(order_id)</code>" beats exposing your entire order service.</li>
+    <li>Describe when to use the tool, what it returns, and its limits ("returns at most 20 results; use <code>cursor</code> for more").</li>
+    <li>Use enums and formats for constrained parameters; avoid free-form strings where an ID pattern is known.</li>
+    <li>Return compact, relevant results — not raw 50 KB JSON payloads, which cost tokens and bury the signal.</li>
+    <li>Make write operations explicit and separately authorised; consider requiring human confirmation for destructive or financial actions (Chapter 6).</li>
+    <li>Keep the tool list deterministic in order and content so prompt caching works.</li>
+  </ul>
+
+  <h3>3.11 The messages API shape</h3>
+  <p>Across providers, chat APIs share a shape: model ID, a list of messages with roles and typed content blocks (text, image, document, tool use, tool result), an optional system prompt, tool definitions, output constraints and limits, and a response with content blocks, a stop reason and usage. Anthropic's endpoint is <code>POST /v1/messages</code> with a required <code>max_tokens</code>; OpenAI's current primary interface is its Responses API, with Chat Completions still widely used; many open-model servers implement an OpenAI-compatible endpoint. Differences matter at the edges — where the system prompt goes, how tool results are represented, what usage fields mean — which is precisely what client abstractions like Spring AI and LangChain4j smooth over.</p>
+
+  <h3>3.12 Streaming with server-sent events</h3>
+  <p>With streaming enabled, the response is a <code>text/event-stream</code>. Anthropic's stream, for example, emits <code>message_start</code>, then for each content block a <code>content_block_start</code>, many <code>content_block_delta</code> events (text deltas, or partial JSON for tool inputs), and <code>content_block_stop</code>, followed by <code>message_delta</code> (stop reason and final usage) and <code>message_stop</code>; <code>ping</code> events may appear and an <code>error</code> event can arrive mid-stream. Practical consequences: an HTTP 200 does not mean success — errors can arrive inside the stream; your read timeout should be an <em>idle</em> timeout between events plus an overall deadline; and to relay to a browser you re-emit events from a Spring MVC <code>SseEmitter</code> or a WebFlux <code>Flux&lt;ServerSentEvent&gt;</code>.</p>
+
+  <h3>3.13 Batch APIs</h3>
+  <p>For work that does not need an immediate answer — nightly classification of the day's tickets, backfilling embeddings, evaluation runs — batch APIs accept thousands of requests in one submission and return results asynchronously within a deadline (Anthropic: most batches within an hour, at most 24 hours, results in any order keyed by <code>custom_id</code>) at a substantial discount (50% at both Anthropic and OpenAI). <span class="tag version">Version-sensitive · checked Nov 2026</span> This is the LLM equivalent of moving work from a synchronous endpoint to a Spring Batch job: cheaper, more throughput, no latency guarantee.</p>
+
+  <h3>3.14 Rate limits</h3>
+  <p>Providers limit requests per minute and tokens per minute (often separately for input and output), per organisation, model and tier; some also cap concurrent requests or have separate limits for special modes. Exceeding them yields HTTP 429 with a <code>retry-after</code> header; overloaded upstream capacity may yield a 5xx or provider-specific "overloaded" error. Treat token rate limits as a shared quota: a single batch job can starve your interactive traffic, so isolate workloads by API key or workspace and apply your own client-side rate limiting and bulkheads.</p>
+
+  <h3>3.15 Retries, backoff and timeouts</h3>
+  <p>Retry only what is retryable: 429, 408, 409 (where documented), 5xx, overloaded errors and connection failures. Never retry 400 (bad request), 401/403 (auth), 404, or 413 (too large) — they will fail again and waste quota. Use exponential backoff with full jitter, honour <code>retry-after</code>, cap attempts (2–3), and cap total time with a deadline. Remember that official SDKs retry by default (the Anthropic SDKs retry twice by default); if you add Resilience4j retries on top without disabling the SDK's, you get multiplicative retry storms. Pick one layer. For timeouts, distinguish connection timeout (short), idle/read timeout between streamed events (tens of seconds), and the overall request deadline (driven by your SLO and output size; long generations can legitimately take minutes).</p>
+
+  <h3>3.16 Token accounting</h3>
+  <p>Every response reports usage: input tokens, output tokens, and cache creation/read tokens. Log these with the model ID, prompt version, feature, tenant and request ID, and compute cost from a price table in configuration. Counting endpoints let you estimate before sending. Aggregated, this becomes your LLM FinOps dashboard and the basis for per-tenant quotas — and it is also your best early-warning system for runaway loops and abuse.</p>
+
+  <h3>3.17 The SDK and framework landscape</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Option</th><th>What it is</th><th>Strengths</th><th>Watch out for</th></tr></thead>
+    <tbody>
+      <tr><td>Anthropic Python SDK (<code>anthropic</code>)</td><td>Official typed client: sync/async, streaming helpers, Pydantic structured outputs, batches, token counting, tool runner</td><td>First access to new features; precise types</td><td>Provider-specific; major versions move quickly (2.x in Nov 2026) <span class="tag version">Version-sensitive</span></td></tr>
+      <tr><td>Anthropic Java SDK (<code>com.anthropic:anthropic-java</code>)</td><td>Official Java client with builders, typed exceptions, streaming, POJO-derived structured outputs</td><td>No framework lock-in; full feature coverage</td><td>Verbose builder style; you write the integration glue</td></tr>
+      <tr><td>Spring AI</td><td>Spring project: portable <code>ChatClient</code>, advisor chain, <code>@Tool</code> methods, structured <code>entity()</code> mapping, vector stores, RAG advisors, MCP, observability</td><td>Idiomatic Spring Boot auto-configuration; Micrometer observations; provider portability</td><td>Abstraction lags new provider features; 2.x targets Spring Boot 4 and changed APIs from 1.x</td></tr>
+      <tr><td>LangChain4j</td><td>Independent Java library: <code>AiServices</code> declarative interfaces, tools, memory, RAG, many integrations; Spring Boot and Quarkus starters</td><td>Declarative interfaces feel like Spring Data repositories; broad integration catalogue</td><td>Frequent releases; abstractions differ from Spring AI's</td></tr>
+      <tr><td>LangChain / LangGraph (Python)</td><td>Python orchestration framework and graph-based agent runtime</td><td>Huge ecosystem; LangGraph is strong for stateful agents</td><td>Abstraction overhead for simple calls</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working</h2>
+
+  <h3>4.1 How constrained decoding enforces a schema</h3>
+  <p>Recall from Chapter 1 that at each step the model produces logits for every token, and a processing pipeline transforms them before sampling. Constrained decoding inserts a <strong>mask</strong> into that pipeline. The schema is compiled ahead of time into a grammar — conceptually a state machine over characters — and then into a structure that answers, for the current state, "which <em>tokens</em> are allowed next?" Tokens that would make the output invalid get a logit of negative infinity and therefore zero probability.</p>
+  <p>Walk through a tiny schema <code>{"type":"object","properties":{"priority":{"enum":["LOW","HIGH"]}},"required":["priority"],"additionalProperties":false}</code>. At the start, only tokens beginning with <code>{</code> (and allowed whitespace) are permitted. After <code>{</code>, only the key <code>"priority"</code> can follow. After the colon, only tokens that are prefixes of <code>"LOW"</code> or <code>"HIGH"</code>. Then only <code>}</code>. The model still chooses <em>which</em> enum value based on its learned probabilities; the mask only removes invalid options. Two subtleties make this hard to implement: tokens span multiple characters, so the engine must check whether each multi-character token keeps the automaton in a valid state; and doing that for a vocabulary of 100K+ tokens at every step must be fast, so engines precompute token-to-transition tables. Schema compilation is why the first request with a new schema can be slower, and why providers cache compiled grammars and limit schema complexity.</p>
+  <p>There is a quality caveat: forcing a model off its preferred path can push it into low-probability continuations. A schema that demands a field before the model has "seen" the reasoning it needs (for example, <code>verdict</code> before <code>evidence</code>) can lower accuracy. Order fields the way a careful human would fill them in: evidence first, conclusion last.</p>
+
+  <h3>4.2 Tool calls are just tokens</h3>
+  <p>Under the hood, tool definitions are rendered into the prompt in a format the model was post-trained on, and a tool call is a span of generated tokens in a special format that the provider parses into a <code>tool_use</code> block. Consequences: tool definitions consume input tokens on every request; models differ in how well they choose tools and fill arguments (it is a learned skill); "strict" tool mode applies constrained decoding to the argument span; and the provider stops generation when the call is complete so your code can execute it. The model has no access to your systems — it has only the text of the tool result you send back, which is why result content is also a prompt-injection surface.</p>
+
+  <h3>4.3 Inside prompt caching</h3>
+  <p>When a request marks a cache breakpoint, the provider hashes the prefix up to that point (tools, then system, then messages, in render order). On a miss, prefill runs normally and the KV cache for the prefix is stored (a "cache write"). On a later request whose prefix hashes identically, the stored KV entries are loaded and prefill runs only on the remaining tokens (a "cache read"). Because the KV cache at position <em>i</em> depends on every token before it, a single changed byte early in the prompt changes all subsequent entries — hence the byte-exact prefix rule. Entries are scoped to a model (and typically organisation), so switching models or effort mid-conversation can forfeit the cache. A write becomes readable only once the first response has begun, so many parallel requests with a cold cache all pay full price; warm the cache with one request first.</p>
+
+  <h3>4.4 The SSE event stream</h3>
+  <p>A streamed Anthropic response for a turn that writes some text and then calls a tool looks like this (abbreviated):</p>
+<pre><code class="language-plaintext">event: message_start
+data: {"type":"message_start","message":{"id":"msg_...","model":"...","usage":{"input_tokens":812,...}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Let me check"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_...","name":"get_order_status","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"order_id\": \"ORD-1"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":57}}
+
+event: message_stop
+data: {"type":"message_stop"}</code></pre>
+  <p>Tool input arrives as partial JSON fragments that are only valid once concatenated, so do not execute a tool until its block has stopped (the SDKs accumulate this for you). The final usage and stop reason arrive at the end, so a client that disconnects early loses them.</p>
+
+  <h3>4.5 Where retries actually happen</h3>
+  <p>In a typical Spring service there are up to four retry layers: the HTTP client (OkHttp can retry connection failures), the provider SDK (retries 408/409/429/5xx by default), your resilience layer (Resilience4j), and the caller (a message consumer redelivering on exception). Each layer multiplies attempts: 3 × 3 × 3 is 27 calls for one user action during an outage — the textbook retry storm. Choose a single owner for retries of LLM calls (this chapter's wrapper disables SDK retries and owns them in Resilience4j), and make outer layers fail fast while the circuit is open.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture</h2>
+
+  <h3>5.1 The tool-use loop</h3>
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant U as User
+  participant S as Spring service
+  participant M as LLM API
+  participant T as Tool executor (your code)
+  U-&gt;&gt;S: "Where are orders ORD-1 and ORD-2?"
+  S-&gt;&gt;M: messages + tools [get_order_status]
+  M--&gt;&gt;S: tool_use(id=a, ORD-1), tool_use(id=b, ORD-2), stop_reason=tool_use
+  par parallel execution
+    S-&gt;&gt;T: get_order_status(ORD-1) with user's authorisation
+    S-&gt;&gt;T: get_order_status(ORD-2) with user's authorisation
+  end
+  T--&gt;&gt;S: SHIPPED / error NOT_FOUND
+  S-&gt;&gt;M: history + assistant turn + ONE user message [tool_result a, tool_result b is_error]
+  M--&gt;&gt;S: final text, stop_reason=end_turn
+  S--&gt;&gt;U: "ORD-1 shipped; ORD-2 was not found - please check the ID"
+</pre>
+<figcaption>Figure 8.8 — A tool-use round trip with two parallel calls, one of which fails.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> the model requests two calls in one turn; the service executes both concurrently using the <em>end user's</em> permissions (never a superuser service account), then returns both results — including the error — in a single user message. The model turns the partial failure into a helpful answer. Note the service, not the model, holds all authority; the model only proposes calls.</p>
+
+  <h3>5.2 Structured output with validation and repair</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A["Render versioned prompt + schema"] --&gt; B["Call model with output_config json_schema"]
+  B --&gt; C{"stop_reason?"}
+  C -- max_tokens --&gt; X["Raise max_tokens or shorten input; do not parse"]
+  C -- refusal --&gt; R["Return safe fallback / escalate"]
+  C -- end_turn --&gt; D["Parse JSON into typed object"]
+  D --&gt; E{"Bean Validation + business rules pass?"}
+  E -- yes --&gt; OK["Return result; log usage + prompt version"]
+  E -- no --&gt; F{"Repair attempts left?"}
+  F -- yes --&gt; G["Append errors as feedback, call again"]
+  G --&gt; C
+  F -- no --&gt; FAIL["Fail closed: human review queue"]
+</pre>
+<figcaption>Figure 8.9 — Structured output handling: check the stop reason, validate, repair at most once or twice, then fail closed.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> schema enforcement removes parse failures but not semantic ones, so validation remains. The repair loop sends the specific validation errors back, which works far better than blindly retrying. "Fail closed" means routing to a safe default or a human queue instead of persisting a dubious value — the LLM equivalent of a dead-letter topic.</p>
+
+  <h3>5.3 A resilient client inside a Spring Boot service</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  C["Controller / Kafka listener"] --&gt; P["PromptService (versioned templates)"]
+  P --&gt; L["ResilientLlmClient"]
+  subgraph R4J["Resilience4j decorators (outermost first)"]
+    RT["Retry (429/5xx, jitter, retry-after)"] --&gt; CB["CircuitBreaker (per model)"] --&gt; BH["Bulkhead (max concurrent calls)"]
+  end
+  L --&gt; RT
+  BH --&gt; SDK["Anthropic Java SDK (SDK retries off, timeouts set)"]
+  SDK --&gt; API["LLM API"]
+  CB -. open .-&gt; FB["Fallback: cheaper model or degraded response"]
+  L --&gt; V["Validator (Jackson + Bean Validation)"]
+  L --&gt; O["Usage metrics + traces (Micrometer)"]
+</pre>
+<figcaption>Figure 8.10 — Component view of the resilient LLM client built in §7.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> retry is the outermost decorator, so every individual attempt passes through — and is recorded by — the circuit breaker (one per model), and once the breaker opens the retry sees a fast <code>CallNotPermittedException</code> that it must not retry; the bulkhead is innermost, so a permit is held only during an actual call, not while sleeping between retries, and a slow model cannot exhaust your request threads. The SDK's own retries are disabled to avoid multiplication. This is the same nesting Resilience4j's Spring Boot annotations use by default (Retry around CircuitBreaker around Bulkhead). Validation and metrics are part of the client contract, not afterthoughts.</p>
+
+  <h3>5.4 Interactive: the circuit breaker</h3>
+<figure class="diagram">
+<div class="widget" data-widget="circuit-breaker"></div>
+<figcaption>Figure 8.11 — Closed, open and half-open states as the failure rate changes.</figcaption>
+</figure>
+  <p><strong>What to try:</strong> raise the failure rate past the threshold and watch the breaker open; while open, calls fail fast — for an LLM dependency this is where you route to a fallback model. Then let the wait duration elapse and watch half-open probes decide whether to close again. Consider how you would tune it for LLMs: calls are slow (seconds), so use a <em>slow-call</em> threshold as well as an error threshold, and size the sliding window by count rather than time when traffic is low.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math: Retries, Caching Break-even and Capacity</h2>
+
+  <h3>6.1 Exponential backoff with full jitter</h3>
+  <p>Intuition: wait longer after each failure, but randomise the wait so thousands of clients that failed together do not retry together. For attempt \(n\) (starting at 1), base delay \(b\) and cap \(c\):</p>
+  \[ \text{sleep}_n \sim \text{Uniform}\big(0,\ \min(c,\ b \cdot 2^{n-1})\big) \]
+  <p>If the server sends <code>retry-after</code> = \(r\) seconds, use \(\max(r, \text{sleep}_n)\). With \(b = 1\) s and \(c = 20\) s, three attempts wait on average 0.5, 1 and 2 seconds.</p>
+
+  <h3>6.2 Does retrying help?</h3>
+  <p>If attempts fail independently with probability \(q\), success within \(k\) attempts is \(1 - q^k\). With \(q = 0.1\), two attempts give 99%, three give 99.9%. But failures during an outage or rate-limit event are highly correlated, so the real benefit is smaller and the cost is extra load on a struggling dependency. That is why retries need caps, jitter and a circuit breaker; the expected number of calls per request is \(\sum_{i=0}^{k-1} q^i\), which approaches \(k\) as \(q \to 1\) — exactly when you least want extra calls.</p>
+
+  <h3>6.3 Prompt-cache break-even</h3>
+  <p>Let a cacheable prefix have \(P\) tokens, input price \(p\), write multiplier \(w\) and read multiplier \(r\). Over \(n\) requests that share the prefix within the cache lifetime, cost with caching is \(P p (w + (n-1) r)\) versus \(P p\, n\) without. Caching wins when \(w + (n-1) r &lt; n\). With Anthropic's five-minute cache (\(w = 1.25\), \(r = 0.1\)) this holds from \(n = 2\): \(1.25 + 0.1 = 1.35 &lt; 2\). With the one-hour cache (\(w = 2\)): \(n = 3\) gives \(2 + 0.2 = 2.2 &lt; 3\). <span class="tag version">Version-sensitive · checked Nov 2026</span> For a 4,000-token system prompt reused 1,000 times, caching cuts that prefix's cost to roughly \( (1.25 + 999 \times 0.1)/1000 \approx 10\% \) of uncached.</p>
+
+  <h3>6.4 Capacity planning with Little's law</h3>
+  <p>Little's law: average concurrency \(L = \lambda W\) (arrival rate × time in system). If a feature receives \(\lambda = 20\) requests/s and each LLM call takes \(W = 6\) s, you have on average 120 calls in flight. With blocking platform threads, that is 120 threads parked on I/O — use virtual threads (Java 21+, <code>spring.threads.virtual.enabled=true</code>) or reactive streaming, and size the bulkhead above the expected concurrency with headroom. Tokens-per-minute limits translate similarly: 20 req/s × 60 × 3,000 input tokens = 3.6M input tokens/min, which you must compare against your rate limit before launch.</p>
+
+  <h3>6.5 Validation-retry expectation</h3>
+  <p>If a structured response fails business validation with probability \(v\) and one repair attempt succeeds with probability \(s\), the expected calls per request are \(1 + v\), and the residual failure rate after one repair is \(v (1 - s)\). With \(v = 0.03\), \(s = 0.8\): 1.03 calls on average and 0.6% routed to humans. Measure \(v\) per prompt version; a jump in \(v\) after a model upgrade is a regression signal.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code: From First Call to a Production Client</h2>
+  <p>Python examples use the official <code>anthropic</code> SDK (2.x in November 2026) and Pydantic 2; Java examples use Spring Boot 4.1, Spring AI 2.1, LangChain4j 1.2x, the Anthropic Java SDK 3.x and Resilience4j 2.4. Model IDs are configuration; the default used here is <code>claude-opus-5-5</code>, with <code>claude-sonnet-5-5</code> and <code>claude-haiku-5-5</code> as cheaper alternatives you should adopt per route only after an evaluation shows they hold quality. <span class="tag version">Version-sensitive · checked Nov 2026</span></p>
+
+  <h3>7.1 A first call: system prompt, caching, streaming, usage (Python)</h3>
+<pre data-file="first_call.py"><code class="language-python">"""pip install "anthropic&gt;=2" ; export ANTHROPIC_API_KEY=..."""
+import os
+import time
+
+import anthropic
+
+MODEL = os.getenv("LLM_MODEL", "claude-opus-5-5")
+client = anthropic.Anthropic()  # SDK default: 2 retries on 408/409/429/5xx, 10 min timeout
+
+# Static, versioned instructions first so the prefix can be cached.
+SYSTEM_PROMPT = open("prompts/incident-summary/v2.md", encoding="utf-8").read()
+
+def summarise(report: str) -&gt; str:
+    start = time.perf_counter()
+    first_token_at = None
+    with client.messages.stream(
+        model=MODEL,
+        max_tokens=2000,
+        output_config={"effort": "low"},  # summarisation rarely needs deep reasoning
+        system=[{
+            "type": "text",
+            "text": SYSTEM_PROMPT,
+            "cache_control": {"type": "ephemeral"},  # cache breakpoint after the static prefix
+        }],
+        messages=[{"role": "user", "content": f"&lt;report&gt;\n{report}\n&lt;/report&gt;"}],
+    ) as stream:
+        for text in stream.text_stream:
+            if first_token_at is None:
+                first_token_at = time.perf_counter()
+            print(text, end="", flush=True)
+        final = stream.get_final_message()
+
+    u = final.usage
+    print(f"\n\nstop_reason={final.stop_reason} ttft={first_token_at - start:.2f}s "
+          f"total={time.perf_counter() - start:.2f}s in={u.input_tokens} out={u.output_tokens} "
+          f"cache_read={u.cache_read_input_tokens} cache_write={u.cache_creation_input_tokens} "
+          f"request_id={final._request_id}")
+    if final.stop_reason == "max_tokens":
+        raise RuntimeError("summary truncated; raise max_tokens or shorten the report")
+    if final.stop_reason == "refusal":
+        raise RuntimeError("model declined the request")
+    return "".join(b.text for b in final.content if b.type == "text")
+
+if __name__ == "__main__":
+    summarise(open("incident-4711.txt", encoding="utf-8").read())</code></pre>
+  <p>Run it twice within five minutes: the second run should report a non-zero <code>cache_read</code> (provided the system prompt exceeds the model's minimum cacheable length) and a lower TTFT. If <code>cache_read</code> stays zero, something in the prefix is changing between calls. Note the checks on <code>stop_reason</code>: a truncated or refused response is not a success even though the HTTP status was 200.</p>
+
+  <h3>7.2 Structured output with Pydantic, business validation and one repair (Python)</h3>
+<pre data-file="triage.py"><code class="language-python">"""Ticket triage with schema-constrained output plus semantic validation."""
+import os
+from enum import Enum
+
+import anthropic
+from pydantic import BaseModel, Field, ValidationError, field_validator
+
+MODEL = os.getenv("LLM_MODEL", "claude-opus-5-5")
+client = anthropic.Anthropic()
+
+
+class Category(str, Enum):
+    BILLING = "BILLING"
+    TECHNICAL = "TECHNICAL"
+    ACCOUNT = "ACCOUNT"
+    UNKNOWN = "UNKNOWN"
+
+
+class Triage(BaseModel):
+    # Evidence before verdict: let the model ground its decision first.
+    evidence: str = Field(description="Quote the sentence(s) that justify the category")
+    category: Category
+    priority: int = Field(description="1 (urgent) to 4 (low)")
+    order_ids: list[str] = Field(description="Order IDs mentioned, format ORD-######")
+
+    @field_validator("priority")
+    @classmethod
+    def priority_range(cls, v: int) -&gt; int:
+        if not 1 &lt;= v &lt;= 4:
+            raise ValueError("priority must be between 1 and 4")
+        return v
+
+    @field_validator("order_ids")
+    @classmethod
+    def order_format(cls, ids: list[str]) -&gt; list[str]:
+        bad = [i for i in ids if not (i.startswith("ORD-") and len(i) == 10 and i[4:].isdigit())]
+        if bad:
+            raise ValueError(f"invalid order ids {bad}; expected ORD- followed by 6 digits")
+        return ids
+
+
+SYSTEM = """You triage customer support tickets for an e-commerce platform.
+Categories: BILLING (payments, refunds, invoices), TECHNICAL (app errors, login failures caused
+by bugs, performance), ACCOUNT (profile, password resets, account closure). If the ticket
+spans categories, choose the one the customer needs resolved first. If there is not enough
+information, use UNKNOWN. Priority 1 means money lost or account locked right now."""
+
+
+def triage(ticket: str, max_repairs: int = 1) -&gt; Triage:
+    messages = [{"role": "user", "content": f"&lt;ticket&gt;\n{ticket}\n&lt;/ticket&gt;"}]
+    for attempt in range(max_repairs + 1):
+        response = client.messages.parse(
+            model=MODEL, max_tokens=1024, system=SYSTEM,
+            messages=messages, output_format=Triage,
+        )
+        if response.stop_reason != "end_turn":
+            raise RuntimeError(f"unexpected stop_reason {response.stop_reason}")
+        try:
+            # parsed_output is already schema-shaped; re-validate to run our custom rules
+            return Triage.model_validate(response.parsed_output.model_dump())
+        except ValidationError as e:
+            if attempt == max_repairs:
+                raise
+            messages += [
+                {"role": "assistant", "content": response.content},
+                {"role": "user", "content": f"Your output failed validation:\n{e}\n"
+                                            "Return a corrected result."},
+            ]
+    raise AssertionError("unreachable")
+
+
+if __name__ == "__main__":
+    print(triage("I was charged twice for ORD-004211 and ORD-4212!! Fix this now.").model_dump_json(indent=2))</code></pre>
+  <p>The schema guarantees parseable output with an allowed category; Pydantic validators enforce what a schema cannot (the order-ID pattern here is deliberately checked in code to show the repair loop — with a well-designed prompt it rarely triggers). The repair message quotes the precise validation error, which models fix far more reliably than a generic "try again."</p>
+
+  <h3>7.3 A correct tool-use loop with parallel calls and errors (Python)</h3>
+<pre data-file="tool_loop.py"><code class="language-python">"""Manual tool loop: parallel execution, is_error results, iteration and cost caps."""
+import json
+import os
+from concurrent.futures import ThreadPoolExecutor
+
+import anthropic
+
+MODEL = os.getenv("LLM_MODEL", "claude-opus-5-5")
+client = anthropic.Anthropic()
+
+ORDERS = {"ORD-000001": "SHIPPED", "ORD-000002": "PROCESSING"}  # stand-in for a service call
+
+TOOLS = [{
+    "name": "get_order_status",
+    "description": ("Look up the current fulfilment status of one order for the signed-in "
+                    "customer. Use when the customer asks where an order is. Returns one of "
+                    "PROCESSING, SHIPPED, DELIVERED, CANCELLED."),
+    "strict": True,
+    "input_schema": {
+        "type": "object",
+        "properties": {"order_id": {"type": "string", "description": "Format ORD-######"}},
+        "required": ["order_id"],
+        "additionalProperties": False,
+    },
+}]
+
+
+class ToolError(Exception):
+    pass
+
+
+def get_order_status(order_id: str, *, customer_id: str) -&gt; dict:
+    # Authorisation happens HERE, with the end user's identity, never in the prompt.
+    if order_id not in ORDERS:
+        raise ToolError(f"Order {order_id} not found for this customer.")
+    return {"order_id": order_id, "status": ORDERS[order_id]}
+
+
+HANDLERS = {"get_order_status": get_order_status}
+
+
+def run_tool(block, customer_id: str) -&gt; dict:
+    try:
+        handler = HANDLERS[block.name]
+        result = handler(**block.input, customer_id=customer_id)
+        return {"type": "tool_result", "tool_use_id": block.id, "content": json.dumps(result)}
+    except (ToolError, KeyError, TypeError) as e:
+        return {"type": "tool_result", "tool_use_id": block.id, "content": str(e), "is_error": True}
+
+
+def answer(question: str, customer_id: str, max_iterations: int = 6,
+           max_output_tokens_total: int = 8000) -&gt; str:
+    messages = [{"role": "user", "content": question}]
+    spent = 0
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for _ in range(max_iterations):
+            response = client.messages.create(
+                model=MODEL, max_tokens=2048, tools=TOOLS, messages=messages,
+                system="You are a customer support assistant. Use tools for order facts; "
+                       "never guess an order status.",
+            )
+            spent += response.usage.output_tokens
+            if response.stop_reason != "tool_use":
+                return "".join(b.text for b in response.content if b.type == "text")
+            if spent &gt; max_output_tokens_total:
+                raise RuntimeError("tool loop exceeded token budget")
+            # 1) append the FULL assistant turn (tool_use blocks, any thinking blocks)
+            messages.append({"role": "assistant", "content": response.content})
+            # 2) execute all calls concurrently, 3) return ALL results in ONE user message
+            calls = [b for b in response.content if b.type == "tool_use"]
+            results = list(pool.map(lambda b: run_tool(b, customer_id), calls))
+            messages.append({"role": "user", "content": results})
+    raise RuntimeError("tool loop did not finish within max_iterations")
+
+
+if __name__ == "__main__":
+    print(answer("Where are my orders ORD-000001 and ORD-999999?", customer_id="c-42"))</code></pre>
+  <p>The loop ends when <code>stop_reason</code> is anything other than <code>tool_use</code> (in production, also handle <code>max_tokens</code>, <code>refusal</code>, and <code>pause_turn</code> for server-side tools explicitly). The unknown order comes back as an error result and the model explains it to the user. The SDK also offers a beta "tool runner" helper that drives this loop for you; writing it once by hand is the best way to understand what that helper — and Spring AI's <code>ToolCallingAdvisor</code> — is doing.</p>
+
+  <h3>7.4 Batch processing at half price (Python)</h3>
+<pre data-file="nightly_batch.py"><code class="language-python">"""Submit a nightly batch of ticket classifications and collect results by custom_id."""
+import time
+
+import anthropic
+from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
+from anthropic.types.messages.batch_create_params import Request
+
+client = anthropic.Anthropic()
+tickets = {"T-1001": "App crashes on login since update", "T-1002": "Refund not received"}
+
+batch = client.messages.batches.create(requests=[
+    Request(custom_id=tid, params=MessageCreateParamsNonStreaming(
+        model="claude-opus-5-5", max_tokens=256,
+        system="Classify the ticket as BILLING, TECHNICAL or ACCOUNT. Reply with the label only.",
+        messages=[{"role": "user", "content": text}],
+    )) for tid, text in tickets.items()
+])
+
+while (b := client.messages.batches.retrieve(batch.id)).processing_status != "ended":
+    time.sleep(60)  # most batches finish within an hour; the hard limit is 24 h
+
+labels = {}
+for item in client.messages.batches.results(batch.id):   # arrives in ANY order
+    if item.result.type == "succeeded":
+        labels[item.custom_id] = item.result.message.content[0].text.strip()
+    else:
+        labels[item.custom_id] = f"FAILED:{item.result.type}"  # errored / expired / canceled
+print(labels)</code></pre>
+  <p>In production, run the poller as a scheduled job (Spring <code>@Scheduled</code>, a Kubernetes CronJob or a workflow engine), persist the batch ID so a restart can resume polling, and re-submit only failed items.</p>
+
+  <h3>7.5 Structured output with the Anthropic Java SDK</h3>
+  <p>The Java SDK can derive a JSON schema from a record and return a typed object — the Jackson-binding experience you know, with the schema enforced at generation time.</p>
+<pre data-file="TriageWithSdk.java"><code class="language-java">package com.example.triage;
+
+import com.anthropic.client.AnthropicClient;
+import com.anthropic.client.okhttp.AnthropicOkHttpClient;
+import com.anthropic.models.messages.MessageCreateParams;
+import com.anthropic.models.messages.StructuredMessageCreateParams;
+import com.fasterxml.jackson.annotation.JsonPropertyDescription;
+
+import java.util.List;
+
+public class TriageWithSdk {
+
+    enum Category { BILLING, TECHNICAL, ACCOUNT, UNKNOWN }
+
+    record Triage(
+            @JsonPropertyDescription("Sentence(s) from the ticket that justify the category") String evidence,
+            Category category,
+            @JsonPropertyDescription("1 (urgent) to 4 (low)") int priority,
+            @JsonPropertyDescription("Order IDs mentioned, format ORD-######") List&lt;String&gt; orderIds) {}
+
+    public static void main(String[] args) {
+        AnthropicClient client = AnthropicOkHttpClient.fromEnv();
+
+        StructuredMessageCreateParams&lt;Triage&gt; params = MessageCreateParams.builder()
+                .model("claude-opus-5-5")             // Version-sensitive · checked Nov 2026
+                .maxTokens(1024L)
+                .outputConfig(Triage.class)           // schema derived from the record
+                .system("You triage support tickets. Categories: BILLING, TECHNICAL, ACCOUNT; UNKNOWN if unclear.")
+                .addUserMessage("&lt;ticket&gt;Charged twice for ORD-004211, please refund.&lt;/ticket&gt;")
+                .build();
+
+        client.messages().create(params).content().stream()
+                .flatMap(block -&gt; block.text().stream())
+                .forEach(typed -&gt; {
+                    Triage t = typed.text();          // already a Triage instance
+                    System.out.println(t.category() + " p" + t.priority() + " " + t.orderIds());
+                });
+    }
+}</code></pre>
+  <p>Jackson annotations such as <code>@JsonPropertyDescription</code> flow into the generated schema, which is how you document fields for the model. Add Bean Validation annotations to the record and validate the result as you would a request body (§7.8 does this).</p>
+
+  <h3>7.6 Spring AI: ChatClient, templates, entity mapping and @Tool</h3>
+  <p>Spring AI 2.x makes <code>ChatClient</code> the primary API. Every request flows through an ordered <strong>advisor chain</strong> — conceptually a servlet filter chain for prompts — and the tool loop itself runs inside an auto-registered <code>ToolCallingAdvisor</code>. <span class="tag version">Version-sensitive · checked Nov 2026</span></p>
+<pre data-file="pom.xml (excerpt)"><code class="language-xml">&lt;parent&gt;
+  &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+  &lt;artifactId&gt;spring-boot-starter-parent&lt;/artifactId&gt;
+  &lt;version&gt;4.1.3&lt;/version&gt;
+&lt;/parent&gt;
+&lt;dependencyManagement&gt;
+  &lt;dependencies&gt;
+    &lt;dependency&gt;
+      &lt;groupId&gt;org.springframework.ai&lt;/groupId&gt;
+      &lt;artifactId&gt;spring-ai-bom&lt;/artifactId&gt;
+      &lt;version&gt;2.1.0&lt;/version&gt;
+      &lt;type&gt;pom&lt;/type&gt;
+      &lt;scope&gt;import&lt;/scope&gt;
+    &lt;/dependency&gt;
+  &lt;/dependencies&gt;
+&lt;/dependencyManagement&gt;
+&lt;dependencies&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-web&lt;/artifactId&gt;
+  &lt;/dependency&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.ai&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-ai-starter-model-anthropic&lt;/artifactId&gt;
+  &lt;/dependency&gt;
+&lt;/dependencies&gt;</code></pre>
+<pre data-file="application.yml"><code class="language-yaml">spring:
+  threads:
+    virtual:
+      enabled: true            # LLM calls are long and I/O-bound
+  ai:
+    anthropic:
+      api-key: ${ANTHROPIC_API_KEY}
+      timeout: 120s
+      max-retries: 2
+      chat:
+        model: claude-opus-5-5 # Version-sensitive · checked Nov 2026
+        max-tokens: 2048</code></pre>
+<pre data-file="src/main/resources/prompts/triage/v3.st"><code class="language-plaintext">You triage customer support tickets for an e-commerce platform.
+Categories: BILLING (payments, refunds, invoices), TECHNICAL (errors, performance),
+ACCOUNT (profile, password, closure). If unclear, use UNKNOWN.
+Use the get_order_status tool when the customer asks about delivery; never guess.
+Today's date is {today}.</code></pre>
+<pre data-file="TriageService.java"><code class="language-java">package com.example.triage;
+
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.client.advisor.SimpleLoggerAdvisor;
+import org.springframework.ai.tool.annotation.Tool;
+import org.springframework.ai.tool.annotation.ToolParam;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.io.Resource;
+import org.springframework.stereotype.Component;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDate;
+import java.util.List;
+
+enum Category { BILLING, TECHNICAL, ACCOUNT, UNKNOWN }
+
+record Triage(String evidence, Category category, int priority, List&lt;String&gt; orderIds) {}
+
+@Configuration
+class ChatClientConfig {
+    @Bean
+    ChatClient triageChatClient(ChatClient.Builder builder) {
+        return builder
+                .defaultAdvisors(new SimpleLoggerAdvisor())   // logs request/response at DEBUG
+                .build();
+    }
+}
+
+@Component
+class OrderTools {
+    private final OrderRepository orders;      // your existing Spring Data repository
+    private final CurrentUser currentUser;     // request-scoped bean holding the caller identity
+
+    OrderTools(OrderRepository orders, CurrentUser currentUser) {
+        this.orders = orders;
+        this.currentUser = currentUser;
+    }
+
+    @Tool(description = "Get the fulfilment status of one order belonging to the signed-in customer")
+    String getOrderStatus(@ToolParam(description = "Order ID, format ORD-######") String orderId) {
+        return orders.findByIdAndCustomerId(orderId, currentUser.id())   // authorisation by query
+                .map(o -&gt; o.getStatus().name())
+                .orElse("NOT_FOUND: no such order for this customer");
+    }
+}
+
+@Service
+public class TriageService {
+    private final ChatClient chat;
+    private final OrderTools orderTools;
+    private final Resource systemTemplate;
+
+    public TriageService(ChatClient triageChatClient, OrderTools orderTools,
+                         @Value("classpath:prompts/triage/v3.st") Resource systemTemplate) {
+        this.chat = triageChatClient;
+        this.orderTools = orderTools;
+        this.systemTemplate = systemTemplate;
+    }
+
+    /** Structured classification: schema sent to the provider, validated, retried with feedback. */
+    public Triage triage(String ticket) {
+        return chat.prompt()
+                .system(s -&gt; s.text(systemTemplate).param("today", LocalDate.now().toString()))
+                .user(u -&gt; u.text("&lt;ticket&gt;{ticket}&lt;/ticket&gt;").param("ticket", ticket))
+                .call()
+                .entity(Triage.class, spec -&gt; spec
+                        .useProviderStructuredOutput()   // constrained decoding at the provider
+                        .validateSchema());              // validate + retry with error feedback
+    }
+
+    /** Free-text answer that may call tools; the advisor chain runs the tool loop. */
+    public String answer(String question) {
+        return chat.prompt()
+                .system(s -&gt; s.text(systemTemplate).param("today", LocalDate.now().toString()))
+                .user(question)
+                .tools(orderTools)
+                .call()
+                .content();
+    }
+}</code></pre>
+  <p>Notice what is now framework-managed: rendering templates (StringTemplate <code>{placeholders}</code>), the tool schema generated from the method signature, the tool loop, and structured output conversion. Notice also what is not: authorisation inside the tool (the repository query is scoped to the current customer), prompt versioning (the template file path carries <code>v3</code>), and evaluation. One caution: putting today's date in the <em>system</em> prompt changes the prefix daily — acceptable here, but if you cache aggressively, move volatile values into the user message.</p>
+
+  <h3>7.7 LangChain4j: declarative AI services</h3>
+  <p>LangChain4j's <code>AiServices</code> generates an implementation of an interface you declare — the same idea as a Spring Data repository or an OpenFeign client.</p>
+<pre data-file="LangChain4jTriage.java"><code class="language-java">package com.example.triage;
+
+// Maven: dev.langchain4j:langchain4j and dev.langchain4j:langchain4j-anthropic (1.24.x, Version-sensitive)
+import dev.langchain4j.agent.tool.P;
+import dev.langchain4j.agent.tool.Tool;
+import dev.langchain4j.model.anthropic.AnthropicChatModel;
+import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.service.AiServices;
+import dev.langchain4j.service.SystemMessage;
+import dev.langchain4j.service.UserMessage;
+import dev.langchain4j.service.V;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+
+public class LangChain4jTriage {
+
+    enum Category { BILLING, TECHNICAL, ACCOUNT, UNKNOWN }
+    record Triage(String evidence, Category category, int priority, List&lt;String&gt; orderIds) {}
+
+    interface SupportAssistant {
+        @SystemMessage("You triage support tickets. Categories: BILLING, TECHNICAL, ACCOUNT, UNKNOWN.")
+        @UserMessage("Classify this ticket: &lt;ticket&gt;{{ticket}}&lt;/ticket&gt;")
+        Triage triage(@V("ticket") String ticket);       // return type drives JSON extraction
+
+        @SystemMessage("You are a support assistant. Use tools for order facts; never guess.")
+        String chat(@UserMessage String question);
+    }
+
+    static class OrderTools {
+        private final Map&lt;String, String&gt; statuses = Map.of("ORD-000001", "SHIPPED");
+
+        @Tool("Get the fulfilment status of an order by its ID (format ORD-######)")
+        String getOrderStatus(@P("the order ID") String orderId) {
+            return statuses.getOrDefault(orderId, "NOT_FOUND");
+        }
+    }
+
+    public static void main(String[] args) {
+        ChatModel model = AnthropicChatModel.builder()
+                .apiKey(System.getenv("ANTHROPIC_API_KEY"))
+                .modelName("claude-opus-5-5")                // Version-sensitive · checked Nov 2026
+                .maxTokens(1024)
+                .timeout(Duration.ofSeconds(120))
+                .build();
+
+        SupportAssistant assistant = AiServices.builder(SupportAssistant.class)
+                .chatModel(model)
+                .tools(new OrderTools())
+                .build();
+
+        System.out.println(assistant.triage("My card was charged twice for ORD-000001"));
+        System.out.println(assistant.chat("Where is ORD-000001?"));
+    }
+}</code></pre>
+  <p>LangChain4j and Spring AI cover similar ground with different philosophies: LangChain4j leans on declarative interfaces and a broad integration catalogue; Spring AI leans on Spring Boot auto-configuration, the advisor chain and Micrometer observability. Either is a reasonable choice for a Spring shop; pick one per codebase and hide it behind your own domain interface.</p>
+
+  <h3>7.8 A resilient LLM client for Spring Boot with Resilience4j</h3>
+  <p>Frameworks are convenient, but a team's core LLM dependency deserves an explicit, tested wrapper that encodes your policies: one retry owner, per-model circuit breakers, a concurrency bulkhead, a model fallback, validation with a single repair attempt, and usage metrics. The version below uses the Anthropic Java SDK directly and programmatic Resilience4j decorators (no AOP proxies, so behaviour is visible and unit-testable).</p>
+<pre data-file="pom.xml (additional dependencies)"><code class="language-xml">&lt;dependency&gt;
+  &lt;groupId&gt;com.anthropic&lt;/groupId&gt;
+  &lt;artifactId&gt;anthropic-java&lt;/artifactId&gt;
+  &lt;version&gt;3.14.0&lt;/version&gt;          &lt;!-- Version-sensitive · checked Nov 2026 --&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+  &lt;groupId&gt;io.github.resilience4j&lt;/groupId&gt;
+  &lt;artifactId&gt;resilience4j-all&lt;/artifactId&gt;
+  &lt;version&gt;2.4.0&lt;/version&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+  &lt;groupId&gt;io.github.resilience4j&lt;/groupId&gt;
+  &lt;artifactId&gt;resilience4j-micrometer&lt;/artifactId&gt;
+  &lt;version&gt;2.4.0&lt;/version&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+  &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+  &lt;artifactId&gt;spring-boot-starter-validation&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+  &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+  &lt;artifactId&gt;spring-boot-starter-actuator&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+<pre data-file="application.yml"><code class="language-yaml">llm:
+  primary-model: claude-opus-5-5      # Version-sensitive · checked Nov 2026
+  fallback-model: claude-sonnet-5-5   # validated on the same eval set before enabling
+  request-timeout: 90s
+  max-concurrent-calls: 64
+  max-attempts: 3
+  base-backoff: 1s
+  max-backoff: 20s</code></pre>
+<pre data-file="LlmProperties.java"><code class="language-java">package com.example.llm;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import java.time.Duration;
+
+@ConfigurationProperties(prefix = "llm")
+public record LlmProperties(String primaryModel, String fallbackModel, Duration requestTimeout,
+                            int maxConcurrentCalls, int maxAttempts,
+                            Duration baseBackoff, Duration maxBackoff) {}</code></pre>
+<pre data-file="LlmClientConfig.java"><code class="language-java">package com.example.llm;
+
+import com.anthropic.client.AnthropicClient;
+import com.anthropic.client.okhttp.AnthropicOkHttpClient;
+import io.github.resilience4j.bulkhead.BulkheadConfig;
+import io.github.resilience4j.bulkhead.BulkheadRegistry;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.github.resilience4j.micrometer.tagged.TaggedCircuitBreakerMetrics;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import java.time.Duration;
+
+@Configuration
+@EnableConfigurationProperties(LlmProperties.class)
+class LlmClientConfig {
+
+    @Bean
+    AnthropicClient anthropicClient(LlmProperties props) {
+        return AnthropicOkHttpClient.builder()
+                .fromEnv()                       // ANTHROPIC_API_KEY etc.
+                .maxRetries(0)                   // Resilience4j is the single retry owner
+                .timeout(props.requestTimeout())
+                .build();
+    }
+
+    @Bean
+    CircuitBreakerRegistry llmCircuitBreakers(MeterRegistry meters) {
+        CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+                .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
+                .slidingWindowSize(20)
+                .minimumNumberOfCalls(10)
+                .failureRateThreshold(50)
+                .slowCallDurationThreshold(Duration.ofSeconds(45))
+                .slowCallRateThreshold(80)
+                .waitDurationInOpenState(Duration.ofSeconds(30))
+                .permittedNumberOfCallsInHalfOpenState(3)
+                .recordException(ResilientLlmClient::isTransient)   // 400s are our bugs, not outages
+                .build();
+        CircuitBreakerRegistry registry = CircuitBreakerRegistry.of(config);
+        TaggedCircuitBreakerMetrics.ofCircuitBreakerRegistry(registry).bindTo(meters);
+        return registry;
+    }
+
+    @Bean
+    BulkheadRegistry llmBulkheads(LlmProperties props) {
+        return BulkheadRegistry.of(BulkheadConfig.custom()
+                .maxConcurrentCalls(props.maxConcurrentCalls())
+                .maxWaitDuration(Duration.ofMillis(500))
+                .build());
+    }
+}</code></pre>
+<pre data-file="ResilientLlmClient.java"><code class="language-java">package com.example.llm;
+
+import com.anthropic.client.AnthropicClient;
+import com.anthropic.errors.AnthropicIoException;
+import com.anthropic.errors.AnthropicServiceException;
+import com.anthropic.errors.InternalServerException;
+import com.anthropic.errors.RateLimitException;
+import com.anthropic.models.messages.Message;
+import com.anthropic.models.messages.MessageCreateParams;
+import com.anthropic.models.messages.StopReason;
+import com.anthropic.models.messages.StructuredMessage;
+import com.anthropic.models.messages.StructuredMessageCreateParams;
+import com.anthropic.models.messages.TextBlock;
+import com.anthropic.models.messages.Usage;
+import io.github.resilience4j.bulkhead.Bulkhead;
+import io.github.resilience4j.bulkhead.BulkheadFullException;
+import io.github.resilience4j.bulkhead.BulkheadRegistry;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.github.resilience4j.decorators.Decorators;
+import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.retry.RetryConfig;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import jakarta.validation.ConstraintViolation;
+import jakarta.validation.Validator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+@Component
+public class ResilientLlmClient {
+    private static final Logger log = LoggerFactory.getLogger(ResilientLlmClient.class);
+
+    private final AnthropicClient client;
+    private final LlmProperties props;
+    private final CircuitBreakerRegistry breakers;
+    private final Bulkhead bulkhead;
+    private final Retry retry;
+    private final MeterRegistry meters;
+    private final Validator validator;
+
+    public ResilientLlmClient(AnthropicClient client, LlmProperties props,
+                              CircuitBreakerRegistry breakers, BulkheadRegistry bulkheads,
+                              MeterRegistry meters, Validator validator) {
+        this.client = client;
+        this.props = props;
+        this.breakers = breakers;
+        this.bulkhead = bulkheads.bulkhead("llm");
+        this.meters = meters;
+        this.validator = validator;
+        this.retry = Retry.of("llm", RetryConfig.custom()
+                .maxAttempts(props.maxAttempts())
+                .retryOnException(ResilientLlmClient::isTransient)
+                .intervalBiFunction((attempt, either) -&gt; backoffMillis(attempt, either.getLeft()))
+                .build());
+    }
+
+    // ---------- public API ----------
+
+    /** Plain-text completion with resilience and model fallback. */
+    public String complete(String route, String system, String user, long maxTokens) {
+        Supplier&lt;String&gt; primary = () -&gt; callText(route, props.primaryModel(), system, user, maxTokens);
+        Supplier&lt;String&gt; fallback = () -&gt; callText(route, props.fallbackModel(), system, user, maxTokens);
+        return withResilience(props.primaryModel(), primary, fallback);
+    }
+
+    /** Structured completion: provider-enforced schema, Bean Validation, one repair attempt. */
+    public &lt;T&gt; T completeStructured(String route, String system, String user,
+                                    Class&lt;T&gt; type, long maxTokens) {
+        T result = completeStructuredOnce(route, system, user, type, maxTokens);
+        Set&lt;ConstraintViolation&lt;T&gt;&gt; violations = validator.validate(result);
+        if (violations.isEmpty()) {
+            return result;
+        }
+        meters.counter("llm.validation.repair", "route", route).increment();
+        String feedback = violations.stream()
+                .map(v -&gt; v.getPropertyPath() + " " + v.getMessage())
+                .collect(Collectors.joining("; "));
+        T repaired = completeStructuredOnce(route, system,
+                user + "\n\nA previous answer failed validation: " + feedback
+                        + ". Return a corrected answer.", type, maxTokens);
+        if (!validator.validate(repaired).isEmpty()) {
+            meters.counter("llm.validation.failed", "route", route).increment();
+            throw new LlmOutputInvalidException(route, feedback);
+        }
+        return repaired;
+    }
+
+    // ---------- internals ----------
+
+    private &lt;T&gt; T completeStructuredOnce(String route, String system, String user,
+                                         Class&lt;T&gt; type, long maxTokens) {
+        Supplier&lt;T&gt; primary = () -&gt; callStructured(route, props.primaryModel(), system, user, type, maxTokens);
+        Supplier&lt;T&gt; fallback = () -&gt; callStructured(route, props.fallbackModel(), system, user, type, maxTokens);
+        return withResilience(props.primaryModel(), primary, fallback);
+    }
+
+    private &lt;R&gt; R withResilience(String model, Supplier&lt;R&gt; primary, Supplier&lt;R&gt; fallback) {
+        CircuitBreaker breaker = breakers.circuitBreaker(model);
+        return Decorators.ofSupplier(primary)
+                .withBulkhead(bulkhead)            // innermost: permit held only during the call
+                .withCircuitBreaker(breaker)       // records every attempt
+                .withRetry(retry)                  // outermost: retries transient failures
+                .withFallback(List.of(CallNotPermittedException.class, RateLimitException.class,
+                                InternalServerException.class, AnthropicIoException.class),
+                        t -&gt; {
+                            log.warn("LLM primary model {} unavailable ({}); using fallback",
+                                    model, t.getClass().getSimpleName());
+                            meters.counter("llm.fallback", "model", model).increment();
+                            return breakers.circuitBreaker(props.fallbackModel())
+                                    .executeSupplier(fallback);
+                        })
+                .decorate()
+                .get();
+    }
+
+    private String callText(String route, String model, String system, String user, long maxTokens) {
+        MessageCreateParams params = MessageCreateParams.builder()
+                .model(model).maxTokens(maxTokens).system(system).addUserMessage(user).build();
+        Message response = timed(route, model, () -&gt; client.messages().create(params));
+        record(route, model, response.usage());
+        checkStop(route, response.stopReason().orElse(null));
+        return response.content().stream()
+                .flatMap(b -&gt; b.text().stream())
+                .map(TextBlock::text)
+                .collect(Collectors.joining());
+    }
+
+    private &lt;T&gt; T callStructured(String route, String model, String system, String user,
+                                 Class&lt;T&gt; type, long maxTokens) {
+        StructuredMessageCreateParams&lt;T&gt; params = MessageCreateParams.builder()
+                .model(model).maxTokens(maxTokens).outputConfig(type)
+                .system(system).addUserMessage(user).build();
+        StructuredMessage&lt;T&gt; response = timed(route, model, () -&gt; client.messages().create(params));
+        record(route, model, response.usage());
+        checkStop(route, response.stopReason().orElse(null));
+        return response.content().stream()
+                .flatMap(b -&gt; b.text().stream())
+                .map(typed -&gt; typed.text())
+                .findFirst()
+                .orElseThrow(() -&gt; new LlmOutputInvalidException(route, "no structured content"));
+    }
+
+    private &lt;R&gt; R timed(String route, String model, Supplier&lt;R&gt; call) {
+        return Timer.builder("llm.request").tag("route", route).tag("model", model)
+                .publishPercentiles(0.5, 0.95, 0.99).register(meters).record(call);
+    }
+
+    private void record(String route, String model, Usage usage) {
+        meters.counter("llm.tokens", "route", route, "model", model, "type", "input")
+                .increment(usage.inputTokens());
+        meters.counter("llm.tokens", "route", route, "model", model, "type", "output")
+                .increment(usage.outputTokens());
+        meters.counter("llm.tokens", "route", route, "model", model, "type", "cache_read")
+                .increment(usage.cacheReadInputTokens().orElse(0L));
+    }
+
+    private void checkStop(String route, StopReason reason) {
+        if (StopReason.MAX_TOKENS.equals(reason)) {
+            throw new LlmOutputInvalidException(route, "truncated at max_tokens");
+        }
+        if (StopReason.REFUSAL.equals(reason)) {
+            throw new LlmOutputInvalidException(route, "model refused");
+        }
+    }
+
+    static boolean isTransient(Throwable t) {
+        if (t instanceof RateLimitException || t instanceof InternalServerException
+                || t instanceof AnthropicIoException) {
+            return true;
+        }
+        return t instanceof AnthropicServiceException e
+                &amp;&amp; (e.statusCode() == 408 || e.statusCode() == 409 || e.statusCode() &gt;= 500);
+    }
+
+    /** Full-jitter exponential backoff that never undercuts the server's retry-after. */
+    long backoffMillis(int attempt, Throwable failure) {
+        long cap = Math.min(props.maxBackoff().toMillis(),
+                props.baseBackoff().toMillis() * (1L &lt;&lt; Math.min(attempt - 1, 16)));
+        long jittered = ThreadLocalRandom.current().nextLong(cap + 1);
+        if (failure instanceof AnthropicServiceException e) {
+            List&lt;String&gt; retryAfter = e.headers().values("retry-after");
+            if (!retryAfter.isEmpty()) {
+                try {
+                    return Math.max(jittered, (long) (Double.parseDouble(retryAfter.get(0)) * 1000));
+                } catch (NumberFormatException ignored) {
+                    // HTTP-date form: fall through to jittered backoff
+                }
+            }
+        }
+        return jittered;
+    }
+}</code></pre>
+<pre data-file="LlmOutputInvalidException.java"><code class="language-java">package com.example.llm;
+
+public class LlmOutputInvalidException extends RuntimeException {
+    public LlmOutputInvalidException(String route, String detail) {
+        super("LLM output invalid for route '" + route + "': " + detail);
+    }
+}</code></pre>
+<pre data-file="TicketController.java"><code class="language-java">package com.example.llm;
+
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+record TicketTriage(
+        @NotBlank String evidence,
+        @NotBlank @Pattern(regexp = "BILLING|TECHNICAL|ACCOUNT|UNKNOWN") String category,
+        @Min(1) @Max(4) int priority,
+        List&lt;@Pattern(regexp = "ORD-\\d{6}") String&gt; orderIds) {}
+
+@RestController
+@RequestMapping("/tickets")
+class TicketController {
+    private static final String SYSTEM = """
+            You triage support tickets. Categories: BILLING, TECHNICAL, ACCOUNT, UNKNOWN.
+            Priority 1 is urgent, 4 is low. Quote evidence from the ticket.""";
+    private final ResilientLlmClient llm;
+
+    TicketController(ResilientLlmClient llm) { this.llm = llm; }
+
+    @PostMapping("/triage")
+    TicketTriage triage(@RequestBody String ticket) {
+        return llm.completeStructured("ticket-triage", SYSTEM,
+                "&lt;ticket&gt;\n" + ticket + "\n&lt;/ticket&gt;", TicketTriage.class, 1024);
+    }
+
+    @ExceptionHandler(LlmOutputInvalidException.class)
+    ProblemDetail invalid(LlmOutputInvalidException e) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.UNPROCESSABLE_ENTITY, e.getMessage());
+    }
+
+    @ExceptionHandler(io.github.resilience4j.bulkhead.BulkheadFullException.class)
+    ProblemDetail busy() {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE, "LLM capacity exhausted; retry later");
+    }
+}</code></pre>
+  <p>Design notes. <strong>One retry owner:</strong> SDK retries are off; Resilience4j retries transient errors only, honouring <code>retry-after</code>. <strong>Breaker per model:</strong> <code>breakers.circuitBreaker(model)</code> creates one breaker per model ID, so a failing primary does not block the fallback. <strong>Slow calls count:</strong> a model that suddenly takes 60 seconds is effectively down for a synchronous endpoint. <strong>Fallback is a decision:</strong> only enable a fallback model that passed your evaluation suite for that route; for some routes the right fallback is a non-LLM degraded response or a 503. <strong>Validation is part of the client:</strong> callers never receive an unvalidated object. In a real codebase you would also add OpenTelemetry spans (Chapter 5), tenant tags on metrics, and a streaming variant for user-facing text.</p>
+  <div class="callout warn"><p class="callout-title">Warning</p><p>Some current models can decline requests with <code>stop_reason: "refusal"</code>, and Anthropic offers a server-side fallback option for its newest models that retries a declined request on another model. If you use it, keep your own fallback logic for availability failures separate, and log which model actually served each response. <span class="tag version">Version-sensitive · checked Nov 2026</span></p></div>
+</section>
+
+<section id="applications">
+  <h2>8. Applications: Where These Techniques Earn Their Keep</h2>
+  <ul>
+    <li><strong>Extraction pipelines.</strong> Invoices, contracts, KYC documents and emails become typed records via structured outputs plus validation, with low-confidence or invalid results routed to a human review queue — the LLM equivalent of a dead-letter topic.</li>
+    <li><strong>Classification and routing.</strong> Support tickets, alerts, and incoming leads are labelled with enum-constrained outputs; small, fast models handle the bulk once evaluation proves they match the large model on the route.</li>
+    <li><strong>Natural-language interfaces to internal APIs.</strong> Tool use turns "refund the duplicate charge on my last order" into authorised calls to existing services — with confirmation steps for money movement.</li>
+    <li><strong>Text-to-SQL and analytics assistants.</strong> Tools expose schema discovery and query execution with read-only credentials and row limits; decomposition (pick domain → pick tables → write SQL → validate) beats one giant prompt.</li>
+    <li><strong>Batch enrichment.</strong> Nightly batch jobs summarise, tag or translate large backlogs at a discount, written as Spring Batch steps or Airflow tasks that submit and poll batch APIs.</li>
+    <li><strong>Streaming assistants.</strong> Chat and drafting UIs stream tokens over SSE from a Spring endpoint, with cancellation propagating to the upstream request to stop paying for unwanted tokens.</li>
+    <li><strong>Prompt platforms.</strong> Larger organisations centralise prompt templates, versions, evaluation results and model configuration in an internal platform or gateway, so product teams consume "the ticket-triage capability v7" rather than raw model calls. <span class="tag opinion">Opinion</span></li>
+  </ul>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+
+  <h3>9.1 LinkedIn: structured output errors at scale</h3>
+  <p><span class="tag fact">Verified</span> In "Musings on building a Generative AI product" (LinkedIn Engineering, 2024), the team behind LinkedIn's AI-assisted job and feed experiences described having the model emit tool-call parameters in YAML (chosen over JSON because it used fewer tokens) and finding that around 10% of responses were malformed or schema-invalid. Rather than re-prompting — costly in latency and GPU capacity — they wrote a defensive parser that patched common mistakes. <strong>Lesson:</strong> this was before provider-side schema enforcement was widespread; today, constrained decoding removes most such failures, but the underlying lesson stands — measure your output failure rate per route and design the recovery path deliberately. (<a href="https://www.linkedin.com/blog/engineering/generative-ai/musings-on-building-a-generative-ai-product">LinkedIn Engineering blog</a>)</p>
+
+  <h3>9.2 Uber QueryGPT: decomposition beats one big prompt</h3>
+  <p><span class="tag fact">Verified</span> Uber's QueryGPT post (September 2024) describes evolving a natural-language-to-SQL tool from a single retrieval-plus-generation prompt into a pipeline of specialised steps: an intent agent that maps the question to a business-domain "workspace," a table agent that proposes relevant tables for the user to confirm, a column-pruning step that trims huge schemas to fit the context, and then SQL generation. <strong>Lesson:</strong> decomposition (§3.5) narrows each step's context, improves accuracy, controls token cost, and creates natural points for human confirmation. (<a href="https://www.uber.com/blog/query-gpt/">Uber Engineering blog</a>)</p>
+
+  <h3>9.3 Provider-enforced schemas</h3>
+  <p><span class="tag fact">Verified</span> When OpenAI introduced Structured Outputs in August 2024, its announcement reported that the new model with strict schema mode scored 100% on its internal evaluation of complex JSON-schema following, compared with under 40% for an earlier model relying on prompting alone. Anthropic later added structured outputs (JSON schema output formats and strict tool inputs) to Claude. <strong>Lesson:</strong> the difference between "usually valid" and "always valid" is a different engineering regime — with enforcement you delete defensive parsing and focus validation on semantics. (<a href="https://openai.com/index/introducing-structured-outputs-in-the-api/">OpenAI announcement</a>; <a href="https://platform.claude.com/docs/en/build-with-claude/structured-outputs">Anthropic structured outputs docs</a>)</p>
+
+  <h3>9.4 Prompt caching economics</h3>
+  <p><span class="tag fact">Verified</span> Anthropic's August 2024 launch of prompt caching stated that caching could reduce costs by up to 90% and latency by up to 85% for long prompts, citing use cases such as conversational agents with long instructions, coding assistants holding a codebase summary, and large-document Q&amp;A. <strong>Lesson:</strong> the gains are real only when prefixes are stable and reused within the cache lifetime — which is an application design property you control (§3.7, §6.3). (<a href="https://www.anthropic.com/news/prompt-caching">Anthropic announcement</a>)</p>
+
+  <h3>9.5 Spring AI moves the tool loop into the advisor chain</h3>
+  <p><span class="tag fact">Verified</span> The Spring AI 2.0 release (June 2026) removed each chat model's private tool-execution loop and introduced a <code>ToolCallingAdvisor</code>, auto-registered by <code>ChatClient</code>, so tool calling runs as part of the same ordered advisor chain as logging, memory and retrieval; advisors can re-enter the downstream chain to loop. <strong>Lesson:</strong> the framework now treats "call the model, run tools, call again" as a composable interception pipeline — the same design you would choose for a servlet filter chain — which makes cross-cutting concerns such as approvals, auditing and limits pluggable. (<a href="https://spring.io/blog/2026/06/15/spring-ai-composable-tool-calling/">Spring blog</a>)</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages, Limitations and Operational Cost</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Technique</th><th>Advantage</th><th>Limitation</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>Detailed system prompts</td><td>Cheap, fast iteration; no training</td><td>No compile-time checks; sensitive to model version</td><td>Input tokens on every call (cacheable); needs eval suite</td></tr>
+      <tr><td>Few-shot examples</td><td>Teaches format and edge cases efficiently</td><td>Model copies surface features; wrong examples poison output</td><td>Hundreds to thousands of tokens per call</td></tr>
+      <tr><td>Reasoning / extended thinking</td><td>Better on multi-step tasks</td><td>Slower; reasoning not inspectable on some APIs</td><td>Thinking billed as output tokens</td></tr>
+      <tr><td>Schema-constrained output</td><td>Always-parseable, typed results</td><td>Schema subset only; semantics unchecked; first-use compile latency</td><td>Small; validation code still needed</td></tr>
+      <tr><td>Tool use</td><td>Grounded facts, real actions</td><td>Model may pick wrong tool or arguments; injection surface</td><td>Extra round trips and tokens per call; authorisation work</td></tr>
+      <tr><td>Streaming</td><td>Perceived latency drops to TTFT</td><td>Errors mid-stream; more complex clients and proxies</td><td>Long-lived connections; idle-timeout tuning</td></tr>
+      <tr><td>Batch API</td><td>Large discount; high throughput</td><td>Hours of latency; results unordered</td><td>Job orchestration and persistence of batch IDs</td></tr>
+      <tr><td>Prompt caching</td><td>Lower cost and TTFT for shared prefixes</td><td>Byte-exact prefix; short lifetimes; model-scoped</td><td>Write premium; discipline in prompt layout</td></tr>
+      <tr><td>Framework (Spring AI / LangChain4j)</td><td>Productivity, portability, Spring integration</td><td>Lags provider features; abstraction leaks</td><td>Upgrade churn across major versions</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Question</th><th>Prefer…</th><th>Over…</th><th>Because</th></tr></thead>
+    <tbody>
+      <tr><td>How do I get JSON?</td><td>Provider structured outputs + local validation</td><td>Prompt-only JSON, assistant prefill, forced tool calls</td><td>Guaranteed shape; prefill and forced tool choice are rejected by several current models</td></tr>
+      <tr><td>Who owns retries?</td><td>Exactly one layer (SDK <em>or</em> Resilience4j)</td><td>Retries at every layer</td><td>Avoids multiplicative retry storms</td></tr>
+      <tr><td>Raw SDK or framework?</td><td>Framework for standard chat/RAG/tool flows; raw SDK for cutting-edge provider features</td><td>Either dogmatically</td><td>Frameworks lag; raw SDKs lock you in — hide both behind your own interface</td></tr>
+      <tr><td>Agent loop or pipeline?</td><td>Deterministic pipeline (prompt chaining)</td><td>Autonomous tool loop</td><td>For known processes, pipelines are cheaper, testable and predictable</td></tr>
+      <tr><td>Sync, stream or batch?</td><td>Stream for humans; batch for backlogs; async jobs for long server-to-server work</td><td>Synchronous blocking calls everywhere</td><td>Matches latency tolerance to cost and resource use</td></tr>
+      <tr><td>Where do prompts live?</td><td>Versioned files with tests and owners</td><td>String literals in services, or a database edited in production without review</td><td>Traceability and safe change management</td></tr>
+    </tbody>
+  </table></div>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  S["Consumer of the output?"] --&gt;|"Human reads it"| H{"Latency matters?"}
+  S --&gt;|"Code parses it"| C["Structured output + validation"]
+  H --&gt;|"yes"| ST["Stream via SSE"]
+  H --&gt;|"no, large volume"| B["Batch API"]
+  C --&gt; T{"Needs live data or actions?"}
+  ST --&gt; T
+  T --&gt;|"no"| D["Single call"]
+  T --&gt;|"yes, known steps"| P["Pipeline with tool calls in code"]
+  T --&gt;|"yes, open-ended"| A["Tool-use loop with caps, see Chapter 6"]
+</pre>
+<figcaption>Figure 8.12 — Choosing the interaction pattern.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> start from who consumes the output, then latency tolerance, then whether external data or actions are needed. Open-ended tool loops sit at the far end of the decision tree on purpose: they are the most flexible and the hardest to make predictable.</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Production Failures</h2>
+  <ul>
+    <li><strong>Parsing without checking <code>stop_reason</code>.</strong> Truncated JSON or a refusal message is fed to Jackson and surfaces as a confusing parse exception far from the cause.</li>
+    <li><strong>Interpolating user input into the system prompt.</strong> Gives users operator-level influence. Keep user data in user messages, inside delimiters.</li>
+    <li><strong>Dropping a failed tool result.</strong> Every <code>tool_use</code> needs a matching <code>tool_result</code>; omit one and the next request fails validation, or the model loses track.</li>
+    <li><strong>Splitting parallel tool results across messages.</strong> Return all results of one turn in one user message; otherwise conversations break or the model learns to stop parallelising.</li>
+    <li><strong>Tools with god-mode credentials.</strong> A "run SQL" tool connected as the application's admin user turns a prompt-injection into a data breach. Use the end user's identity and least privilege.</li>
+    <li><strong>Unbounded tool loops.</strong> A confused model calls the same failing tool forever. Cap iterations, tokens and wall-clock time.</li>
+    <li><strong>Timestamps or random IDs at the top of the prompt.</strong> Silently destroys prompt-cache hit rates. Check <code>cache_read_input_tokens</code> in dashboards.</li>
+    <li><strong>Default HTTP timeouts.</strong> A 30-second read timeout kills legitimate long generations; no timeout at all leaks threads. Stream with idle timeouts and set overall deadlines.</li>
+    <li><strong>Retrying 400s.</strong> Wastes quota and latency; a bad request stays bad.</li>
+    <li><strong>Legacy tricks on new models.</strong> Assistant-turn prefill, forced <code>tool_choice</code> and <code>temperature</code> are rejected by some current Claude models and API versions; code that relied on them breaks on upgrade. <span class="tag version">Version-sensitive · checked Nov 2026</span></li>
+    <li><strong>Prompt edits without evaluation.</strong> Fixing one complaint with a new rule regresses ten other cases nobody re-tested.</li>
+    <li><strong>Logging full prompts and responses with PII to general-purpose logs.</strong> Use a dedicated, access-controlled store with retention limits, or redact.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Engineering</h2>
+  <h3>13.1 Reliability and performance</h3>
+  <ul>
+    <li>Resilience stack per model: timeout, retry (transient only, jittered, <code>retry-after</code>-aware), circuit breaker with slow-call threshold, bulkhead, fallback (§7.8).</li>
+    <li>Virtual threads or reactive streaming for high concurrency of long calls; size bulkheads with Little's law.</li>
+    <li>Stream user-facing responses; cancel upstream generation when the client disconnects.</li>
+    <li>Separate API keys or workspaces for batch versus interactive traffic so rate limits do not collide.</li>
+  </ul>
+  <h3>13.2 Observability</h3>
+  <ul>
+    <li>Per request: model, prompt version, route, tenant, input/output/cache tokens, latency (TTFT and total), stop reason, retries, fallback used, validation outcome, request ID from the provider.</li>
+    <li>Dashboards: p50/p95/p99 latency per route, error and refusal rates, cache-hit ratio, cost per route and tenant, circuit-breaker state (Resilience4j exports Micrometer metrics).</li>
+    <li>Traces: one span per model call and per tool execution, following the OpenTelemetry GenAI conventions (Chapter 5).</li>
+  </ul>
+  <h3>13.3 Security</h3>
+  <ul>
+    <li>Secrets in a vault or environment, never in prompts or code; rotate keys; restrict keys per environment.</li>
+    <li>Tools execute with the end user's authorisation; destructive actions require confirmation; inputs validated as strictly as any public API.</li>
+    <li>Treat tool results and retrieved documents as untrusted input to the model (indirect prompt injection, Chapter 6).</li>
+  </ul>
+  <h3>13.4 Maintainability</h3>
+  <ul>
+    <li>Domain interface (<code>TicketTriager</code>) in front of any SDK or framework, so you can swap providers or move to a framework without touching business code.</li>
+    <li>Prompts, schemas and examples versioned together; evaluation results attached to each version; model IDs and effort levels in configuration.</li>
+    <li>Contract tests with recorded responses for your parsing and tool-handling code; live evaluation suites for model behaviour.</li>
+  </ul>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>Rewrite this prompt into a well-specified system prompt plus user message: "Look at this email and tell me if it's important and what to do." The consumer is a service that files emails into <code>URGENT_ACTION</code>, <code>FYI</code> or <code>SPAM</code> and extracts a due date if present.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-plaintext">SYSTEM:
+You classify inbound emails for an operations team's inbox-routing service.
+Labels:
+- URGENT_ACTION: the sender asks the team to do something with a deadline within 7 days,
+  or reports a production incident, outage, security issue or payment failure.
+- FYI: informational, no action requested, or action with no deadline.
+- SPAM: unsolicited marketing, phishing indicators, or irrelevant bulk mail.
+If an email fits several labels, prefer URGENT_ACTION over FYI over SPAM, except that
+phishing indicators always mean SPAM.
+Extract due_date (ISO-8601) only if a concrete date is stated; otherwise null.
+Return only the JSON defined by the schema.
+
+USER:
+&lt;email&gt;
+{email_text}
+&lt;/email&gt;</code></pre>
+      <p>Pair it with a schema: <code>{"label": enum, "due_date": string|null, "reason": string}</code>, with <code>reason</code> placed first in the schema so the model grounds the label. Add three examples covering a borderline case for each label.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Extend the Python tool loop in §7.3 with a second tool, <code>cancel_order(order_id, reason)</code>, that must not execute without explicit human approval. Design how approval enters the loop.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Mark tools as <code>requires_approval</code>. When the model requests one, do not execute: persist the pending call (conversation ID, tool_use ID, arguments) and return to the client with a confirmation prompt. When the user approves, execute and send the real result; when they decline, send a <code>tool_result</code> with <code>is_error: true</code> and content "User declined cancellation." so the model can respond appropriately.</p>
+<pre><code class="language-python">APPROVAL_REQUIRED = {"cancel_order"}
+
+def step(messages, customer_id, approvals: dict[str, bool]):
+    """approvals maps tool_use_id -&gt; user decision for previously pending calls."""
+    response = client.messages.create(model=MODEL, max_tokens=2048, tools=TOOLS, messages=messages)
+    if response.stop_reason != "tool_use":
+        return {"done": True, "text": "".join(b.text for b in response.content if b.type == "text")}
+    calls = [b for b in response.content if b.type == "tool_use"]
+    pending = [c for c in calls if c.name in APPROVAL_REQUIRED and c.id not in approvals]
+    if pending:
+        # Do not append anything yet; surface the request to the UI and resume later.
+        return {"done": False, "needs_approval": [{"id": c.id, "tool": c.name, "args": c.input} for c in pending],
+                "assistant_content": response.content}
+    messages.append({"role": "assistant", "content": response.content})
+    results = []
+    for c in calls:
+        if c.name in APPROVAL_REQUIRED and not approvals[c.id]:
+            results.append({"type": "tool_result", "tool_use_id": c.id,
+                            "content": "User declined this action.", "is_error": True})
+        else:
+            results.append(run_tool(c, customer_id))
+    messages.append({"role": "user", "content": results})
+    return {"done": False}</code></pre>
+      <p>In a web application the pending state lives in a database row keyed by conversation, not in memory, so the approval can arrive minutes later on another instance — the same pattern Spring AI 2.1's tool-call confirmation feature describes as park-and-resume.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>Your prompt-cache hit rate is 3% although every request uses the same 6,000-token system prompt. List the likely causes and how to confirm each.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <ul>
+        <li>A variable value (date, request ID, user name) inside or before the cached block — diff the rendered prefixes of two requests byte-for-byte.</li>
+        <li>Tool definitions serialised in non-deterministic order (for example, from a <code>HashMap</code>) — tools render before the system prompt, so any change invalidates it. Sort tools.</li>
+        <li>No cache breakpoint set, or the prefix is below the model's minimum cacheable length — check <code>cache_creation_input_tokens</code>; zero on every request means nothing is being written.</li>
+        <li>Requests spaced further apart than the cache lifetime — check traffic gaps; consider the longer TTL if the economics work.</li>
+        <li>Traffic split across several models or effort settings — caches are model-scoped.</li>
+        <li>Bursts of parallel cold requests — a cache entry becomes readable only after the first response starts; warm it with one request.</li>
+      </ul>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>Add a streaming endpoint to the Spring service that relays model text deltas to a browser via SSE, stops the upstream request if the browser disconnects, and records usage when the stream ends.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-java">package com.example.llm;
+
+import com.anthropic.client.AnthropicClient;
+import com.anthropic.core.http.StreamResponse;
+import com.anthropic.models.messages.MessageCreateParams;
+import com.anthropic.models.messages.RawMessageStreamEvent;
+import org.springframework.http.MediaType;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
+import java.io.IOException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+@RestController
+class StreamingController {
+    private final AnthropicClient client;
+    StreamingController(AnthropicClient client) { this.client = client; }
+
+    @PostMapping(value = "/chat/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    SseEmitter stream(@RequestBody String question) {
+        SseEmitter emitter = new SseEmitter(180_000L);              // overall deadline
+        AtomicBoolean cancelled = new AtomicBoolean(false);
+        emitter.onCompletion(() -&gt; cancelled.set(true));
+        emitter.onTimeout(() -&gt; cancelled.set(true));
+        emitter.onError(e -&gt; cancelled.set(true));
+
+        MessageCreateParams params = MessageCreateParams.builder()
+                .model("claude-opus-5-5").maxTokens(4096L).addUserMessage(question).build();
+
+        Executors.newVirtualThreadPerTaskExecutor().submit(() -&gt; {
+            try (StreamResponse&lt;RawMessageStreamEvent&gt; stream = client.messages().createStreaming(params)) {
+                var it = stream.stream().iterator();
+                while (it.hasNext() &amp;&amp; !cancelled.get()) {
+                    RawMessageStreamEvent event = it.next();
+                    event.contentBlockDelta()
+                         .flatMap(d -&gt; d.delta().text())
+                         .ifPresent(t -&gt; send(emitter, t.text()));
+                    event.messageDelta().ifPresent(md -&gt;
+                         System.out.println("output tokens: " + md.usage().outputTokens()));
+                }
+                emitter.complete();
+            } catch (Exception e) {
+                emitter.completeWithError(e);
+            }   // closing the StreamResponse aborts the upstream HTTP request
+        });
+        return emitter;
+    }
+
+    private static void send(SseEmitter emitter, String text) {
+        try {
+            emitter.send(SseEmitter.event().name("delta").data(text));
+        } catch (IOException e) {
+            throw new IllegalStateException("client disconnected", e);
+        }
+    }
+}</code></pre>
+      <p>Closing the <code>StreamResponse</code> (via try-with-resources) when the loop exits on cancellation aborts the HTTP request, so the provider stops generating and you stop paying for tokens nobody will read. In production, replace <code>System.out</code> with the Micrometer counters from §7.8 and reuse a shared virtual-thread executor bean.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>Write a JUnit 5 test for <code>ResilientLlmClient.backoffMillis</code> and <code>isTransient</code> that proves: 400s are not transient; 429 is; <code>retry-after: 7</code> yields at least 7,000 ms; jitter never exceeds the cap.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Construct the client with mocks for collaborators (or extract the two methods into a small <code>RetryPolicy</code> class — the better design). Build exceptions with the SDK's builders (for example <code>RateLimitException.builder().headers(Headers.builder().put("retry-after", "7").build()).build()</code>, checking the exact builder fields against the SDK version you use), assert <code>isTransient</code> results, and call <code>backoffMillis</code> 1,000 times per attempt number asserting <code>0 ≤ value ≤ min(maxBackoff, base × 2^(n−1))</code> unless a retry-after floor applies. Testing policy code separately from network code is exactly how you would test a Resilience4j configuration around any other dependency.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What does constrained decoding guarantee, and what does it not?</summary><div><p>It guarantees the output conforms to the grammar or JSON schema — parseable, required fields present, types and enums respected — by masking invalid tokens at each step. It does not guarantee correctness: values can be wrong, hallucinated or inconsistent with business rules; and output can still be truncated by <code>max_tokens</code>. You still validate semantics and check the stop reason.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Walk through the tool-use protocol.</summary><div><p>Send tool definitions with the request. If the model wants a tool, the response contains <code>tool_use</code> blocks (ID, name, input) and <code>stop_reason=tool_use</code>. Append the full assistant content to history, execute each call in your code with proper authorisation (in parallel if several), and send one user message containing a <code>tool_result</code> per call, referencing the IDs, using <code>is_error</code> for failures. Repeat until the model ends its turn; cap iterations.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Design the resilience configuration for an LLM dependency behind a synchronous REST endpoint with a 10-second SLO.</summary><div><p>Use streaming or keep outputs short so normal calls finish well under 10 s; overall timeout around 8 s; at most one retry on 429/5xx with jitter and <code>retry-after</code> — only if remaining budget allows; circuit breaker per model counting slow calls (e.g., &gt;6 s) and errors; bulkhead sized from Little's law; fallback to a faster model validated for the route or a degraded non-LLM response; disable SDK retries so only one layer retries. If p95 latency of the model exceeds the SLO, the endpoint should become asynchronous.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> How do you implement exponential backoff with full jitter that respects retry-after?</summary><div><p><code>cap = min(maxBackoff, base * 2^(attempt-1)); sleep = random(0, cap); if retryAfter present: sleep = max(sleep, retryAfter)</code>. Bound attempts and total elapsed time; only retry transient errors. See <code>backoffMillis</code> in §7.8.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> After a model upgrade, 4% of extraction responses fail validation, up from 0.5%. What do you do?</summary><div><p>Roll back the model ID via configuration (it should be a flag, not a deploy). Then investigate offline: diff failures by field, check whether the new model formats dates or numbers differently, whether stop reasons changed (more truncation due to verbosity), or whether a prompt rule now over-applies. Fix prompt or schema descriptions, re-run the evaluation set on both models, and promote only when the new model matches or beats the old on validation rate and accuracy.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> How does prompt caching work and what breaks it?</summary><div><p>The provider stores the KV cache of a prompt prefix and reuses it when a later request's prefix matches byte-for-byte within the cache lifetime, cutting cost and TTFT. Anything that changes earlier bytes — timestamps, request IDs, tool order, different model or settings — breaks it. Put static content first, variable content last, and monitor cache-read tokens.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Spring AI, LangChain4j or the raw Anthropic SDK — how do you choose?</summary><div><p>For Spring Boot services doing standard chat, structured extraction, RAG and tools, Spring AI fits idiomatically (auto-configuration, advisors, Micrometer). LangChain4j suits teams that like declarative AI-service interfaces or run Quarkus/plain Java. Use the raw SDK for provider-specific features before frameworks support them, or for a central, heavily tuned client. In all cases, put a domain interface in front so the choice is reversible.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Your batch classification job keeps hitting 429s and also slows down the customer chat feature. Fix it.</summary><div><p>Move the job to the provider's batch API (asynchronous, discounted, separate processing) or at least to a separate API key/workspace with its own limits; add client-side rate limiting and concurrency caps to the job; schedule it off-peak; and ensure chat traffic has reserved capacity. Monitor tokens-per-minute per workload.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why place an "evidence" field before a "verdict" field in a schema?</summary><div><p>Generation is left-to-right; fields generated earlier become context for later ones. Asking for evidence first lets the model ground its verdict in quoted text, which usually improves accuracy and makes outputs auditable. Asking for the verdict first forces a decision before the supporting reasoning exists.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> A product manager wants to edit prompts directly in production through an admin UI. How do you respond?</summary><div><p>Support the goal (fast iteration) while protecting reliability: allow editing in a staging prompt registry, run the evaluation suite automatically on each change, require review for promotion, version every change with rollback, and log the prompt version with each request. Prompts are behaviour-defining code and need the same change management.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Prompts are specifications: define goal, labels, edge cases, fallbacks and output shape; version and evaluate them like code.</li>
+    <li>Few-shot examples teach format and boundaries but cost tokens and are copied literally.</li>
+    <li>Use provider-enforced structured outputs, then validate semantics locally and repair once with specific feedback.</li>
+    <li>Tool use is a loop you own: append the full assistant turn, execute with the user's authority, return all results in one message, use <code>is_error</code>, cap iterations.</li>
+    <li>Streaming hides latency; batch APIs trade latency for cost; caching rewards stable prefixes.</li>
+    <li>Retry only transient errors, with jitter and <code>retry-after</code>, in exactly one layer; add per-model circuit breakers, bulkheads and validated fallbacks.</li>
+    <li>Spring AI 2.x runs tool calling in its advisor chain; LangChain4j offers declarative AI services; hide either behind a domain interface.</li>
+  </ul>
+
+  <div class="quiz" data-answer="b">
+    <p class="q">A model returns two tool_use blocks in one turn. How should you send the results?</p>
+    <ol>
+      <li data-k="a">Two separate user messages, one per result, in completion order</li>
+      <li data-k="b">One user message containing both tool_result blocks, after appending the full assistant turn</li>
+      <li data-k="c">Only the successful result; omit the failed one</li>
+      <li data-k="d">A system message summarising both results</li>
+    </ol>
+    <div class="explain">All results for one assistant turn go into a single user message, each referencing its tool_use ID; failures are included with is_error. Splitting or omitting results breaks the protocol or degrades parallel tool use.</div>
+  </div>
+
+  <div class="quiz" data-answer="d">
+    <p class="q">Which error should your LLM client retry?</p>
+    <ol>
+      <li data-k="a">400 invalid_request_error</li>
+      <li data-k="b">401 authentication_error</li>
+      <li data-k="c">413 request too large</li>
+      <li data-k="d">429 rate_limit_error, honouring retry-after</li>
+    </ol>
+    <div class="explain">Rate limits and 5xx/overloaded errors are transient. 400, 401 and 413 will fail identically on retry and only waste quota.</div>
+  </div>
+
+  <div class="quiz" data-answer="a">
+    <p class="q">Your system prompt starts with "Current time: 2026-11-26T10:15:03Z". What is the main consequence?</p>
+    <ol>
+      <li data-k="a">The prompt-cache prefix changes on every request, so cache hits are lost</li>
+      <li data-k="b">The model will refuse to answer</li>
+      <li data-k="c">Output tokens increase</li>
+      <li data-k="d">Rate limits are applied per timestamp</li>
+    </ol>
+    <div class="explain">Caching requires a byte-identical prefix. A changing value at the top invalidates everything after it. Put volatile values late in the request (for example, in the user message).</div>
+  </div>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">You enabled schema-constrained output but still occasionally get JSON parse errors. What is the most likely cause?</p>
+    <ol>
+      <li data-k="a">The model ignores the schema at high load</li>
+      <li data-k="b">Jackson cannot parse enums</li>
+      <li data-k="c">Generation stopped at max_tokens, truncating the JSON</li>
+      <li data-k="d">Constrained decoding only works with streaming</li>
+    </ol>
+    <div class="explain">Constraints guarantee validity only for a complete generation. If max_tokens is reached, output is cut mid-object. Check stop_reason before parsing and size max_tokens appropriately.</div>
+  </div>
+
+  <div class="quiz" data-answer="b">
+    <p class="q">With Resilience4j decorators Retry, CircuitBreaker and Bulkhead around an LLM call, which nesting is recommended here?</p>
+    <ol>
+      <li data-k="a">Bulkhead outermost, then Retry, then CircuitBreaker innermost</li>
+      <li data-k="b">Retry outermost, then CircuitBreaker, then Bulkhead innermost</li>
+      <li data-k="c">CircuitBreaker outermost so retries are invisible to it</li>
+      <li data-k="d">Order does not matter</li>
+    </ol>
+    <div class="explain">Retry outside the breaker means each attempt is recorded and an open breaker fails fast; the bulkhead inside means a permit is held only during the actual call, not during backoff sleeps. This matches Resilience4j's default annotation ordering.</div>
+  </div>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">What is the main benefit of the batch API for a nightly job of 200,000 classifications?</p>
+    <ol>
+      <li data-k="a">Lower latency per request</li>
+      <li data-k="b">Guaranteed result ordering</li>
+      <li data-k="c">Substantially lower price and isolation from interactive rate limits, at the cost of hours of latency</li>
+      <li data-k="d">Larger context windows</li>
+    </ol>
+    <div class="explain">Batch processing is asynchronous and discounted; results can arrive in any order and are matched by custom_id.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Docs</span> <a href="https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/overview">Anthropic — Prompt engineering overview</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://platform.claude.com/docs/en/build-with-claude/structured-outputs">Anthropic — Structured outputs</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview">Anthropic — Tool use</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching">Anthropic — Prompt caching</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://platform.claude.com/docs/en/build-with-claude/batch-processing">Anthropic — Batch processing</a></li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/anthropics/anthropic-sdk-java">anthropics/anthropic-sdk-java</a> and <a href="https://github.com/anthropics/anthropic-sdk-python">anthropic-sdk-python</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.spring.io/spring-ai/reference/">Spring AI reference documentation</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://spring.io/blog/2026/06/12/spring-ai-2-0-0-GA-available-now/">Spring AI 2.0.0 GA announcement</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.langchain4j.dev/">LangChain4j documentation</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://resilience4j.readme.io/docs">Resilience4j documentation</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://developers.openai.com/api/docs/guides/structured-outputs">OpenAI — Structured outputs guide</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2201.11903">Wei et al., "Chain-of-Thought Prompting Elicits Reasoning in Large Language Models" (2022)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2210.03629">Yao et al., "ReAct: Synergizing Reasoning and Acting in Language Models" (2022)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2307.09702">Willard &amp; Louf, "Efficient Guided Generation for Large Language Models" (2023)</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">AWS Builders' Library — Timeouts, retries and backoff with jitter</a></li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

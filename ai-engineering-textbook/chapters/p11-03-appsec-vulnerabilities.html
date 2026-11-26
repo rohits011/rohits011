@@ -163,3 +163,162 @@
     </tbody>
   </table></div>
 </section>
+
+<section id="internals">
+  <h2>4. Internal Working: Why the Defences Work</h2>
+
+  <h3>4.1 How parameter binding separates code from data</h3>
+  <p>With PostgreSQL's extended query protocol (used by pgJDBC for <code>PreparedStatement</code>), the driver sends a <em>Parse</em> message containing the SQL text with placeholders (<code>$1</code>), then a <em>Bind</em> message with parameter values in a separate field, then <em>Execute</em>. The server parses the SQL before it ever sees the values, so a value can never change the query's structure; it is only ever a literal of the declared type. Some drivers (MySQL Connector/J by default) emulate prepared statements client-side by escaping values into the SQL text; that is also safe because the driver escapes according to the server's exact lexical rules and connection character set — unlike application code doing ad-hoc escaping.</p>
+  <p>Hibernate and Spring Data do the same: <code>:email</code> in JPQL becomes a JDBC <code>?</code> in generated SQL, bound via <code>PreparedStatement.setString</code>. Criteria API and Querydsl build an abstract syntax tree, not strings. Placeholders cannot stand for identifiers (table/column names), keywords (<code>ASC</code>/<code>DESC</code>) or SQL fragments — which is why dynamic <code>ORDER BY</code> is the most common place injection survives in otherwise clean Spring code. Spring Data's <code>Sort</code> and <code>Pageable</code> pass property names through Hibernate's path resolution, which rejects unknown properties for derived queries; with native queries or <code>JpaSort.unsafe</code> you must allow-list yourself.</p>
+
+  <h3>4.2 Browser parsing contexts</h3>
+  <p>A browser runs several parsers over one response: the HTML tokenizer, then attribute value parsing, then URL parsing for <code>href</code>/<code>src</code>, the JavaScript parser for <code>&lt;script&gt;</code> blocks and event-handler attributes, and the CSS parser for <code>style</code>. Each has its own metacharacters. HTML-encoding <code>&lt;</code> stops a new tag in element content, but inside a JavaScript string literal the dangerous characters are quotes, backslashes and the sequence <code>&lt;/script</code>; inside an unquoted attribute, a space ends the value; inside an <code>href</code>, the danger is the <code>javascript:</code> scheme, which no HTML encoding neutralises. Context-aware template engines (Go's <code>html/template</code>, Thymeleaf's attribute processors like <code>th:href</code> with URL handling) track which parser will see each insertion point and pick the right encoder. Generic "escape HTML everywhere" helpers fail in the non-HTML contexts.</p>
+
+  <h3>4.3 How a nonce-based CSP blocks injected script</h3>
+  <p>The server generates a fresh random nonce (≥128 bits) per response, puts it in the CSP header and in the <code>nonce</code> attribute of each legitimate script tag. When the browser encounters a <code>&lt;script&gt;</code>, it checks whether the element's nonce matches the policy. An injected <code>&lt;script&gt;alert(1)&lt;/script&gt;</code> has no nonce (the attacker cannot predict it), so it does not execute; inline event handlers like <code>onerror=</code> are blocked because <code>'unsafe-inline'</code> is absent (and <code>'unsafe-hashes'</code> is not set). With <code>'strict-dynamic'</code>, a nonced script that calls <code>document.createElement('script')</code> passes trust to the created script, so modern bundlers and tag managers keep working. Browsers also hide the nonce attribute from the DOM-reading API to make exfiltration harder. A nonce reused across responses (cached HTML with a static nonce) defeats the scheme.</p>
+
+  <h3>4.4 Inside Spring Security's CSRF protection</h3>
+  <p><code>CsrfFilter</code> runs early in the chain. For every request it loads (lazily, since 6.0, through a <code>DeferredCsrfToken</code>) the expected token from a <code>CsrfTokenRepository</code> — <code>HttpSessionCsrfTokenRepository</code> by default or <code>CookieCsrfTokenRepository</code> for SPAs. Requests with "safe" methods (GET, HEAD, TRACE, OPTIONS) pass. For others, it reads the actual token from the <code>X-CSRF-TOKEN</code> header (or <code>X-XSRF-TOKEN</code> with the cookie repository) or the <code>_csrf</code> parameter, and compares it in constant time with the expected value. The <code>XorCsrfTokenRequestAttributeHandler</code> (default since 6.0) XORs the token with fresh randomness each time it is rendered, protecting against BREACH-style compression side channels; SPAs that read the raw cookie value need the documented <code>SpaCsrfTokenRequestHandler</code> so both raw and masked forms validate. On mismatch, an <code>AccessDeniedHandler</code> returns 403. Logout is POST-only by default when CSRF is enabled, preventing forced-logout attacks.</p>
+
+  <h3>4.5 How the browser decides whether to send a SameSite cookie</h3>
+  <p>For each request, the browser computes whether the request's initiator is same-site with the target (comparing scheme and registrable domain, using the Public Suffix List). If same-site, all cookies are sent. If cross-site: <code>SameSite=Strict</code> cookies are withheld; <code>Lax</code> cookies are sent only for top-level navigations with safe methods (clicking a link, GET form); <code>None</code> cookies (which must be <code>Secure</code>) are always sent. Cookies with no attribute are treated as <code>Lax</code> in Chromium-based browsers (with a short grace period for top-level POSTs on very new cookies) — but do not rely on defaults; set the attribute explicitly.</p>
+
+  <h3>4.6 How an SSRF reaches cloud credentials — and where it is cut</h3>
+  <p>Defender's walkthrough of the chain, so you can see each place to break it:</p>
+  <ol>
+    <li>A feature accepts a URL ("import avatar from URL"). The handler calls <code>restClient.get().uri(userUrl)</code>.</li>
+    <li>Instead of a public image URL, the request names an internal address such as the link-local metadata endpoint. <em>Break here:</em> resolve the hostname yourself, reject private, loopback, link-local, multicast and unique-local ranges (IPv4 and IPv6), connect to the vetted IP, and disable redirects (or re-validate each hop).</li>
+    <li>With IMDSv1, a simple GET returns the instance role name and then temporary credentials. <em>Break here:</em> enforce IMDSv2 (<code>HttpTokens=required</code>), set the hop limit to 1 so containers cannot reach it, or block 169.254.169.254 from application pods with a NetworkPolicy; on EKS use IRSA/Pod Identity rather than node roles.</li>
+    <li>The response body (credentials) is returned to the caller, or the attacker infers it via errors. <em>Break here:</em> never return raw fetched content to the client for features that only need, say, an image — validate content type and size and re-encode.</li>
+    <li>The credentials are used from outside the cloud account. <em>Break here:</em> least-privilege role (Chapter 11.4), and alerting on instance-role credentials used from unexpected sources (AWS GuardDuty has a finding type for this).</li>
+  </ol>
+
+  <h3>4.7 Why Java deserialization executes code</h3>
+  <p><code>ObjectInputStream.readObject()</code> reads a class descriptor from the stream, loads that class from the classpath, allocates an instance without calling its constructor, populates fields from the stream, and invokes the class's private <code>readObject</code> method if present. Collections such as <code>HashMap</code> call <code>hashCode()</code> on keys during deserialization to rebuild buckets. A gadget chain is a sequence of ordinary library classes where one class's deserialization hook calls a method on a field whose type is chosen by the attacker, and so on, until a method with a powerful side effect (reflection, <code>Runtime.exec</code>, JNDI lookup) is reached. The application never calls the gadget code; the stream does. That is why the fix is to never deserialize untrusted streams, or to install an <code>ObjectInputFilter</code> that rejects every class not on a short allow-list <em>before</em> it is loaded.</p>
+
+  <h3>4.8 Path normalisation and where checks go wrong</h3>
+  <p><code>Path.of(base, userName).normalize()</code> collapses <code>..</code> segments lexically. The check must be performed on the normalised, absolute path (<code>startsWith(baseDir)</code> on <code>Path</code> objects, which compares path elements — not on strings, where <code>/data/app-evil</code> "starts with" <code>/data/app</code>). Symlinks inside the base directory can still point outside; <code>toRealPath()</code> resolves them but requires the file to exist. URL-decoding twice (once by the container, once by your code) re-opens encoded traversal sequences, which is why Spring Security's <code>StrictHttpFirewall</code> rejects encoded slashes, backslashes, <code>%2e</code> and semicolons in request paths by default.</p>
+
+  <h3>4.9 Token bucket internals and distributed enforcement</h3>
+  <p>A token bucket stores two numbers per key: tokens remaining and last refill timestamp. On each request: compute elapsed time, add <code>elapsed × rate</code> tokens up to capacity, then if at least one token remains, decrement and allow; otherwise reject with <code>429 Too Many Requests</code> and a <code>Retry-After</code> header. In a cluster the state must be shared and updated atomically, typically in Redis via a Lua script (Spring Cloud Gateway's <code>RedisRateLimiter</code>) or compare-and-swap (Bucket4j's JCache/Redis/JDBC proxies). Local per-instance buckets are cheaper but the effective limit becomes <em>limit × instances</em> and varies with load-balancer skew.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: Diagrams and an Interactive Rate Limiter</h2>
+
+  <h3>5.1 Layered API protection</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  C["Clients: SPA, mobile, partners, AI agents"] --> W["CDN / WAF: TLS, bot signals, virtual patches"]
+  W --> G["API gateway: authn, quotas, schema validation, size limits, inventory"]
+  G --> S1["Orders service"]
+  G --> S2["Accounts service"]
+  S1 --> DB1[("Orders DB")]
+  S2 --> DB2[("Accounts DB")]
+  S1 --> EP["Egress proxy: URL allow-list"]
+  EP --> X["Third-party APIs"]
+</pre>
+  <figcaption>Figure 1 — Responsibilities for API security across layers.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the WAF and gateway handle volume, shape and identity (API2, API4, API8, API9 partly); the services handle object-, property- and function-level authorization (API1, API3, API5) and business-flow limits (API6), because only they know ownership and business rules. Outbound calls go through an egress proxy so SSRF (API7) and unsafe consumption (API10) are constrained at the network layer as well as in code.</p>
+
+  <h3>5.2 Interactive: rate-limiting algorithms under bursts</h3>
+  <figure class="diagram">
+    <div class="widget" data-widget="rate-limiter"></div>
+    <figcaption>Figure 2 — Token bucket vs fixed window vs sliding-window log under bursty traffic.</figcaption>
+  </figure>
+  <p><strong>What to try:</strong> set a limit of 10 requests per window and send a burst at the end of one window followed by a burst at the start of the next. Watch the fixed window admit nearly double the limit across the boundary, while the sliding-window log holds the line. Then compare the token bucket with a capacity equal to the limit: it admits the initial burst (which is often what you want for interactive clients) and then settles to the refill rate. For login and OTP endpoints, a small bucket capacity with a slow refill is the right shape; for read APIs, a larger capacity smooths user experience.</p>
+
+  <h3>5.3 A CSRF attack and the two defences</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant V as Victim browser
+  participant E as evil.example (attacker page)
+  participant B as bank.example (cookie session)
+  V->>B: login, receives SESSION cookie
+  V->>E: visits attacker page
+  E-->>V: page with auto-submitting form to bank.example/transfer
+  V->>B: POST /transfer (browser attaches cookie?)
+  alt SameSite=Lax or Strict
+    B-->>V: cookie not sent cross-site, request unauthenticated, 401
+  else No SameSite, but CSRF token required
+    B-->>V: token missing or wrong, 403
+  else No SameSite and no token
+    B-->>V: 200 transfer executed (vulnerable)
+  end
+</pre>
+  <figcaption>Figure 3 — CSRF depends on ambient credentials; SameSite and tokens each break it.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the attacker never sees the cookie; they rely on the browser attaching it. SameSite removes the cookie from cross-site requests; the token requires a secret the attacker's page cannot read (same-origin policy). Use both: SameSite does not help against same-site attackers (a compromised subdomain) or older browsers, and tokens protect even when the cookie is sent.</p>
+
+  <h3>5.4 SSRF defence in depth</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  U["User-supplied URL"] --> P["Parse with a strict URL parser; scheme must be https"]
+  P --> H{"Host on allow-list?"}
+  H -- no --> R1["Reject"]
+  H -- yes --> D["Resolve DNS once; get IP list"]
+  D --> I{"Any IP private, loopback, link-local, or metadata?"}
+  I -- yes --> R2["Reject"]
+  I -- no --> F["Connect to the vetted IP with SNI/Host = hostname; redirects disabled"]
+  F --> E["Egress proxy enforces allow-list again"]
+  E --> N["NetworkPolicy blocks 169.254.169.254 from pods; IMDSv2 required"]
+</pre>
+  <figcaption>Figure 4 — Application-level and network-level SSRF controls.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the application checks (allow-list, IP classification, pinned connection, no redirects) stop most attempts, including DNS rebinding because the connection uses the IP that was checked. The network controls (egress proxy, NetworkPolicy, IMDSv2) still hold if a developer later adds a new fetch path that skips the helper — they are the independent layer.</p>
+
+  <h3>5.5 Where untrusted data flows in a typical Spring service</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph Sources["Untrusted sources"]
+    Q["Query/path params"]
+    J["JSON body"]
+    HD["Headers, cookies"]
+    K["Kafka messages"]
+    T["Third-party API responses"]
+    FU["Uploaded files"]
+  end
+  subgraph Sinks["Dangerous sinks"]
+    SQL["SQL/JPQL strings"]
+    HTML["HTML/JS rendering"]
+    URL["Outbound URL fetch"]
+    FS["File paths"]
+    DES["Deserializers"]
+    SH["Process exec"]
+    LOG["Logs"]
+  end
+  Q --> SQL
+  J --> DES
+  J --> SQL
+  HD --> LOG
+  K --> HTML
+  T --> HTML
+  Q --> URL
+  FU --> FS
+  J --> SH
+</pre>
+  <figcaption>Figure 5 — Source-to-sink map used by SAST tools and by reviewers.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> SAST tools like CodeQL and Semgrep model exactly this: sources, sinks, and sanitisers in between. When reviewing code, trace each source in the diff to every sink it can reach. Note that Kafka messages and third-party responses are sources too — data that "came from our own system" may have originated with a user several hops earlier.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math: Rate Limits, Token Entropy and Search Spaces</h2>
+  <h3>6.1 Token bucket</h3>
+  <p>Intuition: a bucket holds up to \( B \) tokens and refills at \( r \) tokens per second; you can burst up to \( B \) and then sustain \( r \). Over any interval of length \( t \), the maximum number of admitted requests is</p>
+  \[ N_{\max}(t) = B + r\,t \]
+  <p>For a fixed window of size \( W \) with limit \( L \), two adjacent windows can admit \( 2L \) requests within an interval just over \( \epsilon \) around the boundary, so the worst-case short-term rate is \( 2L/\epsilon \) — unbounded in principle. A sliding window guarantees at most \( L \) in any interval of length \( W \).</p>
+  <h3>6.2 Brute-force budgets</h3>
+  <p>If an attacker can make \( q \) guesses per second against a secret space of size \( S \), the expected time to success is \( S/(2q) \). <span class="tag illus">Illustrative</span> A 6-digit reset code (\( S=10^6 \)) behind a limit of 5 attempts per code and 3 codes per hour per account gives at most 15 guesses per hour: success probability per hour \( \approx 15/10^6 = 1.5\times10^{-5} \), roughly 1 in 67,000. Without limits at 1,000 req/s, expected time is 500 s.</p>
+  <h3>6.3 BOLA and identifier spaces</h3>
+  <p>Sequential IDs make enumeration trivial: \( S \approx \) number of records. Random UUIDv4 (122 random bits) makes blind enumeration infeasible: \( 2^{122} \approx 5.3\times10^{36} \). But this only defeats <em>guessing</em>; leaked IDs (URLs, logs, shared links, other API responses) are still exploitable without an authorization check. Treat ID randomness as defence in depth, never as access control.</p>
+  <h3>6.4 Capacity math for limits</h3>
+  <p>Set limits from capacity, not intuition. If a search endpoint costs about 40 ms of database time and the database pool supports roughly 200 concurrent queries, throughput is about \( 200 / 0.04 = 5{,}000 \) queries/s. Reserving half for other endpoints and supporting 1,000 concurrent active users suggests a per-user limit around \( 2{,}500/1{,}000 = 2.5 \) req/s sustained, with a small burst. <span class="tag illus">Illustrative</span></p>
+  <h3>6.5 Cost amplification</h3>
+  <p>API4 includes downstream cost: an endpoint that sends an SMS costing \( c \) per message with no per-number limit lets an attacker spend \( c \times q \times t \) of your money ("SMS pumping"); an LLM-backed endpoint with no token budget does the same with model costs. Limit by the resource that costs money (per destination number, per tenant token budget), not just by request count.</p>
+</section>

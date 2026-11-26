@@ -369,3 +369,414 @@ sequenceDiagram
   \[ \text{state} \approx K \cdot \frac{w + d}{s} \cdot \sigma \]
   <p>where \( d \) is the watermark delay and \( \sigma \) the per-window aggregate size. A 1-hour window sliding every minute with a 10-minute watermark and a million keys keeps about 70 million window aggregates, which is why such jobs need RocksDB state and why delay thresholds directly drive memory and checkpoint size.</p>
 </section>
+
+<section id="code">
+  <h2>7. Code: CDC, Outbox, Spark Batch, Skew, Structured Streaming, Kafka EOS and Flink SQL</h2>
+  <p>Versions assumed: Spark 4.0 (PySpark), Iceberg 1.10 Spark runtime, Kafka 3.9/4.x clients, Debezium 3.x, Flink 2.x, Spring Boot 3.x <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+
+  <h3>7.1 The transactional outbox in Spring Boot</h3>
+<pre data-file="src/main/java/com/example/orders/OrderService.java"><code class="language-java">package com.example.orders;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.persistence.*;
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.Map;
+import java.util.UUID;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Entity @Table(name = "outbox")
+class OutboxEvent {
+    @Id UUID id;
+    @Column(name = "aggregatetype", nullable = false) String aggregateType;   // routes to topic
+    @Column(name = "aggregateid", nullable = false) String aggregateId;       // becomes Kafka key
+    @Column(name = "type", nullable = false) String type;                     // event type header
+    @Column(name = "payload", columnDefinition = "jsonb", nullable = false) String payload;
+    @Column(name = "created_at", nullable = false) Instant createdAt;
+    protected OutboxEvent() {}
+    OutboxEvent(String aggType, String aggId, String type, String payload) {
+        this.id = UUID.randomUUID(); this.aggregateType = aggType; this.aggregateId = aggId;
+        this.type = type; this.payload = payload; this.createdAt = Instant.now();
+    }
+}
+
+interface OutboxRepository extends JpaRepository&lt;OutboxEvent, UUID&gt; {}
+interface OrderRepository extends JpaRepository&lt;Order, Long&gt; {}
+
+@Service
+public class OrderService {
+    private final OrderRepository orders;
+    private final OutboxRepository outbox;
+    private final ObjectMapper json;
+
+    public OrderService(OrderRepository orders, OutboxRepository outbox, ObjectMapper json) {
+        this.orders = orders; this.outbox = outbox; this.json = json;
+    }
+
+    @Transactional   // order row and outbox row commit atomically, or neither does
+    public Order placeOrder(long customerId, BigDecimal amount) throws Exception {
+        Order o = orders.save(new Order(customerId, amount, "PLACED"));
+        String payload = json.writeValueAsString(Map.of(
+            "orderId", o.getId(), "customerId", customerId,
+            "amount", amount, "status", "PLACED", "schemaVersion", 2));
+        outbox.save(new OutboxEvent("order", o.getId().toString(), "OrderPlaced", payload));
+        return o;
+    }
+}</code></pre>
+  <p>No Kafka client in the service at all: Debezium publishes the outbox rows. A scheduled job (or Postgres partition drop) deletes outbox rows older than a few days, since the WAL, not the table, is what Debezium reads.</p>
+
+  <h3>7.2 Debezium connectors: raw CDC and outbox routing</h3>
+<pre data-file="connect/orders-cdc.json (POST to http://connect:8083/connectors)"><code class="language-json">{
+  "name": "orders-cdc",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "plugin.name": "pgoutput",
+    "database.hostname": "orders-db",
+    "database.port": "5432",
+    "database.user": "debezium",
+    "database.password": "${file:/opt/kafka/secrets/orders-db.properties:password}",
+    "database.dbname": "orders",
+    "topic.prefix": "cdc",
+    "slot.name": "debezium_orders",
+    "publication.name": "dbz_orders",
+    "publication.autocreate.mode": "filtered",
+    "table.include.list": "public.orders,public.order_lines,public.outbox",
+    "snapshot.mode": "initial",
+    "heartbeat.interval.ms": "10000",
+    "tombstones.on.delete": "true",
+    "key.converter": "io.confluent.connect.avro.AvroConverter",
+    "key.converter.schema.registry.url": "http://schema-registry:8081",
+    "value.converter": "io.confluent.connect.avro.AvroConverter",
+    "value.converter.schema.registry.url": "http://schema-registry:8081",
+
+    "transforms": "outbox",
+    "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+    "transforms.outbox.predicate": "isOutbox",
+    "transforms.outbox.route.by.field": "aggregatetype",
+    "transforms.outbox.route.topic.replacement": "domain.${routedByValue}-events",
+    "transforms.outbox.table.expand.json.payload": "true",
+    "predicates": "isOutbox",
+    "predicates.isOutbox.type": "org.apache.kafka.connect.transforms.predicates.TopicNameMatches",
+    "predicates.isOutbox.pattern": "cdc\\.public\\.outbox"
+  }
+}</code></pre>
+<pre data-file="postgres prerequisites"><code class="language-sql">-- postgresql.conf: wal_level = logical; max_replication_slots and max_wal_senders sized;
+-- max_slot_wal_keep_size = '50GB'  (protect the primary if the connector stalls)
+CREATE ROLE debezium WITH LOGIN REPLICATION PASSWORD '...';
+GRANT SELECT ON public.orders, public.order_lines, public.outbox TO debezium;
+-- Monitor slot lag:
+SELECT slot_name, active,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS lag
+FROM pg_replication_slots;</code></pre>
+
+  <h3>7.3 A production-shaped PySpark batch job</h3>
+<pre data-file="jobs/daily_zone_metrics.py"><code class="language-python">"""Daily zone metrics from NYC TLC trips into an Iceberg table, idempotent per day.
+
+Run:  spark-submit jobs/daily_zone_metrics.py --run-date 2024-01-15
+"""
+from __future__ import annotations
+
+import argparse
+from datetime import date, timedelta
+
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import functions as F
+
+
+def build_spark() -&gt; SparkSession:
+    return (
+        SparkSession.builder.appName("daily_zone_metrics")
+        .config("spark.sql.adaptive.enabled", "true")                     # default since 3.2
+        .config("spark.sql.adaptive.skewJoin.enabled", "true")
+        .config("spark.sql.adaptive.advisoryPartitionSizeInBytes", "128m")
+        .config("spark.sql.shuffle.partitions", "400")                     # initial; AQE coalesces
+        .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
+        .getOrCreate()
+    )
+
+
+def read_trips(spark: SparkSession, path: str, run_date: date) -&gt; DataFrame:
+    start, end = run_date.isoformat(), (run_date + timedelta(days=1)).isoformat()
+    return (
+        spark.read.parquet(path)
+        # Filter on the raw timestamp so Parquet statistics can prune row groups.
+        .where((F.col("tpep_pickup_datetime") &gt;= F.lit(start).cast("timestamp"))
+               &amp; (F.col("tpep_pickup_datetime") &lt; F.lit(end).cast("timestamp")))
+        .select("tpep_pickup_datetime", "tpep_dropoff_datetime", "PULocationID",
+                "payment_type", "fare_amount", "tip_amount", "total_amount", "trip_distance")
+    )
+
+
+def clean(df: DataFrame) -&gt; DataFrame:
+    duration_s = F.unix_timestamp("tpep_dropoff_datetime") - F.unix_timestamp("tpep_pickup_datetime")
+    return (df.withColumn("duration_s", duration_s)
+              .where((F.col("fare_amount") &gt; 0) &amp; (F.col("trip_distance") &gt; 0)
+                     &amp; F.col("duration_s").between(60, 3 * 3600)))
+
+
+def metrics(trips: DataFrame, zones: DataFrame, run_date: date) -&gt; DataFrame:
+    agg = (trips.groupBy("PULocationID")
+                .agg(F.count("*").alias("trips"),
+                     F.sum("total_amount").alias("revenue"),
+                     # tip ratio from additive parts, card trips only
+                     F.sum(F.when(F.col("payment_type") == 1, F.col("tip_amount"))).alias("card_tips"),
+                     F.sum(F.when(F.col("payment_type") == 1, F.col("fare_amount"))).alias("card_fares"),
+                     F.percentile_approx("duration_s", 0.5, 1000).alias("p50_duration_s"),
+                     F.percentile_approx("duration_s", 0.9, 1000).alias("p90_duration_s")))
+    return (agg.join(F.broadcast(zones), agg.PULocationID == zones.LocationID, "left")  # small side
+               .select(F.lit(run_date).cast("date").alias("metric_date"),
+                       F.col("PULocationID").alias("location_id"),
+                       F.col("Borough").alias("borough"), F.col("Zone").alias("zone"),
+                       "trips", "revenue",
+                       (F.col("card_tips") / F.col("card_fares")).alias("card_tip_ratio"),
+                       "p50_duration_s", "p90_duration_s"))
+
+
+def main() -&gt; None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--run-date", required=True, type=date.fromisoformat)  # logical date, never now()
+    ap.add_argument("--trips", default="s3a://raw/tlc/yellow/")
+    ap.add_argument("--zones", default="s3a://raw/tlc/taxi_zone_lookup.csv")
+    args = ap.parse_args()
+
+    spark = build_spark()
+    trips = clean(read_trips(spark, args.trips, args.run_date))
+    zones = spark.read.option("header", True).option("inferSchema", True).csv(args.zones)
+    out = metrics(trips, zones, args.run_date)
+
+    # Data-quality guard before publishing.
+    n = out.agg(F.sum("trips")).first()[0] or 0
+    if n &lt; 50_000:
+        raise RuntimeError(f"only {n} trips for {args.run_date}; refusing to publish")
+
+    spark.sql("""
+      CREATE TABLE IF NOT EXISTS lake.gold.zone_daily_metrics (
+        metric_date DATE, location_id INT, borough STRING, zone STRING, trips BIGINT,
+        revenue DOUBLE, card_tip_ratio DOUBLE, p50_duration_s DOUBLE, p90_duration_s DOUBLE)
+      USING iceberg PARTITIONED BY (metric_date)""")
+    # Idempotent: replaces exactly the partitions present in `out` (one day).
+    out.writeTo("lake.gold.zone_daily_metrics").overwritePartitions()
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+  <p>Three properties make this safe to retry and backfill: the job is parameterized by a <em>logical</em> run date; it reads exactly that day's input; and <code>overwritePartitions()</code> replaces that day's partition atomically (an Iceberg snapshot), so running it twice yields one copy, and a backfill over 90 days is 90 independent, parallelizable runs.</p>
+
+  <h3>7.4 Diagnosing and fixing skew with salting</h3>
+<pre data-file="jobs/skew_demo.py"><code class="language-python">from pyspark.sql import SparkSession, functions as F
+
+spark = SparkSession.builder.appName("skew-demo").getOrCreate()
+
+# Fact: billions of events; merchant 42 is a marketplace giant with 30% of rows.
+events = spark.read.table("lake.silver.payment_events")          # merchant_id, amount, ...
+merchants = spark.read.table("lake.silver.merchant_attributes")  # too large to broadcast
+
+# 1. Measure skew before guessing.
+(events.groupBy("merchant_id").count()
+       .orderBy(F.desc("count")).limit(10).show())
+
+# 2. Salt only the hot keys (keeps replication cost small).
+SALT = 32
+hot = [r.merchant_id for r in
+       events.groupBy("merchant_id").count().where("count &gt; 50000000").collect()]
+
+events_s = events.withColumn(
+    "salt",
+    F.when(F.col("merchant_id").isin(hot), (F.rand(seed=7) * SALT).cast("int")).otherwise(F.lit(0)))
+
+salts = spark.range(SALT).withColumnRenamed("id", "salt").withColumn("salt", F.col("salt").cast("int"))
+merchants_s = (merchants.where(F.col("merchant_id").isin(hot)).crossJoin(salts)
+               .unionByName(merchants.where(~F.col("merchant_id").isin(hot)).withColumn("salt", F.lit(0))))
+
+joined = events_s.join(merchants_s, ["merchant_id", "salt"]).drop("salt")
+
+# 3. Two-phase aggregation also tames skewed groupBy.
+by_cat = (joined.groupBy("category", "merchant_id").agg(F.sum("amount").alias("amt"))  # partial
+                .groupBy("category").agg(F.sum("amt").alias("amount")))                 # final
+by_cat.explain(mode="formatted")</code></pre>
+  <p>Before hand-salting, check whether AQE's skew-join handling already split the partition (Spark UI → SQL tab → the join node shows "skewed partitions"). Hand-salting is for cases AQE does not cover, such as skewed aggregations or joins with non-splittable plans.</p>
+
+  <h3>7.5 Structured Streaming: Kafka to Iceberg with event-time windows</h3>
+<pre data-file="jobs/stream_trip_events.py"><code class="language-python">"""Consume trip-completed events (JSON) from Kafka, compute 5-minute event-time windows per
+zone with a 10-minute watermark, and append finalized windows to Iceberg exactly once."""
+from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.types import (DoubleType, IntegerType, StringType, StructField, StructType,
+                               TimestampType)
+
+spark = (SparkSession.builder.appName("trip-windows")
+         .config("spark.sql.streaming.stateStore.providerClass",
+                 "org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider")
+         .getOrCreate())
+
+schema = StructType([
+    StructField("trip_id", StringType()), StructField("pu_location_id", IntegerType()),
+    StructField("dropoff_ts", TimestampType()),          # event time
+    StructField("total_amount", DoubleType()),
+])
+
+raw = (spark.readStream.format("kafka")
+       .option("kafka.bootstrap.servers", "kafka:9092")
+       .option("subscribe", "domain.trip-events")
+       .option("startingOffsets", "earliest")
+       .option("maxOffsetsPerTrigger", 2_000_000)        # bound batch size for catch-up
+       .load())
+
+events = (raw.select(F.from_json(F.col("value").cast("string"), schema).alias("e"),
+                     F.col("timestamp").alias("kafka_ts"))
+             .select("e.*", "kafka_ts"))
+
+# Route unparseable records to a dead-letter table instead of silently dropping them.
+bad = events.where(F.col("trip_id").isNull())
+good = events.where(F.col("trip_id").isNotNull())
+
+windows = (good
+    .withWatermark("dropoff_ts", "10 minutes")
+    .dropDuplicatesWithinWatermark(["trip_id"])          # dedupe retries/at-least-once producers
+    .groupBy(F.window("dropoff_ts", "5 minutes"), "pu_location_id")
+    .agg(F.count("*").alias("trips"), F.sum("total_amount").alias("revenue"))
+    .select(F.col("window.start").alias("window_start"), F.col("window.end").alias("window_end"),
+            "pu_location_id", "trips", "revenue"))
+
+q1 = (windows.writeStream
+      .format("iceberg")
+      .outputMode("append")                               # finalized windows only
+      .trigger(processingTime="1 minute")
+      .option("checkpointLocation", "s3a://checkpoints/trip-windows/")
+      .toTable("lake.silver.trip_windows_5m"))
+
+q2 = (bad.writeStream.format("iceberg").outputMode("append")
+      .option("checkpointLocation", "s3a://checkpoints/trip-events-dlq/")
+      .toTable("lake.bronze.trip_events_dlq"))
+
+spark.streams.awaitAnyTermination()</code></pre>
+  <p>Correctness hinges on the checkpoint location: it holds the offsets log, commit log and state. Never share a checkpoint between queries, never delete it to "fix" a problem in production without understanding that it resets state and offsets, and keep it on durable storage.</p>
+
+  <h3>7.6 Upserts from a stream with foreachBatch and MERGE (CDC to current state)</h3>
+<pre data-file="jobs/cdc_merge.py"><code class="language-python">from pyspark.sql import DataFrame, SparkSession, Window, functions as F
+
+spark = SparkSession.builder.appName("orders-cdc-merge").getOrCreate()
+
+cdc = (spark.readStream.format("kafka")
+       .option("kafka.bootstrap.servers", "kafka:9092")
+       .option("subscribe", "cdc.public.orders")
+       .load())
+# Assume a helper decodes Avro with the schema registry into columns:
+# order_id, status, amount, op ('c','u','d','r'), lsn (source.lsn), ts_ms
+from decoders import decode_debezium_orders   # project-specific
+changes = decode_debezium_orders(cdc)
+
+def upsert(batch: DataFrame, batch_id: int) -&gt; None:
+    # Keep only the latest change per key within this micro-batch (ordered by LSN).
+    latest = (batch.withColumn("rn", F.row_number().over(
+                  Window.partitionBy("order_id").orderBy(F.col("lsn").desc())))
+                   .where("rn = 1").drop("rn"))
+    latest.createOrReplaceTempView("latest")
+    batch.sparkSession.sql("""
+      MERGE INTO lake.silver.orders t
+      USING latest s ON t.order_id = s.order_id
+      WHEN MATCHED AND s.op = 'd' THEN DELETE
+      WHEN MATCHED AND s.lsn &gt; t.lsn THEN UPDATE SET *
+      WHEN NOT MATCHED AND s.op &lt;&gt; 'd' THEN INSERT *
+    """)
+    # Re-running the same batch_id after a failure re-applies the same MERGE: the LSN guard
+    # (s.lsn &gt; t.lsn) makes it idempotent.
+
+(changes.writeStream.foreachBatch(upsert)
+        .option("checkpointLocation", "s3a://checkpoints/orders-cdc-merge/")
+        .trigger(availableNow=True)          # or processingTime for continuous operation
+        .start().awaitTermination())</code></pre>
+  <p><code>availableNow</code> turns this into an incremental batch job: an orchestrator runs it every 15 minutes, it processes everything new since the last checkpoint, and exits, so you pay for compute only while it runs.</p>
+
+  <h3>7.7 Exactly-once consume-transform-produce with Kafka transactions (Java)</h3>
+<pre data-file="TripEnricher.java"><code class="language-java">import java.time.Duration;
+import java.util.*;
+import org.apache.kafka.clients.consumer.*;
+import org.apache.kafka.clients.producer.*;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.ProducerFencedException;
+import org.apache.kafka.common.serialization.*;
+
+public class TripEnricher {
+    public static void main(String[] args) {
+        Properties pc = new Properties();
+        pc.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092");
+        pc.put(ConsumerConfig.GROUP_ID_CONFIG, "trip-enricher");
+        pc.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        pc.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");
+        pc.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        pc.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+
+        Properties pp = new Properties();
+        pp.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092");
+        pp.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "trip-enricher-" + System.getenv("POD_ORDINAL"));
+        pp.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
+        pp.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        pp.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+
+        try (var consumer = new KafkaConsumer&lt;String, String&gt;(pc);
+             var producer = new KafkaProducer&lt;String, String&gt;(pp)) {
+            producer.initTransactions();                 // fences zombies with the same id
+            consumer.subscribe(List.of("domain.trip-events"));
+            while (true) {
+                ConsumerRecords&lt;String, String&gt; records = consumer.poll(Duration.ofMillis(500));
+                if (records.isEmpty()) continue;
+                producer.beginTransaction();
+                try {
+                    Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets = new HashMap&lt;&gt;();
+                    for (ConsumerRecord&lt;String, String&gt; r : records) {
+                        String enriched = enrich(r.value());
+                        producer.send(new ProducerRecord&lt;&gt;("domain.trip-events-enriched", r.key(), enriched));
+                        offsets.put(new TopicPartition(r.topic(), r.partition()),
+                                    new OffsetAndMetadata(r.offset() + 1));
+                    }
+                    // Offsets commit atomically with the output records.
+                    producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata());
+                    producer.commitTransaction();
+                } catch (ProducerFencedException e) {
+                    throw e;                              // another instance took over: exit
+                } catch (RuntimeException e) {
+                    producer.abortTransaction();
+                    // rewind to last committed offsets so the batch is reprocessed
+                    consumer.assignment().forEach(tp -&gt; consumer.seek(tp,
+                        Optional.ofNullable(consumer.committed(Set.of(tp)).get(tp))
+                                .map(OffsetAndMetadata::offset).orElse(0L)));
+                }
+            }
+        }
+    }
+
+    static String enrich(String json) { return json; }   // placeholder transformation
+}</code></pre>
+
+  <h3>7.8 The same windowed aggregation in Flink SQL</h3>
+<pre data-file="trip_windows.sql (Flink SQL client)"><code class="language-sql">CREATE TABLE trip_events (
+  trip_id        STRING,
+  pu_location_id INT,
+  dropoff_ts     TIMESTAMP(3),
+  total_amount   DOUBLE,
+  WATERMARK FOR dropoff_ts AS dropoff_ts - INTERVAL '10' MINUTE
+) WITH (
+  'connector' = 'kafka',
+  'topic' = 'domain.trip-events',
+  'properties.bootstrap.servers' = 'kafka:9092',
+  'properties.group.id' = 'flink-trip-windows',
+  'scan.startup.mode' = 'earliest-offset',
+  'format' = 'json'
+);
+
+CREATE TABLE trip_windows_5m (
+  window_start TIMESTAMP(3), window_end TIMESTAMP(3), pu_location_id INT,
+  trips BIGINT, revenue DOUBLE,
+  PRIMARY KEY (window_start, pu_location_id) NOT ENFORCED
+) WITH ('connector' = 'upsert-kafka', 'topic' = 'metrics.trip-windows-5m',
+        'properties.bootstrap.servers' = 'kafka:9092',
+        'key.format' = 'json', 'value.format' = 'json');
+
+INSERT INTO trip_windows_5m
+SELECT window_start, window_end, pu_location_id, COUNT(*) AS trips, SUM(total_amount) AS revenue
+FROM TABLE(TUMBLE(TABLE trip_events, DESCRIPTOR(dropoff_ts), INTERVAL '5' MINUTES))
+GROUP BY window_start, window_end, pu_location_id;</code></pre>
+  <p>Flink's window table-valued functions (<code>TUMBLE</code>, <code>HOP</code>, <code>CUMULATE</code>, <code>SESSION</code>) mirror Spark's <code>window()</code>; the watermark is declared on the table. With checkpointing enabled and a transactional or upsert sink, results are exactly-once.</p>
+</section>

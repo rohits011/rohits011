@@ -308,3 +308,480 @@ flowchart TB
     </tbody>
   </table></div>
 </section>
+
+<section id="code">
+  <h2>7. Code: From Scratch, Then With Libraries</h2>
+  <p>Environment: Python 3.11+, <code>pip install numpy pandas scikit-learn xgboost lightgbm catboost</code>. Seeds are fixed. Outputs are <span class="tag illus">Illustrative</span> (typical values, not captured from a run for this book) and library APIs are <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+
+  <h3>7.1 Logistic regression from scratch (breast cancer)</h3>
+<pre data-file="logreg_scratch.py"><code class="language-python">import numpy as np
+from sklearn.datasets import load_breast_cancer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import log_loss, roc_auc_score, accuracy_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+X, y = load_breast_cancer(return_X_y=True)          # 569 rows, 30 features, y=1 benign
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.25, stratify=y, random_state=0)
+sc = StandardScaler().fit(X_tr)
+X_tr, X_te = sc.transform(X_tr), sc.transform(X_te)
+
+def sigmoid(z):
+    # numerically stable: avoid exp overflow for large |z|
+    out = np.empty_like(z)
+    pos = z &gt;= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-z[pos]))
+    ez = np.exp(z[~pos])
+    out[~pos] = ez / (1.0 + ez)
+    return out
+
+def fit_logreg(X, y, lam=0.01, eta=0.5, epochs=3000):
+    m, n = X.shape
+    w, b = np.zeros(n), 0.0
+    for epoch in range(epochs):
+        p = sigmoid(X @ w + b)
+        grad_w = X.T @ (p - y) / m + 2 * lam * w      # L2 on weights, not on bias
+        grad_b = np.mean(p - y)
+        w -= eta * grad_w
+        b -= eta * grad_b
+    return w, b
+
+w, b = fit_logreg(X_tr, y_tr)
+p_te = sigmoid(X_te @ w + b)
+print("scratch : acc %.3f  auc %.4f  logloss %.4f" % (
+    accuracy_score(y_te, p_te &gt;= 0.5), roc_auc_score(y_te, p_te), log_loss(y_te, p_te)))
+
+# Same objective in scikit-learn: C = 1 / (2 * lam * m) maps our averaged penalty to sklearn's
+sk = LogisticRegression(C=1 / (2 * 0.01 * len(y_tr)), max_iter=5000).fit(X_tr, y_tr)
+p_sk = sk.predict_proba(X_te)[:, 1]
+print("sklearn : acc %.3f  auc %.4f  logloss %.4f" % (
+    accuracy_score(y_te, p_sk &gt;= 0.5), roc_auc_score(y_te, p_sk), log_loss(y_te, p_sk)))
+print("max |w diff|:", np.abs(sk.coef_.ravel() - w).max())   # small: same optimum
+# Illustrative: acc ~0.97, AUC ~0.99 for both</code></pre>
+  <p>The mapping C = 1/(2λm) comes from scikit-learn minimising ½‖w‖² + C·Σℓ<sub>i</sub> (a sum, not a mean). Matching your from-scratch objective to the library's exact parameterisation is a valuable exercise in reading docs carefully.</p>
+
+  <h3>7.2 Softmax regression from scratch (digits)</h3>
+<pre data-file="softmax_scratch.py"><code class="language-python">import numpy as np
+from sklearn.datasets import load_digits
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+rng = np.random.default_rng(0)
+X, y = load_digits(return_X_y=True)                  # 1797 8x8 images, 10 classes
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.25, stratify=y, random_state=0)
+sc = StandardScaler().fit(X_tr)
+X_tr, X_te = sc.transform(X_tr), sc.transform(X_te)
+K, (m, n) = 10, X_tr.shape
+Y = np.eye(K)[y_tr]                                  # one-hot targets
+
+def softmax(Z):
+    Z = Z - Z.max(axis=1, keepdims=True)
+    E = np.exp(Z)
+    return E / E.sum(axis=1, keepdims=True)
+
+W, b = 0.01 * rng.normal(size=(n, K)), np.zeros(K)
+for epoch in range(500):
+    P = softmax(X_tr @ W + b)
+    G = (P - Y) / m                                  # dL/dZ, the (p - onehot) result
+    W -= 0.5 * (X_tr.T @ G + 1e-3 * W)
+    b -= 0.5 * G.sum(axis=0)
+    if epoch % 100 == 0:
+        loss = -np.mean(np.log(P[np.arange(m), y_tr] + 1e-12))
+        print(f"epoch {epoch} loss {loss:.4f}")
+acc = (softmax(X_te @ W + b).argmax(axis=1) == y_te).mean()
+print("test accuracy", round(acc, 3))                # ~0.96-0.97 (Illustrative)</code></pre>
+
+  <h3>7.3 Ridge and lasso: shrinkage versus selection</h3>
+<pre data-file="regularisation_paths.py"><code class="language-python">import numpy as np
+from sklearn.datasets import fetch_california_housing
+from sklearn.linear_model import Lasso, Ridge, ElasticNetCV, LinearRegression
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+X, y = fetch_california_housing(return_X_y=True, as_frame=True)
+rng = np.random.default_rng(0)
+for i in range(20):                                   # add 20 pure-noise features
+    X[f"noise_{i}"] = rng.normal(size=len(X))
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=0)
+
+for name, est in [("OLS", LinearRegression()), ("Ridge a=10", Ridge(alpha=10)),
+                  ("Lasso a=0.01", Lasso(alpha=0.01)), ("Lasso a=0.1", Lasso(alpha=0.1))]:
+    pipe = make_pipeline(StandardScaler(), est).fit(X_tr, y_tr)
+    coef = pipe[-1].coef_
+    mse = np.mean((pipe.predict(X_te) - y_te) ** 2)
+    print(f"{name:13s} test MSE {mse:.4f}  zero coefs {np.sum(np.abs(coef) &lt; 1e-8):2d}/{len(coef)}"
+          f"  noise |coef| sum {np.abs(coef[8:]).sum():.4f}")
+# Lasso zeroes most noise features; Ridge only shrinks them (Illustrative)
+
+enet = make_pipeline(StandardScaler(), ElasticNetCV(l1_ratio=[0.2, 0.5, 0.8, 1.0], cv=5,
+                                                    random_state=0)).fit(X_tr, y_tr)
+print("ElasticNetCV chose alpha=%.4f l1_ratio=%.1f" % (enet[-1].alpha_, enet[-1].l1_ratio_))</code></pre>
+
+  <h3>7.4 A regression tree from scratch</h3>
+<pre data-file="tree_scratch.py"><code class="language-python">import numpy as np
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class Node:
+    value: float
+    feature: Optional[int] = None
+    threshold: Optional[float] = None
+    left: Optional["Node"] = None
+    right: Optional["Node"] = None
+
+def best_split(X, y, min_leaf):
+    m, n = X.shape
+    best = (None, None, 0.0)                    # feature, threshold, gain (SSE reduction)
+    parent_sse = ((y - y.mean()) ** 2).sum()
+    for j in range(n):
+        order = np.argsort(X[:, j])
+        xs, ys = X[order, j], y[order]
+        csum, csq = np.cumsum(ys), np.cumsum(ys ** 2)
+        tot, totsq = csum[-1], csq[-1]
+        for i in range(min_leaf, m - min_leaf + 1):
+            if xs[i - 1] == xs[i]:
+                continue                        # cannot split between equal values
+            nl, nr = i, m - i
+            sl, sr = csum[i - 1], tot - csum[i - 1]
+            sse_l = csq[i - 1] - sl ** 2 / nl   # SSE = sum(y^2) - (sum y)^2 / n, O(1) per candidate
+            sse_r = (totsq - csq[i - 1]) - sr ** 2 / nr
+            gain = parent_sse - sse_l - sse_r
+            if gain &gt; best[2]:
+                best = (j, (xs[i - 1] + xs[i]) / 2, gain)
+    return best
+
+def grow(X, y, depth=0, max_depth=4, min_leaf=5):
+    node = Node(value=float(y.mean()))
+    if depth &gt;= max_depth or len(y) &lt; 2 * min_leaf:
+        return node
+    j, t, gain = best_split(X, y, min_leaf)
+    if j is None:
+        return node
+    mask = X[:, j] &lt;= t
+    node.feature, node.threshold = j, t
+    node.left = grow(X[mask], y[mask], depth + 1, max_depth, min_leaf)
+    node.right = grow(X[~mask], y[~mask], depth + 1, max_depth, min_leaf)
+    return node
+
+def predict_one(node, x):
+    while node.feature is not None:
+        node = node.left if x[node.feature] &lt;= node.threshold else node.right
+    return node.value
+
+if __name__ == "__main__":
+    from sklearn.datasets import fetch_california_housing
+    from sklearn.model_selection import train_test_split
+    from sklearn.tree import DecisionTreeRegressor
+    X, y = fetch_california_housing(return_X_y=True)
+    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=0)
+    X_tr, y_tr = X_tr[:5000], y_tr[:5000]           # keep the pure-Python loop quick
+    root = grow(X_tr, y_tr)
+    pred = np.array([predict_one(root, x) for x in X_te])
+    sk = DecisionTreeRegressor(max_depth=4, min_samples_leaf=5, random_state=0).fit(X_tr, y_tr)
+    print("scratch MSE", np.mean((pred - y_te) ** 2), " sklearn MSE", np.mean((sk.predict(X_te) - y_te) ** 2))
+    # Both ~0.6 (Illustrative); identical up to tie-breaking</code></pre>
+
+  <h3>7.5 Gradient boosting from scratch</h3>
+<pre data-file="gbm_scratch.py"><code class="language-python">import numpy as np
+from sklearn.datasets import fetch_california_housing
+from sklearn.model_selection import train_test_split
+from sklearn.tree import DecisionTreeRegressor
+
+X, y = fetch_california_housing(return_X_y=True)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=0)
+X_tr, X_val, y_tr, y_val = train_test_split(X_tr, y_tr, test_size=0.2, random_state=0)
+
+class TinyGBM:
+    """Squared-error gradient boosting with shrinkage, row subsampling and early stopping."""
+    def __init__(self, n_estimators=2000, learning_rate=0.05, max_depth=4,
+                 subsample=0.8, patience=50, seed=0):
+        self.n, self.lr, self.depth = n_estimators, learning_rate, max_depth
+        self.subsample, self.patience = subsample, patience
+        self.rng = np.random.default_rng(seed)
+
+    def fit(self, X, y, X_val, y_val):
+        self.f0 = y.mean()
+        self.trees = []
+        F, F_val = np.full(len(y), self.f0), np.full(len(y_val), self.f0)
+        best, best_iter = np.inf, 0
+        for t in range(self.n):
+            residual = y - F                               # negative gradient of 1/2 (y-F)^2
+            idx = self.rng.random(len(y)) &lt; self.subsample # stochastic gradient boosting
+            tree = DecisionTreeRegressor(max_depth=self.depth, random_state=t)
+            tree.fit(X[idx], residual[idx])
+            F += self.lr * tree.predict(X)
+            F_val += self.lr * tree.predict(X_val)
+            self.trees.append(tree)
+            val_mse = np.mean((y_val - F_val) ** 2)
+            if val_mse &lt; best:
+                best, best_iter = val_mse, t
+            elif t - best_iter &gt;= self.patience:
+                break
+        self.trees = self.trees[: best_iter + 1]           # keep the best iteration
+        return self
+
+    def predict(self, X):
+        return self.f0 + self.lr * sum(t.predict(X) for t in self.trees)
+
+gbm = TinyGBM().fit(X_tr, y_tr, X_val, y_val)
+print("trees kept:", len(gbm.trees), " test MSE:", np.mean((gbm.predict(X_te) - y_te) ** 2))
+# Illustrative: several hundred trees, test MSE ~0.22-0.25 (vs ~0.55 for linear regression)</code></pre>
+
+  <h3>7.6 The library zoo on one benchmark</h3>
+<pre data-file="tabular_benchmark.py"><code class="language-python">import time
+import numpy as np
+import lightgbm as lgb
+import xgboost as xgb
+from sklearn.datasets import fetch_california_housing
+from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
+from sklearn.linear_model import RidgeCV
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import train_test_split
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+SEED = 42
+X, y = fetch_california_housing(return_X_y=True, as_frame=True)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=SEED)
+X_fit, X_val, y_fit, y_val = train_test_split(X_tr, y_tr, test_size=0.15, random_state=SEED)
+
+def rmse(model, X=X_te):
+    return mean_squared_error(y_te, model.predict(X)) ** 0.5
+
+results = {}
+t = time.perf_counter()
+ridge = make_pipeline(StandardScaler(), RidgeCV(alphas=np.logspace(-3, 3, 13))).fit(X_tr, y_tr)
+results["ridge"] = (rmse(ridge), time.perf_counter() - t)
+
+t = time.perf_counter()
+knn = make_pipeline(StandardScaler(), KNeighborsRegressor(n_neighbors=10, weights="distance")).fit(X_tr, y_tr)
+results["knn"] = (rmse(knn), time.perf_counter() - t)
+
+t = time.perf_counter()
+rf = RandomForestRegressor(n_estimators=300, min_samples_leaf=2, n_jobs=-1,
+                           oob_score=True, random_state=SEED).fit(X_tr, y_tr)
+results["random_forest"] = (rmse(rf), time.perf_counter() - t)
+print("RF OOB R^2:", round(rf.oob_score_, 3))
+
+t = time.perf_counter()
+hgb = HistGradientBoostingRegressor(max_iter=2000, learning_rate=0.05, early_stopping=True,
+                                    validation_fraction=0.15, n_iter_no_change=50,
+                                    random_state=SEED).fit(X_tr, y_tr)
+results["sklearn_hgb"] = (rmse(hgb), time.perf_counter() - t)
+
+t = time.perf_counter()
+xgbm = xgb.XGBRegressor(n_estimators=5000, learning_rate=0.03, max_depth=7, subsample=0.8,
+                        colsample_bytree=0.8, reg_lambda=1.0, min_child_weight=3,
+                        tree_method="hist", early_stopping_rounds=100, eval_metric="rmse",
+                        random_state=SEED, n_jobs=-1)
+xgbm.fit(X_fit, y_fit, eval_set=[(X_val, y_val)], verbose=False)
+results["xgboost"] = (rmse(xgbm), time.perf_counter() - t)
+print("XGB best iteration:", xgbm.best_iteration)
+
+t = time.perf_counter()
+lgbm = lgb.LGBMRegressor(n_estimators=5000, learning_rate=0.03, num_leaves=63, min_child_samples=20,
+                         subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
+                         random_state=SEED, verbose=-1)
+lgbm.fit(X_fit, y_fit, eval_set=[(X_val, y_val)],
+         callbacks=[lgb.early_stopping(100, verbose=False)])
+results["lightgbm"] = (rmse(lgbm), time.perf_counter() - t)
+
+for name, (score, secs) in sorted(results.items(), key=lambda kv: kv[1][0]):
+    print(f"{name:14s} RMSE {score:.3f}   fit {secs:6.1f}s")
+# Illustrative ranking: GBDTs ~0.43-0.46, RF ~0.50, kNN ~0.60, ridge ~0.73 (target in $100k)
+
+xgbm.save_model("housing_xgb.json")                  # portable JSON for XGBoost4J / other runtimes</code></pre>
+
+  <h3>7.7 Classification with XGBoost on Adult, with imbalance and categoricals</h3>
+<pre data-file="adult_xgb.py"><code class="language-python">import numpy as np
+import xgboost as xgb
+from sklearn.datasets import fetch_openml
+from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.model_selection import train_test_split
+
+df = fetch_openml("adult", version=2, as_frame=True).frame
+y = (df.pop("class") == "&gt;50K").astype(int)
+X = df.drop(columns=["fnlwgt"])                          # categorical dtype columns kept as-is
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, stratify=y, random_state=0)
+X_fit, X_val, y_fit, y_val = train_test_split(X_tr, y_tr, test_size=0.15, stratify=y_tr, random_state=0)
+
+clf = xgb.XGBClassifier(
+    n_estimators=3000, learning_rate=0.03, max_depth=6, subsample=0.8, colsample_bytree=0.8,
+    enable_categorical=True, tree_method="hist", max_cat_to_onehot=8,
+    eval_metric="aucpr", early_stopping_rounds=100, random_state=0)
+clf.fit(X_fit, y_fit, eval_set=[(X_val, y_val)], verbose=False)
+p = clf.predict_proba(X_te)[:, 1]
+print("ROC-AUC %.4f  PR-AUC %.4f  best_iter %d" % (
+    roc_auc_score(y_te, p), average_precision_score(y_te, p), clf.best_iteration))
+# Illustrative: ROC-AUC ~0.93, PR-AUC ~0.83
+
+# Gain-based importance (see Chapter 6.5 for why permutation/SHAP is more trustworthy)
+imp = clf.get_booster().get_score(importance_type="gain")
+print(sorted(imp.items(), key=lambda kv: -kv[1])[:5])</code></pre>
+
+  <h3>7.8 Serving a boosted model in a Spring Boot service</h3>
+  <div class="code-tabs">
+<pre data-lang="Java"><code class="language-java">// build.gradle: implementation "ml.dmlc:xgboost4j_2.12:&lt;version matching training&gt;"
+package com.example.pricing;
+
+import ml.dmlc.xgboost4j.java.Booster;
+import ml.dmlc.xgboost4j.java.DMatrix;
+import ml.dmlc.xgboost4j.java.XGBoost;
+import ml.dmlc.xgboost4j.java.XGBoostError;
+import org.springframework.stereotype.Service;
+import java.util.List;
+
+@Service
+public class HousePriceModel {
+    // Feature order MUST match training column order; keep it in one versioned constant.
+    public static final List&lt;String&gt; FEATURES = List.of(
+        "MedInc", "HouseAge", "AveRooms", "AveBedrms", "Population", "AveOccup", "Latitude", "Longitude");
+
+    private final Booster booster;
+
+    public HousePriceModel() throws XGBoostError {
+        this.booster = XGBoost.loadModel("models/housing_xgb.json");
+    }
+
+    /** Thread-safety: guard with a pool or synchronise per your XGBoost4J version's guarantees. */
+    public synchronized float[] predict(float[][] rows) throws XGBoostError {
+        int n = rows.length, d = FEATURES.size();
+        float[] flat = new float[n * d];
+        for (int i = 0; i &lt; n; i++) System.arraycopy(rows[i], 0, flat, i * d, d);
+        DMatrix dm = new DMatrix(flat, n, d, Float.NaN);   // NaN = missing, follows default branches
+        try {
+            float[][] out = booster.predict(dm);
+            float[] result = new float[n];
+            for (int i = 0; i &lt; n; i++) result[i] = out[i][0];
+            return result;
+        } finally {
+            dm.dispose();
+        }
+    }
+}</code></pre>
+<pre data-lang="Python"><code class="language-python"># Parity check to run in CI: Python predictions vs a JSON fixture produced by the Java service
+import json
+import numpy as np
+import xgboost as xgb
+from sklearn.datasets import fetch_california_housing
+
+X, _ = fetch_california_housing(return_X_y=True, as_frame=True)
+booster = xgb.Booster()
+booster.load_model("housing_xgb.json")
+sample = X.sample(1000, random_state=0)
+py_pred = booster.predict(xgb.DMatrix(sample))
+json.dump({"rows": sample.to_numpy().tolist(), "pred": py_pred.tolist()},
+          open("parity_fixture.json", "w"))
+# The Java test loads parity_fixture.json, scores "rows", and asserts |diff| &lt; 1e-5.</code></pre>
+  </div>
+</section>
+
+<section id="applications">
+  <h2>8. Applications</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Problem</th><th>Task type</th><th>Typical model</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Estimated time of arrival / delivery time</td><td>Regression</td><td>GBDT, later deep models at very large scale</td><td>Non-linear interactions among distance, time of day, location, load</td></tr>
+      <tr><td>Fraud and abuse detection</td><td>Binary classification, imbalanced</td><td>GBDT with velocity features; logistic regression as a transparent fallback</td><td>Strong with heterogeneous features and missing values; fast inference</td></tr>
+      <tr><td>Credit scoring</td><td>Binary classification</td><td>Logistic regression on binned features (scorecards), increasingly constrained GBDT with monotonic constraints</td><td>Regulatory explainability; monotone relationships required</td></tr>
+      <tr><td>Churn and propensity</td><td>Binary classification</td><td>GBDT, logistic regression</td><td>Tabular CRM data; need calibrated probabilities for targeting</td></tr>
+      <tr><td>Search and recommendation ranking</td><td>Learning to rank</td><td>LambdaMART (GBDT with ranking objectives: XGBoost <code>rank:ndcg</code>, LightGBM <code>lambdarank</code>), then neural rankers</td><td>Ranking metrics optimised directly</td></tr>
+      <tr><td>Demand forecasting</td><td>Regression on counts</td><td>GBDT with Poisson/Tweedie loss on lag features</td><td>Handles many related series with shared features</td></tr>
+      <tr><td>Text routing / spam</td><td>Multiclass classification</td><td>TF-IDF + logistic regression or linear SVM; transformer fine-tuning at higher budgets</td><td>Sparse high-dimensional data suits linear models</td></tr>
+      <tr><td>Capacity / latency prediction</td><td>Regression</td><td>Linear models with engineered features, GBDT</td><td>Interpretability for capacity planning</td></tr>
+    </tbody>
+  </table></div>
+  <p>Note the pattern for regulated decisions: <strong>monotonic constraints</strong> (<code>monotone_constraints</code> in XGBoost/LightGBM, <code>monotonic_cst</code> in HistGradientBoosting) force predictions to be non-decreasing in, say, debt-to-income, which makes models easier to justify and prevents absurd local behaviour.</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 XGBoost's own evidence</h3>
+  <p><span class="tag fact">Verified</span> The XGBoost paper reports that among the 29 winning solutions published on Kaggle's blog in 2015, 17 used XGBoost, and that in KDD Cup 2015 every top-10 team used it. It also details the sparsity-aware split finding and weighted quantile sketch described in §3.11 and §4.4. Source: <a href="https://arxiv.org/abs/1603.02754">Chen &amp; Guestrin, "XGBoost: A Scalable Tree Boosting System", arXiv:1603.02754</a>.</p>
+  <h3>9.2 Uber: boosted trees inside a platform</h3>
+  <p><span class="tag fact">Verified</span> Uber's Michelangelo post describes the platform's support for decision-tree ensembles, linear and logistic models and other algorithms, with the UberEATS estimated-time-to-delivery model, built with gradient-boosted decision tree regression, as its running example; features such as average meal preparation time came from the shared feature store. Their later retrospective describes the progression from tree models to deep learning. Sources: <a href="https://www.uber.com/blog/michelangelo-machine-learning-platform/">Meet Michelangelo</a>; <a href="https://www.uber.com/blog/from-predictive-to-generative-ai/">From Predictive to Generative</a>.</p>
+  <h3>9.3 Airbnb search: when boosting plateaued</h3>
+  <p><span class="tag fact">Verified</span> Airbnb reported that a GBDT model drove much of their early search-ranking improvement and that gains plateaued, after which they invested in neural networks, documenting that the transition was harder than expected and that the first simple neural models did not immediately beat the tuned GBDT. Source: <a href="https://arxiv.org/abs/1810.09591">Haldar et al., arXiv:1810.09591</a>. <span class="tag opinion">Opinion</span> The lesson: a well-tuned GBDT is a strong incumbent; plan a neural replacement as a project with its own feature and infrastructure work, not a model swap.</p>
+  <h3>9.4 Tree models versus deep learning on tables</h3>
+  <p><span class="tag fact">Verified</span> Grinsztajn, Oyallon and Varoquaux benchmarked tree-based models against deep architectures on 45 medium-sized tabular datasets and found tree ensembles remained state of the art in that regime, attributing part of the gap to neural networks' bias toward overly smooth functions and sensitivity to uninformative features. Source: <a href="https://arxiv.org/abs/2207.08815">"Why do tree-based models still outperform deep learning on tabular data?", arXiv:2207.08815</a>. Newer tabular foundation models are an active research area; re-check claims for your data size <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages and Limits</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Model</th><th>Strengths</th><th>Weaknesses</th><th>Operational profile</th></tr></thead>
+    <tbody>
+      <tr><td>Linear / logistic (+ L1/L2)</td><td>Convex, fast, interpretable coefficients, calibrated (logistic), tiny artifacts, extrapolates linearly</td><td>Only linear boundaries without feature engineering; sensitive to scaling and collinearity</td><td>Microsecond inference; weights fit in a config file</td></tr>
+      <tr><td>k-NN</td><td>No training; naturally multi-class; adapts locally</td><td>Slow prediction; curse of dimensionality; needs scaling</td><td>Memory = dataset; needs ANN index at scale</td></tr>
+      <tr><td>SVM (kernel)</td><td>Max-margin; effective in high dimensions with modest m</td><td>Poor scaling in m; no native probabilities; kernel/C/γ tuning</td><td>Largely legacy for big data; linear SVM still fine for text</td></tr>
+      <tr><td>Single decision tree</td><td>Readable rules; no scaling; handles interactions</td><td>Unstable; overfits; piecewise-constant; cannot extrapolate</td><td>Trivial to serve; good for explaining or distilling</td></tr>
+      <tr><td>Random forest</td><td>Robust defaults; OOB validation; parallel; hard to overfit by adding trees</td><td>Large models; usually below tuned boosting; cannot extrapolate</td><td>Memory and latency grow with deep trees</td></tr>
+      <tr><td>Gradient boosting (XGBoost/LightGBM/CatBoost)</td><td>Top accuracy on tabular data; any differentiable loss; missing values; monotone constraints</td><td>Sequential training; many hyperparameters; overfits without early stopping; cannot extrapolate</td><td>Fast inference (shallow trees); compact; GPU training available</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs: Choosing a Model</h2>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  S["Tabular supervised problem"] --> B["Always: build a regularised linear/logistic baseline"]
+  B --> Q1{"Need strict interpretability or monotone, auditable model?"}
+  Q1 -- yes --> L["Logistic scorecard or GBDT with monotone constraints + SHAP"]
+  Q1 -- no --> Q2{"Data size?"}
+  Q2 -- "under ~1k rows" --> SM["Regularised linear, small RF; cross-validate heavily"]
+  Q2 -- "1k to 100M rows" --> G["GBDT: LightGBM / XGBoost / CatBoost with early stopping"]
+  G --> Q3{"Many high-cardinality categoricals?"}
+  Q3 -- yes --> CB["Try CatBoost first"]
+  Q3 -- no --> LX["LightGBM for speed, XGBoost for ecosystem"]
+  Q2 -- "huge, plus text/images/sequences" --> NN["Neural networks (Part 7), possibly GBDT on embeddings"]
+</pre>
+  <figcaption>Figure 6.3.4 — A pragmatic model-selection flow for tabular problems.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> every path starts with a linear baseline because it is cheap, interpretable, and tells you how much non-linearity the better model is buying. Data size and data modality then dominate: GBDTs for the broad middle of tabular problems, neural networks when unstructured inputs or enormous scale make representation learning pay. Interpretability requirements can override accuracy, but monotone-constrained GBDTs plus SHAP (Chapter 6.5) often satisfy both. This flow is <span class="tag opinion">Opinion</span> distilled from common practice, not a law.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Trade-off</th><th>Option A</th><th>Option B</th><th>Guidance</th></tr></thead>
+    <tbody>
+      <tr><td>Bagging vs boosting</td><td>Random forest: robust, parallel, few knobs</td><td>GBDT: more accurate, sequential, needs early stopping</td><td>RF for a quick strong baseline; GBDT for the production model</td></tr>
+      <tr><td>Depth-wise vs leaf-wise growth</td><td>Balanced trees, more conservative</td><td>Lower loss per leaf, overfits small data</td><td>Leaf-wise with <code>num_leaves</code> and <code>min_data_in_leaf</code> constraints</td></tr>
+      <tr><td>Learning rate vs trees</td><td>High η, few trees: fast to train</td><td>Low η, many trees: usually better generalisation</td><td>Tune η coarse, then lower it with early stopping for the final model</td></tr>
+      <tr><td>L1 vs L2</td><td>Sparse, selects features</td><td>Stable, keeps correlated features</td><td>Elastic net when unsure; L1 when you need a small feature set</td></tr>
+      <tr><td>Accuracy vs latency</td><td>2,000 deep trees</td><td>200 shallow trees</td><td>Measure p99 in the serving stack; distil or prune if needed</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes</h2>
+  <ul>
+    <li><strong>Interpreting raw coefficients of unscaled or correlated features as importance.</strong> A coefficient's size depends on units; correlated features split or flip weight.</li>
+    <li><strong>Reading <code>C</code> as regularisation strength.</strong> In LogisticRegression and SVC, C is the inverse: higher C means weaker regularisation.</li>
+    <li><strong>Forgetting regularisation is on by default.</strong> scikit-learn's LogisticRegression is L2-regularised by default; coefficients differ from statsmodels' unpenalised MLE.</li>
+    <li><strong>Unlimited-depth single trees in production.</strong> Perfect training accuracy, unstable predictions.</li>
+    <li><strong>Boosting without early stopping.</strong> Validation loss rises while training loss keeps falling.</li>
+    <li><strong>Using the test set for early stopping.</strong> Then the test score is optimistically biased; use a separate validation split.</li>
+    <li><strong>Assuming tree models extrapolate.</strong> A GBDT trained on prices up to $2M will never predict $3M; trees output values within the training target range. Combine with a linear component or model ratios if extrapolation matters.</li>
+    <li><strong>Feature order mismatch at serving.</strong> XGBoost DMatrix columns are positional; a reordered feature list silently produces garbage scores.</li>
+    <li><strong>Trusting gain-based feature importance.</strong> It is biased toward high-cardinality and continuous features; use permutation importance or SHAP.</li>
+    <li><strong>Mismatched library versions</strong> between training and serving (XGBoost4J vs Python XGBoost), changing default behaviours or model format support.</li>
+    <li><strong>Thresholding at 0.5 out of habit.</strong> The threshold is a business decision based on costs and base rates (Chapter 6.5).</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Latency and throughput</h3>
+  <p>Inference cost for GBDTs is roughly trees × depth comparisons, cache behaviour dominating at scale. Batch requests; use compiled predictors where latency matters (ONNX Runtime, Treelite/TL2cgen-style compilation, or the library's native predictor); constrain tree count and depth with latency as an explicit objective. For linear models, the cost is feature retrieval, not math.</p>
+  <h3>13.2 Calibration</h3>
+  <p>Logistic regression is usually well calibrated; boosted models trained on log-loss are often reasonable; random forests and SVMs are not. If probabilities feed decisions, check reliability curves and apply Platt scaling or isotonic regression on held-out data (Chapter 6.5).</p>
+  <h3>13.3 Monitoring and retraining</h3>
+  <p>Monitor input drift, score distributions, and (when labels arrive) performance by segment. Retrain on a schedule or on drift triggers; compare challenger to champion offline, then online. Keep the previous model artifact for instant rollback, as you would keep the previous container image.</p>
+  <h3>13.4 Reproducibility</h3>
+  <p>Seed everything (<code>random_state</code>, <code>seed</code>), pin library versions, log the training data snapshot ID and feature list, and store the model with its metadata in a registry (MLflow or equivalent). Note that multithreaded histogram building can introduce tiny floating-point differences; use deterministic settings where offered if you need bit-exact reproduction.</p>
+  <h3>13.5 Security and robustness</h3>
+  <p>Validate inputs at the service boundary (ranges, types) before scoring; trees will happily score absurd inputs. Rate-limit and avoid exposing raw scores externally to reduce model extraction risk. Model files are code-adjacent: load only signed artifacts from your registry; avoid pickle where a data format (XGBoost JSON, ONNX) exists.</p>
+</section>
