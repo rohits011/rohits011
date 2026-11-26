@@ -347,3 +347,670 @@ flowchart LR
   <h3>6.5 TLS overhead</h3>
   <p>A full TLS 1.3 handshake costs one round trip plus a signature and a key exchange; on modern servers ECDHE + ECDSA/RSA verification takes well under a millisecond of CPU. Hybrid ML-KEM adds roughly a kilobyte to the ClientHello and ServerHello — which can push ClientHello over a single packet and break buggy middleboxes, the main practical deployment issue Chrome and Cloudflare reported. Connection reuse (HTTP/2, keep-alive pools) amortises handshakes; for mTLS-heavy meshes, CPU cost is dominated by data encryption (AES-GCM with AES-NI runs at gigabytes per second per core).</p>
 </section>
+
+<section id="code">
+  <h2>7. Code: Secrets, Envelope Encryption, mTLS, Hardened Images and Cluster Policy</h2>
+  <p><span class="tag version">Version-sensitive · checked Nov 2026</span> Spring Boot 3.5/4.x, AWS SDK for Java v2, Java 21, Go 1.24+, Python <code>cryptography</code> 43+, Kubernetes 1.30+, cosign v2.</p>
+
+  <h3>7.1 Secrets from Vault or AWS Secrets Manager with workload identity</h3>
+  <pre data-file="application.yml (Spring Cloud Vault, Kubernetes auth)"><code class="language-yaml">spring:
+  config:
+    import: "vault://"
+  cloud:
+    vault:
+      uri: https://vault.internal.example.com:8200
+      authentication: KUBERNETES            # pod's service-account token, no static Vault token
+      kubernetes:
+        role: orders-api
+      kv:
+        enabled: true
+        backend: secret
+        default-context: orders-api
+      database:
+        enabled: true                       # dynamic DB credentials with a lease
+        role: orders-api-rw
+        backend: database</code></pre>
+  <pre data-file="application.yml (Spring Cloud AWS Secrets Manager via IRSA)"><code class="language-yaml">spring:
+  config:
+    import: "aws-secretsmanager:/prod/orders-api/db"   # credentials come from the pod's IAM role
+# The secret JSON {"username":"...","password":"..."} becomes properties; reference them as
+# spring.datasource.username=${username} and spring.datasource.password=${password}</code></pre>
+  <p>With dynamic database credentials, configure the Hikari pool's <code>max-lifetime</code> shorter than the lease so connections are recycled before credentials expire; Spring Cloud Vault renews leases while the application runs.</p>
+  <pre data-file=".pre-commit-config.yaml"><code class="language-yaml">repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2            # pin to a reviewed release
+    hooks:
+      - id: gitleaks</code></pre>
+
+  <h3>7.2 Envelope encryption in Java with AWS KMS</h3>
+  <pre data-file="EnvelopeCrypto.java"><code class="language-java">package com.example.crypto;
+
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+import java.util.Arrays;
+import java.util.Map;
+import javax.crypto.Cipher;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+import software.amazon.awssdk.core.SdkBytes;
+import software.amazon.awssdk.services.kms.KmsClient;
+import software.amazon.awssdk.services.kms.model.DataKeySpec;
+import software.amazon.awssdk.services.kms.model.DecryptRequest;
+import software.amazon.awssdk.services.kms.model.GenerateDataKeyRequest;
+import software.amazon.awssdk.services.kms.model.GenerateDataKeyResponse;
+
+/** Format: [1 byte version][2 bytes encDEK length][encDEK][12 bytes nonce][ciphertext||tag] */
+public final class EnvelopeCrypto {
+    private static final byte VERSION = 1;
+    private static final SecureRandom RNG = new SecureRandom();
+    private final KmsClient kms;          // credentials from IRSA / Pod Identity via the default chain
+    private final String kekId;           // e.g. alias/orders-data
+
+    public EnvelopeCrypto(KmsClient kms, String kekId) { this.kms = kms; this.kekId = kekId; }
+
+    public byte[] encrypt(byte[] plaintext, String tenantId) throws Exception {
+        Map&lt;String, String&gt; ctx = Map.of("tenant", tenantId);
+        GenerateDataKeyResponse dk = kms.generateDataKey(GenerateDataKeyRequest.builder()
+                .keyId(kekId).keySpec(DataKeySpec.AES_256).encryptionContext(ctx).build());
+        byte[] dek = dk.plaintext().asByteArray();
+        byte[] encDek = dk.ciphertextBlob().asByteArray();
+        try {
+            byte[] nonce = new byte[12];
+            RNG.nextBytes(nonce);
+            Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+            c.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(dek, "AES"), new GCMParameterSpec(128, nonce));
+            c.updateAAD(aad(tenantId));
+            byte[] ct = c.doFinal(plaintext);
+            return ByteBuffer.allocate(1 + 2 + encDek.length + nonce.length + ct.length)
+                    .put(VERSION).putShort((short) encDek.length).put(encDek).put(nonce).put(ct).array();
+        } finally {
+            Arrays.fill(dek, (byte) 0);
+        }
+    }
+
+    public byte[] decrypt(byte[] blob, String tenantId) throws Exception {
+        ByteBuffer b = ByteBuffer.wrap(blob);
+        if (b.get() != VERSION) throw new IllegalArgumentException("unknown format version");
+        byte[] encDek = new byte[b.getShort()];
+        b.get(encDek);
+        byte[] nonce = new byte[12];
+        b.get(nonce);
+        byte[] ct = new byte[b.remaining()];
+        b.get(ct);
+        byte[] dek = kms.decrypt(DecryptRequest.builder()
+                .ciphertextBlob(SdkBytes.fromByteArray(encDek))
+                .encryptionContext(Map.of("tenant", tenantId))      // must match, or KMS refuses
+                .keyId(kekId).build()).plaintext().asByteArray();
+        try {
+            Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+            c.init(Cipher.DECRYPT_MODE, new SecretKeySpec(dek, "AES"), new GCMParameterSpec(128, nonce));
+            c.updateAAD(aad(tenantId));
+            return c.doFinal(ct);                                     // AEADBadTagException if tampered
+        } finally {
+            Arrays.fill(dek, (byte) 0);
+        }
+    }
+
+    private static byte[] aad(String tenantId) { return ("tenant:" + tenantId).getBytes(StandardCharsets.UTF_8); }
+}</code></pre>
+  <p>For new code, consider Google Tink (<code>com.google.crypto.tink</code>) or the AWS Encryption SDK, which implement this format, key-ID prefixes and rotation for you; the hand-rolled version above is shown so the mechanism is visible.</p>
+
+  <h3>7.3 AEAD in Python and Go</h3>
+  <div class="code-tabs">
+  <pre data-lang="Python"><code class="language-python"># pip install "cryptography&gt;=43"
+import os
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+from cryptography.hazmat.primitives import hashes, hmac
+
+key = AESGCM.generate_key(bit_length=256)     # in production: a DEK from KMS, never a literal
+aead = AESGCM(key)
+nonce = os.urandom(12)                         # unique per encryption under this key
+aad = b"tenant:t-42"
+ct = aead.encrypt(nonce, b"invoice #1001", aad)
+assert aead.decrypt(nonce, ct, aad) == b"invoice #1001"   # raises InvalidTag if modified
+
+# HMAC-SHA256 for webhook signatures, constant-time verify
+def sign(secret: bytes, body: bytes) -&gt; bytes:
+    h = hmac.HMAC(secret, hashes.SHA256()); h.update(body); return h.finalize()
+
+def verify(secret: bytes, body: bytes, sig: bytes) -&gt; None:
+    h = hmac.HMAC(secret, hashes.SHA256()); h.update(body); h.verify(sig)   # raises InvalidSignature</code></pre>
+  <pre data-lang="Go"><code class="language-go">package main
+
+import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"net/http"
+	"os"
+)
+
+func seal(key, plaintext, aad []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key) // 32-byte key = AES-256
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	return gcm.Seal(nonce, nonce, plaintext, aad), nil // nonce prepended
+}
+
+// mTLS server: require and verify client certificates from the internal CA; TLS 1.3 only.
+func mtlsServer() *http.Server {
+	caPEM, _ := os.ReadFile("/etc/tls/ca.crt")
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caPEM)
+	return &amp;http.Server{
+		Addr: ":8443",
+		TLSConfig: &amp;tls.Config{
+			MinVersion: tls.VersionTLS13,
+			ClientAuth: tls.RequireAndVerifyClientCert,
+			ClientCAs:  pool,
+			// Go 1.24+ offers X25519MLKEM768 by default in CurvePreferences.
+		},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			id := r.TLS.PeerCertificates[0].URIs // SPIFFE ID, e.g. spiffe://prod/ns/orders/sa/orders-api
+			fmt.Fprintf(w, "hello %v\n", id)
+		}),
+	}
+}
+
+func main() {
+	key := make([]byte, 32)
+	rand.Read(key)
+	ct, _ := seal(key, []byte("invoice #1001"), []byte("tenant:t-42"))
+	fmt.Println(len(ct))
+	_ = mtlsServer().ListenAndServeTLS("/etc/tls/tls.crt", "/etc/tls/tls.key")
+}</code></pre>
+  </div>
+
+  <h3>7.4 mTLS in Spring Boot with SSL bundles</h3>
+  <pre data-file="application.yml"><code class="language-yaml">spring:
+  ssl:
+    bundle:
+      pem:
+        server:
+          keystore:
+            certificate: file:/etc/tls/tls.crt       # rotated by cert-manager; Boot can reload bundles
+            private-key: file:/etc/tls/tls.key
+          truststore:
+            certificate: file:/etc/tls/ca.crt
+          reload-on-update: true
+        payments-client:
+          keystore:
+            certificate: file:/etc/tls/tls.crt
+            private-key: file:/etc/tls/tls.key
+          truststore:
+            certificate: file:/etc/tls/ca.crt
+server:
+  port: 8443
+  ssl:
+    bundle: server
+    client-auth: need                               # require client certificates
+    enabled-protocols: TLSv1.3</code></pre>
+  <pre data-file="PaymentsClientConfig.java"><code class="language-java">@Bean
+RestClient paymentsClient(RestClient.Builder builder, SslBundles bundles) {
+    var settings = ClientHttpRequestFactorySettings.defaults().withSslBundle(bundles.getBundle("payments-client"));
+    return builder.baseUrl("https://payments.internal.example.com:8443")
+                  .requestFactory(ClientHttpRequestFactoryBuilder.detect().build(settings))
+                  .build();   // hostname verification stays ON; never install a trust-all TrustManager
+}
+// Map the client certificate to a principal on the server side with http.x509(...) and a
+// custom principal extractor that reads the SAN URI (SPIFFE ID) instead of the CN.</code></pre>
+
+  <h3>7.5 Least-privilege IAM policy and trust policy</h3>
+  <pre data-file="orders-api-policy.json"><code class="language-json">{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "InvoiceObjects",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::acme-invoices-prod/orders-api/*"
+    },
+    {
+      "Sid": "UseDataKey",
+      "Effect": "Allow",
+      "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+      "Resource": "arn:aws:kms:eu-west-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+      "Condition": { "StringLike": { "kms:EncryptionContext:tenant": "*" } }
+    },
+    {
+      "Sid": "ReadOwnSecret",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:eu-west-1:111122223333:secret:prod/orders-api/*"
+    }
+  ]
+}</code></pre>
+  <pre data-file="orders-api-trust.json"><code class="language-json">{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::111122223333:oidc-provider/oidc.eks.eu-west-1.amazonaws.com/id/EXAMPLE" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "oidc.eks.eu-west-1.amazonaws.com/id/EXAMPLE:sub": "system:serviceaccount:orders:orders-api",
+        "oidc.eks.eu-west-1.amazonaws.com/id/EXAMPLE:aud": "sts.amazonaws.com"
+      }
+    }
+  }]
+}</code></pre>
+
+  <h3>7.6 Hardened container image</h3>
+  <pre data-file="Dockerfile"><code class="language-dockerfile"># syntax=docker/dockerfile:1.7
+FROM eclipse-temurin:21-jdk@sha256:&lt;pinned-digest&gt; AS build
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,target=/root/.gradle ./gradlew --no-daemon bootJar \
+ &amp;&amp; java -Djarmode=tools -jar build/libs/app.jar extract --layers --launcher --destination /out
+
+FROM gcr.io/distroless/java21-debian12:nonroot@sha256:&lt;pinned-digest&gt;
+WORKDIR /app
+COPY --from=build /out/dependencies/ ./
+COPY --from=build /out/spring-boot-loader/ ./
+COPY --from=build /out/snapshot-dependencies/ ./
+COPY --from=build /out/application/ ./
+USER 65532:65532
+EXPOSE 8443
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "org.springframework.boot.loader.launch.JarLauncher"]</code></pre>
+  <p>Replace <code>&lt;pinned-digest&gt;</code> with real digests (Renovate can keep them current). The <code>jarmode=tools</code> layer extraction applies to Spring Boot 3.3+; older versions use <code>layertools</code>. Jib and Cloud Native Buildpacks produce comparable non-root images without a Dockerfile.</p>
+
+  <h3>7.7 Kubernetes: restricted namespace, hardened pod, default-deny network, external secret</h3>
+  <pre data-file="k8s/orders.yaml"><code class="language-yaml">apiVersion: v1
+kind: Namespace
+metadata:
+  name: orders
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orders-api
+  namespace: orders
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::111122223333:role/orders-api
+automountServiceAccountToken: false          # the app does not call the Kubernetes API
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: orders-api, namespace: orders }
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: orders-api } }
+  template:
+    metadata: { labels: { app: orders-api } }
+    spec:
+      serviceAccountName: orders-api
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: app
+          image: registry.example.com/orders-api@sha256:&lt;digest&gt;
+          ports: [{ containerPort: 8443 }]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits: { memory: "768Mi" }
+          volumeMounts: [{ name: tmp, mountPath: /tmp }]
+      volumes: [{ name: tmp, emptyDir: {} }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny, namespace: orders }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: orders-api-flows, namespace: orders }
+spec:
+  podSelector: { matchLabels: { app: orders-api } }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: ingress } } }]
+      ports: [{ port: 8443 }]
+  egress:
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }, podSelector: { matchLabels: { k8s-app: kube-dns } } }]
+      ports: [{ port: 53, protocol: UDP }, { port: 53, protocol: TCP }]
+    - to: [{ ipBlock: { cidr: 10.20.0.0/16 } }]          # database subnet
+      ports: [{ port: 5432 }]
+    # Note: no rule allows 169.254.169.254 (instance metadata); IRSA uses STS over HTTPS instead —
+    # allow egress to the STS/KMS VPC endpoints' addresses explicitly.
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata: { name: orders-db, namespace: orders }
+spec:
+  refreshInterval: 1h
+  secretStoreRef: { name: aws-secrets-manager, kind: ClusterSecretStore }
+  target: { name: orders-db }
+  data:
+    - secretKey: password
+      remoteRef: { key: prod/orders-api/db, property: password }</code></pre>
+  <p>The External Secrets Operator API version has moved from <code>v1beta1</code> to <code>v1</code> in recent releases; use whichever your installed operator serves.</p>
+
+  <h3>7.8 Signing, SBOM and verification</h3>
+  <pre data-file=".github/workflows/release.yml"><code class="language-yaml">name: release
+on: { push: { branches: [main] } }
+permissions:
+  contents: read
+  packages: write
+  id-token: write          # OIDC token for keyless signing
+  attestations: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4                       # pin to a full commit SHA in production
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@v6
+        with: { push: true, tags: "ghcr.io/acme/orders-api:${{ github.sha }}" }
+      - name: SBOM
+        uses: anchore/sbom-action@v0
+        with: { image: "ghcr.io/acme/orders-api@${{ steps.push.outputs.digest }}", format: cyclonedx-json, output-file: sbom.cdx.json }
+      - name: Provenance attestation (SLSA)
+        uses: actions/attest-build-provenance@v2
+        with: { subject-name: ghcr.io/acme/orders-api, subject-digest: "${{ steps.push.outputs.digest }}", push-to-registry: true }
+      - uses: sigstore/cosign-installer@v3
+      - name: Keyless sign image and attach SBOM attestation
+        run: |
+          cosign sign --yes ghcr.io/acme/orders-api@${{ steps.push.outputs.digest }}
+          cosign attest --yes --type cyclonedx --predicate sbom.cdx.json ghcr.io/acme/orders-api@${{ steps.push.outputs.digest }}</code></pre>
+  <pre data-file="verify.sh"><code class="language-bash">cosign verify ghcr.io/acme/orders-api@sha256:&lt;digest&gt; \
+  --certificate-identity-regexp '^https://github.com/acme/orders-api/.github/workflows/release.yml@refs/heads/main$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+gh attestation verify oci://ghcr.io/acme/orders-api@sha256:&lt;digest&gt; --owner acme</code></pre>
+  <pre data-file="kyverno-verify-images.yaml"><code class="language-yaml">apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata: { name: require-signed-images }
+spec:
+  validationFailureAction: Enforce
+  webhookTimeoutSeconds: 15
+  rules:
+    - name: verify-signature
+      match: { any: [{ resources: { kinds: [Pod] } }] }
+      verifyImages:
+        - imageReferences: ["ghcr.io/acme/*"]
+          mutateDigest: true                  # rewrite tags to digests
+          attestors:
+            - entries:
+                - keyless:
+                    subject: "https://github.com/acme/*/.github/workflows/release.yml@refs/heads/main"
+                    issuer: "https://token.actions.githubusercontent.com"
+                    rekor: { url: https://rekor.sigstore.dev }</code></pre>
+</section>
+
+<section id="applications">
+  <h2>8. Applications: A Realistic Adoption Sequence</h2>
+  <p><span class="tag opinion">Opinion</span> Teams rarely adopt everything at once. A sequence that front-loads risk reduction:</p>
+  <ol>
+    <li><strong>Secrets out of Git and images</strong>; secret scanning with push protection; rotate anything that ever leaked.</li>
+    <li><strong>Workload identity</strong> replaces static cloud keys in pods and CI (GitHub OIDC → cloud roles).</li>
+    <li><strong>Least-privilege IAM</strong> per workload, generated from Access Analyzer data; SCP guardrails (no public buckets, no disabling CloudTrail, region restrictions).</li>
+    <li><strong>TLS everywhere</strong> with cert-manager/ACME; mTLS via mesh for service-to-service.</li>
+    <li><strong>Image hardening</strong>: distroless/non-root base images from the platform team, Renovate keeping digests fresh, registry scanning.</li>
+    <li><strong>Kubernetes baseline</strong>: PSS restricted on application namespaces, default-deny NetworkPolicies, RBAC review, audit logs to SIEM.</li>
+    <li><strong>Supply chain</strong>: SBOM per build, keyless signing, provenance; verify at admission first in audit mode, then enforce.</li>
+    <li><strong>Encryption</strong>: KMS-backed encryption at rest everywhere (usually a checkbox), plus application-level envelope encryption for the most sensitive fields.</li>
+    <li><strong>Runtime detection</strong> and PQ-readiness inventory.</li>
+  </ol>
+  <p>Platform teams expose these as defaults ("golden path" templates) so application teams inherit them rather than rebuilding them per service.</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 Log4Shell (2021) <span class="tag fact">Verified</span></h3>
+  <p>CVE-2021-44228 (CVSS 10.0) in Log4j 2 was disclosed on 9–10 December 2021 and exploited at scale almost immediately; follow-up CVEs showed early mitigations were incomplete. CISA called it one of the most serious vulnerabilities it had seen and added it to KEV. Organisations with SBOMs and dependency inventories could answer "where are we exposed?" in hours. Egress restrictions blocked the remote class-loading step even on unpatched hosts. Sources: <a href="https://nvd.nist.gov/vuln/detail/CVE-2021-44228">NVD CVE-2021-44228</a>; <a href="https://www.cisa.gov/news-events/news/apache-log4j-vulnerability-guidance">CISA Apache Log4j vulnerability guidance</a>.</p>
+  <h3>9.2 The xz-utils backdoor (2024) <span class="tag fact">Verified</span></h3>
+  <p>CVE-2024-3094: malicious code in xz-utils 5.6.0 and 5.6.1 release tarballs targeted OpenSSH on some Linux distributions. Andres Freund's report to the oss-security list on 29 March 2024 described the build-time injection and the sshd impact; distributions rolled back within hours, and most stable releases were never affected. Source: <a href="https://www.openwall.com/lists/oss-security/2024/03/29/4">Andres Freund's oss-security disclosure</a>; <a href="https://nvd.nist.gov/vuln/detail/CVE-2024-3094">NVD CVE-2024-3094</a>.</p>
+  <h3>9.3 Dependency confusion (2021) <span class="tag fact">Verified</span></h3>
+  <p>Security researcher Alex Birsan published packages to public registries with names matching internal package names he found referenced by large companies; build systems configured to consult both public and private registries fetched his higher-versioned public packages, executing his (benign, reporting-only) code inside many organisations, under their bug bounty programmes. Fixes: scoped/namespaced packages, a single proxied registry with explicit precedence, and claiming internal names publicly. Source: <a href="https://medium.com/@alex.birsan/dependency-confusion-4a5d60fec610">Alex Birsan, "Dependency Confusion"</a>.</p>
+  <h3>9.4 Capital One (2019) — IAM as the blast-radius control <span class="tag fact">Verified</span></h3>
+  <p>Covered in Chapter 11.3: the SSRF gave access to instance-role credentials, and the role's broad S3 read permissions turned a bug into a large breach. It is the canonical case for least-privilege IAM and IMDSv2. Source: <a href="https://www.capitalone.com/digital/facts2019/">Capital One incident facts</a>.</p>
+  <h3>9.5 Chrome and Cloudflare deploy hybrid post-quantum key exchange <span class="tag fact">Verified</span></h3>
+  <p>Chrome enabled hybrid Kyber/ML-KEM key agreement by default in 2024 and Cloudflare reports the share of PQ-protected traffic on its network on Cloudflare Radar; both documented middlebox breakage from larger ClientHellos as the main deployment issue. Source: <a href="https://radar.cloudflare.com/post-quantum">Cloudflare Radar: post-quantum encryption adoption</a>; <a href="https://blog.cloudflare.com/pq-2024">Cloudflare, "The state of the post-quantum Internet" (2024)</a>.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages and Limits</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Control</th><th>Advantages</th><th>Limits / cost</th></tr></thead>
+    <tbody>
+      <tr><td>Cloud secret manager</td><td>Managed, IAM-integrated, rotation hooks</td><td>Per-secret/per-call pricing; cloud lock-in</td></tr>
+      <tr><td>Vault</td><td>Dynamic secrets, PKI, transit encryption, multi-cloud</td><td>Operating a highly available, unsealed cluster; licensing changes (OpenBao fork exists)</td></tr>
+      <tr><td>Kubernetes Secrets</td><td>Native, simple</td><td>Base64 only; RBAC subtleties; needs KMS encryption at rest</td></tr>
+      <tr><td>KMS envelope encryption</td><td>Audited decrypts, crypto-shredding, cheap rotation</td><td>KMS latency/cost per call; request quotas; availability dependency</td></tr>
+      <tr><td>mTLS via service mesh</td><td>Transparent workload authN, encryption</td><td>Mesh complexity, sidecar/ambient overhead, debugging</td></tr>
+      <tr><td>Workload identity</td><td>No static credentials, short-lived, attributable</td><td>Trust-policy mistakes are high impact; setup per cloud</td></tr>
+      <tr><td>Distroless images</td><td>Fewer CVEs, no shell for attackers</td><td>Harder debugging (use ephemeral debug containers)</td></tr>
+      <tr><td>PSS restricted + NetworkPolicy</td><td>Large reduction in container escape and lateral movement</td><td>Breaks charts that assume root; egress policies need upkeep</td></tr>
+      <tr><td>Signing + admission verification</td><td>Only trusted builds run</td><td>Webhook availability on deploy path; key/identity policy management</td></tr>
+      <tr><td>SBOM</td><td>Instant exposure queries; licence compliance</td><td>Only as accurate as generation; storage and tooling</td></tr>
+      <tr><td>CSPM</td><td>Continuous posture visibility</td><td>Alert volume; detective, not preventive</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+  <h3>11.1 Where should encryption happen?</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Layer</th><th>Protects against</th><th>Does not protect against</th><th>Choose when</th></tr></thead>
+    <tbody>
+      <tr><td>Disk/volume encryption (provider-managed)</td><td>Stolen disks, decommissioned hardware</td><td>Anyone with database access</td><td>Always (baseline, nearly free)</td></tr>
+      <tr><td>Database TDE / storage service encryption with customer-managed KMS key</td><td>Above + lets you revoke the provider's ability to read via key policy</td><td>Application or DBA access</td><td>Regulated data; tenant-level crypto-shredding</td></tr>
+      <tr><td>Application-level field encryption (envelope)</td><td>DB admins, backups, SQL injection reading the column</td><td>Compromise of the application itself</td><td>PII/PCI fields, secrets, per-tenant keys</td></tr>
+      <tr><td>Client-side / end-to-end</td><td>The service operator</td><td>Endpoint compromise; enables few server features</td><td>Messaging, zero-knowledge products</td></tr>
+    </tbody>
+  </table></div>
+  <p>Field encryption costs searchability (equality search needs deterministic encryption or blind indexes, each leaking some information) and complicates analytics. Encrypt only the fields that warrant it.</p>
+  <h3>11.2 Mesh mTLS vs application TLS</h3>
+  <p>A mesh gives uniform mTLS and identity with no code changes, but adds an infrastructure layer and makes the application trust the local sidecar. Application-level TLS (SSL bundles, Go <code>tls.Config</code>) keeps control in the service but multiplies configuration. <span class="tag opinion">Opinion</span> Above a dozen services, a mesh (or ambient/eBPF-based mTLS) usually wins; keep per-request user tokens regardless.</p>
+  <h3>11.3 Verification enforcement</h3>
+  <p>Enforcing signature verification at admission risks blocking deploys when the verifier or Rekor is unavailable. Mitigate with highly available admission controllers, caching, and a documented break-glass path that is itself audited — rather than running in audit-only mode forever.</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes</h2>
+  <ul>
+    <li><strong>Deleting a leaked secret from Git history without rotating it.</strong></li>
+    <li><strong>Trust-all TrustManagers / <code>InsecureSkipVerify: true</code> / <code>verify=False</code></strong> left over from testing.</li>
+    <li><strong>AES-GCM with a fixed or counter-reset nonce</strong>, or AES/ECB because it was the JCA default for <code>"AES"</code>.</li>
+    <li><strong>Using SHA-256 for passwords or plain SHA-256(key || message) as a MAC.</strong></li>
+    <li><strong>Hard-coded keys</strong> in source or config, including "test" keys that end up in production.</li>
+    <li><strong>IRSA trust policies without a <code>sub</code> condition.</strong></li>
+    <li><strong><code>"Action": "*"</code> / <code>"Resource": "*"</code> policies</strong> that were meant to be temporary.</li>
+    <li><strong>Images tagged <code>latest</code></strong>, built from unpinned base images, running as root.</li>
+    <li><strong>Secrets passed as build args</strong> (visible in image history).</li>
+    <li><strong>No NetworkPolicies</strong> — every compromised pod can reach every database.</li>
+    <li><strong>Granting <code>create pods</code> broadly</strong>, unaware it implies reading every secret in the namespace.</li>
+    <li><strong>CI workflows triggered by <code>pull_request_target</code> that check out untrusted code with secrets available</strong>, and third-party actions pinned to mutable tags.</li>
+    <li><strong>Generating SBOMs nobody queries</strong> and signatures nobody verifies.</li>
+    <li><strong>Assuming "encrypted at rest" means protected from your own application's compromise.</strong></li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Certificate and key operations</h3>
+  <p>Automate issuance and renewal (cert-manager, ACME, mesh CAs); alert on certificates expiring within 14 days and on renewal failures; test reload without restarts (Spring Boot SSL bundle reloading, Go <code>GetCertificate</code> callbacks). Expired certificates remain a leading cause of self-inflicted outages.</p>
+  <h3>13.2 KMS and secret-manager limits</h3>
+  <p>KMS APIs have per-account request quotas; envelope encryption with DEK caching keeps you within them. Secret managers charge per secret and per call — fetch at startup and on rotation events, not per request.</p>
+  <h3>13.3 Monitoring and detection</h3>
+  <p>Alert on: CloudTrail <code>StopLogging</code>/<code>DeleteTrail</code>, root logins, new IAM access keys, <code>ScheduleKeyDeletion</code> on KMS keys, <code>GetSecretValue</code> by unexpected principals, instance credentials used outside the account's network, Kubernetes <code>exec</code> into production pods, privileged pod creation attempts denied by admission, Falco shell-in-container events, and admission rejections for unsigned images.</p>
+  <h3>13.4 Reliability</h3>
+  <p>Every security dependency on the request path (KMS, Vault, admission webhooks, policy engines) needs an availability design: caching, retries with backoff, regional replicas, and explicit fail-open/fail-closed decisions per path. Vault needs auto-unseal (KMS-backed) to recover from restarts without humans.</p>
+  <h3>13.5 Compliance mapping</h3>
+  <p>These controls map onto common frameworks: SOC 2 (logical access, change management), PCI DSS v4 (encryption of cardholder data, key management, TLS), ISO 27001 Annex A, NIST SSDF (SP 800-218) for secure development and supply chain, and the EU Cyber Resilience Act's requirements for vulnerability handling and SBOMs for products with digital elements. <span class="tag version">Version-sensitive · checked Nov 2026</span></p>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundation</p>
+    <p>Pick the primitive: (a) verify a partner's webhook; (b) store a user's national ID number so support can display it; (c) prove a container image came from your CI; (d) store passwords; (e) fingerprint uploaded files for deduplication.</p>
+    <details class="solution"><summary>Solution</summary><div><p>(a) HMAC-SHA-256 with a shared secret (or the partner's signature with their public key). (b) AEAD field encryption with an envelope DEK under a KMS KEK, AAD = record ID. (c) Digital signature (cosign keyless, identity = CI workflow). (d) Argon2id/bcrypt. (e) SHA-256 (or BLAKE3); note that hashing low-entropy data does not hide it.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Review this IAM policy for an image-thumbnail service and rewrite it: <code>{"Effect":"Allow","Action":"s3:*","Resource":"*"}</code>. The service reads originals from <code>acme-uploads/originals/</code> and writes to <code>acme-uploads/thumbs/</code>.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-json">{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::acme-uploads/originals/*" },
+    { "Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::acme-uploads/thumbs/*",
+      "Condition": { "StringEquals": { "s3:x-amz-server-side-encryption": "aws:kms" } } }
+  ]
+}</code></pre>
+      <p>No delete, no list, no other buckets, no bucket-policy changes. Attach to a dedicated role via workload identity with a trust policy scoped to the thumbnail service account. If the bucket uses a customer-managed KMS key, add <code>kms:Decrypt</code>/<code>kms:GenerateDataKey</code> on that key only.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>Apply the PSS "restricted" profile to an existing namespace running a Helm chart that sets no <code>securityContext</code>. Predict what fails and fix it.</p>
+    <details class="solution"><summary>Solution</summary><div><p>Use <code>kubectl label --dry-run=server --overwrite ns X pod-security.kubernetes.io/enforce=restricted</code> to see warnings first. Failures: missing <code>runAsNonRoot</code>, <code>allowPrivilegeEscalation</code> not false, capabilities not dropped, no seccomp profile. Fix by adding pod/container <code>securityContext</code> as in §7.7; if the image needs root (e.g. binds port 80 or writes to <code>/var</code>), change the port to ≥1024, mount <code>emptyDir</code> for writable paths, and rebuild on a non-root base.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>A new critical CVE affects a library used somewhere in your 80 microservices. Using SBOMs stored as cosign attestations, describe the commands/queries to find affected running workloads within an hour, and how VEX helps.</p>
+    <details class="solution"><summary>Solution</summary><div><p>List running image digests from the clusters (<code>kubectl get pods -A -o jsonpath</code> over <code>status.containerStatuses[*].imageID</code>); for each digest, fetch the SBOM attestation (<code>cosign verify-attestation --type cyclonedx ...</code> then extract the predicate) or query your SBOM store (Dependency-Track ingests CycloneDX and does this continuously); search for the package URL and vulnerable version range; scan with Grype against the SBOM. Teams that determined the vulnerable code is unreachable publish a VEX statement ("not_affected", justification "vulnerable_code_not_in_execute_path"), which scanners then use to suppress noise — reviewed, not assumed.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced (local lab)</p>
+    <p>In a local kind or minikube cluster you own, install Kyverno, write a policy requiring cosign signatures from your own key pair (<code>cosign generate-key-pair</code>), push a signed and an unsigned image to a local registry, and show that only the signed one is admitted.</p>
+    <details class="solution"><summary>Solution</summary><div><p>Use a <code>verifyImages</code> rule with <code>attestors.entries.keys.publicKeys</code> set to your <code>cosign.pub</code> (keyless needs internet access to Fulcio/Rekor; key-based works offline with <code>rekor.ignoreTlog: true</code> for the lab only). Deploy both images; the unsigned one is rejected with a Kyverno policy violation message. Then sign the second image and redeploy to confirm admission.</p></div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain envelope encryption and why it is used with a KMS.</summary><div><p>Data is encrypted locally with a per-object DEK; the DEK is encrypted by a KEK held in the KMS and stored with the data. Bulk data never goes to the KMS, every decrypt is authorised and audited, KEK rotation does not require re-encrypting data, and destroying a KEK crypto-shreds all data under it.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What does TLS 1.3 change compared with TLS 1.2?</summary><div><p>Mandatory forward secrecy (no static RSA key exchange), AEAD-only cipher suites, encrypted certificates and most of the handshake, 1-RTT handshake with optional 0-RTT resumption (replayable), removal of renegotiation and many legacy options, simplified HKDF key schedule.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is "harvest now, decrypt later" and what should a backend team do about it today?</summary><div><p>Adversaries record encrypted traffic to decrypt once quantum computers can break ECDH/RSA. Use hybrid PQ key exchange (X25519MLKEM768) where you control TLS endpoints (proxies, Go services, CDNs), inventory crypto usage, and build crypto agility. Symmetric encryption at rest with AES-256 is not the urgent concern.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How would you get secrets into a Spring Boot pod on EKS with no static credentials?</summary><div><p>IRSA or EKS Pod Identity gives the pod a role; Spring Cloud AWS (or External Secrets Operator / Secrets Store CSI) fetches from Secrets Manager using that role; rotation via Secrets Manager rotation Lambdas or dynamic DB credentials from Vault (Kubernetes auth). Nothing secret in the image, Helm values or Git.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> What is wrong with <code>Cipher.getInstance("AES")</code>?</summary><div><p>On most JCA providers it defaults to <code>AES/ECB/PKCS5Padding</code>: deterministic, no IV, no integrity — identical blocks produce identical ciphertext. Use <code>AES/GCM/NoPadding</code> with a unique 12-byte nonce, or Tink.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What do the Pod Security Standards levels mean?</summary><div><p>Privileged: no restrictions. Baseline: blocks known privilege escalations (privileged containers, host namespaces, hostPath, dangerous capabilities). Restricted: additionally requires non-root, dropping all capabilities, no privilege escalation, seccomp RuntimeDefault, limited volume types. Enforced per namespace via labels by Pod Security Admission.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How do SBOM, SLSA provenance and Sigstore signatures differ?</summary><div><p>An SBOM says <em>what</em> is in the artifact; provenance says <em>how and from what source</em> it was built and by which builder; a signature says <em>who</em> vouches for the artifact digest. Admission policies verify the signature identity and can check provenance claims; SBOMs feed vulnerability and licence analysis.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> An AWS access key was committed to a public repo 10 minutes ago. What do you do?</summary><div><p>Deactivate/delete the key immediately (do not wait for history rewrite); check CloudTrail for its use since creation, especially from unfamiliar IPs; look for persistence (new users, keys, roles, Lambda functions, instances); rotate anything it could read; then replace the use case with workload identity, enable push protection, and run a blameless review. GitHub and AWS may already have flagged it via secret scanning partnerships.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> What lessons does the xz backdoor teach for a Java shop that never used xz directly?</summary><div><p>Transitive and system-level dependencies matter (base images include such libraries); build from source repositories rather than opaque release artifacts where possible; prefer minimal base images; monitor anomalies; support and vet critical upstream maintainers; maintain SBOMs including OS packages so you can answer "do we ship it?" immediately.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why is IRSA's trust policy <code>sub</code> condition critical?</summary><div><p>Without it, any service account token from the cluster's OIDC issuer can assume the role, so compromising any pod grants this role's permissions. The condition pins the role to one namespace/service account.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Secrets live in a manager, are delivered via workload identity, rotated, revocable and scanned for; a leaked secret is rotated, not just deleted.</li>
+    <li>Use AEAD (AES-GCM, ChaCha20-Poly1305) with unique nonces, HMAC for integrity, slow hashes for passwords, and envelope encryption with a KMS.</li>
+    <li>Build crypto agility now; deploy hybrid ML-KEM key exchange where you terminate TLS.</li>
+    <li>TLS 1.3 gives forward secrecy and encrypted handshakes; validate full chains and hostnames; automate short-lived certificates; use mTLS between services.</li>
+    <li>IAM: explicit deny wins; guardrails only restrict; grant specific actions on specific resources to per-workload roles.</li>
+    <li>Kubernetes: PSS restricted, default-deny NetworkPolicies, minimal RBAC, admission policies, runtime detection.</li>
+    <li>Supply chain: lockfiles and private proxies, SBOMs, SLSA provenance, Sigstore signatures verified at admission.</li>
+  </ul>
+  <div class="quiz" data-answer="b">
+    <p class="q">What is the most serious consequence of reusing an AES-GCM nonce with the same key?</p>
+    <ol>
+      <li data-k="a">Slightly slower decryption</li>
+      <li data-k="b">Loss of confidentiality (XOR of plaintexts) and the ability to forge authentication tags</li>
+      <li data-k="c">Ciphertext becomes larger</li>
+      <li data-k="d">Nothing, GCM is nonce-misuse resistant</li>
+    </ol>
+    <div class="explain">GCM is catastrophically broken by nonce reuse; AES-GCM-SIV is the misuse-resistant variant.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">In AWS IAM, a role's identity policy allows <code>s3:GetObject</code> on a bucket, but an SCP denies it. What happens?</p>
+    <ol>
+      <li data-k="a">Allowed, because identity policies take precedence</li>
+      <li data-k="b">Allowed only for the root user</li>
+      <li data-k="c">Denied, because an explicit deny (or missing SCP allow) restricts regardless of identity policies</li>
+      <li data-k="d">Depends on the bucket region</li>
+    </ol>
+    <div class="explain">Guardrails restrict; an explicit Deny anywhere is final.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">Which property of TLS 1.3 ensures that stealing a server's certificate private key next year does not decrypt traffic recorded today?</p>
+    <ol>
+      <li data-k="a">Forward secrecy from ephemeral key exchange</li>
+      <li data-k="b">Certificate Transparency</li>
+      <li data-k="c">OCSP stapling</li>
+      <li data-k="d">0-RTT resumption</li>
+    </ol>
+    <div class="explain">Session keys come from ephemeral (EC)DHE/KEM shares; the certificate key only signs the transcript.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">What does keyless signing with Sigstore bind a signature to?</p>
+    <ol>
+      <li data-k="a">A long-lived GPG key stored in CI secrets</li>
+      <li data-k="b">The image tag</li>
+      <li data-k="c">The developer's laptop</li>
+      <li data-k="d">An OIDC identity (e.g. a specific CI workflow) via a short-lived Fulcio certificate, recorded in Rekor</li>
+    </ol>
+    <div class="explain">Verification checks certificate identity and issuer plus the transparency-log entry; no long-lived private key exists.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">Which Pod Security Standards level requires containers to run as non-root and drop all capabilities?</p>
+    <ol>
+      <li data-k="a">Privileged</li>
+      <li data-k="b">Restricted</li>
+      <li data-k="c">Baseline</li>
+      <li data-k="d">None; this needs a third-party tool</li>
+    </ol>
+    <div class="explain">Restricted adds non-root, drop ALL, no privilege escalation and seccomp on top of baseline.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Dependency confusion is best prevented by:</p>
+    <ol>
+      <li data-k="a">Using only the latest version of every package</li>
+      <li data-k="b">Running SAST</li>
+      <li data-k="c">Scoped/namespaced internal packages resolved through a single private proxy with explicit precedence</li>
+      <li data-k="d">Signing commits</li>
+    </ol>
+    <div class="explain">The attack exploits resolvers consulting public registries for internal names; controlling resolution removes it.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Spec</span> <a href="https://www.rfc-editor.org/rfc/rfc8446">RFC 8446 — TLS 1.3</a>.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://csrc.nist.gov/pubs/fips/203/final">NIST FIPS 203 — ML-KEM</a>; <a href="https://csrc.nist.gov/pubs/sp/800/38/d/final">SP 800-38D — GCM</a>; <a href="https://csrc.nist.gov/pubs/sp/800/57/pt1/r5/final">SP 800-57 Part 1 — Key Management</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic.html">AWS IAM policy evaluation logic</a>; <a href="https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html">IAM roles for service accounts</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://kubernetes.io/docs/concepts/security/pod-security-standards/">Kubernetes Pod Security Standards</a>; <a href="https://kubernetes.io/docs/concepts/services-networking/network-policies/">Network Policies</a>; <a href="https://kubernetes.io/docs/concepts/security/secrets-good-practices/">Good practices for Secrets</a>.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://slsa.dev/spec/v1.2/">SLSA specification v1.2</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.sigstore.dev/">Sigstore documentation</a>; <a href="https://cyclonedx.org/">CycloneDX</a>; <a href="https://spdx.dev/">SPDX</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://developer.hashicorp.com/vault/docs">HashiCorp Vault documentation</a>; <a href="https://docs.spring.io/spring-cloud-vault/reference/">Spring Cloud Vault reference</a>.</li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/tink-crypto/tink-java">Google Tink for Java</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html">OWASP Secrets Management Cheat Sheet</a>; <a href="https://cheatsheetseries.owasp.org/cheatsheets/Kubernetes_Security_Cheat_Sheet.html">Kubernetes Security Cheat Sheet</a>.</li>
+    <li><span class="ref-kind">Book</span> Jean-Philippe Aumasson, <em>Serious Cryptography</em>, 2nd ed., No Starch Press, 2024.</li>
+    <li><span class="ref-kind">Book</span> David Wong, <em>Real-World Cryptography</em>, Manning, 2021.</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

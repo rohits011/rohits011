@@ -1,0 +1,1168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Production Python — AI-Era Software Engineering</title>
+<meta name="description" content="Testing with pytest, hypothesis and Testcontainers; packaging with pyproject.toml, uv, Poetry, lockfiles and wheels; profiling and performance; deployment with Uvicorn/Gunicorn, containers and OpenTelemetry; and integrating Python services with Java/Spring Boot over REST, gRPC and Kafka, finishing the docflow project.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p4-04-production-python" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 4 · Chapter 4</p>
+  <h1>Production Python: Testing, Packaging, Performance, Deployment &amp; Java Interop</h1>
+  <p class="lede">Writing Python that works is easy; shipping Python that a platform team will run for years is a discipline. This chapter covers the parts of the Python toolchain that correspond to Maven/Gradle, JUnit/Testcontainers, JFR/async-profiler, Spring Boot Actuator and Micrometer, and the integration contracts (REST, gRPC, Kafka) that let a Python AI service live inside a Spring Boot estate. We finish <strong>docflow</strong> with tests, a reproducible build, a hardened container image, telemetry, and Java clients.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Chapters 4.1–4.3; Maven or Gradle, JUnit 5, Testcontainers, Docker, Kubernetes basics, Micrometer/OpenTelemetry in Spring.</li>
+    <li><strong>You will be able to:</strong> structure a pytest suite with fixtures, parametrisation, property-based and container-backed tests; manage dependencies reproducibly with <code>pyproject.toml</code> and uv; profile CPU and memory with py-spy, Scalene and memray and pick the right optimisation (algorithmic, vectorised, compiled, cached); deploy with correctly sized Uvicorn/Gunicorn workers in a minimal container; instrument with OpenTelemetry; and integrate with Spring Boot through REST, gRPC and Kafka with shared schemas.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: From "It Runs on My Laptop" to a Platform Citizen</h2>
+  <p>A Spring Boot team arrives with strong production expectations: <code>mvn verify</code> runs unit and integration tests; the build is reproducible from the lockstep of the POM and a repository manager; the artifact is a single JAR or an OCI image built by Jib or Buildpacks; Actuator exposes health and metrics; Micrometer and OpenTelemetry export to the observability stack; and other services consume an OpenAPI or protobuf contract. Python can meet every one of these expectations, but the tools are different, more numerous, and historically less standardised. In 2026 the ecosystem has largely converged: <code>pyproject.toml</code> for metadata and tool configuration, uv (or Poetry) for environments and lockfiles, pytest for tests, ruff for linting and formatting, pyright or mypy for types, OpenTelemetry for telemetry.</p>
+  <p>The second half of the chapter is about the boundary. A Python AI service in a Java company succeeds or fails on its contracts: are the request and event schemas shared and versioned? Are deadlines propagated? Can the Java team's tracing follow a request into Python and back? Do both sides agree on retries and idempotency? Those are architecture questions, and they are where your Spring experience is most valuable.</p>
+
+<div class="bridge">
+  <h4>Bridging from Java &amp; Spring Boot</h4>
+  <dl>
+    <dt>What you already know</dt><dd>Maven/Gradle with dependency management and lockfiles (Gradle dependency locking, Maven Enforcer), JUnit 5 with <code>@ParameterizedTest</code>, Mockito, AssertJ, Testcontainers, Spring Boot test slices; JFR and async-profiler; JMH; fat JARs, Jib, distroless images; Actuator probes; Micrometer; springdoc OpenAPI; gRPC-Java; Spring Kafka with Avro/Protobuf and Schema Registry.</dd>
+    <dt>Why that is not enough</dt><dd>Python has no single build tool, no compile step to catch errors, and a packaging history (setup.py, requirements.txt, Pipfile, conda) that still leaks into real projects. Its runtime characteristics (GIL, process-per-core, slow interpreter) change how you deploy and profile. And a Java engineer integrating with Python needs to know which contracts are safe (protobuf, JSON Schema, OpenAPI) and which approaches are traps (embedding Python in the JVM).</dd>
+    <dt>The modern approach</dt><dd>One <code>pyproject.toml</code> per service; uv for resolution, lockfile (<code>uv.lock</code>), virtual environments and Python version management; pytest with fixtures and Testcontainers; ruff and pyright in CI; py-spy in production; multi-stage Docker builds with a slim or distroless runtime; OpenTelemetry auto plus manual instrumentation; separate service with gRPC or REST plus Kafka events for Java integration.</dd>
+    <dt>Where Python and Go fit</dt><dd>Go's toolchain is the opposite extreme: one official tool (<code>go build</code>, <code>go test</code>, <code>go mod</code>), static binaries, built-in profiling. Chapter 5.4 compares all three. Python's advantage is the ecosystem you are deploying it for: ML and data libraries.</dd>
+    <dt>In production</dt><dd>Python services ship as container images with a pinned interpreter and locked dependencies, run as several worker processes per pod, expose <code>/healthz</code> and <code>/readyz</code>, emit OTLP traces and metrics, and are consumed by Java services through generated clients.</dd>
+    <dt>Use it when / avoid it when</dt><dd>Use this production toolkit for every service that other teams depend on. Avoid the shortcuts that work in notebooks: unpinned <code>pip install</code>, global interpreters, root containers, print-debugging in prod, and pickle across service boundaries.</dd>
+  </dl>
+</div>
+  <div class="callout note"><p class="callout-title">Versions used</p><p><span class="tag version">Version-sensitive · checked Nov 2026</span> Python 3.13/3.14 runtime images, uv (Astral; still a 0.x version line but widely adopted), pytest 8+/9, Testcontainers for Python, OpenTelemetry Python SDK, grpcio, confluent-kafka. Pin exact versions in your lockfile; the chapter shows constraints, not exact pins, wherever a version would go stale quickly.</p></div>
+</section>
+
+<section id="history">
+  <h2>2. History: Python Packaging and Tooling</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Year</th><th>Event</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td>1998–2000</td><td>distutils; Python Package Index launched 2003</td><td>Build/installation in the stdlib; central repository like Maven Central.</td></tr>
+      <tr><td>2004</td><td>setuptools and eggs</td><td>Dependencies declared in executable <code>setup.py</code>: builds could run arbitrary code.</td></tr>
+      <tr><td>2008</td><td>pip; virtualenv (2007)</td><td>Installer with uninstall; isolated environments.</td></tr>
+      <tr><td>2012</td><td>Wheel format (PEP 427); <code>venv</code> in 3.3</td><td>Pre-built binary distributions: no compiler needed at install time.</td></tr>
+      <tr><td>2012</td><td>Anaconda/conda</td><td>Binary packages including non-Python libraries (BLAS, CUDA); dominant in data science.</td></tr>
+      <tr><td>2016</td><td>manylinux1 (PEP 513); PEP 518 <code>pyproject.toml</code> build requirements</td><td>Portable Linux wheels; the start of declarative builds.</td></tr>
+      <tr><td>2017</td><td>PEP 517 build backends; Pipenv</td><td>Any build backend (setuptools, flit, hatchling, maturin) behind one interface.</td></tr>
+      <tr><td>2018</td><td>Poetry 1.0 (2019); Black formatter</td><td>Lockfiles and dependency resolution as a first-class tool.</td></tr>
+      <tr><td>2020</td><td>pip's new backtracking resolver; PEP 621 project metadata</td><td>Consistent resolution; standard <code>[project]</code> table.</td></tr>
+      <tr><td>2022–2023</td><td>ruff (Astral) replaces flake8/isort/pyupgrade, later Black</td><td>Rust-based tools 10–100x faster: the start of the Rust tooling wave.</td></tr>
+      <tr><td>2024</td><td>uv released (February), project management and <code>uv.lock</code> (August); PEP 735 dependency groups accepted</td><td>One fast tool for Python versions, venvs, resolution, locking and running.</td></tr>
+      <tr><td>2025</td><td>Poetry 2.0 adopts <code>[project]</code>; PEP 751 standard lockfile (<code>pylock.toml</code>) accepted</td><td>Convergence on standards across tools.</td></tr>
+      <tr><td>2025–2026</td><td>Free-threaded wheels (<code>cp314t</code>), abi3t stable ABI in 3.15</td><td>Another wheel dimension to manage in builds.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Compared with Java, where Maven standardised the build in 2004 and the ecosystem never fragmented much, Python spent fifteen years with competing tools. The practical upshot for you: be explicit and boring. One tool (uv or Poetry), one lockfile, one <code>pyproject.toml</code>, wheels only in production images.</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+  <h3>3.1 pytest's model</h3>
+  <p>pytest discovers <code>test_*.py</code> files and <code>test_*</code> functions, and rewrites <code>assert</code> statements at import time to produce rich failure messages (no AssertJ needed). Its central concept is the <strong>fixture</strong>: a function decorated with <code>@pytest.fixture</code> that provides a resource, requested by naming it as a test parameter. Fixtures have scopes (<code>function</code>, <code>class</code>, <code>module</code>, <code>package</code>, <code>session</code>), can depend on other fixtures, and use <code>yield</code> for teardown. This is dependency injection for tests, the equivalent of JUnit 5 extensions plus <code>@BeforeEach</code>/<code>@BeforeAll</code>, and Spring's test context caching corresponds roughly to session-scoped fixtures. <code>conftest.py</code> files share fixtures across a directory tree.</p>
+  <h3>3.2 Parametrisation, markers and plugins</h3>
+  <p><code>@pytest.mark.parametrize("a,b,expected", [...])</code> generates one test per case (<code>@ParameterizedTest</code> with <code>@CsvSource</code>); fixtures can be parametrised too (run every test against SQLite and PostgreSQL). Markers (<code>@pytest.mark.integration</code>) select subsets (<code>-m "not integration"</code>), like JUnit tags. Plugins extend everything: pytest-asyncio or AnyIO's plugin for async tests, pytest-xdist for parallel execution, pytest-cov for coverage, pytest-randomly for order randomisation.</p>
+  <h3>3.3 Property-based testing with Hypothesis</h3>
+  <p>Instead of hand-picked examples, you state properties ("chunking then joining preserves every word", "serialise then parse is identity") and Hypothesis generates inputs, including nasty edge cases, then <em>shrinks</em> failures to minimal examples and stores them in a database for replay. jqwik is the JVM equivalent. Property-based tests are especially valuable for parsers, chunkers, serialisers and anything handling LLM output.</p>
+  <h3>3.4 Testcontainers and the test pyramid</h3>
+  <p>Testcontainers for Python mirrors the Java library: start PostgreSQL, Redis or Kafka in Docker from a fixture, yield a connection URL, stop it at the end of the session. Use SQLite or fakes for fast unit tests of logic, but run repositories, migrations and locking behaviour against the real database engine.</p>
+  <h3>3.5 Mocks, fakes and dependency overrides</h3>
+  <p><code>unittest.mock</code> (<code>Mock</code>, <code>AsyncMock</code>, <code>patch</code>) is Mockito with less ceremony and more danger: <code>patch("module.name")</code> replaces an attribute where it is <em>looked up</em>, not where it is defined, a classic source of tests that patch the wrong thing. Prefer fakes behind Protocols (docflow's <code>HashEmbedder</code>, <code>LocalBlobStore</code>) and FastAPI's <code>dependency_overrides</code>; use <code>patch</code> for genuinely global things (time, randomness) or third-party calls.</p>
+  <h3>3.6 Environments: interpreter, venv, site-packages</h3>
+  <p>A virtual environment is a directory with a <code>pyvenv.cfg</code>, a symlink or copy of an interpreter, and its own <code>site-packages</code>. Activating it just puts its <code>bin/</code> first on <code>PATH</code>. There is no classpath per application: one environment has exactly one version of each distribution installed, so two dependencies requiring incompatible versions of a third cannot coexist (no shading as in Maven). The resolver must find one consistent set, which is why lockfiles matter so much.</p>
+  <h3>3.7 pyproject.toml, build backends, wheels</h3>
+  <ul>
+    <li><strong><code>[project]</code></strong> (PEP 621): name, version, <code>requires-python</code>, dependencies (with version specifiers), optional dependencies (extras), entry points/scripts.</li>
+    <li><strong><code>[dependency-groups]</code></strong> (PEP 735): dev/test/lint groups that are not part of the published package, like Maven's test scope.</li>
+    <li><strong><code>[build-system]</code></strong>: the PEP 517 backend (hatchling, setuptools, flit-core, maturin for Rust, scikit-build-core for C++).</li>
+    <li><strong><code>[tool.*]</code></strong>: configuration for ruff, pyright, pytest, coverage, uv.</li>
+    <li><strong>Wheels</strong> are zip archives with a tag like <code>cp313-cp313-manylinux_2_28_x86_64</code> (interpreter, ABI, platform). Pure-Python wheels are <code>py3-none-any</code>. Installing a wheel is just unzipping into site-packages: fast and no compiler. An <em>sdist</em> must be built on install, which in a Docker build can mean pulling compilers: avoid.</li>
+  </ul>
+  <h3>3.8 Lockfiles</h3>
+  <p><code>pyproject.toml</code> declares ranges (<code>fastapi&gt;=0.121,&lt;1</code>); the lockfile records the exact resolved versions and hashes of the full transitive graph for all target platforms. <code>uv.lock</code> is cross-platform (one lock for Linux, macOS, Windows); <code>uv sync --frozen</code> installs exactly the lock and fails if <code>pyproject.toml</code> changed without relocking: the equivalent of Gradle's dependency locking in strict mode. Hashes protect against tampered artifacts. PEP 751's <code>pylock.toml</code> standardises the format across tools (uv can export it).</p>
+  <h3>3.9 Profiling vocabulary</h3>
+  <ul>
+    <li><strong>Deterministic profilers</strong> (<code>cProfile</code>): hook every call; exact counts, high overhead, distorts fast functions. Like an instrumenting Java profiler.</li>
+    <li><strong>Sampling profilers</strong> (py-spy, Scalene, Austin, the 3.15 stdlib sampler): read the interpreter's stacks periodically from outside or via signals; low overhead, safe in production. Like async-profiler and JFR.</li>
+    <li><strong>Memory profilers</strong>: <code>tracemalloc</code> (stdlib, snapshots and diffs), memray (Bloomberg; native and Python allocations, flame graphs), Scalene (CPU plus memory per line).</li>
+    <li><strong>Native vs Python time</strong>: py-spy <code>--native</code> and Scalene separate time in C extensions from interpreter time, which tells you whether optimising Python code can help at all.</li>
+  </ul>
+  <h3>3.10 Performance levers, in order</h3>
+  <ol>
+    <li>Do less: algorithms, data structures, avoid repeated work (caching).</li>
+    <li>Do it in bulk in native code: vectorise with NumPy/Polars/Arrow; push work into the database.</li>
+    <li>Do it concurrently where it waits: asyncio, threads for I/O.</li>
+    <li>Do it in parallel where it computes: processes, or native code that releases the GIL.</li>
+    <li>Compile the hot spot: Cython, mypyc, or Rust via PyO3/maturin.</li>
+    <li>Change the runtime: PyPy, free-threaded CPython, or move the component to Go/Java.</li>
+  </ol>
+  <h3>3.11 Process models for serving</h3>
+  <p>Uvicorn runs one event loop per process; <code>uvicorn --workers N</code> starts a supervisor with N worker processes. Gunicorn is a mature pre-fork process manager (worker restarts, graceful reloads, <code>max_requests</code>) and can host Uvicorn workers (via the <code>uvicorn-worker</code> package). In Kubernetes many teams run a single Uvicorn process per container and scale with replicas, letting the orchestrator be the process manager; others prefer several workers per pod to share memory and reduce per-pod overhead. Both are valid; be deliberate.</p>
+  <h3>3.12 Integration styles with the JVM</h3>
+  <ul>
+    <li><strong>Separate service over the network</strong> (REST/JSON, gRPC/protobuf): the default. Clear ownership, independent scaling and deployment, polyglot-friendly.</li>
+    <li><strong>Asynchronous events</strong> (Kafka with Avro/Protobuf/JSON Schema in a schema registry): for decoupled workflows and fan-out.</li>
+    <li><strong>Durable workflows</strong> (Temporal with Java workflows calling Python activities).</li>
+    <li><strong>In-process embedding</strong>: Jython (Python 2.7 only, effectively obsolete for modern libraries), GraalPy (Python 3 on GraalVM, can run many pure-Python packages and some native ones, embeddable via the polyglot API), JEP (embeds CPython via JNI). Niche: plugin/scripting use-cases, not ML serving.</li>
+  </ul>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working</h2>
+  <h3>4.1 How pytest runs a test</h3>
+  <ol>
+    <li><strong>Collection</strong>: pytest imports test modules (with its assertion-rewriting import hook, which rewrites the AST of <code>assert</code> statements into code that records sub-expression values) and builds a tree of <em>nodes</em> (session, packages, modules, classes, functions). Parametrisation expands one function into several items.</li>
+    <li><strong>Fixture resolution</strong>: for each item, pytest computes the transitive closure of requested fixtures, ordered by scope (session first). A fixture instance is cached for its scope; teardown runs in reverse order when the scope ends.</li>
+    <li><strong>Execution</strong>: hooks (<code>pytest_runtest_setup/call/teardown</code>) run; plugins such as pytest-asyncio wrap coroutine tests by running them on an event loop with the configured loop scope.</li>
+    <li><strong>Reporting</strong>: failures display rewritten assertion details; xdist workers send reports to the controller process.</li>
+  </ol>
+  <p>Because fixtures are cached by scope, an expensive session fixture (a PostgreSQL container) is started once, while a function-scoped fixture (a transaction rolled back after each test) isolates tests. This is the same idea as Spring's test-context cache combined with <code>@Transactional</code> test rollback.</p>
+
+  <h3>4.2 How uv resolves and installs</h3>
+  <ol>
+    <li>Reads <code>pyproject.toml</code> (and workspace members), the <code>requires-python</code> range and dependency groups.</li>
+    <li>Resolves with a PubGrub-based solver (the same algorithm family as Dart's pub and Cargo-like resolvers), fetching only metadata where possible (PEP 658 metadata files on PyPI avoid downloading whole wheels), and produces a <em>universal</em> resolution with environment markers so that one lock covers all platforms and Python versions in range.</li>
+    <li>Writes <code>uv.lock</code> with exact versions, sources and hashes.</li>
+    <li><code>uv sync</code> creates <code>.venv</code> (downloading a managed Python build if needed), computes the install plan for the current platform from the lock, fetches wheels into a global content-addressed cache and installs by hard-linking or copy-on-write cloning from the cache: why repeat installs take milliseconds to seconds.</li>
+  </ol>
+  <p>Maven's model is different: the dependency tree is resolved at build time with "nearest wins" mediation and each application ships its own classpath; conflicts are resolved silently. Python's single-version-per-environment rule plus a real SAT-style resolver means conflicts are errors, not surprises at runtime.</p>
+
+  <h3>4.3 How a sampling profiler reads a running Python process</h3>
+  <p>py-spy is written in Rust and runs as a separate process. It locates the interpreter's global runtime state in the target's memory (using symbols or known offsets per Python version), then periodically reads each thread's frame chain via <code>process_vm_readv</code> (Linux) or equivalent, decoding code objects to function names and line numbers. The target is not paused by default and needs no instrumentation, which is why it is safe in production (it needs <code>SYS_PTRACE</code> capability in containers). Python 3.12+ adds <code>sys.monitoring</code> (PEP 669) for low-overhead in-process tooling, and 3.14 adds a safe external debugger interface (PEP 768), while 3.15 ships a sampling profiler in the stdlib.</p>
+
+  <h3>4.4 What "vectorisation" really does</h3>
+  <p>A Python loop over a million floats executes millions of bytecodes, each boxing and unboxing PyFloat objects. <code>np.dot(a, b)</code> executes one Python call that dispatches to a compiled BLAS kernel operating on contiguous <code>double</code> arrays with SIMD instructions, often multi-threaded, with the GIL released. The interpreter overhead becomes constant per call instead of per element. The JVM does not need this trick as much because C2 auto-vectorises simple loops (and the Vector API gives explicit SIMD).</p>
+
+  <h3>4.5 PyO3 and the extension boundary</h3>
+  <p>A Rust function exported with <code>#[pyfunction]</code> is compiled by maturin into a shared library with a C-ABI entry point. Arguments arrive as Python objects and are converted (<code>&amp;str</code> borrows the UTF-8 buffer, <code>Vec&lt;f64&gt;</code> copies); results are converted back. Inside, you can release the GIL with <code>py.detach</code> (named <code>allow_threads</code> in older PyO3 versions) for pure-Rust work, enabling parallelism with Rayon. The conversion cost at the boundary is why you push whole batches across, never one element at a time: the same advice as for JNI or the FFM API.</p>
+
+  <h3>4.6 What Uvicorn and Gunicorn do with signals</h3>
+  <p>On SIGTERM, Uvicorn stops accepting new connections, waits for in-flight requests (up to <code>--timeout-graceful-shutdown</code>), sends the ASGI lifespan shutdown event (your lifespan's code after <code>yield</code> runs: dispose engines, flush telemetry), and exits. Gunicorn's master forwards SIGTERM to workers and waits up to <code>graceful_timeout</code>, then SIGKILLs. Kubernetes sends SIGTERM to PID 1 after removing the pod from endpoints (asynchronously, so a short <code>preStop</code> sleep avoids routing new requests to a terminating pod). If your entrypoint is a shell script that does not <code>exec</code> the server, SIGTERM never reaches it: the container is SIGKILLed after the grace period.</p>
+
+  <h3>4.7 OpenTelemetry context propagation in Python</h3>
+  <p>The OTel Python SDK stores the active span in a <code>contextvars.ContextVar</code>. Server instrumentation (ASGI/FastAPI) extracts the W3C <code>traceparent</code> header and starts a server span; client instrumentation (httpx, grpcio, confluent-kafka wrappers) injects the current context into outgoing headers. Because <code>asyncio</code> tasks copy the context when created, spans flow into child tasks automatically. Threads do not inherit context automatically, so <code>run_in_executor</code> callers must copy it (<code>contextvars.copy_context().run</code>; <code>asyncio.to_thread</code> does this for you). A Spring Boot service with Micrometer Tracing (OTel bridge) emits the same W3C headers, so traces connect across languages without extra work.</p>
+
+  <h3>4.8 gRPC in Python</h3>
+  <p><code>grpcio</code> wraps the C-core gRPC implementation; <code>grpc.aio</code> exposes an asyncio API. <code>grpcio-tools</code> runs <code>protoc</code> with the Python plugin to generate message classes (<code>*_pb2.py</code>) and service stubs (<code>*_pb2_grpc.py</code>). Deadlines arrive as <code>context.time_remaining()</code>; cancellation from the client cancels the server-side coroutine. Java's gRPC stubs generated from the same <code>.proto</code> interoperate byte-for-byte, which makes protobuf the strongest cross-language contract available.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture</h2>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph Java["Spring Boot estate"]
+    ORD["Orders / Support services"] --&gt;|"REST (OpenAPI client)"| GW["API gateway"]
+    CHAT["Assistant service"] --&gt;|"gRPC Search (deadline 800 ms)"| DGRPC
+    KCONS["@KafkaListener document.ingested"]
+  end
+  GW --&gt;|"POST /v1/documents"| DAPI["docflow API (FastAPI, Uvicorn x N)"]
+  DGRPC["docflow gRPC (grpc.aio)"] --&gt; PG[("PostgreSQL + pgvector")]
+  DAPI --&gt; PG
+  DAPI --&gt; BLOB[("Object storage")]
+  REL["outbox relay"] --&gt; REDIS[("Redis broker")]
+  REDIS --&gt; WK["Celery workers (extract, embed)"]
+  WK --&gt; PG
+  WK --&gt; EMB["Embedding model"]
+  REL --&gt; KAFKA[("Kafka")]
+  KAFKA --&gt; KCONS
+  DAPI -.-&gt;|OTLP| OTEL["OTel Collector"]
+  WK -.-&gt;|OTLP| OTEL
+  CHAT -.-&gt;|OTLP| OTEL
+</pre>
+  <figcaption>Figure 4.4.1 — docflow in production, integrated with a Spring Boot estate through REST, gRPC and Kafka.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> three integration styles, each for a reason. Uploads are REST because they are coarse-grained, browser- and gateway-friendly. Search is gRPC because it is a low-latency, high-volume, strongly typed internal call from the Java assistant service, with deadlines. Completion notifications are Kafka events because several Java consumers react independently and may need replay. All components export OTLP to one collector, so a trace from the Java assistant through docflow's gRPC server into PostgreSQL is one trace.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  B1["Stage 1: builder (python:3.13-slim + uv)"] --&gt; L1["uv sync --frozen --no-install-project (deps layer, cached)"]
+  L1 --&gt; L2["copy src, uv sync --frozen --no-editable (project)"]
+  L2 --&gt; R["Stage 2: runtime (python:3.13-slim, no compilers, non-root)"]
+  R --&gt; C["COPY --from=builder /app/.venv"]
+  C --&gt; E["ENTRYPOINT exec uvicorn / celery"]
+</pre>
+  <figcaption>Figure 4.4.2 — Multi-stage image build: dependency layer cached separately from source.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the dependency layer only rebuilds when <code>uv.lock</code> changes, the same caching strategy as Jib's separate dependency and class layers. The runtime stage contains no compilers, no uv cache and no build tools, reducing size and attack surface.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant J as Java Assistant (gRPC stub)
+  participant G as docflow grpc.aio server
+  participant P as PostgreSQL
+  J-&gt;&gt;G: Search(query_embedding, k=8) deadline=800ms, traceparent
+  G-&gt;&gt;G: interceptor: auth, start server span, read time_remaining()
+  G-&gt;&gt;P: SELECT ... ORDER BY embedding cosine distance LIMIT 8 (statement_timeout from deadline)
+  P--&gt;&gt;G: rows
+  G--&gt;&gt;J: SearchResponse
+  Note over J,G: deadline exceeded: client gets DEADLINE_EXCEEDED, server task cancelled
+</pre>
+  <figcaption>Figure 4.4.3 — A deadline-aware cross-language gRPC call.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the Java client sets a deadline; gRPC transmits it as the <code>grpc-timeout</code> header; the Python server reads the remaining time and derives the database statement timeout from it, so work stops when nobody is waiting anymore. This end-to-end deadline propagation is the cross-language equivalent of passing a Go <code>context.Context</code> down the call chain.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  S{"Need Python in a JVM system?"} --&gt; Q1{"Is it ML/data code using native libraries (NumPy, PyTorch)?"}
+  Q1 --&gt;|yes| SVC["Separate Python service: gRPC/REST + Kafka"]
+  Q1 --&gt;|no| Q2{"Small user-supplied scripts or rules inside the JVM?"}
+  Q2 --&gt;|yes| GP["GraalPy embedding (sandboxed), evaluate carefully"]
+  Q2 --&gt;|no| Q3{"Batch job only?"}
+  Q3 --&gt;|yes| BATCH["Container job orchestrated by Airflow / K8s Job / Temporal"]
+  Q3 --&gt;|no| SVC
+</pre>
+  <figcaption>Figure 4.4.4 — How to bring Python into a Java system.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the separate-service path wins almost always. Embedding is reserved for scripting-style use where pure-Python code is small and isolation from native-library chaos is acceptable. Jython does not appear: it is Python 2.7, which cannot run any modern library.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math: Worker Sizing, Profiling Statistics and Benchmarks</h2>
+  <h3>6.1 Workers, memory and CPU</h3>
+  <p>Per pod: \( W = \min\left(\left\lfloor \frac{C_{pod}}{c_{w}} \right\rfloor, \left\lfloor \frac{M_{pod} - M_{base}}{m_{w}} \right\rfloor\right) \), where \( C_{pod} \) is the CPU limit, \( c_w \) the CPU one busy worker uses (about 1 core), \( M_{pod} \) the memory limit, \( M_{base} \) shared overhead, and \( m_w \) private memory per worker. For an ML-heavy service where each worker loads a 1.2 GB model: a 4 CPU / 6 GB pod gives \( \min(4, \lfloor (6 - 0.3)/1.4 \rfloor) = \min(4, 4) = 4 \). If the model is loaded before fork and shared copy-on-write (and not touched), \( m_w \) shrinks and more workers fit; this is the economic reason for <code>preload_app</code> and <code>gc.freeze()</code>.</p>
+  <h3>6.2 Sampling profiler accuracy</h3>
+  <p>With sampling interval \( \Delta \) over a duration \( T \), you collect \( n = T/\Delta \) samples. A function that truly accounts for fraction \( p \) of time appears in \( \hat{p} = k/n \) samples with standard error \( \sqrt{p(1-p)/n} \). At 100 Hz for 30 s, \( n = 3000 \); for \( p = 0.05 \) the standard error is about 0.4 percentage points: plenty for finding hotspots, useless for comparing two variants differing by 1%. For that, use benchmarks.</p>
+  <h3>6.3 Benchmark statistics</h3>
+  <p>Like JMH, Python's <code>pyperf</code> runs multiple processes, warm-ups and many loops, reporting mean and standard deviation. Treat a difference as real only if confidence intervals do not overlap and the effect is larger than run-to-run noise. The speed-up of an optimisation applied to a fraction \( f \) of runtime with local speed-up \( s \) is bounded by Amdahl: \( S = 1 / ((1 - f) + f/s) \). Rewriting a function that takes 20% of request time in Rust with a 50x local speed-up yields \( 1/(0.8 + 0.004) \approx 1.24 \)x overall. Profile first; the arithmetic often says "do not bother".</p>
+  <h3>6.4 Cache effectiveness</h3>
+  <p>Expected latency with a cache: \( E[L] = h \cdot L_{hit} + (1 - h) \cdot (L_{miss} + L_{hit}) \). For embedding lookups with \( L_{hit} = 1 \) ms (Redis), \( L_{miss} = 120 \) ms (API) and hit ratio \( h = 0.6 \): \( 0.6 + 0.4 \times 121 = 49 \) ms, and 60% fewer paid API calls. Cache keys must include the model name and version, or a model upgrade silently mixes vector spaces.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code: Testing, Packaging, Performance, and Finishing docflow</h2>
+
+  <h3>7.1 JUnit 5 vs pytest vs Go testing</h3>
+  <div class="code-tabs">
+  <pre data-lang="Java"><code class="language-java">class ChunkerTest {
+    @ParameterizedTest
+    @CsvSource({"10,3,1", "300,50,1", "700,50,3"})
+    void chunkCount(int words, int overlap, int expected) {
+        var text = "w ".repeat(words);
+        assertThat(Chunker.chunk(text, 300, overlap)).hasSize(expected);
+    }
+
+    @Test
+    void rejectsOverlapLargerThanWindow() {
+        assertThatThrownBy(() -&gt; Chunker.chunk("a b", 10, 10))
+            .isInstanceOf(IllegalArgumentException.class);
+    }
+}</code></pre>
+  <pre data-lang="Python"><code class="language-python"># tests/unit/test_chunker.py
+import pytest
+from hypothesis import given, settings, strategies as st
+from docflow.ingest.chunker import chunk_text
+
+@pytest.mark.parametrize(("words", "overlap", "expected"), [(10, 3, 1), (300, 50, 1), (700, 50, 3)])
+def test_chunk_count(words: int, overlap: int, expected: int) -&gt; None:
+    assert len(chunk_text("w " * words, 300, overlap)) == expected
+
+def test_rejects_overlap_larger_than_window() -&gt; None:
+    with pytest.raises(ValueError, match="overlap"):
+        chunk_text("a b", max_tokens=10, overlap=10)
+
+word = st.text(alphabet=st.characters(categories=["L", "N"]), min_size=1, max_size=12)
+
+@settings(max_examples=300)
+@given(words=st.lists(word, max_size=2000),
+       size=st.integers(2, 400), data=st.data())
+def test_chunks_cover_every_word_in_order(words: list[str], size: int, data: st.DataObject) -&gt; None:
+    overlap = data.draw(st.integers(0, size - 1))
+    chunks = chunk_text(" ".join(words), size, overlap)
+    # Property 1: no chunk exceeds the window
+    assert all(c.token_count &lt;= size for c in chunks)
+    # Property 2: removing overlaps reconstructs the original word sequence
+    rebuilt: list[str] = []
+    for i, c in enumerate(chunks):
+        toks = c.content.split(" ")
+        rebuilt.extend(toks if i == 0 else toks[overlap:])
+    assert rebuilt == words
+    # Property 3: ordinals are dense and ordered
+    assert [c.ordinal for c in chunks] == list(range(len(chunks)))</code></pre>
+  <pre data-lang="Go"><code class="language-go">func TestChunkCount(t *testing.T) {
+	cases := []struct{ words, overlap, want int }{{10, 3, 1}, {300, 50, 1}, {700, 50, 3}}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("%d_%d", tc.words, tc.overlap), func(t *testing.T) {
+			got := Chunk(strings.Repeat("w ", tc.words), 300, tc.overlap)
+			if len(got) != tc.want {
+				t.Fatalf("got %d chunks, want %d", len(got), tc.want)
+			}
+		})
+	}
+}
+// Property-based: Go's native fuzzing (func FuzzChunk(f *testing.F)) since Go 1.18.</code></pre>
+  </div>
+  <p>Property 2 guards a classic off-by-one: if the chunker kept looping after a window reached the end of the text, it would emit a trailing chunk made only of overlap words, and reconstruction would duplicate them. Remove the <code>break</code> in docflow's <code>chunk_text</code> and Hypothesis reports a minimal failing input within seconds. That is the value of property-based testing: you state the invariant, the tool finds the boundary.</p>
+
+  <h3>7.2 Fixtures with Testcontainers (session-scoped container, per-test rollback)</h3>
+  <pre data-file="tests/conftest.py"><code class="language-python"># uv add --group test pytest pytest-asyncio "testcontainers[postgres]" asgi-lifespan httpx hypothesis
+import os
+from collections.abc import AsyncIterator, Iterator
+
+import pytest
+from alembic import command
+from alembic.config import Config
+from asgi_lifespan import LifespanManager
+from httpx import ASGITransport, AsyncClient
+from testcontainers.postgres import PostgresContainer
+
+from docflow.api.app import create_app
+from docflow.settings import Settings
+
+@pytest.fixture(scope="session")
+def pg_urls() -&gt; Iterator[tuple[str, str]]:
+    """One real PostgreSQL + pgvector for the whole session, like a static @Container in JUnit."""
+    with PostgresContainer("pgvector/pgvector:pg17", driver=None) as pg:
+        base = pg.get_connection_url().replace("postgresql://", "")
+        sync_url, async_url = f"postgresql+psycopg://{base}", f"postgresql+asyncpg://{base}"
+        cfg = Config("alembic.ini")
+        cfg.set_main_option("sqlalchemy.url", sync_url)
+        command.upgrade(cfg, "head")               # test the real migrations, not create_all()
+        yield sync_url, async_url
+
+@pytest.fixture
+def settings(pg_urls: tuple[str, str], tmp_path) -&gt; Settings:
+    sync_url, async_url = pg_urls
+    return Settings(database_url=async_url, worker_database_url=sync_url, blob_dir=tmp_path,
+                    broker_url="memory://")
+
+@pytest.fixture
+async def client(settings: Settings) -&gt; AsyncIterator[AsyncClient]:
+    app = create_app(settings)
+    async with LifespanManager(app):               # runs lifespan: engines, blob store
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            yield c
+
+@pytest.fixture(autouse=True)
+def _truncate(pg_urls: tuple[str, str]) -&gt; Iterator[None]:
+    yield
+    from sqlalchemy import create_engine, text
+    eng = create_engine(pg_urls[0])
+    with eng.begin() as conn:                      # isolation between tests
+        conn.execute(text("TRUNCATE documents, chunks, ingest_jobs, outbox RESTART IDENTITY CASCADE"))
+    eng.dispose()</code></pre>
+  <pre data-file="tests/integration/test_documents_api.py"><code class="language-python">import asyncio
+import pytest
+from httpx import AsyncClient
+
+pytestmark = pytest.mark.integration
+H = {"X-Tenant-ID": "acme"}
+
+async def upload(c: AsyncClient, body: bytes, name: str = "a.md"):
+    return await c.post("/v1/documents", headers=H, files={"file": (name, body, "text/markdown")})
+
+async def test_upload_is_idempotent(client: AsyncClient) -&gt; None:
+    r1 = await upload(client, b"hello world " * 100)
+    r2 = await upload(client, b"hello world " * 100)
+    assert (r1.status_code, r2.status_code) == (202, 200)
+    assert r1.json()["id"] == r2.json()["id"]
+
+async def test_concurrent_identical_uploads_create_one_document(client: AsyncClient) -&gt; None:
+    results = await asyncio.gather(*(upload(client, b"same bytes " * 50) for _ in range(10)))
+    ids = {r.json()["id"] for r in results}
+    assert len(ids) == 1                                   # unique constraint + IntegrityError path
+    assert sorted(r.status_code for r in results).count(202) == 1
+
+async def test_tenant_isolation(client: AsyncClient) -&gt; None:
+    doc_id = (await upload(client, b"secret")).json()["id"]
+    r = await client.get(f"/v1/documents/{doc_id}", headers={"X-Tenant-ID": "other"})
+    assert r.status_code == 404
+
+@pytest.mark.parametrize(("ctype", "status"), [("image/png", 415), ("text/plain", 202)])
+async def test_content_type_policy(client: AsyncClient, ctype: str, status: int) -&gt; None:
+    r = await client.post("/v1/documents", headers=H, files={"file": ("x", b"abc", ctype)})
+    assert r.status_code == status</code></pre>
+  <pre data-file="tests/integration/test_pipeline.py"><code class="language-python">import uuid
+import pytest
+from sqlalchemy import select
+from docflow.models import Chunk, DocStatus, Document
+from docflow.worker import celery_app as ca
+from docflow.worker import tasks
+from docflow.worker.relay import relay_once
+
+pytestmark = pytest.mark.integration
+
+async def test_full_pipeline_is_idempotent(client, settings, monkeypatch) -&gt; None:
+    monkeypatch.setattr(ca, "settings", settings)
+    monkeypatch.setattr(tasks, "settings", settings)
+    ca.init_child()                                       # sync engine + fake embedder
+    published: list[tuple[str, dict]] = []
+    pubs = {t: (lambda m: published.append((m.topic, m.payload)))
+            for t in ("docflow.tasks.extract", "docflow.tasks.embed", "document.ingested")}
+
+    r = await client.post("/v1/documents", headers={"X-Tenant-ID": "acme"},
+                          files={"file": ("a.md", b"alpha beta gamma " * 400, "text/markdown")})
+    doc_id = r.json()["id"]
+
+    assert relay_once(ca.res.sessionmaker, pubs) == 1
+    assert tasks.extract_document(**published[-1][1]) == "extracted"
+    assert tasks.extract_document(**published[-1][1]) == "skipped"      # duplicate delivery
+    relay_once(ca.res.sessionmaker, pubs)
+    assert tasks.embed_document(**published[-1][1]) == "ready"
+    relay_once(ca.res.sessionmaker, pubs)
+    assert published[-1][0] == "document.ingested"
+
+    with ca.res.sessionmaker() as s:
+        doc = s.get(Document, uuid.UUID(doc_id))
+        assert doc is not None and doc.status == DocStatus.READY
+        assert all(c.embedding is not None for c in s.scalars(select(Chunk)))</code></pre>
+  <p>Run fast tests on every save (<code>uv run pytest -m "not integration" -x</code>) and integration tests in CI (<code>uv run pytest -m integration -n auto</code> with pytest-xdist). Real PostgreSQL catches what SQLite hides: the concurrent-upload test exercises the unique constraint under real concurrency, and the migrations are tested instead of <code>create_all()</code>.</p>
+
+  <h3>7.3 pyproject.toml for docflow</h3>
+  <pre data-file="pyproject.toml"><code class="language-plaintext">[project]
+name = "docflow"
+version = "1.0.0"
+description = "Document ingestion service for RAG pipelines"
+requires-python = "&gt;=3.12,&lt;3.15"
+dependencies = [
+  "fastapi&gt;=0.121,&lt;1",
+  "uvicorn[standard]&gt;=0.30",
+  "pydantic&gt;=2.7,&lt;3",
+  "pydantic-settings&gt;=2.3",
+  "python-multipart&gt;=0.0.9",
+  "sqlalchemy[asyncio]&gt;=2.0.30,&lt;2.2",
+  "asyncpg&gt;=0.29",
+  "psycopg[binary]&gt;=3.2",
+  "pgvector&gt;=0.3",
+  "alembic&gt;=1.13",
+  "celery[redis]&gt;=5.4,&lt;6",
+  "httpx&gt;=0.27",
+  "grpcio&gt;=1.66",
+  "protobuf&gt;=5.27",
+  "confluent-kafka&gt;=2.5",
+  "opentelemetry-sdk&gt;=1.27",
+  "opentelemetry-exporter-otlp-proto-grpc&gt;=1.27",
+  "opentelemetry-instrumentation-fastapi",
+  "opentelemetry-instrumentation-sqlalchemy",
+  "opentelemetry-instrumentation-httpx",
+  "opentelemetry-instrumentation-celery",
+  "opentelemetry-instrumentation-grpc",
+  "prometheus-client&gt;=0.20",
+]
+
+[project.optional-dependencies]
+pdf = ["pypdf&gt;=4"]
+
+[project.scripts]
+docflow-relay = "docflow.worker.relay:main"
+docflow-grpc = "docflow.grpc_server:main"
+
+[dependency-groups]                    # PEP 735: not published, like Maven test scope
+dev = ["ruff&gt;=0.6", "pyright&gt;=1.1.380", "grpcio-tools&gt;=1.66"]
+test = ["pytest&gt;=8", "pytest-asyncio&gt;=0.24", "pytest-xdist&gt;=3.6", "hypothesis&gt;=6.100",
+        "testcontainers[postgres]&gt;=4.8", "asgi-lifespan&gt;=2.1", "aiosqlite&gt;=0.20"]
+
+[build-system]
+requires = ["hatchling&gt;=1.25"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+default-groups = ["dev", "test"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC", "S", "SIM", "RUF"]   # ASYNC: blocking calls in async code
+ignore = ["S101"]                                                  # assert is fine in tests
+
+[tool.pyright]
+typeCheckingMode = "strict"
+pythonVersion = "3.12"
+include = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+markers = ["integration: needs Docker (Testcontainers)"]
+addopts = "-ra --strict-markers"</code></pre>
+  <p>Note ruff's <code>ASYNC</code> rule set: it flags blocking calls such as <code>time.sleep</code>, <code>open()</code> or sync HTTP clients inside <code>async def</code>, catching the most common production bug of Chapter 4.1 at lint time. Daily commands:</p>
+  <pre><code class="language-bash">uv sync                       # create .venv from uv.lock (installs Python if needed)
+uv add "tenacity&gt;=9"          # add dependency + relock (like adding to pom.xml + mvn dependency:resolve)
+uv lock --upgrade-package fastapi   # controlled upgrade of one package
+uv run pytest -m "not integration"
+uv run ruff check --fix &amp;&amp; uv run ruff format &amp;&amp; uv run pyright
+uv export --format requirements-txt --no-dev &gt; requirements.txt   # for tools that need it
+uv build                      # sdist + wheel into dist/</code></pre>
+
+  <h3>7.4 The container image</h3>
+  <pre data-file="Dockerfile"><code class="language-dockerfile"># syntax=docker/dockerfile:1.7
+ARG PYTHON=3.13
+FROM python:${PYTHON}-slim AS builder
+COPY --from=ghcr.io/astral-sh/uv:0.9 /uv /uvx /bin/     # pin the uv version you develop with
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
+WORKDIR /app
+# 1) dependencies only: cached until uv.lock changes
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --frozen --no-install-project --no-default-groups --extra pdf
+# 2) the project itself
+COPY pyproject.toml uv.lock alembic.ini ./
+COPY src ./src
+COPY migrations ./migrations
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-default-groups --extra pdf --no-editable
+
+FROM python:${PYTHON}-slim AS runtime
+RUN groupadd --system app &amp;&amp; useradd --system --gid app --home /app app
+WORKDIR /app
+COPY --from=builder --chown=app:app /app/.venv /app/.venv
+COPY --from=builder --chown=app:app /app/alembic.ini /app/alembic.ini
+COPY --from=builder --chown=app:app /app/migrations /app/migrations
+ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+USER app
+EXPOSE 8000 50051
+HEALTHCHECK NONE
+# exec form: uvicorn is PID 1 and receives SIGTERM directly
+ENTRYPOINT ["uvicorn", "docflow.api.app:app", "--host", "0.0.0.0", "--port", "8000", \
+            "--workers", "2", "--proxy-headers", "--forwarded-allow-ips", "*", \
+            "--timeout-graceful-shutdown", "20", "--no-server-header"]
+# Same image, different commands in Kubernetes:
+#   worker: celery -A docflow.worker.celery_app worker -Q extract --concurrency 4
+#   embed:  celery -A docflow.worker.celery_app worker -Q embed --pool threads --concurrency 16
+#   relay:  docflow-relay        grpc: docflow-grpc        migrate: alembic upgrade head</code></pre>
+  <p>One image, several Deployments (api, grpc, extract workers, embed workers, relay) plus a migration Job: the Python counterpart of a Spring Boot fat JAR started with different profiles. The embed queue uses Celery's <code>threads</code> pool because embedding is I/O-bound; the extract queue keeps prefork for CPU-bound parsing. For a distroless runtime, <code>gcr.io/distroless/python3</code> exists but pins a Debian-provided Python version; most teams use <code>-slim</code> plus a non-root user and image scanning, or Chainguard-style minimal Python images.</p>
+
+  <h3>7.5 Local stack</h3>
+  <pre data-file="docker-compose.yml"><code class="language-yaml">services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment: { POSTGRES_USER: docflow, POSTGRES_PASSWORD: docflow, POSTGRES_DB: docflow }
+    ports: ["5432:5432"]
+    healthcheck: { test: ["CMD", "pg_isready", "-U", "docflow"], interval: 2s, retries: 30 }
+  redis:
+    image: redis:7-alpine
+  kafka:
+    image: apache/kafka:3.9.0          # KRaft single node, no ZooKeeper
+    ports: ["9092:9092"]
+  migrate:
+    build: .
+    entrypoint: ["alembic", "upgrade", "head"]
+    environment: &amp;env
+      DOCFLOW_DATABASE_URL: postgresql+asyncpg://docflow:docflow@postgres:5432/docflow
+      DOCFLOW_WORKER_DATABASE_URL: postgresql+psycopg://docflow:docflow@postgres:5432/docflow
+      DOCFLOW_BROKER_URL: redis://redis:6379/0
+      DOCFLOW_KAFKA_BOOTSTRAP: kafka:9092
+      DOCFLOW_BLOB_DIR: /data/blobs
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: docflow
+    depends_on: { postgres: { condition: service_healthy } }
+  api:
+    build: .
+    environment: *env
+    ports: ["8000:8000"]
+    volumes: ["blobs:/data/blobs"]
+    depends_on: { migrate: { condition: service_completed_successfully } }
+  worker:
+    build: .
+    entrypoint: ["celery", "-A", "docflow.worker.celery_app", "worker", "-Q", "extract,embed", "-c", "4"]
+    environment: *env
+    volumes: ["blobs:/data/blobs"]
+    depends_on: [migrate, redis]
+  relay:
+    build: .
+    entrypoint: ["docflow-relay"]
+    environment: *env
+    depends_on: [migrate, redis, kafka]
+  grpc:
+    build: .
+    entrypoint: ["docflow-grpc"]
+    environment: *env
+    ports: ["50051:50051"]
+    depends_on: [migrate]
+volumes:
+  blobs: {}</code></pre>
+
+  <h3>7.6 Profiling and optimising a hot path</h3>
+  <pre data-file="perf_demo.py"><code class="language-python"># python perf_demo.py ; then: py-spy record -o flame.svg -- python perf_demo.py
+import cProfile
+import pstats
+import time
+from functools import lru_cache
+
+import numpy as np
+
+def cosine_top_k_python(q: list[float], docs: list[list[float]], k: int) -&gt; list[int]:
+    def cos(a: list[float], b: list[float]) -&gt; float:
+        dot = sum(x * y for x, y in zip(a, b))
+        na = sum(x * x for x in a) ** 0.5
+        nb = sum(y * y for y in b) ** 0.5
+        return dot / (na * nb)
+    scores = [(cos(q, d), i) for i, d in enumerate(docs)]
+    return [i for _, i in sorted(scores, reverse=True)[:k]]
+
+def cosine_top_k_numpy(q: np.ndarray, docs: np.ndarray, k: int) -&gt; np.ndarray:
+    docs_n = docs / np.linalg.norm(docs, axis=1, keepdims=True)    # normalise once in real code
+    scores = docs_n @ (q / np.linalg.norm(q))                       # one BLAS call, GIL released
+    idx = np.argpartition(-scores, k)[:k]                           # O(n) selection, not a full sort
+    return idx[np.argsort(-scores[idx])]
+
+@lru_cache(maxsize=10_000)                                          # memoise pure, hashable inputs
+def normalise_query(text: str) -&gt; str:
+    return " ".join(text.lower().split())
+
+if __name__ == "__main__":
+    rng = np.random.default_rng(0)
+    docs = rng.standard_normal((20_000, 384)).astype(np.float32)
+    q = rng.standard_normal(384).astype(np.float32)
+
+    t0 = time.perf_counter(); cosine_top_k_numpy(q, docs, 8)
+    print(f"numpy : {(time.perf_counter() - t0) * 1000:7.1f} ms")
+
+    small = docs[:2000].tolist(); ql = q.tolist()
+    with cProfile.Profile() as prof:
+        t0 = time.perf_counter(); cosine_top_k_python(ql, small, 8)
+        print(f"python: {(time.perf_counter() - t0) * 1000:7.1f} ms  (10x fewer docs!)")
+    pstats.Stats(prof).sort_stats("cumulative").print_stats(5)</code></pre>
+  <p>On a typical laptop the NumPy version over 20,000 vectors runs in a few milliseconds, while the pure-Python version over a tenth of the data takes hundreds <span class="tag illus">Illustrative</span>; run it yourself. In production you would not even do this in Python: pgvector's HNSW index (Chapter 4.3 migration) answers the query inside PostgreSQL. The order of levers in §3.10 applies: push the work to where it is cheapest.</p>
+
+  <h3>7.7 Rust for a genuine hot spot (PyO3 + maturin)</h3>
+  <pre data-file="fastchunk/src/lib.rs"><code class="language-plaintext">// cargo new --lib fastchunk; maturin develop --release
+use pyo3::prelude::*;
+
+/// Count whitespace-separated words in many texts, in parallel, without the GIL.
+#[pyfunction]
+fn word_counts(py: Python&lt;'_&gt;, texts: Vec&lt;String&gt;) -&gt; Vec&lt;usize&gt; {
+    py.detach(|| {                       // "allow_threads" in PyO3 versions before 0.26
+        use rayon::prelude::*;
+        texts.par_iter().map(|t| t.split_whitespace().count()).collect()
+    })
+}
+
+#[pymodule]
+fn fastchunk(m: &amp;Bound&lt;'_, PyModule&gt;) -&gt; PyResult&lt;()&gt; {
+    m.add_function(wrap_pyfunction!(word_counts, m)?)?;
+    Ok(())
+}</code></pre>
+  <p>Note the batch signature (<code>Vec&lt;String&gt;</code> in, <code>Vec&lt;usize&gt;</code> out): one boundary crossing per batch. This is the approach behind Pydantic-core, Polars, Hugging Face tokenizers, orjson and ruff: Python ergonomics, Rust inner loops.</p>
+
+  <h3>7.8 docflow telemetry</h3>
+  <pre data-file="src/docflow/telemetry.py"><code class="language-python">"""Call setup_telemetry() at process start (API lifespan, worker_process_init, gRPC main).
+Equivalent of Spring Boot's micrometer-tracing-bridge-otel + OTLP exporter auto-config."""
+import os
+
+from opentelemetry import metrics, trace
+from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+_done = False
+
+def setup_telemetry(component: str) -&gt; None:
+    global _done
+    if _done or not os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
+        return
+    resource = Resource.create({"service.name": os.getenv("OTEL_SERVICE_NAME", "docflow"),
+                                "service.component": component,
+                                "deployment.environment": os.getenv("ENV", "dev")})
+    tp = TracerProvider(resource=resource)
+    tp.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))   # endpoint from env
+    trace.set_tracer_provider(tp)
+    metrics.set_meter_provider(MeterProvider(
+        resource=resource, metric_readers=[PeriodicExportingMetricReader(OTLPMetricExporter())]))
+    _done = True
+
+def instrument_app(app, engine) -&gt; None:
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+    from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+    FastAPIInstrumentor.instrument_app(app, excluded_urls="healthz,readyz")
+    SQLAlchemyInstrumentor().instrument(engine=engine.sync_engine)
+    HTTPXClientInstrumentor().instrument()
+
+meter = metrics.get_meter("docflow")
+chunks_embedded = meter.create_counter("docflow.chunks.embedded", unit="{chunk}")
+embed_latency = meter.create_histogram("docflow.embed.batch.duration", unit="s")</code></pre>
+  <p>Wire it into <code>create_app</code>'s lifespan (<code>setup_telemetry("api"); instrument_app(app, engine)</code>), into <code>init_child</code> for workers (plus <code>CeleryInstrumentor().instrument()</code>, which propagates trace context through task headers so the relay, the worker and the original HTTP request appear in one trace), and into the gRPC server. Set <code>OTEL_*</code> environment variables in Kubernetes exactly as for the Java agent.</p>
+
+  <h3>7.9 The shared contract: protobuf</h3>
+  <pre data-file="proto/docflow/v1/docflow.proto"><code class="language-plaintext">syntax = "proto3";
+package docflow.v1;
+option java_multiple_files = true;
+option java_package = "com.example.docflow.v1";
+
+service DocflowService {
+  rpc Search(SearchRequest) returns (SearchResponse);
+  rpc GetDocument(GetDocumentRequest) returns (Document);
+}
+
+message SearchRequest {
+  string tenant_id = 1;
+  repeated float query_embedding = 2;   // packed by default in proto3
+  uint32 k = 3;
+}
+message SearchHit {
+  string document_id = 1;
+  uint32 ordinal = 2;
+  string content = 3;
+  float score = 4;
+}
+message SearchResponse { repeated SearchHit hits = 1; }
+message GetDocumentRequest { string tenant_id = 1; string document_id = 2; }
+message Document {
+  string id = 1;
+  string filename = 2;
+  string status = 3;
+  uint32 version = 4;
+  uint32 chunk_count = 5;
+}</code></pre>
+  <p>The proto lives in a contracts repository (or is published from docflow as a versioned artifact). Java builds it with the <code>protobuf-maven-plugin</code>/Gradle protobuf plugin; Python with <code>python -m grpc_tools.protoc -I proto --python_out=src --grpc_python_out=src --pyi_out=src proto/docflow/v1/docflow.proto</code>. Buf's breaking-change detection in CI prevents incompatible edits (never renumber or reuse a field number).</p>
+
+  <h3>7.10 docflow gRPC server</h3>
+  <pre data-file="src/docflow/grpc_server.py"><code class="language-python">import asyncio
+import logging
+import signal
+import uuid
+
+import grpc
+from sqlalchemy import select, text
+
+from docflow.db import make_async_engine, make_async_sessionmaker
+from docflow.models import Chunk, Document
+from docflow.settings import get_settings
+from docflow.telemetry import setup_telemetry
+from docflow.v1 import docflow_pb2 as pb
+from docflow.v1 import docflow_pb2_grpc as pb_grpc
+
+log = logging.getLogger("docflow.grpc")
+
+class DocflowService(pb_grpc.DocflowServiceServicer):
+    def __init__(self, sessionmaker) -&gt; None:
+        self.sm = sessionmaker
+
+    async def Search(self, request: pb.SearchRequest, context: grpc.aio.ServicerContext) -&gt; pb.SearchResponse:
+        if not request.tenant_id or len(request.query_embedding) != get_settings().embedding_dim:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "tenant_id and a 384-d embedding required")
+        k = min(request.k or 8, 50)
+        remaining = context.time_remaining()                     # seconds or None
+        timeout_ms = int(max(0.05, (remaining or 2.0) - 0.05) * 1000)
+        distance = Chunk.embedding.cosine_distance(list(request.query_embedding))
+        stmt = (select(Chunk.document_id, Chunk.ordinal, Chunk.content, distance.label("d"))
+                .join(Document, Document.id == Chunk.document_id)
+                .where(Document.tenant_id == request.tenant_id, Chunk.embedding.is_not(None))
+                .order_by(distance).limit(k))
+        async with self.sm() as s, s.begin():
+            await s.execute(text(f"SET LOCAL statement_timeout = {timeout_ms}"))   # deadline -&gt; DB
+            rows = (await s.execute(stmt)).all()
+        return pb.SearchResponse(hits=[pb.SearchHit(document_id=str(r.document_id), ordinal=r.ordinal,
+                                                    content=r.content, score=1.0 - float(r.d)) for r in rows])
+
+    async def GetDocument(self, request: pb.GetDocumentRequest, context: grpc.aio.ServicerContext) -&gt; pb.Document:
+        try:
+            doc_id = uuid.UUID(request.document_id)
+        except ValueError:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "bad document_id")
+        async with self.sm() as s:
+            doc = await s.scalar(select(Document).where(Document.id == doc_id,
+                                                        Document.tenant_id == request.tenant_id))
+        if doc is None:
+            await context.abort(grpc.StatusCode.NOT_FOUND, "document not found")
+        return pb.Document(id=str(doc.id), filename=doc.filename, status=doc.status.value,
+                           version=doc.version, chunk_count=doc.chunk_count)
+
+async def serve() -&gt; None:
+    settings = get_settings()
+    setup_telemetry("grpc")
+    engine = make_async_engine(settings.database_url, settings.db_pool_size)
+    server = grpc.aio.server(options=[("grpc.max_receive_message_length", 4 * 1024 * 1024)])
+    pb_grpc.add_DocflowServiceServicer_to_server(DocflowService(make_async_sessionmaker(engine)), server)
+    server.add_insecure_port("[::]:50051")      # mTLS via the service mesh in production
+    await server.start()
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop.set)
+    await stop.wait()
+    await server.stop(grace=15)                 # finish in-flight RPCs, reject new ones
+    await engine.dispose()
+
+def main() -&gt; None:
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(serve())</code></pre>
+
+  <h3>7.11 docflow Kafka publisher (used by the outbox relay)</h3>
+  <pre data-file="src/docflow/events/kafka.py"><code class="language-python">import json
+from collections.abc import Callable
+
+from confluent_kafka import KafkaException, Producer
+
+from docflow.models import OutboxMessage
+
+def kafka_publisher(bootstrap: str) -&gt; Callable[[OutboxMessage], None]:
+    producer = Producer({
+        "bootstrap.servers": bootstrap,
+        "enable.idempotence": True,          # no duplicates from producer retries, ordered per partition
+        "acks": "all",
+        "compression.type": "zstd",
+        "linger.ms": 5,
+    })
+
+    def publish(msg: OutboxMessage) -&gt; None:
+        errors: list[Exception] = []
+        def on_delivery(err, _m) -&gt; None:
+            if err is not None:
+                errors.append(KafkaException(err))
+        producer.produce("document.ingested", key=msg.key.encode(),
+                         value=json.dumps({"schema": "docflow.document.ingested.v1", **msg.payload}).encode(),
+                         headers=[("content-type", b"application/json")], on_delivery=on_delivery)
+        producer.flush(10)                   # synchronous per outbox row: simple and safe
+        if errors:
+            raise errors[0]                  # relay transaction rolls back; retried next poll
+    return publish</code></pre>
+  <p>Keyed by document ID, so all events for one document land in one partition in order. For higher throughput, flush once per relay batch instead of per row. Many organisations use a schema registry with Avro or Protobuf instead of JSON; confluent-kafka's serializers support both, and Spring Kafka consumes them with the matching Confluent deserializers.</p>
+
+  <h3>7.12 The Java side: three Spring Boot clients</h3>
+  <div class="code-tabs">
+  <pre data-lang="REST"><code class="language-java">// Spring Boot 3.2+: RestClient with timeouts; OpenAPI Generator can generate this from docflow's /openapi.json
+@Configuration
+class DocflowRestConfig {
+    @Bean
+    RestClient docflowRestClient(RestClient.Builder builder) {
+        var rf = new JdkClientHttpRequestFactory();
+        rf.setReadTimeout(Duration.ofSeconds(10));
+        return builder.baseUrl("http://docflow-api:8000").requestFactory(rf).build();
+    }
+}
+
+@Service
+class DocumentUploader {
+    private final RestClient docflow;
+    DocumentUploader(RestClient docflowRestClient) { this.docflow = docflowRestClient; }
+
+    DocflowDocument upload(String tenant, String filename, byte[] bytes) {
+        var parts = new LinkedMultiValueMap&lt;String, Object&gt;();
+        parts.add("file", new ByteArrayResource(bytes) {
+            @Override public String getFilename() { return filename; }
+        });
+        return docflow.post().uri("/v1/documents")
+                .header("X-Tenant-ID", tenant)
+                .contentType(MediaType.MULTIPART_FORM_DATA)
+                .body(parts)
+                .retrieve()
+                .body(DocflowDocument.class);       // 200 (duplicate) and 202 both map here
+    }
+}
+record DocflowDocument(UUID id, String status, int version, int chunkCount) {}
+// Note: docflow emits snake_case (chunk_count); configure Jackson SNAKE_CASE or use @JsonProperty.</code></pre>
+  <pre data-lang="gRPC"><code class="language-java">// Generated from the same docflow.proto; grpc-netty-shaded + protobuf-java
+@Service
+class KnowledgeSearch {
+    private final DocflowServiceGrpc.DocflowServiceBlockingStub stub;
+
+    KnowledgeSearch(@Value("${docflow.grpc.target:docflow-grpc:50051}") String target) {
+        ManagedChannel ch = ManagedChannelBuilder.forTarget(target).usePlaintext().build();
+        this.stub = DocflowServiceGrpc.newBlockingStub(ch);
+    }
+
+    List&lt;SearchHit&gt; search(String tenant, float[] embedding) {
+        var req = SearchRequest.newBuilder().setTenantId(tenant).setK(8);
+        for (float f : embedding) req.addQueryEmbedding(f);
+        try {
+            return stub.withDeadlineAfter(800, TimeUnit.MILLISECONDS)   // propagated to Python
+                       .search(req.build()).getHitsList();
+        } catch (StatusRuntimeException e) {
+            if (e.getStatus().getCode() == Status.Code.DEADLINE_EXCEEDED) return List.of();  // degrade
+            throw e;
+        }
+    }
+}</code></pre>
+  <pre data-lang="Kafka"><code class="language-java">@Component
+class DocumentIngestedListener {
+    private final ObjectMapper json = new ObjectMapper();
+    private final ProcessedEvents processed;          // idempotency store (table with unique key)
+    DocumentIngestedListener(ProcessedEvents processed) { this.processed = processed; }
+
+    @KafkaListener(topics = "document.ingested", groupId = "support-assistant")
+    @Transactional
+    void onIngested(ConsumerRecord&lt;String, String&gt; rec) throws Exception {
+        JsonNode e = json.readTree(rec.value());
+        String key = e.get("document_id").asText() + ":" + e.get("version").asInt();
+        if (!processed.markIfNew(key)) return;        // relay may republish: at-least-once
+        // ... enable the document in the assistant's knowledge base for e.get("tenant_id")
+    }
+}</code></pre>
+  </div>
+  <p>Each client mirrors an idea from the Python side: the REST client tolerates the idempotent 200/202 contract; the gRPC client sets a deadline that Python honours down to PostgreSQL; the Kafka listener is idempotent because the outbox relay is at-least-once. Contracts and failure semantics, not languages, are what make polyglot systems reliable.</p>
+
+  <h3>7.13 Why not embed Python in the JVM?</h3>
+  <pre data-file="GraalPyDemo.java"><code class="language-java">// org.graalvm.polyglot:polyglot + org.graalvm.polyglot:python (GraalPy). Works for pure-Python logic.
+import org.graalvm.polyglot.*;
+
+public class GraalPyDemo {
+    public static void main(String[] args) {
+        try (Context ctx = Context.newBuilder("python").allowAllAccess(false).build()) {
+            Value fn = ctx.eval("python", "lambda text: ' '.join(text.lower().split())");
+            System.out.println(fn.execute("  Hello   GraalPy ").asString());
+        }
+    }
+}</code></pre>
+  <p>This is fine for small, pure-Python rules or user scripts in a sandbox. It is the wrong tool for docflow-style services: native-extension compatibility (PyTorch, many wheels) is limited or slower, you inherit two runtimes' memory and debugging complexity in one process, and you lose independent scaling and deployment. Jython is not an option for modern code because it implements Python 2.7. <span class="tag opinion">Opinion</span> Default to separate services; consider GraalPy only for embedded scripting.</p>
+</section>
+
+<section id="applications">
+  <h2>8. Applications</h2>
+  <h3>8.1 Python as the AI tier of a JVM company</h3>
+  <p>The most common shape in 2026: Java/Kotlin services own transactional domains; Python services own model inference, retrieval, document processing, evaluation and agent orchestration; contracts are gRPC/OpenAPI plus Kafka events; one observability stack spans both. docflow is a template for that tier.</p>
+  <h3>8.2 Internal Python platform teams</h3>
+  <p>Larger organisations create a "Python platform" team that maintains base images, a cookiecutter or copier template (pyproject, ruff, pyright, pytest, Dockerfile, OTel), an internal package index or proxy, and shared libraries (auth middleware, telemetry setup). Netflix has publicly discussed a central Python team providing shared tooling (Talk Python episode 421, 2023).</p>
+  <h3>8.3 Batch and pipeline jobs</h3>
+  <p>The same packaging and image practices apply to Airflow/Dagster tasks, Kubernetes Jobs for re-embedding, and evaluation runs in CI: one lockfile, one image, deterministic runs.</p>
+  <h3>8.4 Performance-critical libraries in Rust</h3>
+  <p>When a Python hotspot is unavoidable (tokenisation, parsing, validation), teams write a small Rust extension with PyO3 rather than rewriting the service. The ecosystem's best-known libraries (Pydantic-core, Polars, tokenizers, orjson) prove the pattern.</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 Astral's uv and ruff</h3>
+  <p><span class="tag fact">Verified</span> Astral released ruff (2022) and uv (2024) as Rust implementations of Python tooling. uv's documentation describes it as a replacement for pip, pip-tools, pipx, poetry, pyenv, virtualenv and more, with a universal lockfile. Adoption was rapid because it removed the slowest step in CI and Docker builds (dependency resolution and installation). Speed claims on Astral's site are vendor benchmarks <span class="tag illus">vendor-reported</span>; measure in your CI.</p>
+  <h3>9.2 Dropbox and mypyc</h3>
+  <p><span class="tag fact">Verified</span> Dropbox's type-checking journey (2019) included compiling mypy itself with mypyc, a compiler that turns type-annotated Python into C extensions, reported in the post as making mypy substantially faster. It is a real example of "compile the hot spot" without leaving Python syntax.</p>
+  <h3>9.3 Instagram's pre-fork memory work</h3>
+  <p><span class="tag fact">Verified</span> Instagram's GC posts (Chapter 4.1) are as much deployment lessons as runtime lessons: worker process models, <code>preload</code>, and copy-on-write determine memory cost per pod. They led to <code>gc.freeze()</code> in CPython 3.7.</p>
+  <h3>9.4 Uber's Temporal-style polyglot workflows</h3>
+  <p><span class="tag fact">Verified</span> Uber built Cadence and later engineers founded Temporal, whose SDKs (Java, Go, Python, TypeScript) let workflows in one language call activities in another: a documented, supported way to integrate Python AI activities into Java business workflows without in-process embedding.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages, Limitations and Operational Cost</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Area</th><th>Python (2026 toolchain)</th><th>Java/Spring Boot</th></tr></thead>
+    <tbody>
+      <tr><td>Build &amp; deps</td><td>uv/Poetry, fast, lockfiles; one version per env; native wheels per platform</td><td>Maven/Gradle; mature; shading possible; JARs platform-independent</td></tr>
+      <tr><td>Testing</td><td>pytest fixtures, Hypothesis, Testcontainers; no compile-time safety net</td><td>JUnit 5, Mockito, Testcontainers, Spring test slices; compiler catches much</td></tr>
+      <tr><td>Performance</td><td>Slow interpreter; excellent when work is native; process-per-core</td><td>Fast JIT; threads use all cores; higher memory baseline</td></tr>
+      <tr><td>Startup</td><td>Fast unless importing heavy ML libraries (seconds)</td><td>Seconds; CDS/AOT/native image improve</td></tr>
+      <tr><td>Image size</td><td>Slim base ~ 50 MB compressed; ML deps add GBs (CUDA wheels)</td><td>JRE base + fat JAR ~ 100–200 MB</td></tr>
+      <tr><td>Observability</td><td>OTel SDK + instrumentations; py-spy</td><td>OTel Java agent, Micrometer, JFR: very mature</td></tr>
+      <tr><td>Interop</td><td>gRPC, REST, Kafka equally well supported</td><td>Same</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Decision</th><th>Options</th><th>Recommendation <span class="tag opinion">Opinion</span></th></tr></thead>
+    <tbody>
+      <tr><td>Dependency tool</td><td>uv / Poetry / pip-tools / conda</td><td>uv for services; conda only when you need non-Python binaries it uniquely provides</td></tr>
+      <tr><td>Process manager</td><td>Uvicorn workers / Gunicorn + uvicorn-worker / one process per container</td><td>One or a few Uvicorn workers per container; Gunicorn when you need max-requests recycling and preload</td></tr>
+      <tr><td>Contract to Java</td><td>REST+OpenAPI / gRPC / Kafka</td><td>gRPC for internal low-latency calls; REST for edge and coarse calls; Kafka for events</td></tr>
+      <tr><td>Hot spot</td><td>NumPy / Cython / mypyc / Rust (PyO3) / move service to Go</td><td>Vectorise first, Rust second, rewrite last</td></tr>
+      <tr><td>Test DB</td><td>SQLite / Testcontainers PostgreSQL</td><td>Both: SQLite for fast logic tests, PostgreSQL for repositories and migrations</td></tr>
+      <tr><td>Embedding in JVM</td><td>GraalPy / Jython / separate service</td><td>Separate service</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes</h2>
+  <ol>
+    <li><strong>Unpinned dependencies</strong> (<code>pip install fastapi</code> in a Dockerfile): every build is different. Use a lockfile and <code>--frozen</code>.</li>
+    <li><strong>Building sdists in the runtime image</strong>, pulling compilers into production. Build in a builder stage; install wheels only.</li>
+    <li><strong>Shell-form ENTRYPOINT</strong> without <code>exec</code>: SIGTERM never reaches Python; pods are SIGKILLed and in-flight requests drop.</li>
+    <li><strong>Running as root</strong> and writing to the image filesystem.</li>
+    <li><strong><code>patch()</code> on the wrong import path</strong>, producing tests that pass while production fails.</li>
+    <li><strong>Session-scoped async fixtures with mismatched event loop scopes</strong> (pytest-asyncio): "attached to a different loop" errors. Configure loop scopes explicitly (see pyproject).</li>
+    <li><strong>Optimising without profiling</strong>, or profiling with cProfile in production (overhead). Use py-spy.</li>
+    <li><strong>Too many workers</strong> for the CPU limit, causing CPU throttling and latency spikes; or too few for I/O-heavy sync endpoints.</li>
+    <li><strong>Java and Python disagreeing on JSON naming</strong> (camelCase vs snake_case), nullability or date formats. Generate clients from the contract and configure Jackson accordingly.</li>
+    <li><strong>No deadline propagation</strong>: Java times out at 800 ms, Python keeps searching for 5 s, wasting DB capacity during incidents.</li>
+    <li><strong>Pickle across services</strong> (Celery with pickle, caching pickled objects shared with other services): remote code execution risk and version coupling.</li>
+  </ol>
+</section>
+
+<section id="production">
+  <h2>13. Production Checklist</h2>
+  <h3>13.1 Build and supply chain</h3>
+  <ul>
+    <li>Lockfile with hashes; <code>uv sync --frozen</code>; private index proxy (Artifactory/Nexus support PyPI) like your Maven proxy.</li>
+    <li>Vulnerability scanning: <code>pip-audit</code> or the scanner of your image registry; SBOM generation (CycloneDX for Python exists).</li>
+    <li>Reproducible images: pinned base image digests, multi-stage builds, non-root user, read-only root filesystem where possible.</li>
+  </ul>
+  <h3>13.2 Runtime</h3>
+  <ul>
+    <li>Workers sized from §6.1; CPU limits that match; memory limits with headroom for fragmentation; periodic worker recycling for Gunicorn/Celery.</li>
+    <li>Probes: liveness cheap, readiness checks dependencies, startup probe for slow model loading.</li>
+    <li>Graceful shutdown: exec-form entrypoint, <code>preStop</code> sleep, grace periods longer than in-flight work.</li>
+    <li>Configuration via environment and mounted secrets into <code>BaseSettings</code>; fail fast on invalid config.</li>
+  </ul>
+  <h3>13.3 Observability</h3>
+  <ul>
+    <li>Traces: OTel server/client spans, Celery and Kafka propagation, consistent <code>service.name</code>.</li>
+    <li>Metrics: RED metrics per route, event-loop lag, queue depth and age, DB pool usage, GC collections.</li>
+    <li>Logs: structured JSON with trace and span IDs; no PII or document content at INFO.</li>
+    <li>Profiling: py-spy available in debug images or as an ephemeral container (<code>kubectl debug</code> with <code>SYS_PTRACE</code>); continuous profiling (Pyroscope/Grafana, Datadog) where available.</li>
+  </ul>
+  <h3>13.4 Security</h3>
+  <ul>
+    <li>mTLS between services (mesh) or TLS on gRPC; JWT verification on REST.</li>
+    <li>Input limits at the proxy and in models; tenant scoping in every query.</li>
+    <li>Dependency hygiene: avoid typosquatting by using an allow-listed internal index.</li>
+  </ul>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundation</p>
+    <p>Write a pytest fixture that yields an <code>httpx.AsyncClient</code> against a FastAPI app with an overridden settings dependency and verify that it runs the lifespan.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-python">import pytest
+from asgi_lifespan import LifespanManager
+from httpx import ASGITransport, AsyncClient
+from docflow.api.app import create_app
+from docflow.settings import Settings
+
+@pytest.fixture
+async def client(tmp_path):
+    s = Settings(database_url="sqlite+aiosqlite:///:memory:", blob_dir=tmp_path)
+    app = create_app(s)
+    async with LifespanManager(app):
+        assert hasattr(app.state, "sessionmaker")          # lifespan ran
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            yield c</code></pre>
+    <p><code>ASGITransport</code> alone does not send lifespan events; <code>LifespanManager</code> does. Passing settings into <code>create_app</code> is the app-factory pattern, which makes overrides trivial.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Your Docker build takes 6 minutes on every source change. Diagnose with the Dockerfile in §7.4 as the target.</p>
+    <details class="solution"><summary>Solution</summary><div><p>Likely causes: copying the whole source before installing dependencies (cache busted on every change), no BuildKit cache mount for the uv/pip cache, building sdists (compilers) because wheels are unavailable for the base image's platform (e.g. musl/Alpine), or downloading Python. Fix: dependency layer from <code>pyproject.toml</code> + <code>uv.lock</code> only, cache mounts, glibc-based slim image so manylinux wheels apply, <code>UV_PYTHON_DOWNLOADS=never</code> with a Python base image.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Advanced</p>
+    <p>A FastAPI pod with 4 workers and a 2-CPU limit has good average latency but terrible p99 under load. CPU throttling metrics are high. Explain and fix.</p>
+    <details class="solution"><summary>Solution</summary><div><p>Four busy single-threaded processes can consume 4 CPUs worth of time per CFS period; the 2-CPU quota is exhausted early in each 100 ms period and all processes are throttled for the rest, adding up to tens of ms to unlucky requests. Fix: match workers to the CPU limit (2), or raise the limit, or remove CPU limits and rely on requests (a common Kubernetes practice for latency-sensitive services); verify with <code>container_cpu_cfs_throttled_periods_total</code>.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>Add a server-side gRPC interceptor to docflow that rejects calls without an <code>authorization</code> metadata entry and records a latency histogram per method.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-python">import time
+import grpc
+from prometheus_client import Histogram
+
+RPC_LATENCY = Histogram("docflow_grpc_seconds", "gRPC latency", ["method", "code"])
+
+class AuthAndMetrics(grpc.aio.ServerInterceptor):
+    async def intercept_service(self, continuation, details: grpc.HandlerCallDetails):
+        md = dict(details.invocation_metadata or ())
+        handler = await continuation(details)
+        if "authorization" not in md:
+            async def deny(request, context):
+                await context.abort(grpc.StatusCode.UNAUTHENTICATED, "missing credentials")
+            return grpc.unary_unary_rpc_method_handler(deny)
+        inner = handler.unary_unary
+        async def timed(request, context):
+            t0, code = time.perf_counter(), "OK"
+            try:
+                return await inner(request, context)
+            except Exception:
+                code = "ERROR"; raise
+            finally:
+                RPC_LATENCY.labels(details.method, code).observe(time.perf_counter() - t0)
+        return grpc.unary_unary_rpc_method_handler(
+            timed, request_deserializer=handler.request_deserializer,
+            response_serializer=handler.response_serializer)
+
+# server = grpc.aio.server(interceptors=[AuthAndMetrics()])</code></pre>
+    <p>Real code verifies the token (JWT/JWKS) rather than checking presence, and handles streaming handlers too. The Java equivalent is a <code>ServerInterceptor</code>; Chapter 5.3 shows Go's.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Expert</p>
+    <p>Design the migration of docflow's event payload from JSON to Protobuf with a schema registry without breaking the Java consumers.</p>
+    <details class="solution"><summary>Solution</summary><div><p>Define <code>DocumentIngested</code> in the contracts repo; register it with BACKWARD compatibility. Phase 1: relay dual-publishes to a new topic <code>document.ingested.v2</code> (Protobuf, Confluent wire format) while keeping v1 JSON. Phase 2: Java consumers migrate to v2 with the Protobuf deserializer, verified by consumer-group lag on v1 dropping to idle. Phase 3: stop publishing v1 after all consumer groups have moved, then delete the topic after retention. Alternatively use a single topic with a header-based content type, but separate topics make the cut-over observable and reversible.</p></div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is the difference between <code>pyproject.toml</code> dependencies and a lockfile?</summary><div><p>The former declares compatible ranges (abstract requirements, like POM version ranges); the lockfile records the exact resolved transitive graph with hashes for reproducible installs. Libraries publish ranges; applications deploy locks.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> How do pytest fixtures compare with JUnit 5 extensions?</summary><div><p>Both provide setup/teardown and injection. Fixtures are injected by parameter name, compose by depending on other fixtures, have explicit scopes up to session, and use <code>yield</code> for teardown; JUnit uses annotations, lifecycle callbacks and parameter resolvers. Session fixtures play the role of Spring's cached test context.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> When is a sampling profiler preferable to cProfile?</summary><div><p>In production and for realistic workloads: low overhead, no code changes, attaches to running processes, and does not distort timings of small functions. cProfile is useful locally for exact call counts.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How would you integrate a Python ML service with a Spring Boot system?</summary><div><p>Separate service; gRPC for low-latency internal calls with deadlines, REST/OpenAPI for coarse or external calls, Kafka events with a schema registry for async integration; shared identity and mTLS; W3C trace propagation; contract tests and breaking-change checks in CI; idempotent consumers. Avoid in-process embedding.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How many Uvicorn workers per pod?</summary><div><p>Start with one per CPU of limit for CPU-heavy work (fewer if native libraries spawn their own threads), check memory per worker (models), and decide between "few workers per pod" and "one per pod, more replicas" based on memory sharing, per-pod overhead and autoscaling granularity. Measure throttling and latency.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Write a minimal multi-stage Dockerfile for a uv project.</summary><div><p>See §7.4: builder with uv copying <code>pyproject.toml</code> and <code>uv.lock</code> first, <code>uv sync --frozen --no-install-project</code>, then the source and a second sync; runtime stage copying <code>.venv</code>, non-root user, exec-form entrypoint.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> p99 latency doubles after upgrading a transitive dependency; nobody changed code. How do you find it?</summary><div><p>Diff the lockfiles between releases; bisect by pinning versions; profile both images under the same load with py-spy flame graphs; check changelogs of changed packages (e.g. a JSON library falling back to pure Python because a wheel was missing for the platform). Prevent with locked upgrades in small PRs and performance tests in CI.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Java calls to the Python gRPC service time out, but Python logs show successful responses a few seconds later. What is wrong?</summary><div><p>The server ignores deadlines: it keeps working after the client gave up. Read <code>context.time_remaining()</code>, pass timeouts to downstream calls (DB statement timeout, HTTP timeouts), check for cancellation, and fix the slow path (likely event-loop blocking or pool exhaustion).</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> How did you help a Java-centric team adopt Python safely?</summary><div><p>Good answers mention a service template with the toolchain prebuilt, shared contracts, CI gates equivalent to the Java ones, pairing, clear guidance on when to use Python, and production readiness reviews.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>pytest fixtures with scopes, parametrisation, Hypothesis properties and Testcontainers give you a JUnit-class testing stack.</li>
+    <li>One <code>pyproject.toml</code>, one lockfile, uv, wheels only, multi-stage images, non-root, exec-form entrypoint.</li>
+    <li>Profile with py-spy/Scalene/memray before optimising; vectorise, then compile hot spots with Rust; apply Amdahl.</li>
+    <li>Size workers by CPU and memory; avoid CPU throttling; drain gracefully on SIGTERM.</li>
+    <li>OpenTelemetry with W3C propagation connects Java and Python traces.</li>
+    <li>Integrate with Spring via REST, gRPC (with deadlines) and Kafka (with idempotent consumers); do not embed Python in the JVM for ML.</li>
+  </ul>
+  <div class="quiz" data-answer="b">
+    <p class="q">What does <code>uv sync --frozen</code> guarantee?</p>
+    <ol><li data-k="a">It upgrades all packages to the latest versions</li><li data-k="b">It installs exactly what the lockfile specifies and fails rather than re-resolving</li><li data-k="c">It builds a wheel</li><li data-k="d">It freezes the interpreter</li></ol>
+    <div class="explain">Frozen mode installs from the lock without updating it, like strict dependency locking.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Why use a session-scoped Testcontainers fixture plus per-test cleanup?</p>
+    <ol><li data-k="a">Containers cannot be restarted</li><li data-k="b">It is required by pytest</li><li data-k="c">Starting the DB once is fast; cleanup keeps tests isolated</li><li data-k="d">To share data between tests</li></ol>
+    <div class="explain">Same trade-off as Spring's cached context with transactional rollback.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">A function taking 10% of request time is made 100x faster in Rust. Overall speed-up?</p>
+    <ol><li data-k="a">About 1.11x</li><li data-k="b">About 10x</li><li data-k="c">About 100x</li><li data-k="d">About 2x</li></ol>
+    <div class="explain">Amdahl: 1 / (0.9 + 0.001) is approximately 1.11.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">Why should a container use the exec form of ENTRYPOINT?</p>
+    <ol><li data-k="a">Smaller image</li><li data-k="b">Faster startup</li><li data-k="c">Required for non-root users</li><li data-k="d">So the server is PID 1 and receives SIGTERM for graceful shutdown</li></ol>
+    <div class="explain">Shell form wraps the process in <code>/bin/sh -c</code>, which does not forward signals.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">Best default way to use a PyTorch-based Python component from Spring Boot?</p>
+    <ol><li data-k="a">Jython</li><li data-k="b">A separate Python service over gRPC/REST</li><li data-k="c">GraalPy in the same JVM</li><li data-k="d">Calling the Python CLI with ProcessBuilder per request</li></ol>
+    <div class="explain">Separate services keep native ML libraries, scaling and deployments independent.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.pytest.org/">pytest documentation</a> (fixtures, parametrize, plugins)</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://hypothesis.readthedocs.io/">Hypothesis documentation</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://testcontainers-python.readthedocs.io/">Testcontainers for Python</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.astral.sh/uv/">uv documentation</a> (projects, lockfile, Docker integration guide)</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://packaging.python.org/">Python Packaging User Guide</a></li>
+    <li><span class="ref-kind">Spec</span> <a href="https://peps.python.org/pep-0621/">PEP 621</a>, <a href="https://peps.python.org/pep-0735/">PEP 735</a>, <a href="https://peps.python.org/pep-0751/">PEP 751</a></li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/benfred/py-spy">py-spy</a>, <a href="https://github.com/plasma-umass/scalene">Scalene</a>, <a href="https://github.com/bloomberg/memray">memray</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://pyo3.rs/">PyO3 user guide</a> and <a href="https://www.maturin.rs/">maturin</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://www.uvicorn.org/deployment/">Uvicorn deployment guide</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://opentelemetry.io/docs/languages/python/">OpenTelemetry Python</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://grpc.io/docs/languages/python/">gRPC Python</a> and <a href="https://grpc.io/docs/languages/java/">gRPC Java</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.confluent.io/kafka-clients/python/current/overview.html">confluent-kafka Python client</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://www.graalvm.org/python/">GraalPy</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://dropbox.tech/application/our-journey-to-type-checking-4-million-lines-of-python">Dropbox — type checking 4 million lines of Python (mypyc)</a></li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

@@ -192,3 +192,118 @@
   </ul>
   <p>A key result (Kleinberg, Mullainathan, Raghavan 2016; Chouldechova 2017): when base rates differ between groups, a non-trivial classifier cannot simultaneously satisfy calibration within groups and equal FPR and FNR. Fairness therefore requires choosing which criterion fits the decision's harms, which is a product, legal and ethical decision, not a purely technical one. Technical mitigations exist (reweighting, constraints during training, group-specific thresholds via Fairlearn's ThresholdOptimizer), and the first step is always measuring. Simply removing the sensitive attribute ("fairness through unawareness") rarely works, because proxies (postcode, name, purchase patterns) remain.</p>
 </section>
+
+<section id="internals">
+  <h2>4. Internal Working</h2>
+  <h3>4.1 How ROC and PR curves are computed</h3>
+  <ol>
+    <li>Sort examples by score descending.</li>
+    <li>Walk down the list; at each distinct score, treat it as the threshold and update cumulative TP and FP counts (O(m log m) for the sort, O(m) for the sweep).</li>
+    <li>ROC points: (FP/N, TP/P). PR points: (TP/P, TP/(TP + FP)).</li>
+    <li>ROC-AUC by the trapezoidal rule, equivalently the Mann-Whitney U statistic: AUC = (sum of positive ranks − P(P + 1)/2)/(P · N). Average precision as Σ(R<sub>n</sub> − R<sub>n−1</sub>)P<sub>n</sub> (scikit-learn's step-wise definition, which avoids the optimistic linear interpolation of PR curves).</li>
+  </ol>
+  <h3>4.2 What cross_validate does</h3>
+  <p>For each split from the CV iterator: clone the estimator (unfitted copy with the same hyperparameters), fit on the training indices, score on the validation indices with each scorer, record fit and score times, optionally keep the fitted estimator. Jobs run in parallel via joblib. Scorers follow a "greater is better" convention, which is why scikit-learn exposes <code>neg_mean_squared_error</code>.</p>
+  <h3>4.3 Inside an Optuna study</h3>
+  <ol>
+    <li>The study asks its sampler for a trial; the objective function calls <code>trial.suggest_*</code>, which the sampler answers (TPE: split past trials into the top γ fraction "good" and the rest "bad", fit a Parzen density to each, sample candidates from the good density and pick the one maximising the good/bad density ratio).</li>
+    <li>The objective trains and reports intermediate values (<code>trial.report(score, step)</code>); the pruner (median, successive halving, Hyperband) compares them with other trials at the same step and raises <code>TrialPruned</code> for unpromising ones.</li>
+    <li>The completed value is stored (in memory, SQLite or an RDBMS, enabling distributed workers sharing one study).</li>
+  </ol>
+  <h3>4.4 How TreeSHAP gets exact Shapley values fast</h3>
+  <p>Naively, Shapley values need the model's expected output for every subset of features: 2<sup>n</sup> subsets. For a tree, the expected output given a subset S can be computed by walking the tree: at a split on a feature in S, follow the example's branch; at a split on a feature not in S, follow both branches weighted by the fraction of training samples (cover) going each way. TreeSHAP tracks, in a single recursive pass, how many subsets of each size reach each leaf, giving exact values in O(T · L · D²) for T trees, L leaves and depth D, instead of exponential time. The "interventional" variant instead uses a background dataset to break feature dependence; the two can give different values for correlated features.</p>
+  <h3>4.5 How permutation importance is computed</h3>
+  <p>Score the fitted model on validation data (baseline). For each feature j and each of n_repeats: copy the data, permute column j, rescore, record the drop. Report mean and standard deviation of drops. Cost: n_features × n_repeats predictions over the validation set, no retraining.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: The Evaluation System</h2>
+  <figure class="diagram">
+    <div class="widget" data-widget="bias-variance"></div>
+    <figcaption>Figure 6.5.1 — Interactive: polynomial degree versus training and test error.</figcaption>
+  </figure>
+  <p><strong>What to try:</strong> start at degree 1 and observe both errors high and close together (underfitting, high bias). Raise the degree step by step: training error falls monotonically, while test error falls, bottoms out, then climbs as the curve starts threading through individual noisy points (overfitting, high variance). Find the degree minimising test error. If the widget lets you resample the data or change the number of points, do so at a high degree: the fitted curve changes wildly between samples (that visible wobble <em>is</em> variance), and with more points the same degree overfits less, which is why more data reduces variance.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  D["Labelled data"] --> SP["Split: train+val / test (held out)"]
+  SP --> CV["Cross-validation on train+val"]
+  CV --> HP["Tuning loop: Optuna trials + pruning"]
+  HP --> CV
+  HP --> BEST["Best configuration"]
+  BEST --> REFIT["Refit on all train+val"]
+  REFIT --> TEST["Single evaluation on test: metrics + CIs + slices + calibration"]
+  TEST --> GATE{"Beats champion and passes fairness/latency gates?"}
+  GATE -- yes --> ONLINE["Shadow / canary / A/B test"]
+  GATE -- no --> BACK["Iterate on data/features"]
+  ONLINE --> PROD["Promote"]
+</pre>
+  <figcaption>Figure 6.5.2 — An honest evaluation pipeline, from split to promotion.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the test set is split off first and touched once. The inner tuning loop only ever sees cross-validation scores on the train+validation portion. Offline evaluation produces more than a single number (intervals, segment slices, calibration), and the gate compares against the current production model on the same test set. Passing offline is necessary but not sufficient: online testing is the final gate, mirroring a canary release.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  subgraph KF["5-fold (stratified)"]
+    k1["Fold1 val | F2-F5 train"]
+    k2["Fold2 val | others train"]
+    k3["... each fold validates once"]
+  end
+  subgraph GK["Group k-fold"]
+    g1["Users A,B val | all other users train"]
+    g2["No user appears on both sides"]
+  end
+  subgraph TS["Time-series split"]
+    t1["Jan-Mar train | Apr val"]
+    t2["Jan-Apr train | May val"]
+    t3["Jan-May train | Jun val"]
+  end
+</pre>
+  <figcaption>Figure 6.5.3 — Three cross-validation schemes and the production assumption each simulates.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> stratified k-fold assumes production rows are exchangeable with training rows. Group k-fold assumes production brings new entities, so it keeps entities from leaking across the split. Time-series splitting assumes the future may differ from the past, so validation always comes after training, and expanding windows show how performance evolves as data accumulate. Pick the scheme whose assumption matches deployment.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  M["Trained model"] --> G["Global: permutation importance, mean abs SHAP"]
+  M --> E["Effects: PDP / ICE / ALE, SHAP dependence"]
+  M --> L["Local: SHAP values per prediction, LIME"]
+  G --> DBG["Debugging and leakage hunting"]
+  E --> DOM["Domain sanity checks, monotonicity"]
+  L --> RC["Reason codes for users / regulators"]
+  M --> F["Fairness slices: TPR, FPR, selection rate by group"]
+  F --> MIT["Mitigation: thresholds, constraints, data"]
+</pre>
+  <figcaption>Figure 6.5.4 — Interpretability and fairness tools mapped to the questions they answer.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> global tools find what the model depends on (and expose leaks); effect plots check that dependence has a sensible shape; local tools justify individual decisions; fairness slicing checks that errors are distributed acceptably. Each feeds a different consumer, from the ML engineer to a compliance team.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math</h2>
+  <h3>6.1 Deriving the bias–variance decomposition</h3>
+  <p><strong>Setup:</strong> y = f(x) + ε with E[ε] = 0, Var(ε) = σ², ε independent of the training set D. The model f̂<sub>D</sub> depends on the random training set. Fix x and write f = f(x), f̂ = f̂<sub>D</sub>(x), f̄ = E<sub>D</sub>[f̂].</p>
+  <p><strong>Step 1</strong> (separate noise): E[(y − f̂)²] = E[(f + ε − f̂)²] = E[(f − f̂)²] + 2E[ε(f − f̂)] + E[ε²]. The cross term is zero because ε is independent of f̂ and has mean zero. So E[(y − f̂)²] = E[(f − f̂)²] + σ².</p>
+  <p><strong>Step 2</strong> (separate bias and variance): add and subtract f̄: E[(f − f̂)²] = E[(f − f̄ + f̄ − f̂)²] = (f − f̄)² + 2(f − f̄)E[f̄ − f̂] + E[(f̄ − f̂)²]. The middle term vanishes since E[f̂] = f̄. Hence</p>
+  \[ \mathbb{E}_{D,\varepsilon}\big[(y-\hat f_D(\mathbf{x}))^2\big] = \underbrace{(f(\mathbf{x})-\bar f(\mathbf{x}))^2}_{\text{bias}^2} + \underbrace{\mathbb{E}_D\big[(\hat f_D(\mathbf{x})-\bar f(\mathbf{x}))^2\big]}_{\text{variance}} + \sigma^2. \]
+  <p><strong>Numeric example:</strong> true f(x₀) = 10, noise σ² = 4. Across five training sets, a model predicts 12, 13, 11, 12, 12 at x₀: f̄ = 12, bias² = 4, variance = (0 + 1 + 1 + 0 + 0)/5 = 0.4, expected error 4 + 0.4 + 4 = 8.4. A more flexible model predicts 7, 14, 9, 13, 7: f̄ = 10, bias² = 0, variance = (9 + 16 + 1 + 9 + 9)/5 = 8.8, expected error 12.8. The unbiased model is worse.</p>
+  <h3>6.2 Ridge regression: bias and variance in closed form</h3>
+  <p>For a single standardised feature with Σx² = S, OLS ŵ = Σxy/S has variance σ²/S and no bias. Ridge ŵ<sub>λ</sub> = Σxy/(S + λ) = ŵ · S/(S + λ): its mean is w · S/(S + λ), so bias = −wλ/(S + λ), and its variance is σ²S/(S + λ)². Example: S = 10, σ² = 4, w = 1, λ = 2: OLS MSE = 0.4; ridge bias² = (2/12)² = 0.028, variance = 40/144 = 0.278, total 0.306. A little bias bought a larger variance reduction.</p>
+  <h3>6.3 ROC-AUC as a probability</h3>
+  \[ \text{AUC} = P(s^+ &gt; s^-) + \tfrac12 P(s^+ = s^-) = \frac{1}{PN}\sum_{i\in +}\sum_{j\in -}\Big[\mathbb{1}(s_i &gt; s_j) + \tfrac12\mathbb{1}(s_i = s_j)\Big]. \]
+  <p>Any strictly increasing transformation of scores leaves every comparison unchanged, proving AUC ignores calibration.</p>
+  <h3>6.4 Why precision collapses with rare positives</h3>
+  <p>With prevalence π, recall R and false positive rate F, Bayes' rule gives</p>
+  \[ \text{Precision} = \frac{R\,\pi}{R\,\pi + F(1-\pi)}. \]
+  <p>π = 0.001, R = 0.9, F = 0.01: precision = 0.0009/(0.0009 + 0.00999) ≈ 8.3%. Halving F to 0.005 gives 15.3%. Tiny FPR changes, invisible in ROC-AUC, nearly double precision.</p>
+  <h3>6.5 Proper scoring rules</h3>
+  <p>A scoring rule is <em>proper</em> if the expected score is optimised by reporting the true probability. For the Brier score with true probability q and report p: E = q(1 − p)² + (1 − q)p², derivative −2q(1 − p) + 2(1 − q)p = 2(p − q) = 0 ⇒ p = q. Log-loss is likewise proper. Accuracy at a threshold is not, so optimising it can reward miscalibrated probabilities.</p>
+  <h3>6.6 Shapley values</h3>
+  \[ \phi_j = \sum_{S\subseteq N\setminus\{j\}}\frac{|S|!\,(n-|S|-1)!}{n!}\Big[v(S\cup\{j\}) - v(S)\Big], \]
+  <p>where v(S) is the expected model output when only the features in S are known. The weight is the fraction of feature orderings in which exactly the set S precedes j. Shapley values are the unique attribution satisfying efficiency (they sum to v(N) − v(∅)), symmetry, dummy (a feature that never changes the output gets 0), and additivity. <strong>Worked example:</strong> two features, v(∅) = 10, v({a}) = 30, v({b}) = 20, v({a, b}) = 50. Orderings a-then-b: a adds 20, b adds 20; b-then-a: b adds 10, a adds 30. φ<sub>a</sub> = (20 + 30)/2 = 25, φ<sub>b</sub> = (20 + 10)/2 = 15; sum 40 = 50 − 10. The interaction (50 − 30 − 20 + 10 = 10) is split equally.</p>
+  <h3>6.7 Standard error of a cross-validation estimate</h3>
+  <p>With fold scores s₁…s<sub>k</sub>, the naive standard error sd/√k underestimates uncertainty because folds share training data (scores are correlated). Treat it as a rough lower bound; for model comparisons, use the same folds for both models and look at the distribution of paired differences, or use repeated CV with a corrected resampled t-test (Nadeau and Bengio, 2003).</p>
+</section>
