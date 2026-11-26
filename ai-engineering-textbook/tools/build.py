@@ -41,6 +41,7 @@ class ChapterParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.errors: list[str] = []
         self.body_chapter: str | None = None
+        self.planned = False
         self.title = ""
         self.h1 = ""
         self.sections: list[str] = []
@@ -78,6 +79,7 @@ class ChapterParser(HTMLParser):
             self.errors.append(f"{self._loc()}: <{tag}> inside mermaid block — escape or remove it")
         if tag == "body":
             self.body_chapter = a.get("data-chapter")
+            self.planned = a.get("data-status") == "planned"
         elif tag == "title":
             self.in_title = True
         elif tag == "h1":
@@ -166,7 +168,7 @@ def validate(path: Path, known: set[str]) -> tuple[ChapterParser, list[str], lis
         errors.append(f"<body data-chapter> is {p.body_chapter!r}, expected {cid!r}")
     if cid not in known:
         errors.append(f"{cid!r} is not listed in assets/js/toc.js")
-    if cid not in FREEFORM:
+    if cid not in FREEFORM and not p.planned:
         missing = [s for s in REQUIRED_SECTIONS if s not in p.sections]
         if missing:
             errors.append(f"missing sections: {', '.join(missing)}")
@@ -242,6 +244,8 @@ def main(argv: list[str]) -> int:
     total_err = 0
     for f in files:
         p, errors, warnings = validate(f, known)
+        if p.planned:
+            continue
         parsed[f.stem] = p
         status = "FAIL" if errors else ("warn" if warnings else "ok  ")
         print(f"[{status}] {f.name}  (~{p.words:,} words, {p.mermaid_count} diagrams, {p.widget_count} widgets, {len(p.quizzes)} quiz)")
@@ -253,7 +257,10 @@ def main(argv: list[str]) -> int:
     if not argv:
         missing = [c for c in toc_ids() if not (CHAPTERS / f"{c}.html").exists()]
         if missing:
-            print(f"\n{len(missing)} TOC chapters not yet written: {', '.join(missing)}")
+            print(f"\n{len(missing)} TOC chapters have no file: {', '.join(missing)}")
+        planned = [c for c in toc_ids() if (CHAPTERS / f"{c}.html").exists() and c not in parsed]
+        if planned:
+            print(f"{len(planned)} chapters are placeholders (data-status=planned)")
         # index every page that exists, in TOC order
         order = {c: i for i, c in enumerate(toc_ids())}
         build_index(dict(sorted(parsed.items(), key=lambda kv: order.get(kv[0], 999))))

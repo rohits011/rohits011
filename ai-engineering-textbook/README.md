@@ -18,6 +18,8 @@ A deep, interactive HTML textbook that takes an experienced Java/Spring Boot bac
 
 There is also a 12-month roadmap (10–15 h/week) and a reference library.
 
+**Status:** 41 of 72 chapters are written, plus the roadmap and reference library. The other 31 are placeholder pages marked *planned* in `assets/js/toc.js` and in the sidebar. To write one, replace its placeholder file (`data-status="planned"`), remove `planned: true` from its TOC entry, and run `python3 tools/build.py`.
+
 ## Reading it
 
 No build step and no server are required.

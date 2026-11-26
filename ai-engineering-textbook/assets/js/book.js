@@ -35,7 +35,7 @@
   // ------------------------------------------------------------- toc helpers
   var flat = [];
   TOC.forEach(function (part, pi) {
-    part.chapters.forEach(function (c) { flat.push({ id: c.id, title: c.title, mins: c.mins, part: part, pi: pi }); });
+    part.chapters.forEach(function (c) { flat.push({ id: c.id, title: c.title, mins: c.mins, planned: !!c.planned, part: part, pi: pi }); });
   });
   function chapterHref(id) { return ROOT + "/chapters/" + id + ".html"; }
   function findIdx(id) { for (var i = 0; i < flat.length; i++) if (flat[i].id === id) return i; return -1; }
@@ -121,7 +121,8 @@
       html += '<div class="toc-part' + (open ? " open" : "") + '" data-pi="' + pi + '"><button aria-expanded="' + open + '">' + ICON.chev + '<span>' + esc(part.part) + '</span>' + (part.priority ? '<span class="prio">Priority</span>' : "") + '</button><ol>';
       part.chapters.forEach(function (c) {
         var cur = c.id === CURRENT;
-        html += '<li><a href="' + chapterHref(c.id) + '"' + (cur ? ' class="current" aria-current="page"' : "") + '><span>' + esc(c.title) + '</span>' + (done[c.id] ? '<span class="done" title="Completed">✓</span>' : "") + '</a></li>';
+        var cls = (cur ? "current" : "") + (c.planned ? " missing" : "");
+        html += '<li><a href="' + chapterHref(c.id) + '"' + (cls.trim() ? ' class="' + cls.trim() + '"' : "") + (cur ? ' aria-current="page"' : "") + (c.planned ? ' title="Planned: not yet written"' : "") + '><span>' + esc(c.title) + (c.planned ? " <small>(planned)</small>" : "") + '</span>' + (done[c.id] ? '<span class="done" title="Completed">✓</span>' : "") + '</a></li>';
       });
       html += "</ol></div>";
     });
@@ -639,7 +640,7 @@
       var dn = flat.filter(function (c) { return done[c.id]; }).length;
       stats.innerHTML =
         '<div class="stat"><b>' + TOC.length + '</b><span>parts incl. front matter</span></div>' +
-        '<div class="stat"><b>' + flat.length + '</b><span>chapters</span></div>' +
+        '<div class="stat"><b>' + flat.filter(function (c) { return !c.planned; }).length + ' / ' + flat.length + '</b><span>chapters written (rest planned)</span></div>' +
         '<div class="stat"><b>~' + Math.round(totalMins / 60) + ' h</b><span>core reading time</span></div>' +
         '<div class="stat"><b>' + dn + '</b><span>chapters you have completed</span></div>';
     }

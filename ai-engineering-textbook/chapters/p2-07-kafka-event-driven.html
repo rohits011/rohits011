@@ -435,7 +435,7 @@ sequenceDiagram
   participant App as Streams task / transactional app
   participant TC as Transaction coordinator
   participant Out as Output partition
-  participant Off as __consumer_offsets
+  participant CO as __consumer_offsets
   App->>TC: initTransactions(transactional.id) bumps epoch, fences zombies
   App->>TC: beginTransaction (client-side)
   App->>Out: produce records (PID, epoch, seq)
@@ -443,7 +443,7 @@ sequenceDiagram
   App->>TC: commitTransaction
   TC->>TC: log PREPARE_COMMIT
   TC->>Out: write COMMIT marker
-  TC->>Off: write COMMIT marker
+  TC->>CO: write COMMIT marker
   TC->>TC: log COMPLETE_COMMIT
   Note over Out: read_committed consumers now see records up to the new LSO
 </pre>

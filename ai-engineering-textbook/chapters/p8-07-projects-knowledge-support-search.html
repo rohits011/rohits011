@@ -192,7 +192,7 @@ sequenceDiagram
   P->>K: DocumentParsed(pageId, v42)
   K->>E: consume (group embed)
   E->>E: chunk, contextual prefix, cache lookup
-  E->>DB: BEGIN; upsert document; delete chunks v41; insert chunks v42; upsert acl; COMMIT
+  E->>DB: BEGIN, upsert document, delete chunks v41, insert chunks v42, upsert acl, COMMIT
   E->>K: DocumentIndexed(pageId, v42, chunks=37)
 </pre>
   <figcaption>Figure 8.7.1 — Ingestion of one changed Confluence page, from poll to atomic index swap.</figcaption>
