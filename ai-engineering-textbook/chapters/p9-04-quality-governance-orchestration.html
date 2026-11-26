@@ -830,3 +830,289 @@ CALL lake.system.expire_snapshots(table =&gt; 'bronze.trip_events',
 CALL lake.system.remove_orphan_files(table =&gt; 'bronze.trip_events');</code></pre>
 </div>
 </section>
+
+<section id="applications">
+  <h2>8. Real-World Applications</h2>
+  <h3>8.1 Write-audit-publish for tier-1 tables</h3>
+  <p>Finance and executive dashboards read tables that are only published after blocking checks pass: the pipeline writes to a staging branch or table, runs dbt tests and Soda/GX checks, and atomically swaps or fast-forwards the branch. A failed check pages the owning team instead of silently corrupting the board deck.</p>
+  <h3>8.2 Impact analysis before schema changes</h3>
+  <p>Before a producer team drops a column, the catalog's column-level lineage lists every dbt model, dashboard and ML feature that depends on it, and owners are notified. Contract CI blocks the change until a new major version is published.</p>
+  <h3>8.3 Privacy operations</h3>
+  <p>Erasure requests are recorded in a table; scheduled jobs propagate deletes through bronze, silver and gold, expire snapshots and confirm completion with lineage-driven coverage reports. Tag-based masking ensures new tables containing tagged columns are protected on day one.</p>
+  <h3>8.4 Feature platforms for ML</h3>
+  <p>Fraud, ranking, pricing and ETA models share features through a feature store, which turns a three-week "rebuild this notebook feature in Java" project into a feature reference in a config file, and guarantees training/serving consistency.</p>
+  <h3>8.5 Platform orchestration at scale</h3>
+  <p>A central Airflow (or Dagster) platform team runs the orchestrator as a multi-tenant service with per-team DAG bundles, pools, Kubernetes executors and standard operators for Spark, dbt and quality checks, much as a platform team offers a paved road for microservices.</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 Airbnb Chronon: point-in-time-correct features</h3>
+  <p><span class="tag fact">Verified</span> Airbnb open-sourced Chronon, its ML feature platform, in April 2024. Feature authors declare sources and aggregations (sums, counts, last-k over configurable windows) once, and Chronon produces both point-in-time-correct training data and low-latency online values, including from streaming sources, addressing exactly the skew and leakage problems in Sections 3.11–3.12. Stripe later described adapting Chronon as the foundation of its own feature platform. Sources: <a href="https://medium.com/airbnb-engineering/chronon-airbnbs-ml-feature-platform-is-now-open-source-d9c4dba859e8">Chronon, Airbnb's ML Feature Platform, Is Now Open Source</a> and <a href="https://stripe.com/blog/shepherd-how-stripe-adapted-chronon-to-scale-ml-feature-development">Shepherd: How Stripe adapted Chronon</a>.</p>
+  <h3>9.2 DoorDash: an online feature store at very high read rates</h3>
+  <p><span class="tag fact">Verified</span> DoorDash described in 2020 how it built a large-scale online feature store on Redis, using binary serialization, string hashing of keys and compression to cut memory and latency, because store ranking alone made over a million predictions per second with dozens of features each. Later posts describe cost-driven evolution of the store. The lesson: the online store is a high-throughput key-value serving system and needs the same engineering as any hot path. Source: <a href="https://careersatdoordash.com/blog/building-a-gigascale-ml-feature-store-with-redis/">Building a Gigascale ML Feature Store with Redis</a>.</p>
+  <h3>9.3 LinkedIn Feathr</h3>
+  <p><span class="tag fact">Verified</span> LinkedIn open-sourced Feathr, its feature store, in 2022, describing a shared namespace of feature definitions used across many ML applications, with point-in-time-correct training data and online serving, and later contributed it to the LF AI &amp; Data Foundation. Source: <a href="https://engineering.linkedin.com/blog/2022/open-sourcing-feathr---linkedin-s-feature-store-for-productive-m">Open sourcing Feathr – LinkedIn's feature store for productive machine learning</a>.</p>
+  <h3>9.4 Netflix Maestro: orchestration at very large scale</h3>
+  <p><span class="tag fact">Verified</span> Netflix open-sourced Maestro, its general-purpose workflow orchestrator, in July 2024 under the Apache 2.0 licence. Netflix describes it as a fully managed workflow-as-a-service for its data platform users, supporting data pipelines and ML training workflows, built to replace an earlier orchestrator that faced scaling limits. It is a useful reference for what orchestration looks like when a single company runs hundreds of thousands of workflows. Sources: <a href="https://github.com/Netflix/maestro">Netflix/maestro on GitHub</a> and the <a href="https://netflixtechblog.com/maestro-netflixs-workflow-orchestrator-ee13a06f9c78">Netflix TechBlog introduction</a>.</p>
+  <h3>9.5 Lyft Flyte: typed, reproducible workflows</h3>
+  <p><span class="tag fact">Verified</span> Lyft open-sourced Flyte in January 2020 after using it internally for data and ML workflows such as pricing and ETA; Flyte emphasizes strongly typed task interfaces, versioned and cached executions and Kubernetes-native execution, and later joined the LF AI &amp; Data Foundation. Source: <a href="https://flyte.org/blog/introducing-flyte-a-cloud-native-machine-learning-and-data-processing-platform">Introducing Flyte: A Cloud Native Machine Learning and Data Processing Platform</a>.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages, Limitations and Costs</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Tool</th><th>Advantages</th><th>Limitations</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>Airflow</td><td>Largest ecosystem; mature; managed offerings; Airflow 3 assets, versioning, Task SDK</td><td>Task-centric model; DAG-parsing pitfalls; heavier local dev; upgrade 2→3 effort</td><td>Scheduler, DB, workers, triggerer; or managed fee</td></tr>
+      <tr><td>Dagster</td><td>Asset-centric; strong typing, partitions, lineage; excellent dbt integration; local dev</td><td>Smaller ecosystem; different mental model to learn</td><td>Self-host or Dagster+ fee</td></tr>
+      <tr><td>Prefect</td><td>Pythonic dynamic flows; easy to start; hybrid execution</td><td>Less opinionated about data assets; smaller provider ecosystem than Airflow</td><td>Self-host server or Prefect Cloud</td></tr>
+      <tr><td>dbt</td><td>SQL + Git + tests + docs; modular; huge community</td><td>SQL-only transformations; Jinja complexity; Core vs Fusion licensing choices</td><td>Free Core; warehouse compute; optional dbt platform fee</td></tr>
+      <tr><td>Great Expectations</td><td>Expressive Python checks; rich results and docs</td><td>Verbose; API changed significantly at 1.0</td><td>Library; optional GX Cloud</td></tr>
+      <tr><td>Soda</td><td>Readable YAML checks; anomaly detection</td><td>Advanced features in commercial tier</td><td>Library; optional Soda Cloud</td></tr>
+      <tr><td>Feature store (Feast)</td><td>Point-in-time joins; online/offline consistency; reuse</td><td>Another system; you still build feature pipelines; online store ops</td><td>Online store cluster; materialization compute</td></tr>
+      <tr><td>Catalog + OpenLineage</td><td>Discovery, impact analysis, compliance</td><td>Value depends on coverage and metadata hygiene</td><td>Catalog hosting; integration effort</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+  <h3>11.1 Choosing an orchestrator</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>If your situation is...</th><th>Lean toward</th><th>Because</th></tr></thead>
+    <tbody>
+      <tr><td>Large existing estate, many integrations, managed service desired</td><td>Airflow (MWAA, Composer, Astronomer)</td><td>Ecosystem, hiring pool, operators for everything</td></tr>
+      <tr><td>dbt-heavy analytics platform, asset thinking, strong local dev</td><td>Dagster</td><td>Assets, partitions and freshness are first-class</td></tr>
+      <tr><td>Python-heavy dynamic ML/data workflows, small platform team</td><td>Prefect</td><td>Low ceremony, dynamic flows</td></tr>
+      <tr><td>Kubernetes-native ML pipelines with strong typing and caching</td><td>Flyte or Kubeflow Pipelines</td><td>Container-per-task, typed I/O, ML focus</td></tr>
+      <tr><td>Warehouse-only ELT with simple schedules</td><td>dbt platform scheduler or warehouse tasks</td><td>No separate orchestrator needed yet</td></tr>
+    </tbody>
+  </table></div>
+  <h3>11.2 Tests versus observability</h3>
+  <p>Explicit tests encode known invariants and block bad data; observability detects unknown failure modes across thousands of tables without hand-written rules. Start with tests on tier-1 models, add observability when the table count outgrows hand-written coverage.</p>
+  <h3>11.3 Feature store: build, adopt or skip?</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A["Any model needs online features at request time?"] -->|"no, batch scoring only"| B["Skip: point-in-time SQL in dbt or Spark is enough"]
+  A -->|"yes"| C{"More than a few models or teams sharing features?"}
+  C -->|"no"| D["Lightweight: one feature pipeline writing Redis, plus logged features for training"]
+  C -->|"yes"| E{"Need streaming features with point-in-time training?"}
+  E -->|"yes"| F["Feature platform: Chronon, Tecton, Feast with streaming push, or cloud offering"]
+  E -->|"no"| G["Feast with batch materialization"]
+</pre>
+<figcaption>Figure 9.22 — Deciding how much feature-store machinery you need.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> a feature store earns its keep when features are served online and shared. Batch-only scoring can do point-in-time joins in SQL. A single online model can start with a dedicated pipeline, provided it logs served features for training. Streaming features plus point-in-time training is the hardest combination and the strongest case for a platform.</p>
+  <h3>11.4 dbt incremental versus full rebuild</h3>
+  <p>Full rebuilds are simplest and always correct, but cost grows with history. Incremental models are cheaper but need careful handling of late data, deletes and schema changes, and occasional full refreshes. Rule of thumb: start with tables, switch to incremental when the build time or cost hurts, and test incremental logic with unit tests.</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Production Failures</h2>
+  <ul>
+    <li><strong>Heavy top-level code in DAG files.</strong> Database queries at import time slow the DAG processor and can take down scheduling for every team.</li>
+    <li><strong>Passing data through XCom.</strong> Pushing DataFrames into the metadata database; XCom is for small references.</li>
+    <li><strong>Non-idempotent tasks and <code>now()</code>.</strong> Using wall-clock time instead of the data interval breaks backfills and reruns.</li>
+    <li><strong>Accidental catchup.</strong> Deploying a DAG with an old <code>start_date</code> and catchup enabled launches hundreds of runs at once.</li>
+    <li><strong>Sensors that hold worker slots.</strong> Hundreds of poking sensors starve real work; use deferrable mode.</li>
+    <li><strong>Testing only at the end.</strong> Checks on gold tables only; bad data has already polluted intermediate models and caches. Test sources and staging too.</li>
+    <li><strong>Alert fatigue.</strong> Hundreds of warn-level failures nobody reads; tiers and ownership are missing.</li>
+    <li><strong>Incremental models with strict high-water marks.</strong> <code>&gt; max(ts)</code> drops late-arriving rows forever; use lookback windows and merge.</li>
+    <li><strong>Feature leakage.</strong> Joining labels to current feature values; or using a feature timestamp that reflects when the data was computed rather than when it became knowable.</li>
+    <li><strong>Online/offline divergence.</strong> Re-implementing a feature in Java for serving with subtly different rounding or windowing.</li>
+    <li><strong>Masking only in BI tools.</strong> Users with SQL access bypass dashboard-level masking; enforce in the warehouse or catalog.</li>
+    <li><strong>Deletes that are not physical.</strong> Rows deleted logically but retained in old snapshots, backups and derived tables.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Running Airflow well</h3>
+  <p>Managed Postgres for the metadata DB with regular cleanup (<code>airflow db clean</code>) of old runs and logs; remote logging to object storage; KubernetesExecutor or Celery with autoscaling (KEDA on queue depth); multiple schedulers for HA; DAG bundles from Git with CI that imports every DAG and runs unit tests (DAG integrity tests: no import errors, no cycles, required tags and owners); secrets backend (Vault, AWS Secrets Manager); StatsD/OpenTelemetry metrics for scheduler loop duration, queued tasks, pool usage and DAG parse time; alerting via callbacks or notifiers.</p>
+  <h3>13.2 Running dbt well</h3>
+  <p>Separate dev, CI and prod targets; slim CI with state comparison; enforced contracts on public models; source freshness before builds; artifacts uploaded for docs, lineage and state; model-level ownership (<code>meta.owner</code>); query tags for cost attribution; scheduled full refreshes for incremental models where drift accumulates.</p>
+  <h3>13.3 Quality operations</h3>
+  <p>Tier datasets (tier 1: blocking tests, paging, SLAs; tier 3: warnings only). Every test has an owner and a runbook. Track SLIs (on-time publication rate, test pass rate, incidents per month) like service SLOs. Run post-incident reviews for data incidents with the same rigour as outages.</p>
+  <h3>13.4 Security and governance</h3>
+  <p>Least privilege for service accounts; separate roles for pipelines and humans; tag-based policies; audit logs exported to the SIEM; periodic access reviews; retention policies implemented as scheduled, monitored jobs; data processing inventory linked to the catalog for regulatory requests.</p>
+  <h3>13.5 Feature store operations</h3>
+  <p>Monitor materialization freshness per feature view, online store latency (p99) and memory, feature null rates and distributions online versus offline (skew), and TTL expirations. Size the online store for peak QPS and key count; plan for regional replication if serving is multi-region.</p>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>For <code>fct_trips</code>, write one check for each of the six quality dimensions, in dbt YAML or SodaCL, and label each as blocking or warning with a one-line justification.</p>
+    <details class="solution"><summary>Solution</summary><div>
+    <p>Completeness: <code>missing_count(pickup_ts) = 0</code> (blocking: the grain depends on it). Validity: <code>accepted_values</code> on <code>payment_type</code> (blocking). Uniqueness: <code>unique(trip_id)</code> (blocking: duplicates inflate revenue). Consistency: the singular reconciliation test in Section 7.3 (warning at a small threshold, blocking above 0.1% of rows). Timeliness: source freshness <code>error_after: 36h</code> (blocking for the daily publish). Accuracy: monthly reconciliation of total revenue against an independent finance feed within 0.5% (warning, investigated by the owner). Distribution: avg trip distance in 2–6 (warning).</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Find and fix the problems in this Airflow DAG.</p>
+<pre><code class="language-python">import requests, pandas as pd
+from datetime import datetime
+from airflow.sdk import dag, task
+
+zones = requests.get("https://internal-api/zones").json()        # (1)
+
+@dag(schedule="@daily", start_date=datetime(2020, 1, 1))          # (2)
+def report():
+    @task
+    def extract():
+        return pd.read_parquet(f"s3://raw/trips/{datetime.now():%Y-%m-%d}.parquet")  # (3)(4)
+    @task
+    def load(df):
+        df.to_sql("trips", "postgresql://...", if_exists="append")  # (5)
+    load(extract())
+report()</code></pre>
+    <details class="solution"><summary>Solution</summary><div>
+    <p>(1) Network call at parse time: runs on every parse; move into a task. (2) Old <code>start_date</code> with default catchup behaviour risks thousands of runs; set <code>catchup=False</code> and backfill deliberately, and use a timezone-aware <code>pendulum</code> date. (3) <code>datetime.now()</code> instead of the logical date: use the <code>ds</code> context variable or <code>data_interval_start</code>. (4) Returning a DataFrame passes it through XCom; pass a path, or do extract-and-load in one task or in Spark/dbt. (5) Appending is not idempotent; delete-then-insert the day's rows in one transaction or write to a partitioned table with overwrite. Also add retries, owner, and a quality check.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>Given a label table of (rider_id, prediction_ts, churned) and a daily feature table of (rider_id, feature_date, trips_30d), write the point-in-time join in SQL with a 2-day TTL, and explain what goes wrong if you join on <code>feature_date = current_date</code> instead.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-sql">SELECT l.rider_id, l.prediction_ts, l.churned, f.trips_30d
+FROM labels l
+LEFT JOIN LATERAL (
+    SELECT trips_30d, feature_date
+    FROM rider_features f
+    WHERE f.rider_id = l.rider_id
+      AND f.feature_date &lt; CAST(l.prediction_ts AS DATE)          -- computed from complete past days
+      AND f.feature_date &gt;= CAST(l.prediction_ts AS DATE) - INTERVAL 2 DAY
+    ORDER BY f.feature_date DESC
+    LIMIT 1
+) f ON TRUE;</code></pre>
+    <p>Note the strict <code>&lt;</code>: a feature dated today was computed from today's complete data, which was not available at prediction time during today. Joining today's features to historical labels leaks the future: riders who churned stopped taking trips, so <code>trips_30d</code> computed now is near zero for them, and the model learns a relationship that does not exist at prediction time.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>Design governance for a new <code>rider_profiles</code> table containing email, phone, home zone and lifetime spend, consumed by marketing analysts, a support tool and an ML churn model, under GDPR. Cover classification, access, lineage, retention and erasure.</p>
+    <details class="solution"><summary>Solution</summary><div>
+    <p>Classification: email and phone as direct identifiers; home zone as quasi-identifier; spend as personal data. Tag in the contract and catalog. Access: base table restricted to a <code>pii_reader</code> role used by the support tool's service account; analysts query a masked view (email masked, phone removed, home zone generalized to borough); the ML model uses a pseudonymous <code>rider_id</code> and no direct identifiers. Policies via tags so derived tables inherit. Lineage: OpenLineage from the pipelines so every downstream table with these columns is discoverable for access requests. Retention: profiles of riders inactive for N years (per policy) deleted by a scheduled job. Erasure: deletion requests table; pipeline deletes from bronze, silver, gold and feature store (offline and online), expires snapshots, logs completion; training datasets are regenerated from source rather than kept indefinitely, or crypto-shredded.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>Convert the time-scheduled chain "ingest at 02:00, dbt at 04:00, features at 06:00" into data-aware scheduling with Airflow assets, and compute the expected freshness improvement if ingest usually finishes at 02:40 and dbt at 04:35.</p>
+    <details class="solution"><summary>Solution</summary><div>
+    <p>Ingest DAG declares <code>outlets=[Asset("...bronze...")]</code>; the dbt DAG is scheduled on that asset and declares the gold asset as outlet; the features DAG is scheduled on the gold asset. With times: dbt now starts at ~02:40 and (taking 35 minutes) finishes ~03:15; features start at 03:15 instead of 06:00. Freshness of features improves by about 2 h 45 min, and a late ingest no longer causes dbt to run on stale data (it simply starts later). Add an SLA/deadline alert on the final asset rather than on each step.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is a data contract and how is it different from a schema?</summary><div><p>A schema defines structure. A contract adds semantics (units, meanings), quality guarantees, SLAs, ownership, versioning and change policy, and is enforced at the producer (CI, registry compatibility, runtime validation). It is to datasets what an API specification plus consumer-driven contract tests are to services.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain point-in-time correctness and how a feature store provides it.</summary><div><p>Training rows must use feature values that were knowable at the prediction time. Feature stores store timestamped feature history and perform as-of joins (latest value at or before the label timestamp, within a TTL) for training, and serve the latest values online, so that training and serving see equivalent values.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Describe Airflow 3's architecture and what changed from Airflow 2.</summary><div><p>Separate DAG processor, scheduler (with executors), triggerer, API server and workers, plus the metadata DB. In 3.0, task code runs via the Task SDK and talks to the API server instead of the database; DAGs are versioned; datasets became assets with event-driven scheduling; backfills are scheduler-managed; DAG bundles load DAGs from Git; a new UI. Consequence: task code can no longer use the ORM directly, improving isolation and security.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> When would you choose each dbt materialization?</summary><div><p>View: cheap, always fresh, light logic (staging). Table: heavier logic queried often, rebuildable in acceptable time. Incremental: large, append-mostly facts where full rebuilds are too slow or costly. Ephemeral: small reusable CTE logic not worth persisting. Materialized view: when the warehouse can maintain it incrementally and freshness matters. Snapshot: SCD2 history of mutable sources.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Write a dbt incremental model that handles late-arriving data for an events table.</summary><div><p>Configure <code>materialized='incremental'</code>, <code>unique_key='event_id'</code>, <code>incremental_strategy='merge'</code>, and filter <code>where loaded_at &gt; (select max(loaded_at) - interval '3 days' from {{ this }})</code> inside <code>{% if is_incremental() %}</code>. Filter on load time (when the row arrived), not event time, so late events are caught; merge on the key makes reprocessing the lookback idempotent. Alternatively use the <code>microbatch</code> strategy with a lookback.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> A tier-1 dashboard showed wrong revenue this morning. Walk through your response.</summary><div><p>Acknowledge and communicate (incident channel, banner on dashboard). Use lineage to trace upstream; check test results, freshness and recent changes (dbt deploys, upstream schema changes, late loads). Identify the root cause (for example, a source changed amounts to cents). Fix forward or revert, backfill affected partitions idempotently, verify with reconciliation, remove the banner. Post-incident: add a contract or test that would have caught it (unit check on amount distribution, contract on units), and consider write-audit-publish for this table.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How do you implement GDPR erasure in a lakehouse with time travel?</summary><div><p>Row-level delete by subject id in every table containing their data (found via lineage and tags), then expire snapshots older than the deletion (or the retention window) and remove orphan files so the bytes are physically gone; rewrite affected files if using deletion vectors. Alternatively crypto-shred per-subject keys. Track requests and completion for audit.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Airflow versus Dagster: what is the core difference in mental model?</summary><div><p>Airflow models workflows as tasks with dependencies (what to run and when); Airflow 3 assets add data awareness. Dagster models the data assets themselves and derives the work needed to materialize them, with partitions, freshness and lineage as first-class concepts. Airflow wins on ecosystem and ubiquity, Dagster on asset-centric development and testing.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> How would you get product teams to own data contracts?</summary><div><p>Make it cheap and valuable for them: contract templates and CI checks in their existing build, generated documentation, visible consumers and impact via lineage, and a clear incident story ("your change broke finance"). Start with tier-1 events, pair with teams, and make breaking changes a reviewable, versioned process rather than a blame exercise.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Name quality problems by dimension; combine blocking tests with observability; tier your datasets.</li>
+    <li>Data contracts move quality left to the producer, enforced in CI and the schema registry.</li>
+    <li>Governance = catalog + lineage + classification + policy-based access + retention and erasure that are physically complete.</li>
+    <li>Feature stores exist to prevent training-serving skew and future leakage via point-in-time joins and shared definitions.</li>
+    <li>Airflow 3 separates parsing, scheduling, triggering and execution, isolates task code behind an API, and adds assets and DAG versioning; tasks must be idempotent and parameterized by the data interval.</li>
+    <li>dbt turns SQL into a tested, versioned DAG with materializations, snapshots, contracts and unit tests; analytics engineers own that layer.</li>
+    <li>DE, AE, DS and MLE interact through explicit artifacts: contracts, sources, marts and metrics, feature definitions, registered models and prediction APIs.</li>
+  </ul>
+  <div class="quiz" data-answer="b">
+    <p class="q">A model trained with features joined on "latest value as of today" performs far worse in production than offline. Most likely cause?</p>
+    <ol>
+      <li data-k="a">The online store is too slow</li>
+      <li data-k="b">Future leakage from a non-point-in-time feature join</li>
+      <li data-k="c">Too few features</li>
+      <li data-k="d">The model registry used the wrong stage</li>
+    </ol>
+    <div class="explain">Using today's feature values for historical labels leaks information unavailable at prediction time, inflating offline metrics. A point-in-time (as-of) join fixes it.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">In Airflow 3, how does task code access connections and variables?</p>
+    <ol>
+      <li data-k="a">Directly through SQLAlchemy sessions on the metadata database</li>
+      <li data-k="b">Through the scheduler process via XCom</li>
+      <li data-k="c">From environment variables only</li>
+      <li data-k="d">Through the Task SDK calling the API server's Task Execution API</li>
+    </ol>
+    <div class="explain">Airflow 3 decouples workers from the database; the Task SDK talks to the API server, which mediates all metadata access.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">Which dbt feature produces SCD Type 2 history from a mutable source table?</p>
+    <ol>
+      <li data-k="a">Snapshots</li>
+      <li data-k="b">Ephemeral models</li>
+      <li data-k="c">Seeds</li>
+      <li data-k="d">Exposures</li>
+    </ol>
+    <div class="explain">Snapshots compare current source rows with the previous state (timestamp or check strategy) and maintain validity ranges per version.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Why should Airflow sensors usually run in deferrable mode?</p>
+    <ol>
+      <li data-k="a">Deferrable sensors check conditions more accurately</li>
+      <li data-k="b">They avoid the need for retries</li>
+      <li data-k="c">While waiting they release the worker slot, with the async triggerer monitoring the condition</li>
+      <li data-k="d">They run inside the scheduler for lower latency</li>
+    </ol>
+    <div class="explain">Classic sensors occupy a worker slot for the whole wait; deferral hands the wait to the triggerer's event loop, which can manage thousands of waits cheaply.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">An incremental dbt model filters <code>where event_ts &gt; (select max(event_ts) from {{ this }})</code>. What is the main risk?</p>
+    <ol>
+      <li data-k="a">It will run a full refresh every time</li>
+      <li data-k="b">Late-arriving events with older timestamps are permanently skipped</li>
+      <li data-k="c">It will create duplicate tables</li>
+      <li data-k="d">The model cannot be tested</li>
+    </ol>
+    <div class="explain">Events arriving after newer ones have loaded fall below the high-water mark. Use a lookback window on load time with merge, or microbatch with lookback.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">Which artifact is the cleanest interface between analytics engineering and data science?</p>
+    <ol>
+      <li data-k="a">Raw CDC topics</li>
+      <li data-k="b">Airflow XComs</li>
+      <li data-k="c">Model registry entries</li>
+      <li data-k="d">Tested, documented marts and semantic-layer metric definitions</li>
+    </ol>
+    <div class="explain">AEs publish modelled, tested data and canonical metrics; data scientists consume them rather than re-deriving metrics from raw data.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Docs</span> <a href="https://airflow.apache.org/docs/apache-airflow/stable/">Apache Airflow documentation</a> and <a href="https://airflow.apache.org/blog/airflow-three-point-oh-is-here/">Airflow 3.0 announcement</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.getdbt.com/docs/build/incremental-models">dbt: incremental models</a>, <a href="https://docs.getdbt.com/docs/build/snapshots">snapshots</a>, <a href="https://docs.getdbt.com/docs/build/unit-tests">unit tests</a>.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://docs.getdbt.com/blog/dbt-fusion-engine">dbt Labs: Meet the dbt Fusion engine</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.greatexpectations.io/docs/core/introduction/">Great Expectations GX Core documentation</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.soda.io/">Soda documentation (SodaCL)</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.feast.dev/">Feast documentation</a> (point-in-time joins, materialization).</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://openlineage.io/docs/spec/object-model">OpenLineage object model</a>.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://bitol-io.github.io/open-data-contract-standard/">Open Data Contract Standard (Bitol)</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.dagster.io/">Dagster documentation</a> and <a href="https://docs.prefect.io/">Prefect documentation</a>.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://eur-lex.europa.eu/eli/reg/2016/679/oj">Regulation (EU) 2016/679 (GDPR)</a>.</li>
+    <li><span class="ref-kind">Book</span> Joe Reis, Matt Housley, <em>Fundamentals of Data Engineering</em>, O'Reilly, 2022 (read alongside; this chapter does not reproduce it).</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

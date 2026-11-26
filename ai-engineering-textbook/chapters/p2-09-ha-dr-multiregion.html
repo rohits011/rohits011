@@ -162,6 +162,230 @@
   </ul>
 </section>
 
+<section id="internals">
+  <h2>4. Internal Working</h2>
+
+  <h3>4.1 How a trace is built and propagated</h3>
+  <ol>
+    <li>An inbound request reaches the Spring MVC filter chain. The tracing filter (Micrometer Observation with an OpenTelemetry or Brave bridge) looks for a <code>traceparent</code> header. If present, it continues that trace; if absent, it creates a new 128-bit trace id and makes a sampling decision.</li>
+    <li>A <em>server span</em> is started with attributes (HTTP method, route template, status). The current span is stored in a context (thread-local, or Reactor context in WebFlux), and trace and span ids are copied into the logging MDC.</li>
+    <li>Instrumented outbound clients (<code>RestClient</code>, <code>WebClient</code>, JDBC via datasource-micrometer, <code>KafkaTemplate</code> with observation enabled) start <em>client spans</em> as children and inject <code>traceparent</code> into outgoing headers (HTTP headers, Kafka record headers).</li>
+    <li>On completion each span is ended and handed to an exporter, which batches spans and sends them via OTLP to an OpenTelemetry Collector.</li>
+    <li>The Collector applies processors (batching, attribute redaction, tail sampling that keeps all errors and slow traces), then exports to the tracing backend. Metrics may be derived from spans (span-metrics) and exemplars link histogram buckets to trace ids.</li>
+  </ol>
+  <p>Sampling must be consistent: if service A samples a trace, downstream services must honour the sampled flag in <code>traceparent</code>, or traces become fragmented. Tail sampling requires all spans of a trace to reach the same Collector instance (load-balance by trace id).</p>
+
+  <h3>4.2 How a metric becomes an alert</h3>
+  <p>Micrometer records measurements into meters in memory (a <code>Timer</code> keeps counts, sums and, if configured, histogram buckets). Prometheus scrapes <code>/actuator/prometheus</code> every 15–60 s (pull model), or an OTLP exporter pushes. The time-series database stores samples per unique label set. Recording rules pre-compute aggregates (error ratio per service over 5 minutes); alerting rules evaluate expressions such as multi-window burn rates and send firing alerts to Alertmanager, which deduplicates, groups, silences and routes them to on-call. Latency must be aggregated from <em>histograms</em>, not averaged percentiles: percentiles from different instances cannot be averaged, but histogram buckets can be summed and the quantile computed afterwards.</p>
+
+  <h3>4.3 Failure detection and failover inside a region</h3>
+  <ul>
+    <li><strong>Instance or pod failure:</strong> the kubelet's liveness probe restarts a hung container; a node failure is detected by missing node heartbeats (node lease), pods are evicted after a toleration timeout (default 5 minutes for unreachable nodes, often tuned down), and the scheduler places replacements. Meanwhile, readiness and endpoint updates stop traffic to pods on the failed node.</li>
+    <li><strong>Load balancer:</strong> health checks against targets at an interval with healthy/unhealthy thresholds; failed targets are removed; connection draining (deregistration delay) lets in-flight requests finish during planned removal.</li>
+    <li><strong>Database primary failure:</strong> a managed service (e.g., RDS Multi-AZ, Cloud SQL HA) detects primary failure, promotes the synchronous standby in another zone and updates a DNS name, typically within a minute or two; clients must reconnect (connection pools need validation and short DNS caching; the JVM's DNS cache TTL matters). Self-managed PostgreSQL uses Patroni with an etcd/Consul leader key and fencing to avoid two primaries.</li>
+    <li><strong>Zone failure:</strong> a statically stable design simply loses a third of capacity; load balancers stop sending to unhealthy targets in that zone; zonal autoscaling may add capacity elsewhere if the control plane is healthy, but the design must not depend on it. Gray failures (a zone partially degraded rather than down) are harder: health checks pass but latency rises. Zonal shift capabilities (e.g., Route 53 Application Recovery Controller zonal shift) let operators or automation evacuate a zone deliberately.</li>
+  </ul>
+
+  <h3>4.4 Cross-region database replication mechanics</h3>
+  <ul>
+    <li><strong>Asynchronous physical/log shipping:</strong> the primary streams its write-ahead log or binlog to replicas in other regions (PostgreSQL streaming replication, MySQL replication, Aurora Global Database's storage-level replication). Replication lag is the RPO on failover. Promotion: stop writes to the old primary (fence), promote a replica, repoint writers.</li>
+    <li><strong>Logical / CDC replication:</strong> Debezium or native logical replication ships row changes; allows different schemas or engines on each side and bidirectional setups (with conflict handling).</li>
+    <li><strong>Multi-active stores:</strong> DynamoDB global tables, Cassandra multi-DC, Cosmos DB multi-region writes: each region accepts writes and replicates asynchronously, resolving conflicts by last-writer-wins on timestamps (or configurable policies). Some providers now offer stronger multi-region consistency modes for selected tables at higher write latency; check the current documentation. <span class="tag version">Version-sensitive · checked Nov 2026</span></li>
+    <li><strong>Consensus across regions:</strong> Spanner, CockroachDB and YugabyteDB replicate each range with Raft or Paxos across regions; a write commits when a majority of replicas (in different regions) acknowledge. With a 3-region configuration, losing one region keeps the database fully consistent and available; each write pays the round trip to the nearest majority. Placement controls (leaseholder/leader pinning, regional-by-row tables) keep latency low for local data.</li>
+    <li><strong>Object storage:</strong> cross-region replication of buckets (asynchronous, often with an optional replication-time SLA). Use it for backups, model artifacts and data-lake files.</li>
+  </ul>
+
+  <h3>4.5 How global routing fails over</h3>
+  <p><strong>DNS failover:</strong> a DNS provider runs health checks against regional endpoints from many vantage points; when a region fails its checks, the provider stops returning that region's address. The effective failover time is detection time (check interval × failure threshold) plus TTL plus resolver and client caching, which can exceed the TTL (some clients and JVMs cache longer; the JVM security property <code>networkaddress.cache.ttl</code> controls Java's cache). Use low TTLs (30–60 s) on failover records and verify client behaviour. <strong>Anycast:</strong> edges announce the same prefix; if a site fails, its BGP announcement is withdrawn and routers converge on other sites within seconds; long-lived TCP connections to the failed site break and must reconnect. <strong>Global load balancers</strong> (anycast front ends that proxy to regional backends) combine both: users connect to the nearest edge, and the edge chooses a healthy backend region per request.</p>
+
+  <h3>4.6 Anatomy of a regional failover runbook</h3>
+  <ol>
+    <li><strong>Detect and declare:</strong> SLO burn alerts and synthetic probes from outside the region; an incident commander declares a regional failover using pre-agreed criteria (to avoid both hesitation and flapping).</li>
+    <li><strong>Fence the failed region:</strong> stop it from accepting writes (disable writers, revoke credentials, set the database read-only if reachable) so that it cannot diverge if it comes back partially.</li>
+    <li><strong>Promote data stores</strong> in the recovery region (replicas to primaries), recording the replication position to quantify data loss.</li>
+    <li><strong>Scale up</strong> compute in the recovery region to full capacity (pre-provisioned if statically stable; otherwise this step dominates RTO and depends on capacity availability).</li>
+    <li><strong>Shift traffic</strong> (DNS weights, global load balancer configuration, or routing-control switches that were pre-created so the data plane needs no new resources).</li>
+    <li><strong>Verify</strong> with synthetic transactions and SLO dashboards; communicate status.</li>
+    <li><strong>Reconcile</strong> after recovery: writes that reached the old region but not the replica must be identified (from its WAL or audit logs) and replayed or compensated.</li>
+    <li><strong>Fail back</strong> deliberately later, usually by re-establishing replication in reverse and repeating a controlled switchover.</li>
+  </ol>
+
+  <h3>4.7 Cell routing internals</h3>
+  <p>The cell router maps a partition key to a cell using a mapping table (tenant → cell) cached at the router, with consistent hashing or explicit assignment for placement. To stay statically stable the router serves from its cached mapping if the mapping store is unavailable, and new tenants are placed by an offline control plane. Migrating a tenant between cells follows a careful sequence: copy data, catch up with CDC, briefly block writes for that tenant, flip the mapping, resume. Deployments proceed in waves: one canary cell, then increasingly larger groups, with automated rollback on SLO regression, so a bad change hits a small fraction of customers.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: Diagrams</h2>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph Services
+    A["order-service (Micrometer + OTel)"]
+    B["payment-service (Go, OTel SDK)"]
+    C["ranker (Python, OTel SDK)"]
+  end
+  A -- "traceparent over HTTP and Kafka headers" --> B
+  A --> C
+  A -->|"OTLP: traces, metrics, logs"| COL["OpenTelemetry Collector (tail sampling, redaction)"]
+  B --> COL
+  C --> COL
+  PROM["Prometheus scrape /actuator/prometheus"] --> A
+  COL --> TR[(Trace store)]
+  COL --> LG[(Log store)]
+  COL --> MT[(Metrics store)]
+  PROM --> MT
+  PROF["Continuous profiler"] --> A
+  MT --> AL["Burn-rate alerts to on-call"]
+  MT --> GR[Dashboards]
+  TR --> GR
+  LG --> GR
+</pre>
+  <figcaption>Figure 9.1 — A vendor-neutral observability pipeline across Java, Go and Python services.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> all services emit telemetry using the same semantic conventions and propagate the same trace context, so a single trace spans Java, Go and Python. The Collector decouples applications from backends and is where you apply tail sampling and PII redaction. Alerts are based on SLO burn rates in the metrics store; dashboards link metrics to traces (exemplars) and traces to logs (trace id).</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  U[Users] --> R53["DNS / global LB"]
+  R53 --> LB["Regional load balancer (spans 3 AZs)"]
+  subgraph AZa[AZ a]
+    A1[app pods]
+    DBp[(DB primary)]
+  end
+  subgraph AZb[AZ b]
+    B1[app pods]
+    DBs[(DB sync standby)]
+  end
+  subgraph AZc[AZ c]
+    C1[app pods]
+    DBr[(read replica)]
+  end
+  LB --> A1
+  LB --> B1
+  LB --> C1
+  A1 --> DBp
+  B1 --> DBp
+  C1 --> DBp
+  DBp -- sync replication --> DBs
+  DBp -- async replication --> DBr
+</pre>
+  <figcaption>Figure 9.2 — Multi-AZ high availability within a region.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> every tier spans three zones. Losing AZ a removes a third of the application capacity (absorbed if each zone runs at most ~66% utilisation) and triggers promotion of the synchronous standby in AZ b, with no committed data lost. Notice the cross-AZ dependency: pods in b and c talk to the primary in a, so zone-aware routing for reads (replicas in each zone) reduces both latency and cross-AZ data-transfer cost.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph BR[Backup and restore]
+    P1[Primary region] -. snapshots .-> S1[(Backups in DR region)]
+  end
+  subgraph PL[Pilot light]
+    P2[Primary region] -- replication --> D2[(DR database live)]
+    D2 --- I2["DR compute: off or minimal"]
+  end
+  subgraph WS[Warm standby]
+    P3[Primary region] -- replication --> D3[(DR database live)]
+    D3 --- I3["DR compute: small but serving"]
+  end
+  subgraph AA[Active-active]
+    P4[Region A serving] <-- bidirectional replication --> P5[Region B serving]
+  end
+</pre>
+  <figcaption>Figure 9.3 — The DR spectrum from backup-and-restore to multi-site active-active.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> moving right, more of the system is already running in the recovery region, so RTO shrinks and cost grows. Pilot light and warm standby both keep data live (low RPO); they differ in whether compute must be launched (pilot light) or merely scaled (warm standby). Active-active removes failover as a special event but requires the multi-writer data design of Chapter 6.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  CL[Clients] --> CR["Cell router (thin, cached mapping, statically stable)"]
+  CR -->|"tenants 1..N hash to cell 1"| C1
+  CR -->|"cell 2"| C2
+  CR -->|"cell 3"| C3
+  subgraph C1["Cell 1"]
+    S1[services] --> D1[(data)]
+  end
+  subgraph C2["Cell 2"]
+    S2[services] --> D2[(data)]
+  end
+  subgraph C3["Cell 3"]
+    S3[services] --> D3[(data)]
+  end
+  CP["Control plane: placement, migration, wave deployments"] -.-> CR
+  CP -.-> C1
+  CP -.-> C2
+  CP -.-> C3
+</pre>
+  <figcaption>Figure 9.4 — Cell-based architecture: independent full stacks behind a thin router.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> no arrows connect cells to each other, which is the point. The control plane (dotted) is not on the request path; if it fails, the router keeps routing with its cached mapping. A bad deployment, a poison tenant, or data corruption in cell 2 affects only cell 2's tenants.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant Mon as Monitoring and synthetics
+  participant IC as Incident commander
+  participant RA as Region A (failed)
+  participant RB as Region B
+  participant DNS as Global routing
+  Mon->>IC: Region A SLO burn and probe failures
+  IC->>RA: fence: disable writes, revoke write credentials
+  IC->>RB: promote DB replica, note replication position
+  IC->>RB: scale to full capacity (or confirm pre-provisioned)
+  IC->>DNS: shift 100% traffic to Region B
+  Mon-->>IC: synthetic checkout OK in Region B
+  Note over IC,RB: later: reconcile writes lost in lag, rebuild replication, planned failback
+</pre>
+  <figcaption>Figure 9.5 — Regional failover runbook as a sequence.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the order matters. Fencing before promotion prevents split brain if region A partially recovers. Recording the replication position quantifies the RPO actually realised and drives reconciliation. Traffic shifts only after the new primary and capacity are ready, otherwise users are sent to a region that cannot serve them.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  UEU[EU user] --> EDGE["Anycast edge / global LB"]
+  UUS[US user] --> EDGE
+  EDGE -->|"home region = EU"| EU["eu-central stack"]
+  EDGE -->|"home region = US"| US["us-east stack"]
+  EU --- EUDB[("EU data: residency-bound")]
+  US --- USDB[("US data")]
+  EU -. "global, non-personal data replicated both ways" .- US
+  EU -. "async DR copy (encrypted, residency-compliant region)" .-> EUDR[(EU DR region)]
+</pre>
+  <figcaption>Figure 9.6 — Home-region routing for latency and data residency.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> each user's personal data lives in a home region and all writes for that user go there, which avoids multi-writer conflicts and satisfies residency rules. Only non-personal reference data (catalogue, configuration) is replicated globally. DR for EU data stays within a compliant region pair. A US user travelling in Europe still writes to the US home region; latency is the price of residency.</p>
+</section>
+
+<section id="math">
+  <h2>6. Math: Availability, Error Budgets, RPO/RTO and Capacity</h2>
+  <h3>6.1 Availability and downtime</h3>
+  <p>Allowed downtime per 30-day month for availability \( A \) is \( (1 - A) \times 43{,}200 \) minutes: 99.9% → 43.2 min, 99.95% → 21.6 min, 99.99% → 4.3 min. Annual: 99.99% ≈ 52.6 minutes per year. Every additional nine needs roughly an order of magnitude better detection, failover automation and change safety.</p>
+
+  <h3>6.2 Redundancy math</h3>
+  <p>With independent components of availability \( a \), \( n \) redundant copies where any one suffices give \( A = 1 - (1-a)^{n} \). Two zones at 99.9% → 99.9999% in theory. Reality is dominated by correlated failures (shared dependencies, bad deployments, control-plane events) and by failover imperfection. A useful refinement: if failover succeeds with probability \( p_f \), \( A \approx 1 - (1-a)\,[(1-a) + (1-p_f)] \). With \( a = 0.999 \) and \( p_f = 0.99 \): \( 1 - 0.001 \times (0.001 + 0.01) = 0.999989 \): the failover success rate, not the second copy, limits availability. <span class="tag illus">Illustrative</span></p>
+
+  <h3>6.3 Mean time to recovery</h3>
+  <p>Steady-state availability \( A = \frac{MTBF}{MTBF + MTTR} \). Halving MTTR has the same effect as doubling MTBF, and MTTR is usually far cheaper to improve (detection, automation, rehearsed runbooks). MTTR decomposes into time to detect + time to decide + time to mitigate; observability attacks the first two.</p>
+
+  <h3>6.4 Error-budget burn rate</h3>
+  <p>With SLO target \( S \), the error budget is \( 1-S \). Burn rate over a window is \( b = \frac{\text{observed error ratio}}{1 - S} \). A burn rate \( b \) sustained for time \( t \) consumes \( b \cdot t / T \) of a budget for period \( T \). For \( S = 99.9\% \), \( T = 30 \) days: an error ratio of 1.44% gives \( b = 14.4 \); in one hour it consumes \( 14.4 \times 1/720 = 2\% \) of the budget, the classic fast-burn paging threshold. A 6-hour window at \( b = 6 \) consumes 5%.</p>
+
+  <h3>6.5 Static-stability headroom</h3>
+  <p>To survive losing one of \( z \) zones without scaling, each zone must be able to carry \( \frac{1}{z-1} \) of peak load, so total provisioned capacity is \( \frac{z}{z-1} \) of peak: 150% for 3 zones, 133% for 4. For active-active across \( r \) regions surviving one region's loss: \( \frac{r}{r-1} \), i.e., 200% for two regions, which is why two-region active-active is expensive and three regions are often more economical.</p>
+
+  <h3>6.6 RPO under asynchronous replication</h3>
+  <p>If replication lag is \( L(t) \), the data lost on an unplanned failover at time \( t \) is roughly the writes in \( [t - L(t), t] \). RPO is therefore bounded by the maximum lag you tolerate: alert when \( L \) exceeds the RPO and consider throttling writes. Example: 2,000 writes/s with a p99 lag of 800 ms risks losing ~1,600 writes on failover, which must be reconciled from the old region's log or accepted. <span class="tag illus">Illustrative</span></p>
+
+  <h3>6.7 Restore time</h3>
+  <p>Backup-and-restore RTO is dominated by data volume over restore throughput: \( RTO \approx t_{provision} + \frac{V}{\text{throughput}} + t_{replay} + t_{verify} \). Restoring 8 TB at 500 MB/s takes about 4.4 hours before log replay and verification. This is why large datasets (including vector indexes and feature stores) push you toward pilot light or warm standby even when the business could tolerate a few hours of downtime. <span class="tag illus">Illustrative</span></p>
+
+  <h3>6.8 Cell blast radius</h3>
+  <p>With \( c \) equally sized cells and a failure confined to one cell, the fraction of customers affected is \( 1/c \). With shuffle sharding, each customer is assigned \( k \) of \( n \) workers; the probability that another specific customer shares all \( k \) workers is \( 1/\binom{n}{k} \). For \( n = 8, k = 2 \): \( 1/28 \approx 3.6\% \); for \( n = 100, k = 5 \): about \( 1.3 \times 10^{-8} \).</p>
+</section>
+
 </article>
 <script src="../assets/js/toc.js"></script>
 <script src="../assets/js/widgets.js"></script>
