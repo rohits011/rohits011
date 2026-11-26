@@ -1,0 +1,1268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Security Foundations, Threat Modeling &amp; the OWASP Top 10 — AI-Era Software Engineering</title>
+<meta name="description" content="Security fundamentals, STRIDE threat modeling with data-flow diagrams, every OWASP Top 10:2025 category with Spring mitigations, security logging, and vulnerability management with CVSS, EPSS and CISA KEV.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p11-01-security-foundations-owasp" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 11 · Chapter 1</p>
+  <h1>Security Foundations, Threat Modeling &amp; the OWASP Top 10</h1>
+  <p class="lede">Most breaches of backend systems are not exotic: they are a missing ownership check, a debug endpoint left open, a library nobody patched, or an incident nobody could reconstruct because the logs were useless. This chapter gives you the mental model senior engineers use to reason about security — principles, threat modeling, the OWASP Top 10:2025, logging and vulnerability management — and maps each idea onto the Spring Boot stack you already run.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Comfortable with Spring Boot, Spring Security basics (you have configured a <code>SecurityFilterChain</code>), REST APIs, relational databases, CI pipelines.</li>
+    <li><strong>You will be able to:</strong> apply CIA/AAA and least privilege to a design; run a STRIDE threat model on a data-flow diagram in a design review; explain and mitigate every OWASP Top 10:2025 category in a Spring service; design security logging that helps incident response without leaking secrets; triage vulnerabilities with CVSS, EPSS and CISA KEV and set realistic patch SLAs.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: Security Is a Property of the Whole System</h2>
+  <p>Security engineering is the discipline of building systems that keep doing what their owners intend while someone is actively trying to make them do something else. That last clause is what separates security from ordinary reliability work. A disk fails at random; an attacker picks the weakest disk, at the worst moment, and keeps trying. Your load tests model users who want the system to work. Your threat models must model users who want it to fail in a specific, profitable way.</p>
+  <p>For a backend engineer this has a practical consequence: security is not a feature you add in a sprint, and it is not the security team's problem. Almost every serious vulnerability class in this chapter — broken access control, injection, misconfiguration, vulnerable dependencies — is introduced by ordinary application code and ordinary deployment choices. The people best placed to prevent them are the people writing the controllers, repositories, Helm charts and Gradle files. That is you.</p>
+  <p>This chapter is the foundation for Part 11. It establishes vocabulary (CIA, AAA, least privilege, attack surface), a repeatable method (threat modeling with STRIDE on data-flow diagrams), a shared catalogue of what goes wrong (the OWASP Top 10:2025), and two operational practices that most teams underinvest in (security logging and vulnerability management). Later chapters go deep on identity (11.2), application vulnerabilities (11.3), cryptography/cloud/supply chain (11.4) and AI-specific threats (11.5).</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>You have written a <code>SecurityFilterChain</code> bean, put <code>@PreAuthorize("hasRole('ADMIN')")</code> on a service method, relied on Spring Data JPA's parameter binding to avoid SQL injection, enjoyed Thymeleaf's auto-escaping, had <code>CsrfFilter</code> reject a POST you forgot to give a token, stored a database password with Jasypt or Vault, and (hopefully) restricted <code>management.endpoints.web.exposure.include</code> to <code>health,info</code>.</dd>
+      <dt>Why that is not enough</dt><dd>Each of those is a <em>control</em>. Controls only help if they are applied to the right place, configured correctly, and cover every path. Spring cannot know that <code>/api/orders/{id}</code> must check that the order belongs to the caller; it cannot know that a new Kafka consumer bypasses the HTTP filter chain entirely; it cannot patch your transitive Jackson dependency. You need a <em>method</em> for finding where controls are missing, not just a toolbox of controls.</dd>
+      <dt>The modern approach</dt><dd>Threat-model at design time (STRIDE over a data-flow diagram), make secure behaviour the default in shared libraries and platform templates, treat dependencies and configuration as first-class attack surface (OWASP 2025 moved supply chain and misconfiguration to #2 and #3), log for detection and forensics, and run vulnerability management as a prioritised, SLA-driven process informed by exploitation data (EPSS, CISA KEV) rather than CVSS alone.</dd>
+      <dt>Where Python and Go fit</dt><dd>The principles are language-neutral; the defaults are not. FastAPI has no built-in CSRF or session framework; Go's <code>net/http</code> gives you almost nothing by default — no auth, no rate limiting, permissive timeouts. In polyglot estates the Spring service is often the best-protected component, and the Python ML sidecar or Go proxy next to it is the weak link. Threat models must cover all of them.</dd>
+      <dt>In production</dt><dd>Mature teams have a lightweight threat-model template in the design-doc process, a security champion per team, SCA and SAST gates in CI, a written patch SLA by severity, centralised security logs with alerting, and an incident runbook that has actually been rehearsed.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use the full method for any new service, new trust boundary (a new external integration, a new tenant model, an LLM with tools), or new sensitive data. Avoid ceremony for trivial internal changes: a two-line config tweak does not need a workshop, but it does need a reviewer who asks "does this widen exposure?".</dd>
+    </dl>
+  </div>
+
+  <div class="callout note"><p class="callout-title">Scope and authorization</p><p>Everything in Part 11 is written from a defender's point of view. Attack techniques are described only to the depth needed to recognise and prevent them. Any hands-on testing in the exercises targets applications you run yourself on your own machine (for example OWASP Juice Shop or WebGoat in Docker). Testing systems you do not own or have explicit written permission to test is illegal in most jurisdictions, regardless of intent.</p></div>
+</section>
+
+<section id="history">
+  <h2>2. History: From Locked Rooms to Supply Chains</h2>
+  <p>Understanding how the field evolved explains why today's guidance looks the way it does — and why some of it is still catching up.</p>
+  <h3>2.1 The principles era (1970s)</h3>
+  <p>In 1975 Jerome Saltzer and Michael Schroeder published "The Protection of Information in Computer Systems" in the <em>Proceedings of the IEEE</em>. Its eight design principles — economy of mechanism, fail-safe defaults, complete mediation, open design, separation of privilege, least privilege, least common mechanism and psychological acceptability — are still the most cited list in the field. When this chapter says "deny by default" or "check every access", it is restating Saltzer and Schroeder. Around the same time the US Department of Defense funded work on multilevel security that led to the "Orange Book" (TCSEC, 1983/1985), which introduced the idea of evaluating systems against formal assurance levels.</p>
+  <h3>2.2 The network era (1988–2000)</h3>
+  <p>The Morris worm (November 1988) exploited a buffer overflow in <code>fingerd</code> and weak <code>sendmail</code>/<code>rsh</code> configurations and infected a significant fraction of the then-small internet. It led directly to the creation of CERT/CC at Carnegie Mellon. In 1999 MITRE launched the CVE (Common Vulnerabilities and Exposures) list so that everyone could refer to the same vulnerability by the same identifier — the foundation of every vulnerability scanner you use today.</p>
+  <h3>2.3 The web application era (2000–2015)</h3>
+  <p>As business logic moved into web applications, the dominant bugs moved too: SQL injection (publicly described in 1998), cross-site scripting, session hijacking. OWASP — the Open Worldwide Application Security Project (renamed from "Open Web" in 2023) — was founded in 2001 and published the first OWASP Top 10 in 2003. Microsoft's Trustworthy Computing memo (January 2002) led to the Security Development Lifecycle and, internally, to the STRIDE threat classification created by Loren Kohnfelder and Praerit Garg in 1999. Adam Shostack's book <em>Threat Modeling: Designing for Security</em> (Wiley, 2014) brought that practice to the wider industry.</p>
+  <h3>2.4 The cloud and API era (2015–2020)</h3>
+  <p>APIs replaced server-rendered pages, and access-control bugs (one user reading another's data by changing an ID) became the most common serious finding. OWASP started a separate API Security Top 10 in 2019. Cloud misconfiguration — public storage buckets, over-privileged IAM roles — became a leading cause of data exposure; the 2019 Capital One breach (Chapter 11.3) combined an SSRF bug with an over-privileged instance role.</p>
+  <h3>2.5 The supply-chain era (2020–today)</h3>
+  <p>SolarWinds (disclosed December 2020) showed that compromising a vendor's build system compromises every customer. Log4Shell (CVE-2021-44228, December 2021) showed that a single transitive dependency could make a large fraction of Java services remotely exploitable overnight. The xz-utils backdoor (CVE-2024-3094, March 2024) showed a patient, multi-year social-engineering takeover of an open-source maintainer role. The response — SBOMs, SLSA, Sigstore, the CISA Known Exploited Vulnerabilities catalog (launched November 2021) — is covered in Chapter 11.4. OWASP's 2025 edition reflects this shift by creating a dedicated "Software Supply Chain Failures" category at #3.</p>
+  <h3>2.6 The AI era (2023–)</h3>
+  <p>Large language models introduced a new class of input-driven vulnerability (prompt injection) and a new class of over-privileged component (agents with tools). OWASP published a separate Top 10 for LLM Applications (first 2023, updated for 2025). AI coding assistants also changed the <em>production</em> of vulnerabilities: more code, written faster, reviewed by people who did not author it. Chapter 11.5 treats this in depth.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Year</th><th>Milestone</th><th>Lasting impact</th></tr></thead>
+    <tbody>
+      <tr><td>1975</td><td>Saltzer &amp; Schroeder design principles</td><td>Least privilege, fail-safe defaults, complete mediation</td></tr>
+      <tr><td>1988</td><td>Morris worm</td><td>CERT/CC; incident response as a discipline</td></tr>
+      <tr><td>1999</td><td>CVE list launched; STRIDE created at Microsoft</td><td>Shared vulnerability identifiers; structured threat enumeration</td></tr>
+      <tr><td>2003</td><td>First OWASP Top 10</td><td>Common vocabulary for web app risk</td></tr>
+      <tr><td>2005</td><td>CVSS v1</td><td>Standardised severity scoring (now v4.0, 2023)</td></tr>
+      <tr><td>2019</td><td>OWASP API Security Top 10; Capital One breach</td><td>API-specific access-control focus; cloud metadata SSRF awareness</td></tr>
+      <tr><td>2021</td><td>Log4Shell; CISA KEV; EPSS v1 public</td><td>SCA becomes mandatory; exploitation-based prioritisation</td></tr>
+      <tr><td>2024</td><td>xz-utils backdoor</td><td>Maintainer trust and build reproducibility in focus</td></tr>
+      <tr><td>2025</td><td>OWASP Top 10:2025; OWASP LLM Top 10 2025</td><td>Supply chain and misconfiguration rise; LLM-specific risks</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals: The Vocabulary of Secure Design</h2>
+
+  <h3>3.1 The CIA triad — what you are protecting</h3>
+  <p>Every security requirement ultimately protects one of three properties of information or service:</p>
+  <ul>
+    <li><strong>Confidentiality</strong> — only authorised parties can read the data. Violations: a tenant reading another tenant's invoices, a stack trace leaking a connection string, an S3 bucket readable by the world, a log line containing a bearer token.</li>
+    <li><strong>Integrity</strong> — data and behaviour change only through authorised, correct operations. Violations: a user changing the <code>price</code> field in a checkout request, a mass-assignment bug that lets a user set <code>role=ADMIN</code>, a tampered build artifact, an unsigned webhook that lets anyone mark an order as paid.</li>
+    <li><strong>Availability</strong> — the system serves legitimate users when they need it. Violations: an unbounded <code>page_size</code> that makes the database scan ten million rows, a regular expression with catastrophic backtracking (ReDoS), a ransomware infection, a credential-stuffing wave that locks out real users.</li>
+  </ul>
+  <p>Two further properties are commonly added. <strong>Authenticity</strong> means you can trust the claimed origin of a message (a signed JWT, an HMAC-signed webhook). <strong>Non-repudiation</strong> means a party cannot credibly deny an action they took — usually achieved by digital signatures plus tamper-evident audit logs. For financial and healthcare backends, non-repudiation is often a regulatory requirement rather than a nice-to-have.</p>
+  <div class="callout insight"><p class="callout-title">Insight</p><p>CIA properties conflict. Maximum confidentiality (encrypt everything, require MFA on every call) costs availability and usability. Maximum availability (fail open when the auth server is down) costs confidentiality and integrity. Security design is the explicit choice of where to sit on these trade-offs for each asset — not maximising all three.</p></div>
+
+  <h3>3.2 AAA — authentication, authorization, accounting</h3>
+  <p><strong>Authentication</strong> answers "who are you?" and produces a principal: a user, a service account, a workload identity. In Spring this is the job of an <code>AuthenticationManager</code> and the resulting <code>Authentication</code> in the <code>SecurityContextHolder</code>. <strong>Authorization</strong> answers "may this principal perform this action on this resource?" — <code>authorizeHttpRequests</code>, <code>@PreAuthorize</code>, and (critically) the ownership checks inside your service layer that no framework writes for you. <strong>Accounting</strong> (often called auditing) records who did what, when, from where, and with what outcome, so you can detect abuse and reconstruct incidents.</p>
+  <p>The most important practical lesson: authentication bugs are rare in mature stacks because you use a framework; authorization bugs are common because authorization is <em>business logic</em>. Spring will happily authenticate Alice and then let her read Bob's order if your controller does <code>orderRepository.findById(id)</code> without checking ownership. That is why Broken Access Control has been #1 in the OWASP Top 10 since 2021.</p>
+
+  <h3>3.3 Least privilege</h3>
+  <p>Every principal — human, service, process, database user, CI job, LLM agent — should have exactly the permissions needed for its task and no more, for no longer than needed. In practice this means:</p>
+  <ul>
+    <li>The application's database user can <code>SELECT/INSERT/UPDATE/DELETE</code> on its own schema but cannot <code>DROP</code>, cannot read other schemas, and is not the migration user. Run Flyway/Liquibase with a separate, more privileged credential in a one-shot job.</li>
+    <li>The pod's cloud IAM role can read <em>one</em> S3 prefix, not <code>s3:*</code> on <code>*</code>.</li>
+    <li>The container runs as a non-root UID with a read-only root filesystem and no Linux capabilities it does not need.</li>
+    <li>The CI token used by a pull-request build cannot publish releases or read production secrets.</li>
+    <li>Administrative privileges are granted just-in-time (time-boxed elevation with approval) rather than standing.</li>
+  </ul>
+  <p>Least privilege does not prevent the initial compromise; it limits the <strong>blast radius</strong> afterwards. In the Capital One incident the SSRF bug was the entry point, but the reason it became a breach of over 100 million records was that the role reachable via the metadata service could list and read a large number of buckets.</p>
+
+  <h3>3.4 Defense in depth</h3>
+  <p>No single control is perfect, so you layer independent controls such that an attacker must defeat several of them. For a typical Spring API, the layers for "an outsider must not read another customer's data" might be: WAF/API gateway rate limiting and schema validation → TLS → OAuth2 resource server JWT validation → URL-level authorization in the filter chain → method-level <code>@PreAuthorize</code> → ownership check in the service → row-level security in PostgreSQL → encryption at rest → audit logging and anomaly alerts. The key word is <em>independent</em>: two layers that share a single point of failure (for example both trusting a header set by a proxy that can be bypassed) are really one layer.</p>
+
+  <h3>3.5 Secure by default and fail-safe defaults</h3>
+  <p>A system is <strong>secure by default</strong> when the out-of-the-box configuration is the safe one and insecure behaviour requires an explicit, visible opt-out. Spring Security is a good example: once it is on the classpath, every endpoint requires authentication, CSRF protection is enabled for browser flows, security headers (<code>X-Content-Type-Options</code>, <code>X-Frame-Options</code>, cache control) are added, and passwords must be encoded. Spring Boot Actuator only exposes <code>health</code> over HTTP by default. Your shared libraries and service templates should follow the same principle: the platform starter should default to deny-all authorization, strict CORS, and no debug endpoints.</p>
+  <p><strong>Fail-safe defaults</strong> (Saltzer and Schroeder's term) means that when a decision cannot be made — the policy engine is unreachable, the token cannot be parsed, an exception is thrown in the middle of an authorization check — the outcome is <em>deny</em>. A surprising number of real vulnerabilities are "fail-open" logic: <code>catch (Exception e) { return true; }</code> in a permission evaluator, or a feature flag service that defaults to "admin features enabled" when it times out. OWASP 2025 created a whole new category (A10, Mishandling of Exceptional Conditions) partly for this.</p>
+
+  <h3>3.6 Attack surface</h3>
+  <p>The attack surface is the sum of all points where an untrusted party can supply input or observe output. For a backend service it includes: every HTTP route (including ones you forgot — actuator, Swagger UI, error pages, H2 console), every message consumer (Kafka topics are input), every file or object it parses, every outbound call whose response it trusts, every admin CLI, every environment variable and config source, and every dependency's code paths that those inputs reach. <strong>Attack surface reduction</strong> — removing endpoints, disabling unused features, shrinking images, closing ports — is often the highest-return security work because it eliminates whole classes of risk rather than mitigating them one by one.</p>
+
+  <h3>3.7 Trust boundaries and complete mediation</h3>
+  <p>A <strong>trust boundary</strong> is a line across which the level of trust changes: browser → API gateway, API → database, your service → a third-party payment API, your process → an LLM that reads untrusted web pages. Data crossing a boundary inward must be validated and authorised; data crossing outward must be encoded for its destination and checked for leakage. <strong>Complete mediation</strong> means every access to every protected resource is checked, every time — not just on the first request, not just on the UI path. The classic failure is checking authorization in the controller that the web UI uses while a second, internal endpoint (or a Kafka consumer, or a GraphQL resolver) reaches the same repository unchecked.</p>
+
+  <h3>3.8 Assets, threats, vulnerabilities, risk</h3>
+  <p>Precise vocabulary prevents muddled design reviews:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Term</th><th>Meaning</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td>Asset</td><td>Something of value to protect</td><td>Customer PII table; signing key; service availability</td></tr>
+      <tr><td>Threat actor</td><td>Who might attack, with what capability and motive</td><td>Opportunistic bot; malicious tenant; insider; nation-state</td></tr>
+      <tr><td>Threat</td><td>A potential way an asset could be harmed</td><td>Tenant A reads tenant B's invoices</td></tr>
+      <tr><td>Vulnerability</td><td>A weakness that makes a threat realisable</td><td>Missing ownership check in <code>InvoiceController#get</code></td></tr>
+      <tr><td>Exploit</td><td>A concrete technique using the vulnerability</td><td>Iterating invoice IDs</td></tr>
+      <tr><td>Control / mitigation</td><td>Something that reduces likelihood or impact</td><td>Ownership check; UUIDs; RLS; anomaly alert</td></tr>
+      <tr><td>Risk</td><td>Likelihood × impact of a threat given current controls</td><td>High: trivial to exploit, regulated data</td></tr>
+      <tr><td>Residual risk</td><td>Risk remaining after controls; must be explicitly accepted by an owner</td><td>Insider with DB access can still read data — accepted, monitored</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>3.9 Threat modeling and the four questions</h3>
+  <p>Threat modeling is structured thinking about what can go wrong <em>before</em> it is built. The most practical framing is the four questions popularised by Adam Shostack and adopted by the Threat Modeling Manifesto (2020):</p>
+  <ol>
+    <li><strong>What are we working on?</strong> — draw a data-flow diagram (DFD) of the system.</li>
+    <li><strong>What can go wrong?</strong> — enumerate threats, e.g. with STRIDE per element.</li>
+    <li><strong>What are we going to do about it?</strong> — mitigate, eliminate, transfer or accept each threat.</li>
+    <li><strong>Did we do a good job?</strong> — validate: are mitigations implemented and tested? Did we miss components?</li>
+  </ol>
+  <p>A <strong>data-flow diagram</strong> uses four element types: <em>external entities</em> (users, third-party systems you do not control), <em>processes</em> (your services, functions), <em>data stores</em> (databases, caches, buckets, queues) and <em>data flows</em> (arrows: HTTP calls, queries, messages). You then draw <em>trust boundaries</em> as dashed boxes. Threats cluster where flows cross boundaries. Section 5 shows a full DFD for an order service.</p>
+
+  <h3>3.10 STRIDE</h3>
+  <p>STRIDE is a mnemonic for six threat categories, each the violation of a security property:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Threat</th><th>Property violated</th><th>Backend example</th><th>Typical Spring-side mitigation</th></tr></thead>
+    <tbody>
+      <tr><td><strong>S</strong>poofing</td><td>Authenticity</td><td>Caller forges <code>X-User-Id</code> header that a downstream service trusts</td><td>OAuth2 resource server; mTLS between services; never trust identity headers from outside the mesh</td></tr>
+      <tr><td><strong>T</strong>ampering</td><td>Integrity</td><td>Client changes <code>amount</code> in a payment request; unsigned webhook</td><td>Server-side price lookup; HMAC signature verification; DTOs without sensitive fields</td></tr>
+      <tr><td><strong>R</strong>epudiation</td><td>Non-repudiation</td><td>Admin deletes a record; no log shows who</td><td>Audit log with principal, action, target, outcome; append-only storage</td></tr>
+      <tr><td><strong>I</strong>nformation disclosure</td><td>Confidentiality</td><td>Stack trace with SQL in 500 response; IDOR</td><td><code>server.error.include-stacktrace=never</code>; ownership checks; field-level DTOs</td></tr>
+      <tr><td><strong>D</strong>enial of service</td><td>Availability</td><td>Unbounded pagination; zip bomb upload; ReDoS</td><td>Max page size; upload limits; timeouts; rate limiting; bulkheads</td></tr>
+      <tr><td><strong>E</strong>levation of privilege</td><td>Authorization</td><td>User calls admin endpoint; mass assignment sets <code>role</code></td><td>Deny-by-default <code>authorizeHttpRequests</code>; <code>@PreAuthorize</code>; explicit DTO binding</td></tr>
+    </tbody>
+  </table></div>
+  <p>"STRIDE per element" applies the categories that are relevant to each DFD element type: external entities are subject to S and R; processes to all six; data stores to T, I, D (and R if they are logs); data flows to T, I, D. This prevents the common failure of brainstorming randomly and missing whole categories.</p>
+  <p>Other methodologies exist and are worth knowing by name: <strong>LINDDUN</strong> for privacy threats (linkability, identifiability, non-repudiation, detectability, disclosure, unawareness, non-compliance), <strong>PASTA</strong> (a seven-stage risk-centric process), and <strong>attack trees</strong>.</p>
+
+  <h3>3.11 Attack trees</h3>
+  <p>An attack tree, introduced by Bruce Schneier in 1999, puts an attacker goal at the root ("read another tenant's invoices") and decomposes it into sub-goals joined by OR (any child suffices) and AND (all children are needed) nodes. Leaves are concrete actions. Attack trees are useful for one high-value asset where you want to see all paths and find the cheapest one; STRIDE is better for broad coverage of a whole system. You can annotate leaves with cost or likelihood and propagate: an OR node is as easy as its easiest child; an AND node is as hard as the sum of its children.</p>
+
+  <h3>3.12 Risk rating</h3>
+  <p>Not every threat deserves the same effort. A rating method makes prioritisation explicit and repeatable. Common options:</p>
+  <ul>
+    <li><strong>Simple likelihood × impact matrix</strong> (each Low/Medium/High). Fast, good enough for most design reviews.</li>
+    <li><strong>OWASP Risk Rating Methodology</strong> — scores likelihood factors (skill level, motive, opportunity, ease of discovery, ease of exploit, awareness, intrusion detection) and impact factors (technical and business) from 0–9 and combines them.</li>
+    <li><strong>CVSS</strong> — designed for scoring <em>published vulnerabilities</em>, not design-time threats; see §3.14.</li>
+    <li><strong>DREAD</strong> (Damage, Reproducibility, Exploitability, Affected users, Discoverability) — historically used at Microsoft but abandoned there because scores were too subjective. Know it for interviews; do not adopt it.</li>
+  </ul>
+
+  <h3>3.13 The OWASP Top 10:2025 at a glance</h3>
+  <p><span class="tag version">Version-sensitive · checked Nov 2026</span> OWASP published the 2025 edition in late 2025 (initially as a release candidate whose list of categories was not expected to change). It is data-informed (contributed testing data mapped to CWEs) plus a community survey for emerging risks. Compared with 2021, Security Misconfiguration rose from #5 to #2, "Vulnerable and Outdated Components" was broadened into <strong>Software Supply Chain Failures</strong> at #3, SSRF (a separate #10 in 2021) was folded into Broken Access Control, and a new category, <strong>Mishandling of Exceptional Conditions</strong>, appeared at #10. <span class="tag fact">Verified</span></p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>ID</th><th>Category</th><th>2021 position</th><th>One-line essence</th></tr></thead>
+    <tbody>
+      <tr><td>A01</td><td>Broken Access Control</td><td>A01 (+ SSRF from A10)</td><td>Users act outside their intended permissions</td></tr>
+      <tr><td>A02</td><td>Security Misconfiguration</td><td>A05</td><td>Insecure defaults, exposed admin/debug features, verbose errors</td></tr>
+      <tr><td>A03</td><td>Software Supply Chain Failures</td><td>A06 (broadened)</td><td>Vulnerable, malicious or untrustworthy dependencies, build systems and distribution</td></tr>
+      <tr><td>A04</td><td>Cryptographic Failures</td><td>A02</td><td>Missing or weak cryptography exposing sensitive data</td></tr>
+      <tr><td>A05</td><td>Injection</td><td>A03</td><td>Untrusted data interpreted as code/commands (SQL, OS, LDAP, XSS…)</td></tr>
+      <tr><td>A06</td><td>Insecure Design</td><td>A04</td><td>Missing or ineffective controls at the design level</td></tr>
+      <tr><td>A07</td><td>Authentication Failures</td><td>A07 (renamed)</td><td>Weak login, credential stuffing, session flaws</td></tr>
+      <tr><td>A08</td><td>Software or Data Integrity Failures</td><td>A08</td><td>Trusting unverified code, data, updates or serialized objects</td></tr>
+      <tr><td>A09</td><td>Security Logging &amp; Alerting Failures</td><td>A09 (renamed)</td><td>Attacks not logged, not alerted, not acted upon</td></tr>
+      <tr><td>A10</td><td>Mishandling of Exceptional Conditions</td><td>new</td><td>Improper error handling, failing open, logic errors under abnormal conditions</td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout warn"><p class="callout-title">The Top 10 is an awareness document, not a standard</p><p>OWASP itself says the Top 10 is not a complete checklist. If you need verifiable requirements for a security review or procurement, use the OWASP <strong>Application Security Verification Standard (ASVS)</strong>, whose version 5.0 was released in May 2025. For APIs also consult the API Security Top 10 2023 (Chapter 11.3) and for LLM features the LLM Top 10 2025 (Chapter 11.5).</p></div>
+
+  <h3>3.14 Vulnerability identifiers and scores: CVE, CWE, CVSS, EPSS, KEV</h3>
+  <ul>
+    <li><strong>CVE</strong> — an identifier for a specific vulnerability in a specific product, e.g. CVE-2021-44228 (Log4Shell). Assigned by CVE Numbering Authorities (CNAs); enriched by NIST's National Vulnerability Database (NVD) and other databases (GitHub Advisory Database, OSV).</li>
+    <li><strong>CWE</strong> — Common Weakness Enumeration: a <em>class</em> of weakness, e.g. CWE-89 (SQL injection), CWE-639 (authorization bypass through user-controlled key, i.e. IDOR). OWASP categories are groups of CWEs.</li>
+    <li><strong>CVSS</strong> — Common Vulnerability Scoring System from FIRST. Version 4.0 was published in November 2023; much tooling still emits v3.1. The <em>Base</em> score (0.0–10.0) describes intrinsic severity; <em>Threat</em> (v4; "Temporal" in v3.1) and <em>Environmental</em> metrics adjust it for exploit maturity and your deployment. Most organisations wrongly use the Base score alone.</li>
+    <li><strong>EPSS</strong> — Exploit Prediction Scoring System, also from FIRST: a daily-updated probability (0–1) that a CVE will be exploited in the wild in the next 30 days, derived from a model trained on observed exploitation. Version 4 was released in March 2025.</li>
+    <li><strong>CISA KEV</strong> — the US Cybersecurity and Infrastructure Security Agency's Known Exploited Vulnerabilities catalog: CVEs with reliable evidence of active exploitation. US federal civilian agencies are required (Binding Operational Directive 22-01) to remediate them by a listed due date; everyone else should treat KEV membership as "patch now".</li>
+  </ul>
+  <p>The combination matters: CVSS says how bad it <em>could</em> be, EPSS says how likely it is to be exploited soon, KEV says it <em>is</em> being exploited. Only a small minority of published CVEs are ever exploited in the wild, so prioritising purely by CVSS wastes effort on unexploited "criticals" while leaving exploited "highs" open.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working: How Each OWASP Risk Arises in a Spring Service — and How It Is Stopped</h2>
+  <p>This section walks every OWASP Top 10:2025 category through the lens of a concrete Spring Boot order service. For each: the mechanism (why the bug happens internally), a vulnerable pattern, and the secure pattern. Full runnable configuration is in §7; deeper treatment of injection, XSS, CSRF and SSRF is in Chapter 11.3, identity in 11.2, cryptography and supply chain in 11.4.</p>
+
+  <h3>4.1 Where controls live in a request's life</h3>
+  <p>When an HTTP request arrives at a Spring MVC application, it passes through the servlet container, then the <code>DelegatingFilterProxy</code> → <code>FilterChainProxy</code>, which selects the first <code>SecurityFilterChain</code> whose <code>securityMatcher</code> matches. Inside that chain the relevant filters run in a fixed order: header writing, CORS, CSRF, logout, authentication (for example <code>BearerTokenAuthenticationFilter</code> for a resource server), request cache, anonymous authentication, exception translation, and finally <code>AuthorizationFilter</code>, which evaluates your <code>authorizeHttpRequests</code> rules. Only then does the <code>DispatcherServlet</code> pick a handler, bind and validate the request body (<code>@Valid</code>), and invoke the controller. Method security (<code>@PreAuthorize</code>, <code>@PostAuthorize</code>) is applied by an AOP proxy around your beans — which means it only works on calls that go <em>through</em> the proxy (not self-invocations within the same class).</p>
+  <p>Knowing this order explains several real bugs: a <code>WebSecurityCustomizer.ignoring()</code> path skips the <em>entire</em> chain including headers; a second <code>SecurityFilterChain</code> with a broad matcher and lax rules silently wins for paths you expected the strict chain to handle; an internal <code>this.deleteOrder()</code> call bypasses <code>@PreAuthorize</code>.</p>
+
+  <h3>4.2 A01 Broken Access Control</h3>
+  <p><strong>Mechanism.</strong> The application authenticates the caller correctly but fails to check that the caller may perform the action on the specific object or function. Sub-types: <em>insecure direct object reference</em> (IDOR / BOLA — object level), missing function-level checks (a normal user calls <code>/admin/**</code>), privilege escalation via modifiable claims or parameters, CORS misconfiguration that lets an untrusted origin make credentialed requests, path traversal into files, and — new in 2025's grouping — SSRF, where the server is tricked into accessing resources the attacker cannot reach directly.</p>
+  <pre data-file="VulnerableOrderController.java"><code class="language-java">// VULNERABLE: authenticated, but any user can read any order by ID.
+@GetMapping("/api/orders/{id}")
+public OrderDto get(@PathVariable UUID id) {
+    return mapper.toDto(orderRepository.findById(id).orElseThrow());
+}</code></pre>
+  <pre data-file="OrderController.java"><code class="language-java">// SECURE: ownership enforced in the query itself, so there is no window
+// where the object is loaded without a check. 404 (not 403) avoids
+// confirming that the ID exists for someone else.
+@GetMapping("/api/orders/{id}")
+public OrderDto get(@PathVariable UUID id, @AuthenticationPrincipal Jwt jwt) {
+    return orderRepository.findByIdAndCustomerId(id, jwt.getSubject())
+            .map(mapper::toDto)
+            .orElseThrow(() -&gt; new ResponseStatusException(HttpStatus.NOT_FOUND));
+}</code></pre>
+  <p>Function-level control belongs in the filter chain with <em>deny by default</em> (<code>.anyRequest().denyAll()</code> or <code>.authenticated()</code> as the last rule) plus method security for anything sensitive. Scoping queries by owner/tenant (or using PostgreSQL row-level security, or Hibernate's <code>@TenantId</code> / filters) moves the check from "remember to add it" to "impossible to forget".</p>
+
+  <h3>4.3 A02 Security Misconfiguration</h3>
+  <p><strong>Mechanism.</strong> The code is fine; the deployment is not. Typical Spring examples: <code>management.endpoints.web.exposure.include=*</code> exposing <code>/actuator/env</code>, <code>/actuator/heapdump</code> (which contains secrets in memory) or <code>/actuator/loggers</code>; H2 console enabled in production; Swagger UI publicly reachable; <code>server.error.include-stacktrace=always</code>; CORS <code>allowedOriginPatterns("*")</code> with <code>allowCredentials(true)</code>; default credentials on an admin tool; verbose <code>X-Powered-By</code>-style banners; missing security headers on a non-Spring component; a Kubernetes Service of type <code>LoadBalancer</code> on an internal admin port. OWASP's 2025 data showed this category being found in a large fraction of tested applications, which is why it rose to #2.</p>
+  <p><strong>Prevention.</strong> Treat configuration as code with review; have a hardened baseline (<code>application-prod.yml</code> in a shared starter); expose actuator on a separate management port bound to the cluster network only; fail the build on dangerous properties; scan running environments (CSPM, Kubernetes admission policies). Repeatable hardening beats heroic audits.</p>
+
+  <h3>4.4 A03 Software Supply Chain Failures</h3>
+  <p><strong>Mechanism.</strong> Your service executes far more third-party code than first-party code. Risks include known-vulnerable versions (Log4Shell), malicious packages (typosquatting, dependency confusion, compromised maintainer accounts), compromised build pipelines (SolarWinds), unverified artifacts pulled at deploy time, and unpinned base images. The 2025 category is broader than 2021's "Vulnerable and Outdated Components" because the industry learned that "is it vulnerable?" is only one of the questions; "is it what we think it is, built how we think it was?" is the other.</p>
+  <p><strong>Prevention.</strong> Software composition analysis (SCA) in CI (OWASP Dependency-Check, Dependabot, Renovate, Snyk, Trivy, osv-scanner); dependency locking (Gradle lockfiles / Maven enforcer); a private artifact proxy; SBOM generation (CycloneDX Maven/Gradle plugins); signed images verified at admission; minimal base images; and a patch SLA (§13). Chapter 11.4 covers SLSA and Sigstore in detail.</p>
+
+  <h3>4.5 A04 Cryptographic Failures</h3>
+  <p><strong>Mechanism.</strong> Sensitive data is exposed because cryptography is absent, weak or misused: HTTP instead of HTTPS between services, TLS without certificate verification (a custom <code>TrustManager</code> that accepts everything), passwords hashed with SHA-256 instead of a slow password hash, AES in ECB mode or GCM with a reused nonce, hard-coded keys, home-grown "encryption", or <code>java.util.Random</code> used for tokens.</p>
+  <pre><code class="language-java">// VULNERABLE: predictable token
+String resetToken = Long.toHexString(new Random().nextLong());
+
+// SECURE: 256 bits from a CSPRNG, URL-safe
+byte[] buf = new byte[32];
+SecureRandom.getInstanceStrong().nextBytes(buf); // or new SecureRandom()
+String resetToken = Base64.getUrlEncoder().withoutPadding().encodeToString(buf);</code></pre>
+  <p><strong>Prevention.</strong> Classify data; encrypt in transit everywhere (TLS 1.2+ with 1.3 preferred); use <code>DelegatingPasswordEncoder</code> (bcrypt/Argon2) for passwords; use vetted high-level libraries (Google Tink, or JCA with AES-GCM and unique nonces); keep keys in a KMS or Vault, not in code. Chapter 11.4 covers this in depth. (Note: <code>SecureRandom.getInstanceStrong()</code> may block on some Linux configurations; plain <code>new SecureRandom()</code> is the usual server choice.)</p>
+
+  <h3>4.6 A05 Injection</h3>
+  <p><strong>Mechanism.</strong> Untrusted data is concatenated into a string that another interpreter parses as code: SQL, JPQL/HQL, LDAP filters, OS commands, Spring Expression Language (SpEL), template engines, XPath, HTML/JavaScript (XSS is in this category). The interpreter cannot tell where your code ends and the attacker's data begins.</p>
+  <pre><code class="language-java">// VULNERABLE: string concatenation into JPQL — input such as  x' OR '1'='1  changes the query's logic
+em.createQuery("select c from Customer c where c.email = '" + email + "'");
+
+// SECURE: parameter binding — the value travels separately from the query text
+em.createQuery("select c from Customer c where c.email = :email", Customer.class)
+  .setParameter("email", email);</code></pre>
+  <p><strong>Prevention.</strong> Parameterised queries everywhere (Spring Data derived queries and <code>@Query</code> with named parameters are safe; <code>JdbcTemplate</code> with <code>?</code> placeholders is safe; string-built <code>ORDER BY</code> clauses are not — allow-list column names); never pass user input to <code>Runtime.exec</code> or a shell; never evaluate user input as SpEL; context-aware output encoding (Thymeleaf <code>th:text</code>, not <code>th:utext</code>). Chapter 11.3 has the full treatment.</p>
+
+  <h3>4.7 A06 Insecure Design</h3>
+  <p><strong>Mechanism.</strong> The implementation is faithful to a design that is itself unsafe. Examples: a password-reset flow that reveals whether an email is registered and has no rate limit; a "transfer funds" API with no idempotency key so retries double-charge; a coupon system that lets the client send the discount amount; a multi-tenant design with no tenant column; a booking system that allows unlimited holds so a bot can reserve all seats. No amount of input validation fixes a missing business rule.</p>
+  <p><strong>Prevention.</strong> Threat modeling during design (§3.9), abuse cases alongside use cases ("as an attacker I want to…"), reference architectures and secure design patterns (server-side authority for prices, idempotency keys, per-account limits), and unit/integration tests that assert security invariants ("a user cannot see another tenant's data") rather than only happy paths.</p>
+
+  <h3>4.8 A07 Authentication Failures</h3>
+  <p><strong>Mechanism.</strong> Attackers obtain or forge an identity: credential stuffing with leaked password lists, brute force on login or OTP endpoints without throttling, weak password policies, missing MFA for privileged accounts, session fixation, sessions or tokens that never expire, JWTs accepted without signature validation, and user-enumeration through different error messages or response timings.</p>
+  <p><strong>Prevention.</strong> Delegate authentication to a hardened identity provider (Keycloak, Okta, Entra ID, Cognito, or Spring Authorization Server) using OIDC; enable MFA/passkeys; rate-limit and add progressive delays on login; check new passwords against breached-password lists (NIST SP 800-63B recommends this and discourages arbitrary composition rules); rotate session IDs on login (Spring Security does this by default via session fixation protection); validate JWT signature, issuer, audience and expiry. All of this is Chapter 11.2.</p>
+
+  <h3>4.9 A08 Software or Data Integrity Failures</h3>
+  <p><strong>Mechanism.</strong> Code or data is trusted without verifying its integrity: Java native deserialization of untrusted bytes (gadget chains leading to remote code execution), Jackson polymorphic typing with <code>enableDefaultTyping()</code>/<code>activateDefaultTyping</code> on untrusted input, auto-update mechanisms that download unsigned code, CI pipelines that run untrusted pull-request code with production secrets, webhooks accepted without signature verification, and caches or cookies whose contents are trusted without a MAC.</p>
+  <pre><code class="language-java">// SECURE webhook verification (HMAC-SHA256, constant-time compare)
+Mac mac = Mac.getInstance("HmacSHA256");
+mac.init(new SecretKeySpec(webhookSecret, "HmacSHA256"));
+byte[] expected = mac.doFinal(rawBody);                 // raw bytes, before JSON parsing
+byte[] provided = HexFormat.of().parseHex(signatureHeader);
+if (!MessageDigest.isEqual(expected, provided)) {
+    throw new ResponseStatusException(HttpStatus.UNAUTHORIZED);
+}</code></pre>
+  <p><strong>Prevention.</strong> Never deserialize untrusted data with Java serialization (if you must, use an <code>ObjectInputFilter</code> allow-list, JEP 290/415); keep Jackson default typing off; sign artifacts and verify at deploy; separate untrusted CI jobs from privileged ones; verify signatures on all inbound webhooks and include a timestamp to prevent replay.</p>
+
+  <h3>4.10 A09 Security Logging &amp; Alerting Failures</h3>
+  <p><strong>Mechanism.</strong> Attacks succeed or persist because nobody notices: login failures, access-control denials and high-value transactions are not logged; logs exist but are not centralised; logs are centralised but nobody alerts on them; or logs are so noisy and unstructured that an investigation cannot reconstruct a timeline. The 2025 rename from "Monitoring" to "Alerting" emphasises that a log nobody acts on provides little protection. The opposite failure — logging sensitive data — creates new confidentiality incidents. §4.13 and §7 detail what to log.</p>
+
+  <h3>4.11 A10 Mishandling of Exceptional Conditions</h3>
+  <p><strong>Mechanism.</strong> New in 2025. Systems behave insecurely when something unexpected happens: an exception in an authorization check that defaults to allow, a partially completed transaction that leaves money moved but not recorded, error messages that leak internals, resource exhaustion because a failure path never releases a lock or connection, or unchecked return values. Many of these are logic flaws that scanners rarely find.</p>
+  <pre><code class="language-java">// VULNERABLE: fails open
+boolean canApprove(Authentication auth, UUID invoiceId) {
+    try {
+        return policyClient.check(auth.getName(), "approve", invoiceId);
+    } catch (Exception e) {
+        log.warn("policy service unavailable, allowing", e);
+        return true;                       // attacker just needs to slow the policy service down
+    }
+}
+
+// SECURE: fails closed, surfaces the condition, keeps a bounded timeout
+boolean canApprove(Authentication auth, UUID invoiceId) {
+    try {
+        return policyClient.check(auth.getName(), "approve", invoiceId); // client has 300 ms timeout
+    } catch (PolicyUnavailableException e) {
+        meterRegistry.counter("authz.policy.unavailable").increment();
+        return false;                      // deny; caller sees 403/503, on-call is alerted
+    }
+}</code></pre>
+  <p><strong>Prevention.</strong> Fail closed; use transactions so failures roll back fully; centralise exception handling (<code>@RestControllerAdvice</code> returning RFC 9457 Problem Details without internals); set timeouts and limits everywhere; test failure paths (fault injection, chaos tests) not only happy paths.</p>
+
+  <h3>4.12 Running a threat model, step by step</h3>
+  <p>In a design review, the internal procedure that works for most teams is:</p>
+  <ol>
+    <li><strong>Scope</strong> (5 min): what is changing? Which assets are touched? Who are plausible attackers (anonymous internet, authenticated customer, malicious tenant, compromised dependency, insider)?</li>
+    <li><strong>Diagram</strong> (15 min): draw the DFD at the level of deployable units and data stores. Mark every trust boundary. Annotate flows with protocol and authentication method ("HTTPS + JWT", "Kafka, mTLS, no per-message auth").</li>
+    <li><strong>Enumerate</strong> (20 min): go element by element applying STRIDE. Write threats as sentences: "A malicious tenant can read another tenant's documents by guessing IDs on <code>GET /docs/{id}</code>."</li>
+    <li><strong>Rate</strong> (10 min): likelihood × impact, High/Medium/Low.</li>
+    <li><strong>Decide</strong> (10 min): for each High and Medium, a mitigation with an owner and a ticket, or an explicit risk acceptance by the product owner.</li>
+    <li><strong>Validate</strong> (later): mitigations get tests (an integration test proving tenant isolation), and the threat model is updated when the design changes.</li>
+  </ol>
+  <p>Keep the output small and living — a page in the design doc, the DFD source in the repository (Mermaid works well), and tickets. A 40-page threat model that nobody updates is worse than a one-page one that is maintained.</p>
+
+  <h3>4.13 What happens when a vulnerability is disclosed</h3>
+  <p>Internally, a vulnerability in a dependency moves through a pipeline: a researcher or maintainer discovers it → coordinated disclosure to the maintainer → a fix is prepared → a CVE is reserved by a CNA → an advisory is published (GitHub Security Advisory, project mailing list) → databases (NVD, GHSA, OSV) ingest and enrich it with CVSS and affected version ranges → your SCA tool matches it against your SBOM or lockfile → a ticket or automated PR (Dependabot/Renovate) is created → triage decides priority using CVSS, EPSS, KEV and reachability → fix is tested, merged and deployed → verification that the vulnerable version is gone from every running workload. The gap between public disclosure and exploitation can be very short for high-profile bugs; for Log4Shell, mass scanning was widely reported within hours of the December 2021 disclosure.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: Threat-Model Diagrams, Attack Trees and Control Placement</h2>
+
+  <h3>5.1 A data-flow diagram with trust boundaries</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph Internet["Trust boundary: Internet (untrusted)"]
+    U["Customer browser / mobile app"]
+    PSP["Payment provider (webhooks)"]
+  end
+  subgraph Edge["Trust boundary: Edge (DMZ)"]
+    GW["API gateway + WAF"]
+  end
+  subgraph Cluster["Trust boundary: Kubernetes cluster"]
+    OS["Order service (Spring Boot)"]
+    NS["Notification service (Go)"]
+    K[("Kafka topic: order-events")]
+  end
+  subgraph Data["Trust boundary: Data tier"]
+    DB[("PostgreSQL: orders")]
+    S3[("Object store: invoices")]
+  end
+  IDP["Identity provider (OIDC)"]
+  U -- "HTTPS + OAuth2 access token" --> GW
+  GW -- "HTTPS, forwards token" --> OS
+  PSP -- "HTTPS + HMAC signature" --> GW
+  OS -- "JDBC over TLS, app DB user" --> DB
+  OS -- "IAM role, PutObject on one prefix" --> S3
+  OS -- "produce, mTLS" --> K
+  K -- "consume, mTLS" --> NS
+  OS -- "fetch JWKS" --> IDP
+  U -- "login, PKCE" --> IDP
+</pre>
+  <figcaption>Figure 1 — Data-flow diagram of an order platform with four trust boundaries.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> rectangles are processes or external entities, cylinders are data stores, arrows are data flows annotated with protocol and authentication, and each subgraph is a trust boundary. Apply STRIDE where arrows cross subgraph edges. Browser → gateway: spoofing (stolen tokens), tampering (modified order amounts), DoS (bursts). Payment provider → gateway: spoofing of webhooks is the key threat, mitigated by HMAC verification and timestamp checks. Order service → S3: elevation of privilege if the IAM role is broader than one prefix. Kafka → notification service: the Go consumer receives data <em>outside</em> the HTTP filter chain, so any authorization it needs must be re-established from message content and producer identity — a classic place where complete mediation is forgotten. Order service → IDP: availability dependency; if JWKS fetch fails, validation must fail closed while cached keys remain usable.</p>
+
+  <h3>5.2 STRIDE results table for Figure 1</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Element / flow</th><th>Threat (STRIDE)</th><th>Rating</th><th>Mitigation</th></tr></thead>
+    <tbody>
+      <tr><td><code>GET /orders/{id}</code></td><td>I/E — customer reads another customer's order (IDOR)</td><td>High</td><td>Owner-scoped query; integration test for cross-user access</td></tr>
+      <tr><td>PSP webhook</td><td>S/T — forged "payment succeeded"</td><td>High</td><td>HMAC-SHA256 over raw body; 5-min timestamp window; idempotent processing</td></tr>
+      <tr><td>Order service process</td><td>E — RCE via vulnerable dependency</td><td>High</td><td>SCA gate; patch SLA; non-root, read-only FS; egress policy</td></tr>
+      <tr><td>Kafka order-events</td><td>T — rogue producer injects events</td><td>Medium</td><td>mTLS + Kafka ACLs (only order service may write)</td></tr>
+      <tr><td>Logs</td><td>I — tokens/PII written to logs</td><td>Medium</td><td>Structured logging with masking; deny-list of fields; log access control</td></tr>
+      <tr><td>Admin actions</td><td>R — refund issued, nobody knows by whom</td><td>Medium</td><td>Audit event with principal, reason, target; immutable store</td></tr>
+      <tr><td>Search endpoint</td><td>D — <code>size=1000000</code></td><td>Medium</td><td>Max page size 100; query timeout; rate limit</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>5.3 An attack tree for one high-value goal</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  G["GOAL: read another tenant's invoices (OR)"]
+  G --> A1["Abuse the API"]
+  G --> A2["Steal a victim's session or token"]
+  G --> A3["Access storage directly"]
+  A1 --> A11["IDOR on GET /invoices/{id}"]
+  A1 --> A12["Over-broad search filter ignores tenant"]
+  A2 --> A21["XSS in invoice notes steals token"]
+  A2 --> A22["Phish credentials, no MFA"]
+  A3 --> A31["AND: SSRF to metadata service"]
+  A31 --> A311["Find an SSRF sink"]
+  A31 --> A312["Instance role can read invoice bucket"]
+  A3 --> A32["Bucket policy allows public read"]
+</pre>
+  <figcaption>Figure 2 — Attack tree: OR branches by default; one AND node requires both children.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the root goal can be reached by any of three branches. Most leaves are single, cheap actions (IDOR, public bucket) — which tells you where to spend first. The SSRF branch is an AND node: the attacker needs both an SSRF sink <em>and</em> an over-privileged role, so fixing either breaks the path. That is defense in depth made visible. Annotate leaves with an estimated cost or likelihood; the cheapest complete path is your top priority.</p>
+
+  <h3>5.4 Control placement along the request path</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  R["Request"] --> E["Edge: TLS, WAF, rate limit, size limits"]
+  E --> F["Spring filter chain: headers, CORS, CSRF, authentication"]
+  F --> Z["AuthorizationFilter: URL rules, deny by default"]
+  Z --> V["Controller: @Valid DTO binding, allow-lists"]
+  V --> M["Method security: @PreAuthorize"]
+  M --> S["Service: ownership/tenant check, business rules"]
+  S --> D["Repository: parameter binding, tenant-scoped queries, RLS"]
+  S --> L["Audit log + metrics"]
+  D --> X["Response: output encoding, no internals in errors"]
+</pre>
+  <figcaption>Figure 3 — Where each class of control sits in a Spring Boot request path.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> each stage handles what it is best placed to know. The edge knows volume and size but not business meaning; the filter chain knows identity and coarse roles; only the service knows that order 42 belongs to customer 7. Pushing an ownership check "up" into a gateway rarely works, because the gateway lacks the data. Pushing input validation "down" into the repository is too late, because the service has already acted on the input. The audit log branch hangs off the service because that is where the business-meaningful action (e.g. "refund approved") is known.</p>
+
+  <h3>5.5 Vulnerability management pipeline</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  A["Advisory published (CVE, GHSA, OSV)"] --> B["SCA / image scan matches SBOM"]
+  B --> C{"In CISA KEV?"}
+  C -- yes --> P0["P0: patch or mitigate within days"]
+  C -- no --> D{"EPSS high or exploit public?"}
+  D -- yes --> P1["P1: short SLA"]
+  D -- no --> E{"Reachable and internet-facing?"}
+  E -- yes --> P2["P2: normal SLA by CVSS"]
+  E -- no --> P3["P3: batch with routine upgrades"]
+  P0 --> V["Deploy, verify runtime inventory, close"]
+  P1 --> V
+  P2 --> V
+  P3 --> V
+</pre>
+  <figcaption>Figure 4 — Risk-based triage using KEV, EPSS, reachability and CVSS.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> rather than sorting by CVSS alone, the triage asks first whether exploitation is <em>known</em> (KEV), then whether it is <em>likely</em> (EPSS, public exploit code), then whether your deployment makes it <em>reachable</em>. CVSS then orders work within a bucket. The final "verify runtime inventory" step matters: many teams merge the fix but leave an old pod, a batch job image or a forgotten staging environment on the vulnerable version.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math of Risk: Likelihood, Impact, Layered Controls and Scores</h2>
+  <h3>6.1 Risk as expected loss</h3>
+  <p>Intuition: a threat that is very likely but harmless and one that is catastrophic but nearly impossible may both deserve less attention than one that is moderately likely and seriously harmful. Formally, for each threat \( t \):</p>
+  \[ \text{Risk}(t) = P(t) \times I(t) \]
+  <p>where \( P \) is the probability of the threat being realised in a period and \( I \) the impact. The classic quantitative form from risk management is annualised loss expectancy:</p>
+  \[ \text{ALE} = \text{SLE} \times \text{ARO} \]
+  <p>with single loss expectancy SLE (cost of one incident) and annual rate of occurrence ARO. <span class="tag illus">Illustrative</span> If a credential-stuffing incident costs about 40,000 (support, resets, fraud) and you expect it 2.5 times per year without controls, ALE ≈ 100,000. A bot-protection and MFA rollout costing 30,000 per year that cuts ARO to 0.25 lowers ALE to 10,000 — net benefit ≈ 60,000. Real numbers are uncertain; the value is in forcing the conversation, not in false precision. Most teams use ordinal scales (Low/Medium/High) for exactly that reason.</p>
+
+  <h3>6.2 Defense in depth, quantified (with a caveat)</h3>
+  <p>If an attack must defeat \( n \) controls and control \( i \) is bypassed with probability \( p_i \), and the controls are <em>independent</em>, the probability that all are bypassed is</p>
+  \[ P_{\text{breach}} = \prod_{i=1}^{n} p_i \]
+  <p><span class="tag illus">Illustrative</span> Three controls each bypassed 10% of the time give \( 0.1^3 = 0.001 \). The caveat is the independence assumption: if all three layers trust the same spoofable header, or share one misconfigured identity provider, they fail together and the real probability is closer to \( \max p_i \). This is why diversity of mechanism (network policy + application authorization + database RLS) beats three copies of the same check.</p>
+
+  <h3>6.3 Attack-tree arithmetic</h3>
+  <p>For cost-annotated trees: an OR node's cost is the minimum of its children's costs; an AND node's cost is the sum. For probability-annotated trees with independent leaves: \( P_{\text{OR}} = 1 - \prod (1-p_i) \) and \( P_{\text{AND}} = \prod p_i \). Fixing the cheapest leaf on every OR branch raises the attacker's minimum cost — the useful metric.</p>
+
+  <h3>6.4 CVSS in brief</h3>
+  <p>CVSS v3.1 base score combines exploitability (attack vector, attack complexity, privileges required, user interaction) and impact (confidentiality, integrity, availability), adjusted by scope. In simplified form, impact sub-score \( \text{ISS} = 1 - (1-C)(1-I)(1-A) \) where C, I, A take values 0, 0.22 or 0.56; exploitability \( = 8.22 \times AV \times AC \times PR \times UI \); and the base score is roughly \( \min(\text{Impact} + \text{Exploitability}, 10) \) rounded up to one decimal. CVSS v4.0 replaced the formula with a lookup over "macro-vectors" and added Attack Requirements and separate subsequent-system impacts. You rarely compute these by hand; you <em>should</em> understand that "network, no privileges, no user interaction, high C/I/A" produces 9.8 and that a 9.8 on an internal batch tool with no network exposure may matter less to you than a 7.5 on your login page.</p>
+
+  <h3>6.5 EPSS as a probability, and why it changes priorities</h3>
+  <p>EPSS gives \( P(\text{exploitation in next 30 days}) \). Treat it as a calibrated-ish probability across the CVE population, not a certainty for your system. A practical policy combines thresholds, e.g. <span class="tag opinion">Opinion</span> "KEV or EPSS ≥ 0.1 → P1; CVSS ≥ 9 and internet-facing → P1; everything else by CVSS band". FIRST publishes percentile alongside probability; percentile is useful for ranking but should not be confused with probability.</p>
+
+  <h3>6.6 Back-of-envelope numbers for security operations</h3>
+  <ul>
+    <li><strong>Brute force:</strong> a 6-digit OTP has \(10^6\) values; with 5 attempts per code lifetime, an attacker's success chance per code is \(5 \times 10^{-6}\). Without throttling at 100 requests/s, they would enumerate the space in under 3 hours — which is why rate limiting is part of authentication.</li>
+    <li><strong>Token entropy:</strong> 128 random bits gives \(2^{128} \approx 3.4\times10^{38}\) values; guessing is infeasible. A 32-bit value (e.g. <code>Random.nextInt()</code>) has 4.3 billion and is brute-forceable.</li>
+    <li><strong>Log volume:</strong> <span class="tag illus">Illustrative</span> 2,000 req/s × 1 KB structured log line ≈ 2 MB/s ≈ 170 GB/day. Security logging is a capacity decision; sample access logs, but never sample authentication and authorization events.</li>
+  </ul>
+</section>
+
+<section id="code">
+  <h2>7. Code: A Hardened Spring Boot Baseline, Security Logging, and Python/Go Equivalents</h2>
+  <p>The following is a complete, minimal order service that applies the principles above. <span class="tag version">Version-sensitive · checked Nov 2026</span> It targets Spring Boot 3.5.x / 4.x with Spring Security 6.5+/7.x; the lambda DSL shown is the only style supported in Spring Security 7, and <code>requestMatchers(String)</code> uses <code>PathPatternRequestMatcher</code> there.</p>
+
+  <h3>7.1 Build file</h3>
+  <pre data-file="build.gradle.kts"><code class="language-plaintext">plugins {
+    java
+    id("org.springframework.boot") version "3.5.7"          // or a 4.x release
+    id("io.spring.dependency-management") version "1.1.7"
+    id("org.cyclonedx.bom") version "2.3.0"                  // SBOM generation (see 11.4)
+    id("org.owasp.dependencycheck") version "12.1.0"         // SCA gate
+}
+
+java { toolchain { languageVersion.set(JavaLanguageVersion.of(21)) } }
+
+dependencies {
+    implementation("org.springframework.boot:spring-boot-starter-web")
+    implementation("org.springframework.boot:spring-boot-starter-security")
+    implementation("org.springframework.boot:spring-boot-starter-oauth2-resource-server")
+    implementation("org.springframework.boot:spring-boot-starter-validation")
+    implementation("org.springframework.boot:spring-boot-starter-data-jpa")
+    implementation("org.springframework.boot:spring-boot-starter-actuator")
+    implementation("net.logstash.logback:logstash-logback-encoder:8.0")
+    runtimeOnly("org.postgresql:postgresql")
+    testImplementation("org.springframework.boot:spring-boot-starter-test")
+    testImplementation("org.springframework.security:spring-security-test")
+}
+
+dependencyLocking { lockAllConfigurations() }               // reproducible resolution
+
+dependencyCheck {
+    failBuildOnCVSS = 7.0f                                    // tune with your patch policy
+    suppressionFile = "config/dependency-check-suppressions.xml"
+}</code></pre>
+  <p>Plugin versions above are examples; pin to the latest patch releases your organisation has approved. The <code>failBuildOnCVSS</code> threshold is a blunt instrument — pair it with the triage policy from §5.5 and a reviewed suppression file whose entries carry an expiry date and justification.</p>
+
+  <h3>7.2 Production configuration (attack-surface reduction)</h3>
+  <pre data-file="application-prod.yml"><code class="language-yaml">server:
+  error:
+    include-stacktrace: never
+    include-message: never
+    include-binding-errors: never
+  servlet:
+    session:
+      cookie:
+        secure: true
+        http-only: true
+        same-site: lax
+  max-http-request-header-size: 16KB
+  tomcat:
+    max-swallow-size: 2MB
+spring:
+  servlet:
+    multipart:
+      max-file-size: 5MB
+      max-request-size: 5MB
+  jpa:
+    open-in-view: false
+  h2:
+    console:
+      enabled: false
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://idp.example.com/realms/shop
+          audiences: orders-api
+management:
+  server:
+    port: 9090                       # separate port, not exposed through the ingress
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: never
+springdoc:
+  swagger-ui:
+    enabled: false
+  api-docs:
+    enabled: false</code></pre>
+
+  <h3>7.3 Security filter chain: deny by default</h3>
+  <pre data-file="SecurityConfig.java"><code class="language-java">package com.example.orders.security;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpMethod;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationConverter;
+import org.springframework.security.oauth2.server.resource.authentication.JwtGrantedAuthoritiesConverter;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter.ReferrerPolicy;
+
+@Configuration
+@EnableMethodSecurity                      // enables @PreAuthorize / @PostAuthorize
+public class SecurityConfig {
+
+    @Bean
+    SecurityFilterChain api(HttpSecurity http) throws Exception {
+        http
+            .securityMatcher("/api/**")
+            .authorizeHttpRequests(auth -&gt; auth
+                .requestMatchers(HttpMethod.GET, "/api/catalog/**").permitAll()
+                .requestMatchers("/api/admin/**").hasAuthority("SCOPE_orders.admin")
+                .requestMatchers(HttpMethod.POST, "/api/orders").hasAuthority("SCOPE_orders.write")
+                .requestMatchers("/api/orders/**").hasAuthority("SCOPE_orders.read")
+                .anyRequest().denyAll())                  // fail-safe default: unknown routes are closed
+            .oauth2ResourceServer(rs -&gt; rs.jwt(jwt -&gt; jwt.jwtAuthenticationConverter(jwtAuthConverter())))
+            .sessionManagement(s -&gt; s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            // Bearer-token API with no cookies: CSRF is not exploitable here (see 11.3).
+            .csrf(csrf -&gt; csrf.disable())
+            .headers(h -&gt; h
+                .contentSecurityPolicy(csp -&gt; csp.policyDirectives("default-src 'none'; frame-ancestors 'none'"))
+                .referrerPolicy(r -&gt; r.policy(ReferrerPolicy.NO_REFERRER))
+                .httpStrictTransportSecurity(hsts -&gt; hsts.includeSubDomains(true).maxAgeInSeconds(31536000)));
+        return http.build();
+    }
+
+    @Bean
+    SecurityFilterChain everythingElse(HttpSecurity http) throws Exception {
+        // Second chain for anything not under /api: closed by default.
+        http.authorizeHttpRequests(auth -&gt; auth.anyRequest().denyAll());
+        return http.build();
+    }
+
+    private JwtAuthenticationConverter jwtAuthConverter() {
+        JwtGrantedAuthoritiesConverter scopes = new JwtGrantedAuthoritiesConverter(); // "scope" claim -&gt; SCOPE_x
+        JwtAuthenticationConverter c = new JwtAuthenticationConverter();
+        c.setJwtGrantedAuthoritiesConverter(scopes);
+        return c;
+    }
+}</code></pre>
+  <p>Note the two chains: the first is selected for <code>/api/**</code>; anything else falls to the second, which denies everything. Actuator runs on the management port, which Spring Boot serves through its own child context; secure that port at the network layer (Kubernetes NetworkPolicy so only Prometheus can reach it) and, if it must be reachable more widely, add a dedicated chain using <code>EndpointRequest.toAnyEndpoint()</code>.</p>
+
+  <h3>7.4 Ownership and method-level authorization</h3>
+  <pre data-file="OrderService.java"><code class="language-java">package com.example.orders;
+
+import java.util.UUID;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class OrderService {
+    private final OrderRepository orders;
+    private final AuditLogger audit;
+
+    public OrderService(OrderRepository orders, AuditLogger audit) {
+        this.orders = orders;
+        this.audit = audit;
+    }
+
+    @Transactional(readOnly = true)
+    public Order getForCustomer(UUID orderId, String customerId) {
+        // Ownership is part of the query: no unchecked load ever happens.
+        return orders.findByIdAndCustomerId(orderId, customerId)
+                     .orElseThrow(OrderNotFoundException::new);
+    }
+
+    @PreAuthorize("hasAuthority('SCOPE_orders.admin') and @refundPolicy.withinLimit(authentication, #amountCents)")
+    @Transactional
+    public void refund(UUID orderId, long amountCents, String reason, String actor) {
+        Order o = orders.findById(orderId).orElseThrow(OrderNotFoundException::new);
+        o.refund(amountCents);                       // domain method enforces amount &lt;= paid
+        audit.event("order.refund", actor, orderId.toString(), "SUCCESS",
+                    java.util.Map.of("amountCents", amountCents, "reason", reason));
+    }
+}</code></pre>
+  <pre data-file="OrderRepository.java"><code class="language-java">package com.example.orders;
+
+import java.util.Optional;
+import java.util.UUID;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface OrderRepository extends JpaRepository&lt;Order, UUID&gt; {
+    Optional&lt;Order&gt; findByIdAndCustomerId(UUID id, String customerId);   // derived query = bound parameters
+}</code></pre>
+
+  <h3>7.5 Exceptions that fail closed and leak nothing</h3>
+  <pre data-file="ApiExceptionHandler.java"><code class="language-java">package com.example.orders.web;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+import com.example.orders.OrderNotFoundException;
+
+@RestControllerAdvice
+public class ApiExceptionHandler {
+    private static final Logger log = LoggerFactory.getLogger(ApiExceptionHandler.class);
+
+    @ExceptionHandler(OrderNotFoundException.class)
+    ProblemDetail notFound() {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, "Order not found");
+    }
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    ProblemDetail invalid(MethodArgumentNotValidException e) {
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, "Invalid request");
+        pd.setProperty("fields", e.getBindingResult().getFieldErrors().stream()
+                .map(fe -&gt; fe.getField()).distinct().toList());   // names only, never rejected values
+        return pd;
+    }
+
+    // Needed because the catch-all handler below would otherwise turn an AccessDeniedException
+    // thrown by @PreAuthorize into a 500. Map it explicitly to 403.
+    @ExceptionHandler(AccessDeniedException.class)
+    ProblemDetail denied() {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.FORBIDDEN, "Forbidden");
+    }
+
+    @ExceptionHandler(Exception.class)
+    ProblemDetail unexpected(Exception e) {
+        String incident = java.util.UUID.randomUUID().toString();
+        log.error("unhandled exception incidentId={}", incident, e);   // full detail stays server-side
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.INTERNAL_SERVER_ERROR, "Internal error");
+        pd.setProperty("incidentId", incident);                          // correlatable, non-sensitive
+        return pd;
+    }
+}</code></pre>
+
+  <h3>7.6 Security audit logging with masking</h3>
+  <p>What to log (OWASP Logging Cheat Sheet, adapted): authentication successes and failures; authorization failures; session/token lifecycle (login, logout, refresh, revocation); input-validation failures that indicate probing; administrative and high-value business actions (refunds, role changes, exports); configuration and security-setting changes; startup/shutdown and changes to logging itself. Each event needs <em>when</em> (UTC, ISO-8601), <em>who</em> (principal ID, client ID, source IP, user agent), <em>what</em> (action, target resource ID), <em>where</em> (service, instance, trace ID) and <em>outcome</em>.</p>
+  <p>What never to log: passwords (including failed ones — users often type a password into the username field), session IDs, access/refresh tokens, API keys, private keys, full card numbers (PCI DSS), CVVs, bank account numbers, raw government IDs, health data, full request bodies of sensitive endpoints, and encryption keys or connection strings. Treat log data as sensitive anyway: restrict access and set retention.</p>
+  <pre data-file="AuditLogger.java"><code class="language-java">package com.example.orders;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Set;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
+import org.springframework.stereotype.Component;
+import static net.logstash.logback.argument.StructuredArguments.entries;
+
+@Component
+public class AuditLogger {
+    private static final Logger AUDIT = LoggerFactory.getLogger("AUDIT");   // routed to its own appender
+    private static final Set&lt;String&gt; FORBIDDEN =
+        Set.of("password", "token", "access_token", "refresh_token", "authorization", "secret", "cardNumber", "cvv");
+
+    public void event(String action, String actor, String target, String outcome, Map&lt;String, ?&gt; details) {
+        Map&lt;String, Object&gt; safe = new LinkedHashMap&lt;&gt;();
+        safe.put("event.action", action);
+        safe.put("user.id", actor);
+        safe.put("target.id", target);
+        safe.put("event.outcome", outcome);
+        safe.put("trace.id", MDC.get("traceId"));
+        details.forEach((k, v) -&gt; safe.put("detail." + k, FORBIDDEN.contains(k) ? "[REDACTED]" : sanitize(v)));
+        AUDIT.info("audit", entries(safe));
+    }
+
+    // Prevent log injection: strip CR/LF so attackers cannot forge extra log lines.
+    private static Object sanitize(Object v) {
+        return (v instanceof String s) ? s.replaceAll("[\\r\\n]", "_") : v;
+    }
+}</code></pre>
+  <pre data-file="SecurityEventListener.java"><code class="language-java">package com.example.orders.security;
+
+import java.util.Map;
+import org.springframework.context.event.EventListener;
+import org.springframework.security.authentication.event.AbstractAuthenticationFailureEvent;
+import org.springframework.security.authentication.event.AuthenticationSuccessEvent;
+import org.springframework.security.authorization.event.AuthorizationDeniedEvent;
+import org.springframework.stereotype.Component;
+import com.example.orders.AuditLogger;
+
+@Component
+public class SecurityEventListener {
+    private final AuditLogger audit;
+    public SecurityEventListener(AuditLogger audit) { this.audit = audit; }
+
+    @EventListener
+    public void onSuccess(AuthenticationSuccessEvent e) {
+        audit.event("authn.success", e.getAuthentication().getName(), "-", "SUCCESS", Map.of());
+    }
+
+    @EventListener
+    public void onFailure(AbstractAuthenticationFailureEvent e) {
+        audit.event("authn.failure", String.valueOf(e.getAuthentication().getName()), "-", "FAILURE",
+                Map.of("reason", e.getException().getClass().getSimpleName()));
+    }
+
+    @EventListener
+    public void onDenied(AuthorizationDeniedEvent&lt;?&gt; e) {
+        audit.event("authz.denied", e.getAuthentication().get().getName(), String.valueOf(e.getSource()), "DENIED", Map.of());
+    }
+}</code></pre>
+  <p>Authorization-denied events are only published if an <code>AuthorizationEventPublisher</code> bean is registered (for example <code>new SpringAuthorizationEventPublisher(applicationEventPublisher)</code>); authentication events are published by default through <code>DefaultAuthenticationEventPublisher</code>.</p>
+
+  <h3>7.7 The same principles in Python (FastAPI) and Go</h3>
+  <div class="code-tabs">
+  <pre data-lang="Python"><code class="language-python"># app.py — FastAPI: deny-by-default dependency, owner-scoped query, safe errors, audit log.
+# pip install "fastapi==0.115.*" "uvicorn==0.32.*" "pyjwt[crypto]==2.9.*" "sqlalchemy==2.0.*"
+import json, logging, re, uuid
+from datetime import datetime, timezone
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+import jwt
+from jwt import PyJWKClient
+
+ISSUER = "https://idp.example.com/realms/shop"
+AUDIENCE = "orders-api"
+jwks = PyJWKClient(f"{ISSUER}/protocol/openid-connect/certs", cache_keys=True)
+audit_log = logging.getLogger("AUDIT")
+bearer = HTTPBearer(auto_error=True)
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)  # no public docs in prod
+
+FORBIDDEN = {"password", "token", "authorization", "secret", "card_number"}
+
+def audit(action: str, actor: str, target: str, outcome: str, **details):
+    safe = {k: ("[REDACTED]" if k in FORBIDDEN else re.sub(r"[\r\n]", "_", str(v))) for k, v in details.items()}
+    audit_log.info(json.dumps({"ts": datetime.now(timezone.utc).isoformat(), "event.action": action,
+                               "user.id": actor, "target.id": target, "event.outcome": outcome, **safe}))
+
+def principal(creds: HTTPAuthorizationCredentials = Depends(bearer)) -&gt; dict:
+    try:
+        key = jwks.get_signing_key_from_jwt(creds.credentials).key
+        return jwt.decode(creds.credentials, key, algorithms=["RS256"], audience=AUDIENCE, issuer=ISSUER,
+                          options={"require": ["exp", "iat", "sub"]})
+    except jwt.PyJWTError:
+        audit("authn.failure", "-", "-", "FAILURE")
+        raise HTTPException(status_code=401, headers={"WWW-Authenticate": "Bearer"})
+
+def require_scope(scope: str):
+    def check(p: dict = Depends(principal)) -&gt; dict:
+        if scope not in p.get("scope", "").split():
+            audit("authz.denied", p["sub"], scope, "DENIED")
+            raise HTTPException(status_code=403)
+        return p
+    return check
+
+@app.get("/api/orders/{order_id}")
+def get_order(order_id: uuid.UUID, p: dict = Depends(require_scope("orders.read"))):
+    order = repo_find_by_id_and_customer(order_id, p["sub"])   # owner-scoped, parameterised query
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return order
+
+@app.exception_handler(Exception)
+async def unexpected(request: Request, exc: Exception):
+    incident = str(uuid.uuid4())
+    logging.exception("unhandled incidentId=%s", incident)
+    return JSONResponse({"title": "Internal error", "incidentId": incident}, status_code=500)
+
+def repo_find_by_id_and_customer(order_id, customer_id):
+    # With SQLAlchemy: session.execute(select(Order).where(Order.id == order_id,
+    #                                    Order.customer_id == customer_id)).scalar_one_or_none()
+    return None</code></pre>
+  <pre data-lang="Go"><code class="language-go">// main.go — Go net/http: explicit timeouts, body limits, security headers,
+// deny-by-default routing and fail-closed authorization middleware.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+)
+
+type ctxKey string
+
+const principalKey ctxKey = "principal"
+
+type Principal struct {
+	Subject string
+	Scopes  map[string]bool
+}
+
+// TokenVerifier validates signature, iss, aud, exp (see Chapter 11.2 for a full JWKS implementation).
+type TokenVerifier interface {
+	Verify(ctx context.Context, raw string) (*Principal, error)
+}
+
+var audit = slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("log.type", "audit")
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+		h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		h.Set("Cache-Control", "no-store")
+		r.Body = http.MaxBytesReader(w, r.Body, 1&lt;&lt;20) // 1 MiB request cap
+		next.ServeHTTP(w, r)
+	})
+}
+
+func authenticate(v TokenVerifier, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !ok {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		p, err := v.Verify(r.Context(), raw)
+		if err != nil { // any error -&gt; deny (fail closed)
+			audit.Info("authn.failure", "event.outcome", "FAILURE")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalKey, p)))
+	})
+}
+
+func requireScope(scope string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		p, ok := r.Context().Value(principalKey).(*Principal)
+		if !ok || !p.Scopes[scope] {
+			audit.Info("authz.denied", "scope", scope, "event.outcome", "DENIED")
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func getOrder(w http.ResponseWriter, r *http.Request) {
+	p := r.Context().Value(principalKey).(*Principal)
+	id := r.PathValue("id") // Go 1.22+ pattern routing
+	// order, err := store.FindByIDAndCustomer(r.Context(), id, p.Subject) // owner-scoped, $1/$2 params
+	_ = p
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"id": id})
+}
+
+func main() {
+	var verifier TokenVerifier // = newJWKSVerifier(...)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/orders/{id}", requireScope("orders.read", getOrder))
+	// No catch-all handler: unknown routes return 404 by default.
+	srv := &amp;http.Server{
+		Addr:              ":8080",
+		Handler:           securityHeaders(authenticate(verifier, mux)),
+		ReadHeaderTimeout: 5 * time.Second, // Slowloris protection; Go has no default
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 &lt;&lt; 10,
+	}
+	if err := srv.ListenAndServeTLS("tls.crt", "tls.key"); err != nil {
+		slog.Error("server stopped", "err", err)
+	}
+}</code></pre>
+  </div>
+  <p>The Python tab pins <code>algorithms=["RS256"]</code> (never let the token choose), requires <code>exp</code>/<code>sub</code>, and disables the auto-generated docs in production. The Go tab shows the defaults you must add yourself: <code>http.Server</code> has no timeouts unless you set them, and there is no body limit unless you wrap the reader. The <code>TokenVerifier</code> is an interface here to keep the listing focused; Chapter 11.2 provides a complete JWKS-backed implementation.</p>
+
+  <h3>7.8 Dependency scanning in CI</h3>
+  <pre data-file=".github/workflows/security.yml"><code class="language-yaml">name: security
+on: [pull_request]
+permissions:
+  contents: read            # least privilege for the workflow token
+jobs:
+  sca:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "21" }
+      - name: Generate SBOM
+        run: ./gradlew cyclonedxBom
+      - name: Scan SBOM with OSV-Scanner
+        run: |
+          go install github.com/google/osv-scanner/v2/cmd/osv-scanner@latest
+          ~/go/bin/osv-scanner scan --sbom=build/reports/bom.json
+      - name: Scan filesystem with Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true</code></pre>
+  <p>In production pipelines pin third-party actions to a full commit SHA rather than a tag (tags can be moved — see Chapter 11.4), and replace <code>@latest</code> with a pinned version. The OSV-Scanner flags shown follow its v2 CLI; check the version you install.</p>
+</section>
+
+<section id="applications">
+  <h2>8. Applications: How Engineering Teams Operationalise Security</h2>
+  <h3>8.1 Security in the design-doc template</h3>
+  <p>The most cost-effective change most teams can make is adding a "Security &amp; privacy" section to the design-doc template with four prompts: (1) DFD with trust boundaries, (2) assets and data classification, (3) top threats with mitigations (STRIDE table), (4) open risks needing acceptance. A security champion or AppSec engineer reviews it for designs that cross a new boundary. Lightweight is the point: the review happens because it is cheap.</p>
+  <h3>8.2 Security champions</h3>
+  <p>Central AppSec teams are typically far smaller than engineering, so many organisations run a champions programme: one engineer per team with extra training and a direct line to AppSec, who runs threat models, triages scanner findings and spreads secure patterns. The OWASP Security Champions Guide describes the model.</p>
+  <h3>8.3 Paved roads</h3>
+  <p>Platform teams encode the secure defaults of §7 in a company Spring Boot starter (security config, logging, error handling), a base Helm chart (non-root, read-only FS, NetworkPolicy, resource limits), and CI templates (SCA, SAST, SBOM, signing). Teams on the paved road get security "for free"; deviations are visible in review. This is the organisational form of "secure by default".</p>
+  <h3>8.4 Security invariants as tests</h3>
+  <p>Teams that rarely ship access-control bugs write tests for them. With <code>spring-security-test</code>: create two users, have user A create a resource, and assert user B receives 404. Assert that every controller method is covered by an explicit rule (some teams write an ArchUnit test that fails if a <code>@RestController</code> method lacks <code>@PreAuthorize</code> or an explicit allow-list entry).</p>
+  <pre data-file="OrderAccessIT.java"><code class="language-java">@SpringBootTest
+@AutoConfigureMockMvc
+class OrderAccessIT {
+    @Autowired MockMvc mvc;
+    @Autowired OrderRepository repo;
+
+    @Test
+    void customerCannotReadAnotherCustomersOrder() throws Exception {
+        Order bobs = repo.save(Order.newFor("bob"));
+        mvc.perform(get("/api/orders/{id}", bobs.getId())
+                .with(jwt().jwt(j -&gt; j.subject("alice"))
+                           .authorities(new SimpleGrantedAuthority("SCOPE_orders.read"))))
+           .andExpect(status().isNotFound());
+    }
+
+    @Test
+    void unknownRoutesAreDenied() throws Exception {
+        mvc.perform(get("/api/debug/whatever").with(jwt()))
+           .andExpect(status().isForbidden());
+    }
+}</code></pre>
+  <h3>8.5 Vulnerability management as a product</h3>
+  <p>Mature organisations run vulnerability management with dashboards per team (open findings by priority and age), SLAs agreed with leadership, automated dependency PRs merged by a bot when tests pass (Renovate auto-merge for patch versions), and a monthly review of exceptions. The metric that matters is <em>time to remediate exploited vulnerabilities</em>, not the raw count of open CVEs.</p>
+  <h3>8.6 Detection engineering</h3>
+  <p>Security logs feed a SIEM (Splunk, Elastic Security, Microsoft Sentinel, Google SecOps, or OpenSearch with detection rules). Typical application-level detections: many authentication failures across many usernames from one IP (credential stuffing); one user receiving many 404/403s on sequential IDs (IDOR probing); an admin action outside business hours from a new country; a spike in validation errors on one endpoint; a service account calling an endpoint it never called before.</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 Equifax (2017): an unpatched framework and blind monitoring <span class="tag fact">Verified</span></h3>
+  <p>Attackers exploited CVE-2017-5638, a remote-code-execution flaw in Apache Struts' Jakarta multipart parser, in an Equifax online dispute portal. A fix had been available since March 2017; the vulnerable system was not patched, and a subsequent scan failed to find it. The attackers then moved through the network for weeks. According to the US Government Accountability Office report, data on roughly 145 million US consumers was exposed, and an expired certificate on a network traffic-inspection device meant encrypted exfiltration traffic was not being inspected for months. Lessons: asset inventory (you cannot patch what you do not know runs the vulnerable library), patch SLAs with verification, and monitoring that is itself monitored. Maps to OWASP A03 and A09. Source: <a href="https://www.gao.gov/products/gao-18-559">GAO-18-559, Data Protection: Actions Taken by Equifax and Federal Agencies in Response to the 2017 Breach</a>.</p>
+  <h3>9.2 Log4Shell (2021): the transitive dependency <span class="tag fact">Verified</span></h3>
+  <p>CVE-2021-44228 in Log4j 2 allowed attacker-controlled strings that were logged to trigger JNDI lookups and load remote code. Because logging user input (a User-Agent header, a username) is ubiquitous, and Log4j 2 was a transitive dependency of a vast number of Java products, exposure was enormous; CISA added it to KEV and issued emergency guidance. Spring Boot's default logging backend is Logback, so plain Spring Boot apps were not affected unless they had opted into <code>log4j-core</code> — a nice example of how defaults shape blast radius. Teams with an SBOM or at least a queryable dependency inventory answered "are we affected?" in hours; others took weeks. Sources: <a href="https://nvd.nist.gov/vuln/detail/CVE-2021-44228">NVD entry for CVE-2021-44228</a>; <a href="https://spring.io/blog/2021/12/10/log4j2-vulnerability-and-spring-boot">Spring blog: Log4J2 Vulnerability and Spring Boot</a>.</p>
+  <h3>9.3 Spring4Shell (2022): data binding as attack surface <span class="tag fact">Verified</span></h3>
+  <p>CVE-2022-22965 affected Spring MVC/WebFlux applications running on JDK 9+; the published exploitation required deployment as a WAR on Apache Tomcat. Spring's data binder allowed a request parameter path to reach <code>class.module.classLoader</code> and manipulate Tomcat's logging configuration to write a web shell. Spring Framework 5.3.18 and 5.2.20 fixed it by restricting binding. Lessons: binding request data onto objects is an injection surface (the same family as mass assignment), and "only exploitable in configuration X" advisories still require you to know your configuration. Source: <a href="https://spring.io/security/cve-2022-22965">Spring security advisory CVE-2022-22965</a>.</p>
+  <h3>9.4 MOVEit Transfer (2023): one injection, thousands of victims <span class="tag fact">Verified</span></h3>
+  <p>CVE-2023-34362 was a SQL injection vulnerability in Progress Software's MOVEit Transfer managed file-transfer product. The Cl0p extortion group exploited it as a zero-day from late May 2023 to install a web shell and steal data from organisations running the product, affecting a very large number of downstream companies and their customers. Lessons: a classic A05 bug in an internet-facing product had supply-chain-scale consequences; internet-facing file-transfer and edge appliances deserve the strictest patch SLAs and exposure reduction. Source: <a href="https://www.cisa.gov/news-events/cybersecurity-advisories/aa23-158a">CISA &amp; FBI advisory AA23-158A</a>.</p>
+  <h3>9.5 Threat modeling at scale: Microsoft and OWASP tooling <span class="tag fact">Verified</span></h3>
+  <p>Microsoft's Security Development Lifecycle has made threat modeling part of product development for two decades and publishes a free DFD-based Threat Modeling Tool that generates STRIDE threats per element; OWASP publishes Threat Dragon, an open-source equivalent. Both show the same practice this chapter teaches: DFD, trust boundaries, STRIDE per element. Sources: <a href="https://learn.microsoft.com/en-us/azure/security/develop/threat-modeling-tool">Microsoft Threat Modeling Tool documentation</a>; <a href="https://owasp.org/www-project-threat-dragon/">OWASP Threat Dragon</a>.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages and Limits of the Core Practices</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Practice</th><th>Strengths</th><th>Limits</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>STRIDE threat modeling</td><td>Systematic coverage; finds design flaws scanners cannot</td><td>Quality depends on participants; misses business-logic abuse unless prompted; decays if not updated</td><td>1–2 hours per significant design</td></tr>
+      <tr><td>Attack trees</td><td>Shows cheapest attacker path; good for one critical asset</td><td>Laborious for whole systems; estimates are guesses</td><td>Half a day for a key asset</td></tr>
+      <tr><td>OWASP Top 10</td><td>Shared vocabulary; good training scaffold</td><td>Not a standard or complete checklist; data-skewed toward testable bugs</td><td>Low</td></tr>
+      <tr><td>OWASP ASVS</td><td>Verifiable, levelled requirements</td><td>Hundreds of requirements; needs tailoring</td><td>Medium</td></tr>
+      <tr><td>SAST</td><td>Early, in-IDE/CI; finds injection sinks</td><td>False positives; weak on access control and logic</td><td>Tuning and triage time</td></tr>
+      <tr><td>SCA</td><td>Cheap, high-value; finds known CVEs</td><td>Noise from unreachable code; does not detect malicious packages well</td><td>Continuous upgrade work</td></tr>
+      <tr><td>CVSS-only prioritisation</td><td>Universally available</td><td>Ignores exploitation likelihood and context</td><td>Wasted effort on unexploited criticals</td></tr>
+      <tr><td>CVSS + EPSS + KEV</td><td>Focuses effort on real-world risk</td><td>EPSS is population-level; KEV lags novel exploitation</td><td>Needs tooling integration</td></tr>
+      <tr><td>Centralised security logging</td><td>Detection and forensics</td><td>Storage cost; privacy risk; useless without alerts</td><td>Significant (ingest pricing)</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs and Decisions</h2>
+  <h3>11.1 Where to put authorization</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Option</th><th>Choose when</th><th>Watch out for</th></tr></thead>
+    <tbody>
+      <tr><td>Gateway only</td><td>Coarse checks: authenticated? has scope?</td><td>Cannot do ownership; internal callers bypass the gateway</td></tr>
+      <tr><td>Filter chain URL rules</td><td>Role/scope per route; deny-by-default</td><td>Path-matching subtleties; rules drift from controllers</td></tr>
+      <tr><td><code>@PreAuthorize</code></td><td>Per-operation rules close to code; reusable SpEL beans</td><td>Self-invocation bypass; SpEL complexity</td></tr>
+      <tr><td>Service-layer / query scoping</td><td>Ownership and tenancy</td><td>Must be applied to every query path</td></tr>
+      <tr><td>Database RLS</td><td>Strong multi-tenant isolation as a backstop</td><td>Connection-pool session variables; migrations; reporting users</td></tr>
+      <tr><td>External policy engine (OPA, Cedar, OpenFGA)</td><td>Many services sharing complex policies</td><td>Latency, availability (must fail closed), policy testing</td></tr>
+    </tbody>
+  </table></div>
+  <p><span class="tag opinion">Opinion</span> Default: URL rules for coarse access + query scoping for ownership + RLS for regulated multi-tenant data. Add a policy engine when three or more services duplicate non-trivial policy.</p>
+  <h3>11.2 Fail open vs fail closed</h3>
+  <p>Fail closed is the security default, but it is an availability trade-off. A sensible pattern: fail closed for authorization and authentication; for non-security dependencies (recommendations, analytics) fail open with degraded responses. When the identity provider's JWKS endpoint is down, continue validating with cached keys (that is not failing open — signatures are still checked) but deny tokens signed with unknown key IDs.</p>
+  <h3>11.3 Patch fast vs patch safely</h3>
+  <p>Fast patching risks regressions; slow patching risks exploitation. Resolve the tension with test coverage and automated rollout (canary + automatic rollback), so that the cost of a patch release is low. Teams that can deploy safely in an hour can afford a "KEV within 72 hours" SLA; teams with a quarterly release train cannot, which is itself the risk to fix.</p>
+  <h3>11.4 How much threat modeling?</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A["Change proposed"] --> B{"New trust boundary, new sensitive data, or new external integration?"}
+  B -- yes --> C["Full STRIDE session with DFD (1-2 h)"]
+  B -- no --> D{"Changes authn/authz, crypto, or input parsing?"}
+  D -- yes --> E["Focused review by security champion"]
+  D -- no --> F["Normal code review with security checklist"]
+</pre>
+  <figcaption>Figure 5 — Right-sizing threat-modeling effort.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> effort scales with how much the change alters trust relationships. Most changes go down the right-hand path; reserving full sessions for boundary changes keeps the practice sustainable.</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes, Misconceptions and Production Failures</h2>
+  <ul>
+    <li><strong>"We use Spring Security, so we are secure."</strong> Spring Security authenticates and enforces the rules you write. It does not know your ownership model.</li>
+    <li><strong>Returning 403 vs 404 inconsistently.</strong> A 403 for someone else's resource and a 404 for a missing one lets attackers enumerate valid IDs. Prefer 404 for objects the caller may not see.</li>
+    <li><strong>Relying on unguessable IDs.</strong> UUIDs reduce enumeration but are not access control: IDs leak in URLs, logs, referrers and shared links.</li>
+    <li><strong>Exposing actuator.</strong> <code>/actuator/heapdump</code> and <code>/actuator/env</code> have been the root cause of real credential leaks; never expose them on the public port.</li>
+    <li><strong>Catch-all handlers that swallow <code>AccessDeniedException</code></strong> and return 500 or, worse, 200 with an empty body.</li>
+    <li><strong>Logging the <code>Authorization</code> header</strong> via a request-logging filter (e.g. <code>CommonsRequestLoggingFilter</code> with <code>setIncludeHeaders(true)</code>).</li>
+    <li><strong>Treating internal traffic as trusted.</strong> "It's behind the VPN" fails the moment one internal service is compromised. Zero trust means authenticating service-to-service calls too.</li>
+    <li><strong>Suppressing scanner findings forever.</strong> Suppressions need a reason, an owner and an expiry.</li>
+    <li><strong>Prioritising by CVSS alone</strong> and drowning in "criticals" in test dependencies while an exploited high on the login path waits.</li>
+    <li><strong>Threat models as one-off documents</strong> that are never revisited after the design changes.</li>
+    <li><strong>Security as a final gate.</strong> A penetration test two weeks before launch finds design flaws when they are most expensive to fix.</li>
+    <li><strong>Self-invocation bypassing method security</strong>: a public method without <code>@PreAuthorize</code> calls <code>this.adminOnly()</code>; the proxy is never involved.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Patch SLAs</h3>
+  <p><span class="tag opinion">Opinion</span> A reasonable starting policy, to be agreed with your risk owners:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Priority</th><th>Criteria</th><th>Remediate within</th></tr></thead>
+    <tbody>
+      <tr><td>P0</td><td>In CISA KEV, or active exploitation observed, and reachable</td><td>72 hours (mitigate within 24 h if patch not possible)</td></tr>
+      <tr><td>P1</td><td>CVSS ≥ 9 internet-facing, or EPSS ≥ 0.1, or public exploit</td><td>7 days</td></tr>
+      <tr><td>P2</td><td>CVSS 7–8.9, reachable</td><td>30 days</td></tr>
+      <tr><td>P3</td><td>Everything else</td><td>90 days or next routine upgrade</td></tr>
+    </tbody>
+  </table></div>
+  <p>For reference, BOD 22-01 gives US federal agencies two weeks for KEV entries added after 2021 (shorter where CISA specifies); PCI DSS v4 requires critical security patches within one month of release. <span class="tag fact">Verified</span></p>
+  <h3>13.2 Monitoring and alerting</h3>
+  <p>Ship audit events to a separate index/stream with restricted access and longer retention than debug logs. Alert on: authentication-failure rate per source and per account; authorization-denied spikes; admin actions; new egress destinations; WAF block spikes; and the absence of logs (a silent service is a signal). Expose security counters as Micrometer metrics so they appear on dashboards next to latency and error rate.</p>
+  <h3>13.3 Log integrity and privacy</h3>
+  <p>Protect logs against tampering (write-once storage such as S3 Object Lock, or forwarding to a SIEM that the application cannot modify) and against over-collection (GDPR purpose limitation; pseudonymise user IDs where possible). Strip CR/LF from user-controlled values or use structured JSON logging so attackers cannot inject fake log lines.</p>
+  <h3>13.4 Maintainability</h3>
+  <p>Centralise security configuration in a shared starter with tests; version it; and upgrade Spring Boot regularly. Spring Boot open-source support windows are relatively short, so a service stuck on an end-of-life version stops receiving security fixes unless you buy extended support. <span class="tag version">Version-sensitive · checked Nov 2026</span></p>
+  <h3>13.5 Performance</h3>
+  <p>Security controls have costs you should measure: bcrypt at cost 12 takes on the order of hundreds of milliseconds per hash on typical server hardware — fine for login, catastrophic if accidentally applied per API request; JWT validation with cached JWKS is sub-millisecond; external policy calls add a network hop (cache decisions with care, short TTL). Rate limiting and request size limits are also <em>performance</em> controls against resource exhaustion.</p>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundation</p>
+    <p>Classify each of the following by CIA property and STRIDE category: (a) a stack trace with a JDBC URL in a 500 response; (b) a webhook endpoint that accepts unsigned payloads; (c) an export endpoint with no page-size limit; (d) an admin deletes a customer and no record shows who; (e) a user changes <code>"role":"USER"</code> to <code>"ADMIN"</code> in a profile update.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>(a) Confidentiality / Information disclosure. (b) Integrity and authenticity / Spoofing and Tampering. (c) Availability / Denial of service. (d) Non-repudiation / Repudiation. (e) Integrity / Elevation of privilege (mass assignment). Fixes: error handler with no internals; HMAC verification; max page size and streaming; audit event; explicit DTO without <code>role</code>.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>A team adds a Kafka consumer to the notification service in Figure 1 that, on receiving <code>OrderShipped{orderId, email}</code>, emails the customer. Threat-model this new flow with STRIDE and propose mitigations.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <ul>
+        <li><strong>Spoofing/Tampering:</strong> any client with produce access could inject events and send phishing emails from your domain. Mitigate with Kafka mTLS + ACLs restricting producers on the topic to the order service; optionally sign events.</li>
+        <li><strong>Information disclosure:</strong> the event carries an email address that may be logged by consumers; minimise payload (send <code>customerId</code>, look up email from the source of truth), and mask in logs.</li>
+        <li><strong>Tampering of content:</strong> if order notes are interpolated into an HTML email, encode them (HTML context) to avoid injection.</li>
+        <li><strong>DoS:</strong> a flood of events could exhaust the email quota; add per-customer rate limits and a dead-letter queue.</li>
+        <li><strong>Repudiation:</strong> log message ID, producer principal and outcome for each email sent.</li>
+      </ul>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>Your scanner reports three findings: (1) CVE A, CVSS 9.8, in a test-scope dependency, EPSS 0.002; (2) CVE B, CVSS 7.5, in the HTTP client of an internet-facing service, listed in CISA KEV; (3) CVE C, CVSS 8.1, in an image-processing library used by an internal batch job, EPSS 0.04. Order them and assign SLAs using §13.1.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>B first (P0: KEV + reachable, 72 h). C next (P2: 30 days; consider P1 if the batch job processes externally supplied images, since reachability then comes from the internet indirectly). A last (P3: test scope is not shipped; fix with the next upgrade, and verify it is truly test-only by checking the runtime classpath/SBOM). CVSS order (A, C, B) would have been exactly backwards.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced (hands-on, local only)</p>
+    <p>Run OWASP Juice Shop locally (<code>docker run --rm -p 127.0.0.1:3000:3000 bkimminich/juice-shop</code>) — an intentionally vulnerable app you own on your machine. Without using any automated attack tool, find one instance each of A01 (broken access control) and A02 (misconfiguration) using only your browser's developer tools. For each, write a one-paragraph finding (description, impact, root cause, fix) as you would in a design review.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Juice Shop's built-in score board lists challenges by category; access-control challenges include viewing another user's basket by changing an identifier in an API call, and misconfiguration challenges include finding exposed files or verbose error messages. A good finding: "<em>GET /rest/basket/{id}</em> returns any basket for any authenticated user. Impact: confidentiality of all customers' baskets. Root cause: the handler loads by ID without comparing basket owner to the authenticated user. Fix: owner-scoped query; integration test asserting another user's basket returns 404." Binding the container to 127.0.0.1 keeps it off your network — an intentionally vulnerable app should never be reachable by others.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>Write an ArchUnit (or reflection-based) test that fails if any <code>@RestController</code> handler method in package <code>com.example</code> has neither <code>@PreAuthorize</code> nor a custom <code>@PublicEndpoint</code> annotation.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-java">import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.methods;
+
+import com.tngtech.archunit.core.importer.ImportOption;
+import com.tngtech.archunit.junit.AnalyzeClasses;
+import com.tngtech.archunit.junit.ArchTest;
+import com.tngtech.archunit.lang.ArchRule;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@AnalyzeClasses(packages = "com.example", importOptions = ImportOption.DoNotIncludeTests.class)
+class EndpointSecurityArchTest {
+    @ArchTest
+    static final ArchRule everyEndpointDeclaresAccess =
+        methods().that().areDeclaredInClassesThat().areAnnotatedWith(RestController.class)
+                 .and().areMetaAnnotatedWith(RequestMapping.class)   // @GetMapping etc. are meta-annotated
+                 .should().beAnnotatedWith(PreAuthorize.class)
+                 .orShould().beAnnotatedWith(PublicEndpoint.class)
+                 .because("every endpoint must declare its access rule explicitly");
+}</code></pre>
+      <p>This turns "remember to add authorization" into a build failure, complementing the deny-by-default filter chain.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is the difference between authentication, authorization and accounting? Which is most often broken in practice, and why?</summary><div><p>Authentication establishes identity, authorization decides whether that identity may perform an action on a resource, accounting records what happened. Authorization is most often broken because it is business logic specific to each resource; frameworks provide the mechanism (filter chain, <code>@PreAuthorize</code>) but not the ownership rules, so every new endpoint is a new opportunity to forget a check. Hence Broken Access Control is OWASP A01.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain defense in depth and when it fails.</summary><div><p>Layer independent controls so an attacker must defeat several. It fails when layers share a common failure mode (all trust the same header or the same compromised identity provider), giving an illusion of depth. Good layering uses diverse mechanisms: network policy, application authorization, database RLS, monitoring.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What changed between the OWASP Top 10 2021 and 2025?</summary><div><p>Security Misconfiguration rose to #2; Vulnerable and Outdated Components became the broader Software Supply Chain Failures at #3; SSRF was merged into Broken Access Control (still #1); Cryptographic Failures, Injection and Insecure Design moved to #4–#6; Authentication Failures stayed at #7 with a simplified name; Logging and Monitoring became Logging and <em>Alerting</em> Failures; and Mishandling of Exceptional Conditions was added at #10.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Walk me through threat modeling a new multi-tenant document-upload feature.</summary><div><p>Draw a DFD: browser → gateway → upload service → object store, plus a virus-scan worker and a metadata DB; mark boundaries. STRIDE: spoofing (token theft — short-lived tokens), tampering (content-type spoofing — validate magic bytes, store with fixed content type), repudiation (audit uploads/downloads), information disclosure (cross-tenant reads — tenant prefix in keys, scoped IAM, owner-scoped metadata queries, pre-signed URLs with short TTL), DoS (size limits, quotas, zip-bomb protection), elevation (malicious files executing in a processor — sandbox the scanner, never serve uploads from the app origin). Rate, decide, write tests for tenant isolation.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Where should ownership checks live in a Spring application, and why not only in the API gateway?</summary><div><p>In the service/query layer (and optionally RLS), because only there is the ownership data available and only there are all entry paths (HTTP, messaging, batch) covered. The gateway sees tokens and paths, not database rows, and internal callers may bypass it.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Show how you would prevent an exception in a permission check from granting access.</summary><div><p>Catch only the expected exception types, return false (deny), increment a metric and alert; never <code>return true</code> in a catch block. Set a timeout on remote policy calls so slowness is converted into a deny rather than a hang. Integration-test the failure path by stubbing the policy client to throw.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> What must never appear in logs, and how do you enforce that in code?</summary><div><p>Passwords, tokens, session IDs, API keys, keys, full card data, sensitive personal data. Enforce with structured logging and a central audit helper that redacts by key name; avoid logging whole request bodies or headers; add a Logback/Log4j masking converter as a safety net; scan logs in CI tests for token patterns; restrict log access.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> A new critical CVE drops in a library you use, on a Friday evening. What do you do?</summary><div><p>Determine exposure via SBOM/dependency inventory (which services, which versions, which are internet-facing). Check KEV/EPSS and vendor advisories for exploitation status and mitigations (config flags, WAF rules). Apply temporary mitigations for exposed services immediately; patch and deploy via canary; verify running images no longer contain the vulnerable version; search logs for indicators of exploitation since disclosure; communicate status. Post-incident: measure time-to-remediate and fix inventory gaps.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Your scanner shows 1,400 open vulnerabilities. Leadership wants zero. How do you respond?</summary><div><p>Reframe the goal as risk-based: zero exploited (KEV) and reachable criticals within SLA, and a downward trend in mean time to remediate. Triage with KEV/EPSS/reachability, remove noise (test scope, unshipped images, duplicates across images), automate upgrades for the long tail with Renovate, fix base images (one base-image update often clears hundreds of findings), and report by priority bucket rather than raw count.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> Tell me about a time you pushed back on a design for security reasons.</summary><div><p>Structure with STAR: describe the design (e.g. a partner API that trusted a client-supplied tenant ID), the risk in concrete terms (one partner reading another's data), the alternative you proposed (tenant derived from the token's client ID; integration test), how you got agreement (showed a one-page threat model, offered to implement the change), and the outcome. Emphasise collaboration and cost-aware proposals, not vetoes.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>CIA (+ authenticity, non-repudiation) defines what you protect; AAA defines how identities are established, checked and recorded.</li>
+    <li>Least privilege limits blast radius; defense in depth needs <em>independent</em> layers; fail-safe defaults mean deny on error.</li>
+    <li>Threat model with the four questions: DFD with trust boundaries, STRIDE per element, mitigate or accept, validate with tests.</li>
+    <li>OWASP Top 10:2025: Broken Access Control #1 (now including SSRF), Misconfiguration #2, Supply Chain #3, new #10 for exceptional conditions.</li>
+    <li>Log security events with who/what/when/where/outcome; never log secrets, tokens or passwords; alert, don't just store.</li>
+    <li>Prioritise vulnerabilities by KEV, then EPSS and reachability, then CVSS — and verify remediation in running workloads.</li>
+  </ul>
+  <div class="quiz" data-answer="c">
+    <p class="q">A customer can read another customer's invoice by changing the ID in the URL. Which OWASP Top 10:2025 category is this?</p>
+    <ol>
+      <li data-k="a">A05 Injection</li>
+      <li data-k="b">A07 Authentication Failures</li>
+      <li data-k="c">A01 Broken Access Control</li>
+      <li data-k="d">A06 Insecure Design</li>
+    </ol>
+    <div class="explain">The caller is correctly authenticated but acts outside their permissions on a specific object (IDOR/BOLA) — the canonical A01 case.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">Which STRIDE categories apply to a data store element under "STRIDE per element"?</p>
+    <ol>
+      <li data-k="a">Spoofing and Repudiation only</li>
+      <li data-k="b">Tampering, Information disclosure, Denial of service (and Repudiation for logs)</li>
+      <li data-k="c">All six</li>
+      <li data-k="d">Elevation of privilege only</li>
+    </ol>
+    <div class="explain">Data stores can be modified, read and made unavailable; repudiation applies when the store is an audit log. Spoofing applies to entities and processes.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">Which signal most strongly justifies emergency patching?</p>
+    <ol>
+      <li data-k="a">CVSS base score 9.8</li>
+      <li data-k="b">The CVE is in a test dependency</li>
+      <li data-k="c">EPSS percentile above 50</li>
+      <li data-k="d">The CVE is in CISA KEV and the component is internet-facing</li>
+    </ol>
+    <div class="explain">KEV means confirmed exploitation in the wild; combined with reachability it is the highest-priority signal. CVSS measures potential severity, not likelihood.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">A permission evaluator returns <code>true</code> when the policy service times out. Which principle and 2025 category does this violate?</p>
+    <ol>
+      <li data-k="a">Fail-safe defaults; A10 Mishandling of Exceptional Conditions</li>
+      <li data-k="b">Least privilege; A04 Cryptographic Failures</li>
+      <li data-k="c">Economy of mechanism; A09 Logging &amp; Alerting Failures</li>
+      <li data-k="d">Open design; A03 Supply Chain Failures</li>
+    </ol>
+    <div class="explain">Failing open on an error is the textbook violation of fail-safe defaults and is the type of flaw A10 was introduced to capture.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">Three independent controls are each bypassed with probability 0.2. What is the probability all three are bypassed, and what assumption could make the real value much higher?</p>
+    <ol>
+      <li data-k="a">0.6; that controls are layered</li>
+      <li data-k="b">0.008; that the controls are independent</li>
+      <li data-k="c">0.2; that attackers are rational</li>
+      <li data-k="d">0.04; that CVSS is accurate</li>
+    </ol>
+    <div class="explain">0.2³ = 0.008 under independence. Shared failure modes (common trust anchor, same misconfiguration) correlate the controls and push the probability toward 0.2.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Which of these is safe to include in a security audit log event?</p>
+    <ol>
+      <li data-k="a">The failed password, to detect typos</li>
+      <li data-k="b">The full Authorization header, for forensics</li>
+      <li data-k="c">The principal ID, action, target ID, outcome and trace ID</li>
+      <li data-k="d">The session cookie value, to correlate requests</li>
+    </ol>
+    <div class="explain">Credentials and session identifiers must never be logged; use trace IDs for correlation.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Spec</span> <a href="https://owasp.org/Top10/2025/">OWASP Top 10:2025</a> — category pages with CWE mappings and prevention guidance.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://owasp.org/www-project-application-security-verification-standard/">OWASP Application Security Verification Standard (ASVS)</a> — verifiable requirements.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html">OWASP Logging Cheat Sheet</a> and <a href="https://cheatsheetseries.owasp.org/cheatsheets/Threat_Modeling_Cheat_Sheet.html">Threat Modeling Cheat Sheet</a>.</li>
+    <li><span class="ref-kind">Book</span> Adam Shostack, <em>Threat Modeling: Designing for Security</em>, Wiley, 2014.</li>
+    <li><span class="ref-kind">Paper</span> <a href="https://www.cs.virginia.edu/~evans/cs551/saltzer/">J. Saltzer &amp; M. Schroeder, "The Protection of Information in Computer Systems", Proc. IEEE, 1975</a>.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://www.threatmodelingmanifesto.org/">Threat Modeling Manifesto</a>.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://www.first.org/cvss/">FIRST CVSS</a> and <a href="https://www.first.org/epss/">FIRST EPSS</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://www.cisa.gov/known-exploited-vulnerabilities-catalog">CISA Known Exploited Vulnerabilities Catalog</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.spring.io/spring-security/reference/">Spring Security reference</a> — architecture, authorization, method security, events.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://pages.nist.gov/800-63-4/">NIST SP 800-63 Digital Identity Guidelines</a>.</li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/juice-shop/juice-shop">OWASP Juice Shop</a> — intentionally vulnerable app for local practice.</li>
+    <li><span class="ref-kind">Book</span> Ross Anderson, <em>Security Engineering</em>, 3rd ed., Wiley, 2020 — broad, deep reference (read the original; it is not summarised here).</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

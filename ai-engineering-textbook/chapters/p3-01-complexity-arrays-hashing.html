@@ -1,0 +1,1811 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Complexity, Arrays, Strings &amp; Hashing — AI-Era Software Engineering</title>
+<meta name="description" content="Asymptotic analysis, amortized costs and recurrences, then arrays, dynamic arrays, strings and string matching (KMP, Rabin–Karp), hash maps and prefix sums, with JDK and CPython internals and interview problem ladders.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p3-01-complexity-arrays-hashing" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 3 · Chapter 1</p>
+  <h1>Complexity, Arrays, Strings &amp; Hashing</h1>
+  <p class="lede">Every later chapter in this part leans on three ideas introduced here: a precise vocabulary for cost (asymptotic, amortized and expected), the contiguous array as the machine's native data structure, and the hash table as the tool that turns "search" into "lookup". We go below the API into <code>ArrayList.grow</code>, <code>HashMap</code> treeification, compact strings and CPython's dict layout, and finish with problem ladders that train you to recognise hashing and prefix-sum patterns on sight.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Comfortable with Java collections and basic Python; high-school algebra (logarithms, geometric series).</li>
+    <li><strong>You will be able to:</strong> derive Θ-bounds and amortized costs, apply the master theorem, explain HashMap/dict internals to an interviewer, implement KMP and Rabin–Karp from memory, and solve "Two Sum"/"subarray sum" family problems in linear time.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: Why Cost Models Still Decide Interviews and Incidents</h2>
+  <p>A senior interview rarely asks you to recite a definition of Big O. It asks you to look at your own solution, say "this is Θ(n log n) time and Θ(n) extra space because…", and then defend whether that is good enough for the stated constraints. In production the same skill shows up when a nightly job that "worked fine in staging" takes nine hours against real data because someone called <code>list.contains(x)</code> inside a loop over another list. Complexity analysis is the discipline of predicting that before it happens.</p>
+  <p>This chapter covers four tightly coupled topics:</p>
+  <ul>
+    <li><strong>Complexity analysis</strong> — asymptotic notation (O, Ω, Θ, o), worst/average/expected cases, space accounting, amortized analysis and recurrences. This is the measuring instrument for every algorithm in the rest of Part 3.</li>
+    <li><strong>Arrays and dynamic arrays</strong> — contiguous memory, why cache lines make arrays beat "theoretically equal" linked structures, and how <code>ArrayList</code> and Python's <code>list</code> grow.</li>
+    <li><strong>Strings</strong> — immutability, encodings (UTF-16 code units vs code points), builders, and linear-time pattern matching with Knuth–Morris–Pratt and Rabin–Karp rolling hashes.</li>
+    <li><strong>Hashing</strong> — hash functions, collisions, chaining vs open addressing, load factor and resizing, with JDK <code>HashMap</code>/<code>ConcurrentHashMap</code> and CPython <code>dict</code> internals — and its frequent companion, the <strong>prefix sum</strong>.</li>
+  </ul>
+  <p>Why group these? Because the single most common interview optimisation — "replace the inner loop with a hash lookup" — sits at their intersection: you need complexity analysis to see the inner loop is the bottleneck, arrays and strings are what you are iterating, and a hash map (often keyed by a prefix sum) is what removes the loop.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>You use <code>HashMap</code>, <code>ArrayList</code>, <code>StringBuilder</code> and <code>ConcurrentHashMap</code> daily; you know to override <code>equals</code> and <code>hashCode</code> together; you have probably seen a Hibernate N+1 query problem, which is a complexity bug wearing an ORM costume.</dd>
+      <dt>Why that is not enough</dt><dd>Senior interviews probe <em>why</em>: why the load factor is 0.75, why table sizes are powers of two, why a bin turns into a red-black tree, why <code>ArrayList.add</code> is O(1) amortized but can still cause a latency spike. Without the internals you cannot reason about worst cases, memory, or adversarial input (HashDoS).</dd>
+      <dt>The modern approach</dt><dd>Reason with three lenses at once: asymptotic cost (Θ), constant factors that come from memory layout (cache lines, boxing, pointer chasing), and adversarial/tail behaviour (worst-case vs expected vs amortized). Modern hash tables (SwissTable in Abseil, Go 1.24 maps) are designed around the second lens.</dd>
+      <dt>Where Python and Go fit</dt><dd>Python's <code>dict</code> uses open addressing with a compact, insertion-ordered layout; its <code>list</code> over-allocates differently from <code>ArrayList</code>; <code>str</code> is immutable with a per-string compact representation (PEP 393). Go's built-in map became a Swiss table in Go 1.24, and Go strings are immutable byte slices (UTF-8). Knowing all three lets you write the same algorithm idiomatically in each.</dd>
+      <dt>In production</dt><dd>Presizing maps for known cardinalities, choosing primitive-specialised collections for hot paths, defending against hash flooding of request parameters, and replacing repeated range scans with prefix sums in reporting endpoints.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use hash maps when you need membership/lookup by exact key and order does not matter; avoid them when you need range queries or ordered iteration (use <code>TreeMap</code> or a sorted array), when memory per entry is critical (use primitive arrays or sorted arrays + binary search), or when keys are mutable.</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="history">
+  <h2>2. History: From Number Theory Notation to Swiss Tables</h2>
+  <ul>
+    <li><strong>1894–1909 — O and o notation.</strong> Paul Bachmann introduced the big-O symbol in analytic number theory (1894); Edmund Landau popularised it and added little-o (1909). They described the growth of number-theoretic functions, not programs.</li>
+    <li><strong>1953 — Hashing.</strong> Hans Peter Luhn at IBM wrote an internal memo describing hashing with chaining; around the same time Gene Amdahl, Elaine McGraw and Arthur Samuel used linear probing (open addressing) in an IBM 701 assembler. Arnold Dumey published the idea of hashing in the open literature in 1956.</li>
+    <li><strong>1965 — Computational complexity as a field.</strong> Juris Hartmanis and Richard Stearns published "On the Computational Complexity of Algorithms", measuring algorithms by time as a function of input size; they later received the 1993 Turing Award for it.</li>
+    <li><strong>1968–1976 — Knuth's analysis and Θ/Ω.</strong> Donald Knuth's <em>The Art of Computer Programming</em> (vol. 1 1968, vol. 3 1973) gave exact average-case analyses, including the famous linear probing analysis. In 1976 his SIGACT News note "Big Omicron and Big Omega and Big Theta" fixed the modern meanings of Ω and Θ.</li>
+    <li><strong>1977 — Knuth–Morris–Pratt.</strong> The linear-time string matching algorithm was published in SIAM Journal on Computing (Morris and Pratt had a 1970 technical report; Knuth found it independently from automata theory).</li>
+    <li><strong>1985 — Amortized analysis formalised.</strong> Robert Tarjan's paper "Amortized Computational Complexity" (SIAM J. Algebraic Discrete Methods) introduced the potential-function method in its general form.</li>
+    <li><strong>1987 — Rabin–Karp.</strong> Richard Karp and Michael Rabin published randomized fingerprinting for pattern matching (IBM Journal of Research and Development).</li>
+    <li><strong>1998 — Java 2 Collections.</strong> JDK 1.2 shipped <code>HashMap</code>, <code>ArrayList</code> and the Collections Framework designed by Joshua Bloch.</li>
+    <li><strong>2011 — Hash flooding.</strong> At 28C3, Alexander Klink and Julian Wälde showed that predictable string hashing let attackers send POST bodies whose parameter names all collide, degrading web frameworks (Java, PHP, Python, Ruby…) to quadratic time (oCERT-2011-003).</li>
+    <li><strong>2014 — Java 8.</strong> <code>HashMap</code> bins that grow past 8 entries become red-black trees (JEP 180), capping adversarial lookups at O(log n). <code>ConcurrentHashMap</code> was rewritten without segments.</li>
+    <li><strong>2014 — Python 3.4</strong> switched <code>str</code>/<code>bytes</code> hashing to SipHash (PEP 456) as a HashDoS defence.</li>
+    <li><strong>2016–2017 — Compact layouts.</strong> Python 3.6 made <code>dict</code> compact and insertion ordered (guaranteed by the language from 3.7). Java 9 introduced Compact Strings (JEP 254), storing Latin-1 strings in one byte per character. Google presented SwissTable at CppCon 2017 and open-sourced it in Abseil.</li>
+    <li><strong>2021–2022 — Python 3.11</strong> replaced Timsort's ad-hoc merge policy with Munro and Wild's <em>powersort</em> policy (relevant again in Chapter 3).</li>
+    <li><strong>2025 — Go 1.24</strong> reimplemented the built-in <code>map</code> as a Swiss table.</li>
+  </ul>
+  <p>The through-line: notation came from mathematics, hashing came from practical engineering, and the last decade's changes were driven by two forces you will meet repeatedly — <em>adversarial input</em> (HashDoS) and <em>memory hierarchy</em> (cache-friendly layouts).</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 What we count: the cost model</h3>
+  <p>Complexity is always relative to a <strong>cost model</strong>. The standard one is the <em>word-RAM</em>: memory is an array of words of w bits (w ≥ log n so an index fits in a word), and arithmetic, comparison, reading or writing one word each cost one unit. Under this model, adding two <code>long</code>s is O(1), but comparing two strings of length m is O(m), and hashing a string is O(m) the first time. A frequent interview slip is to call "sort n strings" O(n log n) — it is O(m · n log n) comparisons-cost in the worst case, where m is string length.</p>
+  <p>Input size <em>n</em> must be named explicitly. For a graph it is usually V and E; for a matrix, rows × cols; for a number-theoretic routine (is this integer prime?), it is the number of <em>bits</em>, which is why trial division up to √N is exponential in the input size even though it "looks" polynomial in N.</p>
+
+  <h3>3.2 Asymptotic notation: O, Ω, Θ, o, ω</h3>
+  <p>Intuition first: we want to compare how functions <em>grow</em> while ignoring constant factors (which depend on hardware and compilers) and small inputs (where everything is fast).</p>
+  <ul>
+    <li><strong>f = O(g)</strong> — f grows <em>no faster</em> than g, up to a constant: an upper bound.</li>
+    <li><strong>f = Ω(g)</strong> — f grows <em>at least</em> as fast as g: a lower bound.</li>
+    <li><strong>f = Θ(g)</strong> — both: a tight bound. When an interviewer says "what is the Big O?" they nearly always mean Θ of the worst case.</li>
+    <li><strong>f = o(g)</strong> — f grows strictly slower (f/g → 0). <strong>ω</strong> is the strict lower analogue.</li>
+  </ul>
+  <p>Important distinction: notation bounds a <em>function</em>; "worst case", "best case" and "average case" choose <em>which</em> function. "Quicksort is O(n²)" (worst-case function) and "quicksort is Θ(n log n) expected" (expected-time function) are both true. Saying "the best case of insertion sort is Ω(n)" mixes nothing up — the best-case function is Θ(n), so it is trivially Ω(n).</p>
+  <p>The common growth ladder, slowest to fastest: 1 ≪ α(n) (inverse Ackermann) ≪ log* n ≪ log n ≪ √n ≪ n ≪ n log n ≪ n² ≪ n³ ≪ 2ⁿ ≪ n! ≪ nⁿ. Two useful facts: any polylogarithm is o(n<sup>ε</sup>) for every ε &gt; 0, and any polynomial is o(cⁿ) for every c &gt; 1.</p>
+
+  <h3>3.3 Worst, average, expected, amortized — four different promises</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Kind</th><th>Randomness over</th><th>Promise</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td>Worst case</td><td>none</td><td>every single operation/input obeys the bound</td><td>Merge sort Θ(n log n)</td></tr>
+      <tr><td>Average case</td><td>an assumed input distribution</td><td>mean over inputs</td><td>Naive quicksort on random permutations</td></tr>
+      <tr><td>Expected</td><td>the algorithm's own coin flips</td><td>mean over coins, for <em>every</em> input</td><td>Randomized quicksort, universal hashing</td></tr>
+      <tr><td>Amortized</td><td>none</td><td>total over any sequence of m ops ≤ m × bound</td><td><code>ArrayList.add</code> O(1)</td></tr>
+    </tbody>
+  </table></div>
+  <p>The distinction matters operationally. An amortized O(1) operation may still take Θ(n) once (the resize) — fine for batch throughput, possibly not fine for a p99.9 latency SLO in a trading gateway. An expected bound holds regardless of the input, so adversaries cannot pick a bad input; an average-case bound can be broken by an adversary who controls the input distribution (exactly what HashDoS did).</p>
+
+  <h3>3.4 Space complexity</h3>
+  <p>Count <strong>auxiliary</strong> space (beyond the input) unless told otherwise, and remember the hidden consumers: the <em>recursion stack</em> (a recursive DFS on a path graph of 10⁶ nodes uses Θ(n) stack and will throw <code>StackOverflowError</code> with default thread stacks), <em>copies</em> made by <code>substring</code>/slicing (Python <code>s[i:]</code> is O(n) time and space), and <em>boxing</em> (a <code>List&lt;Integer&gt;</code> of n elements is roughly 4–5× the memory of an <code>int[]</code> on a 64-bit JVM with compressed oops: a 4-byte reference plus a 16-byte <code>Integer</code> object per element versus 4 bytes).</p>
+
+  <h3>3.5 Amortized analysis — three methods</h3>
+  <p>Amortization answers: "Some operations are expensive, but they are rare; what is the cost per operation <em>averaged over a worst-case sequence</em>?" Three equivalent techniques:</p>
+  <ol>
+    <li><strong>Aggregate method</strong>: bound the total cost T(m) of any m operations, then divide. For a doubling array starting at capacity 1, m appends copy at most 1 + 2 + 4 + … + 2<sup>⌊log m⌋</sup> &lt; 2m elements, plus m writes, so T(m) &lt; 3m and each append is amortized O(1).</li>
+    <li><strong>Accounting (banker's) method</strong>: charge each cheap operation a little extra "credit" stored on the data structure, and pay for expensive operations from saved credit. Charge each append 3 units: 1 to write itself, 1 to pay for its own future copy, 1 to pay for copying an element that was already in the older half. When capacity doubles, every element in the new half has a credit to pay for moving an element.</li>
+    <li><strong>Potential method</strong>: define a potential Φ(state) ≥ 0, Φ(initial)=0; amortized cost = actual cost + ΔΦ. If Φ never goes negative, the sum of amortized costs bounds the sum of actual costs. We do the dynamic-array proof formally in §6.</li>
+  </ol>
+  <p>Amortization appears everywhere in Part 3: dynamic arrays, hash table resizing, the two-stack queue (Chapter 2), monotonic stacks (each element pushed and popped once), union-find with path compression (Chapter 5), and splay trees.</p>
+
+  <h3>3.6 Recurrences and the master theorem (intuition)</h3>
+  <p>Divide-and-conquer algorithms produce recurrences of the form T(n) = a·T(n/b) + f(n): a subproblems, each of size n/b, plus f(n) work to split and combine. Draw the <strong>recursion tree</strong>: level i has aⁱ nodes each of size n/bⁱ, so the work at level i is aⁱ·f(n/bⁱ). There are log<sub>b</sub> n levels and n<sup>log<sub>b</sub> a</sup> leaves. The master theorem simply asks which end of the tree dominates:</p>
+  <ul>
+    <li><strong>Leaves dominate</strong> (f grows polynomially slower than n<sup>log<sub>b</sub> a</sup>): T(n) = Θ(n<sup>log<sub>b</sub> a</sup>). Example: Karatsuba, T = 3T(n/2) + n → Θ(n<sup>1.585</sup>).</li>
+    <li><strong>Every level equal</strong> (f = Θ(n<sup>log<sub>b</sub> a</sup>)): multiply by the number of levels, Θ(n<sup>log<sub>b</sub> a</sup> log n). Example: merge sort, T = 2T(n/2) + n → Θ(n log n); binary search, T = T(n/2) + 1 → Θ(log n).</li>
+    <li><strong>Root dominates</strong> (f grows polynomially faster and satisfies a regularity condition): T(n) = Θ(f(n)). Example: T = 2T(n/2) + n² → Θ(n²).</li>
+  </ul>
+  <p>Recurrences that do not fit — T(n) = T(n−1) + n (selection sort, Θ(n²)), T(n) = 2T(n−1) + 1 (Towers of Hanoi, Θ(2ⁿ)), T(n) = T(n/3) + T(2n/3) + n (unbalanced split, still Θ(n log n)) — are solved by unrolling or by the recursion tree directly. The Akra–Bazzi method generalises the master theorem to unequal splits.</p>
+
+  <h3>3.7 Arrays: the machine's native structure</h3>
+  <p>An array is a contiguous block of equally sized slots. The address of element i is <code>base + i × size</code>, so random access is O(1) — a single multiply-add, no pointer chasing. That arithmetic is the whole reason arrays dominate: CPUs fetch memory in 64-byte cache lines and hardware prefetchers detect sequential strides, so scanning an <code>int[]</code> touches one new cache line every 16 elements. A linked list of the same length incurs a potential cache miss on <em>every</em> node (~100 ns to DRAM vs ~1 ns to L1). That is why "both are O(n) to traverse" hides a 10–50× real-world gap.</p>
+  <p>Costs on a static array of length n: read/write by index Θ(1); search unsorted Θ(n); search sorted Θ(log n) via binary search; insert/delete in the middle Θ(n) (shift); and no growth at all.</p>
+  <p>In Java, an <code>int[]</code> is a real contiguous block of primitives; an <code>Integer[]</code> or <code>Object[]</code> is a contiguous block of <em>references</em> to objects scattered across the heap. Project Valhalla's value classes aim to close this gap, but as of JDK 21 they are not available in a release. Python's <code>list</code> is likewise an array of pointers to <code>PyObject</code>s; for dense numerics use <code>array.array</code> or NumPy.</p>
+
+  <h3>3.8 Dynamic arrays</h3>
+  <p>A dynamic array (Java <code>ArrayList</code>, Python <code>list</code>, Go slices with <code>append</code>, C++ <code>std::vector</code>) wraps a static array with a <em>size</em> and a <em>capacity</em>. Appending when size &lt; capacity is a single write; appending when full allocates a larger array (multiplicative growth), copies everything, then writes. The growth factor must be <em>multiplicative</em>: growing by a constant k gives Θ(n²/k) total copying for n appends — amortized Θ(n) per append. Any factor r &gt; 1 gives amortized O(1); the trade-off is wasted space (up to (r−1)/r of capacity unused right after growth) versus copy frequency. Java uses 1.5×, CPython roughly 1.125× plus a constant, Go 2× for small slices tapering towards 1.25× for large ones.</p>
+  <p>Shrinking needs hysteresis: if you halve when the array becomes half full, alternating push/pop at the boundary causes Θ(n) per operation (thrashing). Shrink only at one-quarter full. <code>ArrayList</code> never shrinks automatically; you call <code>trimToSize()</code>.</p>
+
+  <h3>3.9 Strings</h3>
+  <p>A string is a sequence of characters — but "character" is ambiguous. Unicode defines <em>code points</em> (U+0000 to U+10FFFF). Encodings map code points to code units: UTF-8 (1–4 bytes, used by Go strings and most wire formats), UTF-16 (one or two 16-bit units; Java <code>char</code> is a UTF-16 code unit, so an emoji is two <code>char</code>s, a <em>surrogate pair</em>). A user-perceived character (grapheme cluster, like a flag or an accented letter built from combining marks) can be several code points. Consequences: <code>s.length()</code> in Java counts UTF-16 units, reversing a string <code>char</code>-by-<code>char</code> corrupts surrogate pairs, and "index i" in Go is a byte offset.</p>
+  <p><strong>Immutability.</strong> Java, Python and Go strings are immutable. Benefits: safe sharing across threads, caching the hash code (Java caches <code>hash</code> in the object), safe use as map keys, and string interning. Cost: every "modification" creates a new string, so building a string of length n by repeated <code>+=</code> in a loop is Θ(n²) total copying. Use <code>StringBuilder</code> (Java), <code>"".join(parts)</code> (Python) or <code>strings.Builder</code> (Go), each amortized O(1) per appended character — they are dynamic arrays of characters.</p>
+  <p><strong>Comparison and hashing are O(length).</strong> Two equal 1 MB strings take a megabyte of comparisons to confirm equality (identity checks shortcut only when the references are the same).</p>
+
+  <h3>3.10 String matching</h3>
+  <p>Problem: find occurrences of pattern P (length m) in text T (length n). The <strong>naive</strong> algorithm tries each alignment and compares up to m characters: Θ(nm) worst case (T = "aaaa…a", P = "aa…ab"), but typically fast on natural text because mismatches come early. <strong>KMP</strong> achieves Θ(n + m) worst case by never moving backwards in the text: when a mismatch happens after matching q characters, the longest proper prefix of P[0..q) that is also a suffix tells us how much of the match we can keep. That information is precomputed in the <em>prefix function</em> (failure function) π. <strong>Rabin–Karp</strong> compares <em>hashes</em> of windows: a polynomial rolling hash can be updated in O(1) as the window slides, so all n−m+1 window hashes cost Θ(n); only hash matches are verified character by character. Expected Θ(n + m), worst Θ(nm) if many spurious collisions — but its real power is <em>multi-pattern</em> matching and substring-equality queries (used with binary search in "longest duplicate substring"). <strong>Boyer–Moore</strong> (and the Horspool simplification) scan the pattern right-to-left and can skip large chunks; they are sublinear on average for large alphabets and are what <code>grep</code> descendants favour. The <strong>Z-algorithm</strong> computes, for each position, the longest substring starting there that matches a prefix — an alternative to π with the same Θ(n+m) bound.</p>
+
+  <h3>3.11 Hash functions</h3>
+  <p>A hash table stores key k in slot h(k) mod m. A good hash function for tables is <em>fast</em>, <em>deterministic within a process</em>, and <em>spreads</em> typical key sets uniformly. Cryptographic strength is not required, but <em>unpredictability</em> to attackers is desirable when keys come from untrusted input (hence SipHash in Python, Rust and Ruby). Java's <code>String.hashCode</code> is the polynomial s[0]·31<sup>n−1</sup> + … + s[n−1], computed with Horner's rule in 32-bit wrapping arithmetic. It is deterministic across JVMs — convenient, but it means collisions are trivially constructible: "Aa" and "BB" share a hash code, and so do all 2<sup>k</sup> concatenations of k such blocks.</p>
+  <p><strong>Universal hashing</strong> chooses h at random from a family H such that for any distinct x, y, Pr[h(x)=h(y)] ≤ 1/m. Then for any fixed key set, the expected chain length is O(1 + α) where α = n/m is the load factor — an expected bound adversaries cannot defeat unless they learn h.</p>
+
+  <h3>3.12 Collision resolution: chaining vs open addressing</h3>
+  <p><strong>Separate chaining</strong>: each slot holds a list (or tree) of entries. Simple, tolerant of load factors above 1, deletion is easy, entries never move (so references to them stay valid). Downsides: one pointer chase per entry, per-entry allocation overhead. Java <code>HashMap</code>, <code>ConcurrentHashMap</code> and Go's pre-1.24 map use variants.</p>
+  <p><strong>Open addressing</strong>: all entries live in the table itself; on collision, follow a deterministic <em>probe sequence</em>. Linear probing (i, i+1, i+2…) is the most cache-friendly but suffers <em>primary clustering</em> — runs of occupied slots grow and merge. Quadratic probing and double hashing break clusters at some cache cost. Deletion needs <em>tombstones</em> (a "deleted" marker so probes do not stop early) or backward-shift deletion. Load factor must stay well below 1. Python <code>dict</code>/<code>set</code>, Java's <code>IdentityHashMap</code> and <code>ThreadLocalMap</code>, Abseil SwissTable and Go 1.24 maps use open addressing. <em>Robin Hood hashing</em> (Celis, 1986) steals slots from entries that are closer to home, reducing probe-length variance.</p>
+
+  <h3>3.13 Load factor and resizing</h3>
+  <p>The load factor α = n/m trades memory for speed. With chaining, an unsuccessful lookup inspects about α entries; with linear probing, about ½(1 + 1/(1−α)²) probes — 2.5 at α = 0.5, 8.5 at α = 0.75, 50.5 at α = 0.9. That curve is why open-addressing tables cap α near 0.5–0.875 and chaining tables tolerate 0.75–1.0. When α exceeds the threshold, the table <em>resizes</em> (typically doubles) and <em>rehashes</em> every key — Θ(n) once, amortized O(1) per insertion by the same argument as dynamic arrays.</p>
+
+  <h3>3.14 Hash sets and the "seen" pattern</h3>
+  <p>A hash set is a hash map with no values (Java's <code>HashSet</code> literally wraps a <code>HashMap</code> with a dummy value). Its interview superpower is converting "have I seen something compatible with x before?" from an O(n) scan to O(1) expected. The compatible thing might be x itself (duplicates), target − x (Two Sum), a canonical form of x (sorted letters for anagrams), or a running prefix sum minus k (subarray sums).</p>
+
+  <h3>3.15 Prefix sums and difference arrays</h3>
+  <p>Given array a[0..n), the prefix sum array P has P[0] = 0 and P[i+1] = P[i] + a[i]. Then the sum of any range a[l..r] equals P[r+1] − P[l] — O(1) per query after Θ(n) preprocessing. In 2-D, P[i][j] stores the sum of the rectangle above-left of (i, j), and any sub-rectangle sum is obtained by inclusion–exclusion of four corners. The inverse idea is the <strong>difference array</strong>: to add v to every element in a[l..r] for many updates, record D[l] += v and D[r+1] −= v, then take a prefix sum once at the end — Θ(n + q) instead of Θ(nq). Prefix sums generalise to any associative, invertible operation: XOR prefixes, counts of a character, products (careful with zeros). Combined with a hash map from prefix value to earliest index or count, they solve "subarray with sum k" problems in linear time even with negative numbers — where sliding windows fail.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working: What the JDK and CPython Actually Do</h2>
+
+  <h3>4.1 ArrayList growth</h3>
+  <p>In OpenJDK 21, <code>ArrayList</code> holds an <code>Object[] elementData</code> and an <code>int size</code>. A default-constructed list shares an empty array sentinel and allocates capacity 10 on the first add. When full, <code>grow(minCapacity)</code> computes the new length via <code>ArraysSupport.newLength(oldCapacity, minCapacity − oldCapacity, oldCapacity &gt;&gt; 1)</code> — i.e. old + old/2, a 1.5× factor (or exactly what is needed, if more) — and calls <code>Arrays.copyOf</code>, which bottoms out in an intrinsic memory copy. <span class="tag version">Version-sensitive · checked Nov 2026</span></p>
+<pre class="ascii">
+add #   size  capacity  action
+ 1       1      10      allocate 10 (lazy first allocation)
+ ...
+ 11     11      15      copy 10 -&gt; new[15]
+ 16     16      22      copy 15 -&gt; new[22]
+ 23     23      33      copy 22 -&gt; new[33]
+ 34     34      49      copy 33 -&gt; new[49]
+ total copies for n adds ~ n * (1 + 2/3 + 4/9 + ...) = 3n  -&gt; O(1) amortized
+</pre>
+  <p>Note the geometric series: with growth factor r, the copies per element sum to 1/(r−1) — 2 for r = 1.5, 1 for r = 2. Smaller r wastes less memory but copies more. <code>add(index, e)</code> in the middle uses <code>System.arraycopy</code> to shift the tail: Θ(n − index). <code>remove(Object)</code> is a linear scan plus a shift.</p>
+
+  <h3>4.2 CPython list over-allocation</h3>
+  <p>CPython's <code>list_resize</code> (Objects/listobject.c) computes a new allocation of roughly <code>newsize + (newsize &gt;&gt; 3) + 6</code>, rounded down to a multiple of 4 — about 12.5% headroom plus a small constant. The growth pattern from empty is 0, 4, 8, 16, 24, 32, 40, 52, 64, 76, … Because headroom is proportional to size, the amortized cost of <code>append</code> is still O(1); the small factor favours memory over copy count, which suits a language where lists of pointers are ubiquitous. <code>list.pop()</code> from the end is O(1); <code>pop(0)</code> and <code>insert(0, x)</code> are O(n) — use <code>collections.deque</code>. <span class="tag version">Version-sensitive · checked Nov 2026</span></p>
+
+  <h3>4.3 Java strings: compact strings, cached hash, indy concatenation</h3>
+  <p>Since JDK 9 (JEP 254) a <code>String</code> holds a <code>byte[] value</code> and a <code>byte coder</code>: LATIN1 (one byte per char) when every character fits, otherwise UTF16 (two bytes per char). The field <code>int hash</code> caches the hash code after first computation (with a <code>hashIsZero</code> flag so strings that genuinely hash to 0 are not recomputed every time). <code>substring</code> copies (since 7u6 it no longer shares the parent array, which fixed a memory-leak pattern at the cost of O(k) copies). String concatenation with <code>+</code> compiles to an <code>invokedynamic</code> call to <code>StringConcatFactory</code> (JEP 280, JDK 9) — efficient for a single expression, but <code>s += x</code> <em>inside a loop</em> still allocates a new string each iteration: Θ(n²).</p>
+  <p>Python 3 strings (PEP 393) choose 1, 2 or 4 bytes per code point per string, based on the widest character, so indexing <code>s[i]</code> is O(1) by code point — unlike UTF-8 Go strings, where <code>s[i]</code> is a byte and ranging with <code>for _, r := range s</code> decodes runes.</p>
+
+  <h3>4.4 Java HashMap, step by step</h3>
+  <p>A <code>HashMap&lt;K,V&gt;</code> (OpenJDK 8 through 21) is an array <code>Node&lt;K,V&gt;[] table</code> whose length is always a power of two (default 16, lazily allocated). Each node stores <code>hash</code>, <code>key</code>, <code>value</code>, <code>next</code>.</p>
+  <ol>
+    <li><strong>Spread the hash.</strong> <code>hash(key) = (h = key.hashCode()) ^ (h &gt;&gt;&gt; 16)</code>. Because the index uses only the low bits, XOR-ing the high half down lets high-bit variation influence small tables.</li>
+    <li><strong>Index.</strong> <code>i = (n − 1) &amp; hash</code> — a bit mask instead of a modulo, valid because n is a power of two. Also avoids negative indices from negative hash codes.</li>
+    <li><strong>Empty bin</strong> → place a new node. <strong>Occupied</strong> → walk the chain comparing <code>hash</code> first (cheap int compare) and then <code>==</code> or <code>equals</code>; replace the value on match, else append at the tail (Java 8+ appends at tail; Java 7 prepended at head, which combined with unsynchronised concurrent resize could create a cycle and an infinite loop — a classic production incident).</li>
+    <li><strong>Treeify.</strong> If a chain reaches <code>TREEIFY_THRESHOLD = 8</code> nodes and the table has at least <code>MIN_TREEIFY_CAPACITY = 64</code> slots, the bin becomes a red-black tree of <code>TreeNode</code>s ordered by hash, then by <code>compareTo</code> if keys are <code>Comparable</code>, then by a tie-breaker (class name and identity hash). If the table is smaller than 64 it resizes instead. Trees shrink back to lists at <code>UNTREEIFY_THRESHOLD = 6</code> (the gap of 2 prevents flapping).</li>
+    <li><strong>Resize.</strong> After insert, if <code>++size &gt; threshold</code> (capacity × loadFactor, default 0.75), the table doubles. Because capacity is a power of two, each node either stays at index i or moves to i + oldCap, decided by a single bit: <code>(hash &amp; oldCap) == 0</code>. The JDK splits each chain into "lo" and "hi" lists, preserving relative order, with no rehash computation.</li>
+  </ol>
+<pre class="ascii">
+capacity 16 (mask 0b1111) -&gt; 32 (mask 0b11111); the new bit is 0b10000 = oldCap
+
+ bin 5 before:  [h=0b00101] -&gt; [h=0b10101] -&gt; [h=0b00101'] -&gt; [h=0b110101]
+ split on bit 4 (hash &amp; 16):
+   lo (bit=0) stays in bin 5      : 0b00101 -&gt; 0b00101'
+   hi (bit=1) moves to bin 5+16=21 : 0b10101 -&gt; 0b110101
+</pre>
+  <p>Why the Poisson argument for 8? The source comments note that with a well-distributed hash and load factor 0.75, bin sizes follow roughly a Poisson distribution with mean 0.5, so the probability of a bin reaching 8 is about 6 × 10⁻⁸. Treeification therefore almost never happens by accident; it exists for <em>bad</em> or <em>adversarial</em> hash codes.</p>
+
+  <h3>4.5 ConcurrentHashMap (JDK 8+)</h3>
+  <p>The Java 8 rewrite dropped the 16-segment lock striping. Now:</p>
+  <ul>
+    <li>Reads (<code>get</code>) are lock-free: the table array and node <code>val</code>/<code>next</code> fields are read with volatile semantics.</li>
+    <li>Inserting into an empty bin uses a single CAS. Inserting into a non-empty bin <code>synchronized</code>-locks the <em>first node of that bin</em> only — contention is per bin.</li>
+    <li>The size is maintained like a <code>LongAdder</code>: a base counter plus <code>CounterCell[]</code> to spread contention; <code>size()</code> sums them and is only a moment-in-time estimate under concurrent updates.</li>
+    <li>Resizing is cooperative: the table is split into strides; threads that encounter a <code>ForwardingNode</code> (hash <code>MOVED</code>) help transfer bins rather than block.</li>
+    <li>Null keys and values are forbidden, because <code>get</code> returning <code>null</code> must unambiguously mean "absent" in a concurrent setting.</li>
+    <li><code>computeIfAbsent</code> holds the bin lock while the mapping function runs — keep the function short and never let it update the same map (recursive updates throw <code>IllegalStateException("Recursive update")</code> in JDK 9+).</li>
+  </ul>
+
+  <h3>4.6 CPython dict: indices + compact entries</h3>
+  <p>Since Python 3.6, a dict has two arrays: a sparse <code>indices</code> table (1, 2, 4 or 8 bytes per slot depending on size) and a dense <code>entries</code> array of (hash, key, value) in insertion order. Lookup hashes the key, probes <code>indices</code> using an open-addressing recurrence that mixes in the higher hash bits through a <code>perturb</code> variable (roughly <code>i = (5*i + 1 + perturb) mod size; perturb &gt;&gt;= 5</code>), and follows the stored index into <code>entries</code>. The table is kept at most two-thirds full (usable = 2/3 of slots). Benefits: iteration order is insertion order, iteration is a dense scan, and memory drops 20–25% versus the older layout because the sparse part holds small integers rather than 24-byte entries. Deletion leaves a <code>DKIX_DUMMY</code> tombstone in <code>indices</code>. Small integers hash to themselves, which is why the perturbation is essential to avoid clustering for keys like 0, 8, 16…</p>
+
+  <h3>4.7 KMP prefix function, traced</h3>
+  <p>For pattern P, π[i] is the length of the longest proper prefix of P[0..i] that is also a suffix of it. Build it with the pattern matching against itself:</p>
+<pre class="ascii">
+P = a b a b a c a
+i = 0 1 2 3 4 5 6
+
+i=1 'b': k=0, P[0]='a' != 'b'            -&gt; pi[1]=0
+i=2 'a': k=0, P[0]='a' == 'a', k=1       -&gt; pi[2]=1
+i=3 'b': k=1, P[1]='b' == 'b', k=2       -&gt; pi[3]=2
+i=4 'a': k=2, P[2]='a' == 'a', k=3       -&gt; pi[4]=3
+i=5 'c': k=3, P[3]='b' != 'c', k=pi[2]=1
+         k=1, P[1]='b' != 'c', k=pi[0]=0
+         k=0, P[0]='a' != 'c'            -&gt; pi[5]=0
+i=6 'a': k=0, P[0]='a' == 'a', k=1       -&gt; pi[6]=1
+
+pi = [0,0,1,2,3,0,1]
+
+Search T = a b a b a b a c a :
+ matched "ababa" (q=5), T[5]='b' vs P[5]='c' mismatch
+ -&gt; q = pi[4] = 3 : keep "aba", compare T[5]='b' with P[3]='b' ok ...
+ text pointer never moves left.
+</pre>
+  <p><strong>Why linear?</strong> k increases by at most 1 per character and every fallback decreases it by at least 1, and k ≥ 0; so total fallbacks ≤ total increments ≤ m. The same argument bounds the search phase by 2n. This is an amortized argument with potential Φ = k.</p>
+
+  <h3>4.8 Rabin–Karp rolling hash, traced</h3>
+  <p>Treat a window of length m as a number in base B modulo a prime M: H(s[i..i+m)) = Σ s[i+j]·B<sup>m−1−j</sup> mod M. Sliding the window right by one: remove the leading character's contribution (multiply by B<sup>m−1</sup>, precomputed), shift by multiplying by B, add the new character:</p>
+<pre class="ascii">
+B=10, M=13, text digits "31415", m=3
+ H("314") = 314 mod 13 = 2
+ slide: H("141") = ((2 - 3*100) * 10 + 1) mod 13
+                 = ((2 - 300) * 10 + 1) mod 13 = (-2979) mod 13 = 11   (141 mod 13 = 11 ok)
+ slide: H("415") = ((11 - 1*100) * 10 + 5) mod 13 = (-885) mod 13 = 12 (415 mod 13 = 12 ok)
+ Each slide O(1); compare hashes, verify characters only when equal.
+</pre>
+  <p>In Java, take care with negative intermediate values: use <code>Math.floorMod</code> or add M before reducing. Use 64-bit arithmetic with M near 10⁹ so products fit in a <code>long</code>, or use two independent moduli ("double hashing") to make collisions astronomically unlikely.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: Visualising Growth, Lookups and Resizes</h2>
+
+  <figure class="diagram">
+    <div class="widget" data-widget="big-o"></div>
+    <figcaption>Widget 3.1 — Growth curves of O(1), O(log n), O(n), O(n log n), O(n²) and O(2ⁿ) with adjustable n.</figcaption>
+  </figure>
+  <p><strong>What to try:</strong> drag n from 10 to 1,000 and watch the n² and 2ⁿ curves leave the chart while n log n stays close to n. Then estimate: at 10⁸ simple operations per second, n = 10⁵ with an n² algorithm is 10¹⁰ ops ≈ 100 s — too slow for an online judge's ~1–2 s limit and far too slow for a request path — while n log n is about 1.7 × 10⁶ ops ≈ 17 ms. Keep this table in your head: n ≤ 10–12 suggests factorial/backtracking; n ≤ 20–25 suggests 2ⁿ (bitmask); n ≤ 500 suggests n³; n ≤ 5,000 suggests n²; n ≤ 10⁶ suggests n log n or n; larger suggests O(n) streaming, O(log n) or O(1) math.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A["put(key, value)"] --> B["h = key.hashCode() XOR (h unsigned-shift 16)"]
+  B --> C["i = (n - 1) AND h"]
+  C --> D{"table[i] empty?"}
+  D -- yes --> E["table[i] = new Node"]
+  D -- no --> F{"bin is TreeNode?"}
+  F -- yes --> G["putTreeVal: O(log k)"]
+  F -- no --> H["walk chain: compare hash, then equals"]
+  H --> I{"key found?"}
+  I -- yes --> J["replace value, return old"]
+  I -- no --> K["append at tail"]
+  K --> L{"chain length at least 8?"}
+  L -- "yes and capacity at least 64" --> M["treeifyBin"]
+  L -- "yes but capacity under 64" --> N["resize instead"]
+  E --> O{"++size over threshold?"}
+  G --> O
+  K --> O
+  O -- yes --> P["resize: double, split bins lo/hi"]
+</pre>
+    <figcaption>Figure 3.1 — Control flow of <code>HashMap.put</code> in OpenJDK 8–21.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the fast path is the top-left: one hash spread, one mask, one empty slot. Everything to the right is collision handling. Notice that treeification is gated on table capacity: for a small table, a long chain more likely signals "the table is too small" than "the hash is bad", so the map grows first. In an interview, walking this flow — including the lo/hi split on resize — is a strong signal of depth.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph Chaining["Separate chaining (Java HashMap)"]
+    T0["slot 0"] --> N1["(k1,v1)"] --> N2["(k9,v9)"]
+    T1["slot 1"]
+    T2["slot 2"] --> N3["(k2,v2)"]
+  end
+  subgraph Open["Open addressing, linear probe (Python dict indices)"]
+    S0["0: k1"]
+    S1["1: k9 (probed from 0)"]
+    S2["2: k2"]
+    S3["3: tombstone"]
+    S4["4: empty"]
+  end
+</pre>
+    <figcaption>Figure 3.2 — The same keys under chaining and under linear-probing open addressing.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> under chaining, k9 hangs off slot 0 in a separately allocated node — a pointer chase. Under open addressing, k9 lives in slot 1 because slot 0 was taken; a lookup for k9 starts at 0, probes 1, and stops. A lookup for a missing key that hashes to 0 must continue past the tombstone at slot 3 and stop only at the empty slot 4 — that is why tombstones accumulate cost and why tables periodically rebuild to purge them.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  A["a: 3 1 4 1 5"] --> P["P: 0 3 4 8 9 14"]
+  P --> Q["sum(a[1..3]) = P[4] - P[1] = 9 - 3 = 6"]
+  P --> H["HashMap prefix to count"]
+  H --> R["count subarrays with sum k: look up P[j] - k"]
+</pre>
+    <figcaption>Figure 3.3 — Prefix sums answer range queries; a hash map of previous prefixes answers "how many earlier prefixes differ by k".</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> a subarray a[i..j) has sum P[j] − P[i]. Asking "how many subarrays ending at j have sum k" is asking "how many earlier prefixes equal P[j] − k" — a hash map lookup. That single reframing turns an Θ(n²) double loop into Θ(n).</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math: Definitions, Proofs and Back-of-Envelope Numbers</h2>
+
+  <h3>6.1 Formal definitions</h3>
+  <p>Intuition: "eventually, up to a constant factor". Formally:</p>
+  \[ f(n) = O(g(n)) \iff \exists\, c \gt 0,\ n_0 : \forall n \ge n_0,\ 0 \le f(n) \le c \cdot g(n) \]
+  \[ f(n) = \Omega(g(n)) \iff \exists\, c \gt 0,\ n_0 : \forall n \ge n_0,\ f(n) \ge c \cdot g(n) \ge 0 \]
+  \[ f(n) = \Theta(g(n)) \iff f = O(g) \text{ and } f = \Omega(g), \qquad f = o(g) \iff \lim_{n\to\infty} \frac{f(n)}{g(n)} = 0 \]
+  <p>Worked example: \(3n^2 + 10n + 7 = \Theta(n^2)\). Upper: for \(n \ge 1\), \(3n^2 + 10n + 7 \le 3n^2 + 10n^2 + 7n^2 = 20n^2\), so c = 20, n₀ = 1. Lower: \(3n^2 + 10n + 7 \ge 3n^2\), so c = 3. Logarithm bases do not matter inside O because \(\log_a n = \log_b n / \log_b a\) differs by a constant factor; but they <em>do</em> matter in exponents: \(2^{\log_2 n} = n\) while \(4^{\log_2 n} = n^2\).</p>
+
+  <h3>6.2 Useful sums</h3>
+  \[ \sum_{i=1}^{n} i = \frac{n(n+1)}{2} = \Theta(n^2), \qquad \sum_{i=0}^{k} r^i = \frac{r^{k+1}-1}{r-1} = \Theta(r^k)\ (r \gt 1), \qquad \sum_{i=1}^{n} \frac{1}{i} = H_n = \ln n + O(1) \]
+  <p>The first explains nested loops where the inner loop runs i times. The second (a geometric series is dominated by its largest term) explains dynamic arrays, heaps built bottom-up, and the master theorem's extreme cases. The harmonic series explains, for example, the expected Θ(n log n) comparisons of randomized quicksort and the coupon-collector bound.</p>
+
+  <h3>6.3 Dynamic array: potential-method proof</h3>
+  <p>Let the array double when full. Define \(\Phi = 2 \cdot \text{size} - \text{capacity}\) (non-negative after the first growth, since the array is always at least half full). For an append without growth: actual cost 1, \(\Delta\Phi = 2\), amortized 3. For an append that triggers growth from capacity k (size = k before): actual cost \(k + 1\) (copy k, write 1); before, \(\Phi = 2k - k = k\); after, size = k+1, capacity = 2k, \(\Phi = 2(k+1) - 2k = 2\); so \(\Delta\Phi = 2 - k\) and amortized cost \(= k + 1 + 2 - k = 3\). Every append is amortized 3 = O(1). For a growth factor r, the same argument gives amortized cost \(1 + \frac{r}{r-1}\): 3 for r = 2, 4 for r = 1.5, 10 for r = 1.125.</p>
+
+  <h3>6.4 Master theorem</h3>
+  <p>For \(T(n) = a\,T(n/b) + f(n)\) with \(a \ge 1, b \gt 1\), let \(c^* = \log_b a\):</p>
+  \[ T(n) = \begin{cases} \Theta(n^{c^*}) & \text{if } f(n) = O(n^{c^*-\varepsilon}) \text{ for some } \varepsilon \gt 0 \\ \Theta(n^{c^*} \log^{k+1} n) & \text{if } f(n) = \Theta(n^{c^*} \log^{k} n),\ k \ge 0 \\ \Theta(f(n)) & \text{if } f(n) = \Omega(n^{c^*+\varepsilon}) \text{ and } a f(n/b) \le \delta f(n),\ \delta \lt 1 \end{cases} \]
+  <div class="table-wrap"><table>
+    <thead><tr><th>Algorithm</th><th>Recurrence</th><th>\(c^*\)</th><th>Case</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>Binary search</td><td>T(n/2) + 1</td><td>0</td><td>2 (k=0)</td><td>Θ(log n)</td></tr>
+      <tr><td>Merge sort</td><td>2T(n/2) + n</td><td>1</td><td>2</td><td>Θ(n log n)</td></tr>
+      <tr><td>Tree traversal (balanced)</td><td>2T(n/2) + 1</td><td>1</td><td>1</td><td>Θ(n)</td></tr>
+      <tr><td>Karatsuba multiplication</td><td>3T(n/2) + n</td><td>≈1.585</td><td>1</td><td>Θ(n<sup>1.585</sup>)</td></tr>
+      <tr><td>Strassen</td><td>7T(n/2) + n²</td><td>≈2.807</td><td>1</td><td>Θ(n<sup>2.807</sup>)</td></tr>
+      <tr><td>Quickselect (good pivots)</td><td>T(n/2) + n</td><td>0</td><td>3</td><td>Θ(n)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>6.5 Hashing probabilities</h3>
+  <p><strong>Chaining, simple uniform hashing:</strong> expected chain length α = n/m; unsuccessful search Θ(1 + α); successful search Θ(1 + α/2). <strong>Linear probing</strong> (Knuth's analysis, uniform hashing): expected probes ≈ \(\tfrac12\left(1 + \tfrac{1}{1-\alpha}\right)\) for a hit and \(\tfrac12\left(1 + \tfrac{1}{(1-\alpha)^2}\right)\) for a miss. <strong>Birthday bound:</strong> with n keys hashed into N values, the probability of at least one collision is about \(1 - e^{-n^2/(2N)}\); for 32-bit hash codes (N ≈ 4.3 × 10⁹) a collision becomes likely (≈50%) around n ≈ 77,000. That is why equals must always be checked after a hash match, and why 64-bit fingerprints are the minimum for deduplicating millions of items by hash alone.</p>
+  <p><strong>Rabin–Karp false positives:</strong> for two distinct strings of length m, the probability that their polynomial hashes collide under a random base B mod prime M is at most \((m-1)/M\) (a nonzero polynomial of degree ≤ m−1 has at most m−1 roots). With M ≈ 10⁹ and m = 10⁵, that is ≤ 10⁻⁴ per comparison — small but not negligible over 10⁶ comparisons; use two moduli to square it.</p>
+
+  <h3>6.6 Back-of-envelope memory for maps</h3>
+  <p><span class="tag illus">Illustrative</span> On a 64-bit HotSpot JVM with compressed oops, a <code>HashMap.Node</code> is about 32 bytes (12-byte header + int hash + 3 references, padded), plus 4 bytes per table slot (at load 0.75, ~5.3 bytes per entry), plus key and value objects: a <code>HashMap&lt;Long, Long&gt;</code> costs roughly 32 + 5 + 16 + 16 ≈ 70 bytes per entry versus 16 bytes for the raw data — about 4×. Ten million entries ≈ 700 MB of heap. Primitive maps (fastutil <code>Long2LongOpenHashMap</code>, Eclipse Collections) store keys and values in parallel <code>long[]</code> arrays with open addressing, typically ~20–35 bytes per entry. Measure with JOL (Java Object Layout) rather than trusting these numbers.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code: Implementations You Should Be Able to Write From Memory</h2>
+  <p>All Java listings are complete, compile with JDK 21 (<code>javac X.java &amp;&amp; java X</code>), and self-check in <code>main</code>. Python listings target 3.11+.</p>
+
+  <h3>7.1 Dynamic array with amortized growth and hysteretic shrink</h3>
+  <div class="code-tabs">
+<pre data-lang="Java" data-file="DynamicArray.java"><code class="language-java">import java.util.Arrays;
+import java.util.Iterator;
+import java.util.NoSuchElementException;
+
+/** Growable array: amortized O(1) append/pop, O(1) get/set, O(n) insert/remove in the middle. */
+public final class DynamicArray&lt;T&gt; implements Iterable&lt;T&gt; {
+    private Object[] data = new Object[4];
+    private int size;
+    private int copies; // instrumentation: total elements copied during resizes
+
+    public int size() { return size; }
+
+    @SuppressWarnings("unchecked")
+    public T get(int i) { Objects_checkIndex(i); return (T) data[i]; }
+
+    public void set(int i, T v) { Objects_checkIndex(i); data[i] = v; }
+
+    public void add(T v) {
+        if (size == data.length) resize(data.length * 2);      // multiplicative growth
+        data[size++] = v;
+    }
+
+    public void insert(int i, T v) {
+        if (i &lt; 0 || i &gt; size) throw new IndexOutOfBoundsException(i);
+        if (size == data.length) resize(data.length * 2);
+        System.arraycopy(data, i, data, i + 1, size - i);       // shift tail right: O(n - i)
+        data[i] = v;
+        size++;
+    }
+
+    @SuppressWarnings("unchecked")
+    public T removeLast() {
+        if (size == 0) throw new NoSuchElementException();
+        T v = (T) data[--size];
+        data[size] = null;                                       // let GC reclaim it
+        if (size &gt; 0 &amp;&amp; size == data.length / 4) resize(data.length / 2); // shrink at 1/4, not 1/2
+        return v;
+    }
+
+    private void resize(int newCap) {
+        copies += size;
+        data = Arrays.copyOf(data, Math.max(newCap, 4));
+    }
+
+    private void Objects_checkIndex(int i) {
+        if (i &lt; 0 || i &gt;= size) throw new IndexOutOfBoundsException(i);
+    }
+
+    int capacity() { return data.length; }
+    int copies() { return copies; }
+
+    @Override public Iterator&lt;T&gt; iterator() {
+        return new Iterator&lt;&gt;() {
+            int i = 0;
+            public boolean hasNext() { return i &lt; size; }
+            public T next() { if (!hasNext()) throw new NoSuchElementException(); return get(i++); }
+        };
+    }
+
+    public static void main(String[] args) {
+        var a = new DynamicArray&lt;Integer&gt;();
+        int n = 1_000_000;
+        for (int i = 0; i &lt; n; i++) a.add(i);
+        // aggregate method: total copies &lt; 2n for doubling
+        if (a.copies() &gt;= 2 * n) throw new AssertionError("copies " + a.copies());
+        a.insert(0, -1);
+        if (a.get(0) != -1 || a.get(1) != 0 || a.size() != n + 1) throw new AssertionError();
+        while (a.size() &gt; 1) a.removeLast();
+        if (a.capacity() &gt; 8) throw new AssertionError("did not shrink: " + a.capacity());
+        System.out.println("appends=" + n + " copies=" + a.copies() + " (amortized O(1))");
+    }
+}</code></pre>
+<pre data-lang="Python"><code class="language-python">class DynamicArray:
+    """Growable array with doubling growth and shrink at 1/4 full."""
+    def __init__(self):
+        self._data = [None] * 4
+        self._size = 0
+        self.copies = 0
+
+    def __len__(self):
+        return self._size
+
+    def __getitem__(self, i):
+        if not 0 &lt;= i &lt; self._size:
+            raise IndexError(i)
+        return self._data[i]
+
+    def append(self, v):
+        if self._size == len(self._data):
+            self._resize(2 * len(self._data))
+        self._data[self._size] = v
+        self._size += 1
+
+    def pop(self):
+        if self._size == 0:
+            raise IndexError("pop from empty")
+        self._size -= 1
+        v, self._data[self._size] = self._data[self._size], None
+        if 0 &lt; self._size == len(self._data) // 4:
+            self._resize(len(self._data) // 2)
+        return v
+
+    def _resize(self, cap):
+        self.copies += self._size
+        new = [None] * max(cap, 4)
+        new[: self._size] = self._data[: self._size]
+        self._data = new
+
+
+if __name__ == "__main__":
+    a = DynamicArray()
+    for i in range(100_000):
+        a.append(i)
+    assert a.copies &lt; 2 * 100_000
+    print("copies:", a.copies)</code></pre>
+  </div>
+  <p>Two details interviewers like: nulling the vacated slot in <code>removeLast</code> (otherwise the array keeps a reference and the object cannot be collected — a "loitering" memory leak), and shrinking at one quarter to avoid thrashing.</p>
+
+  <h3>7.2 Open-addressing hash map with linear probing and tombstones</h3>
+  <p>This is the structure behind Python's dict and every "implement a hash map" interview question. Note the separate handling of <em>empty</em> (stop probing) and <em>tombstone</em> (keep probing, but a reusable slot for inserts).</p>
+  <div class="code-tabs">
+<pre data-lang="Java" data-file="LinearProbingMap.java"><code class="language-java">import java.util.Objects;
+
+/** Open addressing, linear probing, power-of-two capacity, max load 0.5 (incl. tombstones). */
+public final class LinearProbingMap&lt;K, V&gt; {
+    private static final Object TOMBSTONE = new Object();
+    private Object[] keys;
+    private Object[] vals;
+    private int size;       // live entries
+    private int used;       // live + tombstones (they lengthen probes too)
+
+    public LinearProbingMap() { this(16); }
+    public LinearProbingMap(int cap) {
+        int c = Integer.highestOneBit(Math.max(4, cap) * 2 - 1); // round up to power of two
+        keys = new Object[c];
+        vals = new Object[c];
+    }
+
+    private static int spread(Object k) {
+        int h = k.hashCode();
+        h ^= (h &gt;&gt;&gt; 16);
+        return h * 0x9E3779B1;      // multiplicative (Fibonacci) mixing so low bits vary
+    }
+
+    private int slotFor(Object k) {
+        int mask = keys.length - 1;
+        int i = spread(k) &amp; mask;
+        while (keys[i] != null) {                     // stop only at a truly empty slot
+            if (keys[i] != TOMBSTONE &amp;&amp; keys[i].equals(k)) return i;
+            i = (i + 1) &amp; mask;
+        }
+        return -1;
+    }
+
+    @SuppressWarnings("unchecked")
+    public V get(K k) {
+        Objects.requireNonNull(k);
+        int i = slotFor(k);
+        return i &lt; 0 ? null : (V) vals[i];
+    }
+
+    @SuppressWarnings("unchecked")
+    public V put(K k, V v) {
+        Objects.requireNonNull(k);
+        if ((used + 1) * 2 &gt; keys.length) rehash(size * 2 + 2 &gt; keys.length ? keys.length * 2 : keys.length);
+        int mask = keys.length - 1;
+        int i = spread(k) &amp; mask, firstTomb = -1;
+        while (keys[i] != null) {
+            if (keys[i] == TOMBSTONE) { if (firstTomb &lt; 0) firstTomb = i; }
+            else if (keys[i].equals(k)) { V old = (V) vals[i]; vals[i] = v; return old; }
+            i = (i + 1) &amp; mask;
+        }
+        if (firstTomb &gt;= 0) i = firstTomb; else used++;  // reuse a tombstone if we passed one
+        keys[i] = k; vals[i] = v; size++;
+        return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    public V remove(K k) {
+        int i = slotFor(k);
+        if (i &lt; 0) return null;
+        V old = (V) vals[i];
+        keys[i] = TOMBSTONE; vals[i] = null; size--;
+        return old;
+    }
+
+    private void rehash(int newCap) {       // also purges tombstones
+        Object[] ok = keys, ov = vals;
+        keys = new Object[newCap]; vals = new Object[newCap];
+        size = 0; used = 0;
+        for (int j = 0; j &lt; ok.length; j++)
+            if (ok[j] != null &amp;&amp; ok[j] != TOMBSTONE) {
+                @SuppressWarnings("unchecked") K kk = (K) ok[j];
+                @SuppressWarnings("unchecked") V vv = (V) ov[j];
+                put(kk, vv);
+            }
+    }
+
+    public int size() { return size; }
+
+    public static void main(String[] args) {
+        var m = new LinearProbingMap&lt;String, Integer&gt;();
+        for (int i = 0; i &lt; 100_000; i++) m.put("k" + i, i);
+        for (int i = 0; i &lt; 100_000; i += 2) m.remove("k" + i);
+        for (int i = 0; i &lt; 100_000; i++) {
+            Integer v = m.get("k" + i);
+            if (i % 2 == 0 ? v != null : v != i) throw new AssertionError(i);
+        }
+        // "Aa" and "BB" collide in String.hashCode -- still correct
+        m.put("Aa", 1); m.put("BB", 2);
+        if (m.get("Aa") != 1 || m.get("BB") != 2 || m.size() != 50_002) throw new AssertionError();
+        System.out.println("ok size=" + m.size());
+    }
+}</code></pre>
+<pre data-lang="Python"><code class="language-python">_EMPTY, _TOMB = object(), object()
+
+class LinearProbingMap:
+    def __init__(self, cap=16):
+        self._keys = [_EMPTY] * cap
+        self._vals = [None] * cap
+        self._size = self._used = 0
+
+    def _probe(self, key):
+        mask = len(self._keys) - 1
+        i = hash(key) &amp; mask
+        while True:
+            yield i
+            i = (i + 1) &amp; mask
+
+    def get(self, key, default=None):
+        for i in self._probe(key):
+            k = self._keys[i]
+            if k is _EMPTY:
+                return default
+            if k is not _TOMB and k == key:
+                return self._vals[i]
+
+    def put(self, key, val):
+        if (self._used + 1) * 2 &gt; len(self._keys):
+            self._rehash(len(self._keys) * 2)
+        tomb = None
+        for i in self._probe(key):
+            k = self._keys[i]
+            if k is _EMPTY:
+                break
+            if k is _TOMB:
+                tomb = i if tomb is None else tomb
+            elif k == key:
+                self._vals[i] = val
+                return
+        if tomb is not None:
+            i = tomb
+        else:
+            self._used += 1
+        self._keys[i], self._vals[i] = key, val
+        self._size += 1
+
+    def remove(self, key):
+        for i in self._probe(key):
+            k = self._keys[i]
+            if k is _EMPTY:
+                raise KeyError(key)
+            if k is not _TOMB and k == key:
+                self._keys[i], self._vals[i] = _TOMB, None
+                self._size -= 1
+                return
+
+    def _rehash(self, cap):
+        old = [(k, v) for k, v in zip(self._keys, self._vals) if k is not _EMPTY and k is not _TOMB]
+        self.__init__(cap)
+        for k, v in old:
+            self.put(k, v)</code></pre>
+  </div>
+  <p>Why the multiplicative mix in Java? With a power-of-two mask we use only the low bits; <code>Integer.hashCode</code> is the identity, so keys 0, 16, 32… would all land in slot 0 of a 16-slot table. The golden-ratio multiplier (0x9E3779B1 ≈ 2³²/φ) propagates entropy into the low bits. Java's <code>HashMap</code> instead relies on the <code>h ^ (h &gt;&gt;&gt; 16)</code> spread plus chaining/treeification as a fallback.</p>
+
+  <h3>7.3 String matching: KMP, Rabin–Karp and Z</h3>
+  <div class="code-tabs">
+<pre data-lang="Java" data-file="StringMatching.java"><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+public final class StringMatching {
+
+    /** pi[i] = length of longest proper prefix of p[0..i] that is also its suffix. O(m). */
+    static int[] prefixFunction(String p) {
+        int m = p.length();
+        int[] pi = new int[m];
+        for (int i = 1, k = 0; i &lt; m; i++) {
+            while (k &gt; 0 &amp;&amp; p.charAt(i) != p.charAt(k)) k = pi[k - 1]; // fall back
+            if (p.charAt(i) == p.charAt(k)) k++;
+            pi[i] = k;
+        }
+        return pi;
+    }
+
+    /** All start indices of p in t. Theta(n + m) worst case. */
+    static List&lt;Integer&gt; kmp(String t, String p) {
+        List&lt;Integer&gt; out = new ArrayList&lt;&gt;();
+        if (p.isEmpty()) return out;
+        int[] pi = prefixFunction(p);
+        for (int i = 0, q = 0; i &lt; t.length(); i++) {
+            while (q &gt; 0 &amp;&amp; t.charAt(i) != p.charAt(q)) q = pi[q - 1];
+            if (t.charAt(i) == p.charAt(q)) q++;
+            if (q == p.length()) {           // full match ending at i
+                out.add(i - q + 1);
+                q = pi[q - 1];               // allow overlapping matches
+            }
+        }
+        return out;
+    }
+
+    /** Rabin-Karp with two moduli; expected Theta(n + m). */
+    static List&lt;Integer&gt; rabinKarp(String t, String p) {
+        final long B = 131, M1 = 1_000_000_007L, M2 = 998_244_353L;
+        int n = t.length(), m = p.length();
+        List&lt;Integer&gt; out = new ArrayList&lt;&gt;();
+        if (m == 0 || m &gt; n) return out;
+        long hp1 = 0, hp2 = 0, ht1 = 0, ht2 = 0, pow1 = 1, pow2 = 1;
+        for (int i = 0; i &lt; m; i++) {
+            hp1 = (hp1 * B + p.charAt(i)) % M1;  hp2 = (hp2 * B + p.charAt(i)) % M2;
+            ht1 = (ht1 * B + t.charAt(i)) % M1;  ht2 = (ht2 * B + t.charAt(i)) % M2;
+            if (i &gt; 0) { pow1 = pow1 * B % M1; pow2 = pow2 * B % M2; } // B^(m-1)
+        }
+        for (int i = 0; ; i++) {
+            if (ht1 == hp1 &amp;&amp; ht2 == hp2 &amp;&amp; t.regionMatches(i, p, 0, m)) out.add(i); // verify
+            if (i + m &gt;= n) break;
+            ht1 = Math.floorMod(ht1 - t.charAt(i) * pow1 % M1, M1);     // drop leading char
+            ht2 = Math.floorMod(ht2 - t.charAt(i) * pow2 % M2, M2);
+            ht1 = (ht1 * B + t.charAt(i + m)) % M1;                      // shift and add new char
+            ht2 = (ht2 * B + t.charAt(i + m)) % M2;
+        }
+        return out;
+    }
+
+    /** z[i] = length of longest substring starting at i that matches a prefix of s. O(n). */
+    static int[] zFunction(String s) {
+        int n = s.length();
+        int[] z = new int[n];
+        for (int i = 1, l = 0, r = 0; i &lt; n; i++) {
+            if (i &lt; r) z[i] = Math.min(r - i, z[i - l]);   // reuse the [l, r) box
+            while (i + z[i] &lt; n &amp;&amp; s.charAt(z[i]) == s.charAt(i + z[i])) z[i]++;
+            if (i + z[i] &gt; r) { l = i; r = i + z[i]; }
+        }
+        return z;
+    }
+
+    public static void main(String[] args) {
+        String t = "abababacaababacab", p = "ababaca";
+        var a = kmp(t, p);
+        var b = rabinKarp(t, p);
+        var expected = List.of(2, 9);
+        if (!a.equals(expected) || !b.equals(expected)) throw new AssertionError(a + " " + b);
+        if (!kmp("aaaaa", "aa").equals(List.of(0, 1, 2, 3))) throw new AssertionError();
+        int[] pi = prefixFunction("abababca");
+        if (pi[5] != 4) throw new AssertionError();
+        int[] z = zFunction("aabxaab");
+        if (z[4] != 3) throw new AssertionError();
+        System.out.println("kmp=" + a + " rk=" + b + " ok");
+    }
+}</code></pre>
+<pre data-lang="Python"><code class="language-python">def prefix_function(p: str) -&gt; list[int]:
+    pi, k = [0] * len(p), 0
+    for i in range(1, len(p)):
+        while k and p[i] != p[k]:
+            k = pi[k - 1]
+        if p[i] == p[k]:
+            k += 1
+        pi[i] = k
+    return pi
+
+
+def kmp(t: str, p: str) -&gt; list[int]:
+    if not p:
+        return []
+    pi, q, out = prefix_function(p), 0, []
+    for i, ch in enumerate(t):
+        while q and ch != p[q]:
+            q = pi[q - 1]
+        if ch == p[q]:
+            q += 1
+        if q == len(p):
+            out.append(i - q + 1)
+            q = pi[q - 1]
+    return out
+
+
+def rabin_karp(t: str, p: str, base: int = 131, mod: int = (1 &lt;&lt; 61) - 1) -&gt; list[int]:
+    n, m = len(t), len(p)
+    if m == 0 or m &gt; n:
+        return []
+    hp = ht = 0
+    for i in range(m):
+        hp = (hp * base + ord(p[i])) % mod
+        ht = (ht * base + ord(t[i])) % mod
+    top = pow(base, m - 1, mod)        # Python ints never overflow
+    out = []
+    for i in range(n - m + 1):
+        if ht == hp and t[i:i + m] == p:
+            out.append(i)
+        if i + m &lt; n:
+            ht = ((ht - ord(t[i]) * top) * base + ord(t[i + m])) % mod
+    return out
+
+
+assert kmp("abababacaababacab", "ababaca") == rabin_karp("abababacaababacab", "ababaca") == [2, 9]</code></pre>
+  </div>
+  <p>Production note: for single-pattern search in Java, <code>String.indexOf</code> is a naive scan heavily optimised with SIMD intrinsics in HotSpot; on realistic text it often beats a hand-written KMP. Reach for KMP when you need a worst-case guarantee (untrusted patterns and texts) or the prefix function itself (periodicity, border problems). Python's <code>str.find</code> uses a hybrid of Boyer–Moore–Horspool and Sunday heuristics, and since 3.10 switches to the Crochemore–Perrin "two-way" algorithm for longer needles, giving a linear worst case. <span class="tag version">Version-sensitive · checked Nov 2026</span></p>
+
+  <h3>7.4 Prefix sums: 1-D, 2-D and difference arrays</h3>
+  <div class="code-tabs">
+<pre data-lang="Java" data-file="PrefixSums.java"><code class="language-java">import java.util.Arrays;
+import java.util.HashMap;
+
+public final class PrefixSums {
+
+    /** P[i] = a[0] + ... + a[i-1]; range sum [l, r] = P[r+1] - P[l]. Uses long to avoid overflow. */
+    static long[] prefix(int[] a) {
+        long[] p = new long[a.length + 1];
+        for (int i = 0; i &lt; a.length; i++) p[i + 1] = p[i] + a[i];
+        return p;
+    }
+
+    /** 2-D: S[i][j] = sum of the rectangle rows [0,i) x cols [0,j). */
+    record Matrix2D(long[][] s) {
+        static Matrix2D of(int[][] g) {
+            int r = g.length, c = g[0].length;
+            long[][] s = new long[r + 1][c + 1];
+            for (int i = 0; i &lt; r; i++)
+                for (int j = 0; j &lt; c; j++)
+                    s[i + 1][j + 1] = g[i][j] + s[i][j + 1] + s[i + 1][j] - s[i][j];
+            return new Matrix2D(s);
+        }
+        /** inclusive corners (r1,c1)..(r2,c2), O(1) by inclusion-exclusion */
+        long sum(int r1, int c1, int r2, int c2) {
+            return s[r2 + 1][c2 + 1] - s[r1][c2 + 1] - s[r2 + 1][c1] + s[r1][c1];
+        }
+    }
+
+    /** Apply q range-add updates in O(n + q) using a difference array. */
+    static long[] applyRangeAdds(int n, int[][] updates) { // each {l, r, v}
+        long[] d = new long[n + 1];
+        for (int[] u : updates) { d[u[0]] += u[2]; d[u[1] + 1] -= u[2]; }
+        long[] out = new long[n];
+        long run = 0;
+        for (int i = 0; i &lt; n; i++) out[i] = run += d[i];
+        return out;
+    }
+
+    /** Count subarrays summing to k (negatives allowed): prefix sum + hash map, O(n). */
+    static int subarraySum(int[] a, int k) {
+        var seen = new HashMap&lt;Long, Integer&gt;();
+        seen.put(0L, 1);                         // the empty prefix
+        long run = 0; int count = 0;
+        for (int x : a) {
+            run += x;
+            count += seen.getOrDefault(run - k, 0);
+            seen.merge(run, 1, Integer::sum);
+        }
+        return count;
+    }
+
+    public static void main(String[] args) {
+        long[] p = prefix(new int[]{3, 1, 4, 1, 5});
+        if (p[4] - p[1] != 6) throw new AssertionError();
+        var m = Matrix2D.of(new int[][]{{1, 2, 3}, {4, 5, 6}, {7, 8, 9}});
+        if (m.sum(1, 1, 2, 2) != 28) throw new AssertionError();
+        long[] r = applyRangeAdds(5, new int[][]{{0, 2, 1}, {1, 4, 10}});
+        if (!Arrays.equals(r, new long[]{1, 11, 11, 10, 10})) throw new AssertionError(Arrays.toString(r));
+        if (subarraySum(new int[]{1, -1, 1, 1, -1}, 1) != 7) throw new AssertionError(subarraySum(new int[]{1, -1, 1, 1, -1}, 1));
+        System.out.println("prefix sums ok");
+    }
+}</code></pre>
+<pre data-lang="Python"><code class="language-python">from collections import defaultdict
+from itertools import accumulate
+
+def prefix(a):                       # P[0] = 0
+    return [0, *accumulate(a)]
+
+def subarray_sum(a, k):
+    seen, run, count = defaultdict(int), 0, 0
+    seen[0] = 1
+    for x in a:
+        run += x
+        count += seen[run - k]
+        seen[run] += 1
+    return count
+
+def range_adds(n, updates):
+    d = [0] * (n + 1)
+    for l, r, v in updates:
+        d[l] += v
+        d[r + 1] -= v
+    return list(accumulate(d[:n]))
+
+assert prefix([3, 1, 4, 1, 5])[4] - prefix([3, 1, 4, 1, 5])[1] == 6
+assert subarray_sum([1, -1, 1, 1, -1], 1) == 7
+assert range_adds(5, [(0, 2, 1), (1, 4, 10)]) == [1, 11, 11, 10, 10]</code></pre>
+  </div>
+  <p>The order inside the loop of <code>subarraySum</code> is load-bearing: look up <em>before</em> inserting the current prefix, otherwise k = 0 counts the empty subarray at every index.</p>
+
+  <h3>7.5 Measuring instead of guessing</h3>
+  <p>Asymptotics tell you the shape; benchmarks tell you the constant. In Java, microbenchmarks must use JMH (warm-up, dead-code elimination, on-stack replacement and GC all distort naive <code>System.nanoTime</code> loops). A minimal JMH comparison of <code>ArrayList.contains</code> vs <code>HashSet.contains</code> for n = 10, 100, 1000 typically shows the list winning at n = 10 (no hashing, one cache line) and losing badly by n = 1000 <span class="tag opinion">Opinion</span> — the crossover is the practical meaning of "constant factors".</p>
+<pre data-file="ContainsBenchmark.java (partial)"><code class="language-java">// Partial snippet: requires org.openjdk.jmh:jmh-core and jmh-generator-annprocess on the classpath.
+@State(Scope.Benchmark)
+@BenchmarkMode(Mode.AverageTime)
+@OutputTimeUnit(TimeUnit.NANOSECONDS)
+public class ContainsBenchmark {
+    @Param({"10", "100", "1000"}) int n;
+    List&lt;Integer&gt; list; Set&lt;Integer&gt; set; int probe;
+
+    @Setup public void setup() {
+        list = IntStream.range(0, n).boxed().toList();
+        set = new HashSet&lt;&gt;(list);
+        probe = n - 1;                                  // worst case for the list scan
+    }
+    @Benchmark public boolean list() { return list.contains(probe); }
+    @Benchmark public boolean set()  { return set.contains(probe); }
+}</code></pre>
+</section>
+
+<section id="applications">
+  <h2>8. Applications in Backend Engineering</h2>
+  <h3>8.1 Hash maps and sets</h3>
+  <ul>
+    <li><strong>Idempotency and deduplication.</strong> A payment API stores idempotency keys in a hash-based store (Redis, a unique index, or an in-memory <code>ConcurrentHashMap</code> with TTL for a single node) so retried requests return the original result. The core operation is "have I seen this key?" — the hash set pattern.</li>
+    <li><strong>Request-scoped joins.</strong> Instead of the N+1 query pattern, load child rows with one <code>WHERE parent_id IN (…)</code> query and group them in a <code>Map&lt;Long, List&lt;Child&gt;&gt;</code>: Θ(n + m) instead of n round trips. This is literally the hash join that your database runs internally.</li>
+    <li><strong>Caches.</strong> Every in-process cache (Caffeine, Guava, Spring's <code>ConcurrentMapCache</code>) is a hash table plus an eviction policy (Chapter 2 builds LRU).</li>
+    <li><strong>Counting and top-k.</strong> Counting events per tenant or per error code in a sliding interval: a hash map of counters, followed by a heap for top-k (Chapter 4).</li>
+    <li><strong>Sharding and routing.</strong> Hashing a key to choose a partition (Kafka's default partitioner hashes the record key with murmur2; consistent hashing in Part 2).</li>
+  </ul>
+  <h3>8.2 Arrays and dynamic arrays</h3>
+  <ul>
+    <li><strong>Ring buffers</strong> (the LMAX Disruptor, Netty's recycler, log appenders) are fixed arrays indexed modulo a power-of-two capacity — the cache-friendly alternative to linked queues.</li>
+    <li><strong>Columnar formats</strong> (Parquet, Arrow) store each column as a contiguous array so scans are sequential and SIMD-friendly.</li>
+    <li><strong>Batching.</strong> Accumulating records into a presized <code>ArrayList</code> before a JDBC batch insert or a Kafka <code>send</code> avoids repeated growth.</li>
+  </ul>
+  <h3>8.3 Strings and string matching</h3>
+  <ul>
+    <li><strong>Log scanning and alerting</strong>: matching many patterns at once is the Aho–Corasick automaton (a trie plus KMP-style failure links); single patterns use Boyer–Moore variants.</li>
+    <li><strong>Content-defined chunking and delta sync</strong>: rsync's rolling checksum finds blocks the receiver already has at any byte offset; backup and dedup systems choose chunk boundaries where a rolling hash hits a pattern, so an insertion shifts only nearby chunks.</li>
+    <li><strong>Plagiarism and near-duplicate detection</strong>: shingling with rolling hashes, then MinHash for similarity.</li>
+    <li><strong>Building responses</strong>: <code>StringBuilder</code>/<code>StringJoiner</code> and streaming writers instead of concatenation in loops; Jackson writes directly to output streams.</li>
+  </ul>
+  <h3>8.4 Prefix sums</h3>
+  <ul>
+    <li><strong>Analytics endpoints</strong>: cumulative counters per day let you answer "events between day l and r" in O(1); Prometheus counters are monotonic precisely so that <code>rate()</code> can be computed as a difference of two samples.</li>
+    <li><strong>Rate limiting and quotas</strong>: sliding-window counters keep per-bucket counts and sum a window (a small prefix-sum problem).</li>
+    <li><strong>Image processing / geospatial</strong>: 2-D summed-area tables (integral images) give O(1) box sums; the Viola–Jones face detector made them famous.</li>
+    <li><strong>Calendar/booking systems</strong>: difference arrays (or sweep lines) count overlapping reservations per time slot.</li>
+  </ul>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+
+  <h3>9.1 Hash flooding and Java 8's treeified bins <span class="tag fact">Verified</span></h3>
+  <p>In December 2011, Klink and Wälde demonstrated at the 28th Chaos Communication Congress that many web platforms parsed POST parameters into hash tables keyed by attacker-controlled strings with predictable hash functions. Since Java's <code>String.hashCode</code> is a public polynomial, an attacker can precompute thousands of colliding names; each insertion then walks a long chain, making parsing Θ(n²) — a few hundred kilobytes could pin a CPU for minutes. The coordinated advisory (oCERT-2011-003) led Tomcat and others to cap the number of parameters. The structural fix in the JDK came with Java 8's JEP 180, which converts long bins into balanced trees so worst-case lookups degrade to O(log n) instead of O(n). Python, Ruby and Perl took the other route — randomised, keyed hash functions (Python's SipHash, PEP 456). Lesson: <em>average-case</em> guarantees are only as good as your assumptions about who chooses the input.</p>
+
+  <h3>9.2 Python's compact dict <span class="tag fact">Verified</span></h3>
+  <p>Raymond Hettinger proposed splitting dict storage into a sparse index table and a dense entries array on python-dev in 2012; PyPy shipped the idea first, and CPython 3.6 adopted it (What's New in Python 3.6 reports 20–25% less memory use). The side effect — insertion ordering — became a language guarantee in 3.7. The design shows a recurring theme: you can keep the O(1) expected bounds while dramatically improving constant factors and memory by thinking about layout.</p>
+
+  <h3>9.3 Swiss tables in Abseil and Go 1.24 <span class="tag fact">Verified</span></h3>
+  <p>Google's SwissTable stores one control byte per slot (7 bits of the hash, or empty/deleted markers) in a separate array, grouped 16 at a time so that one SIMD instruction compares a probe group against the query's 7-bit tag. Most lookups touch one control group and one slot. Go 1.24 (February 2025) replaced the bucket-chained runtime map with a Swiss-table design; the Go blog post explains how they adapted it to Go's requirements such as incremental growth (splitting the map into many small tables so no single insert has to rehash everything — a latency-oriented answer to the amortization spike).</p>
+
+  <h3>9.4 rsync's rolling checksum <span class="tag fact">Verified</span></h3>
+  <p>Andrew Tridgell and Paul Mackerras's 1996 technical report describes rsync: the receiver sends weak (rolling, Adler-32–like) and strong (MD4 at the time) checksums of fixed blocks; the sender slides a window byte by byte over its file, updating the weak checksum in O(1) per byte, and only computes the strong checksum on weak matches. It is Rabin–Karp's "cheap filter, expensive verify" design applied to network synchronisation.</p>
+
+  <h3>9.5 Compact Strings in JDK 9 <span class="tag fact">Verified</span></h3>
+  <p>JEP 254 observed from heap dumps that strings are a major share of live heap data and most contain only Latin-1 characters. Switching <code>String</code>'s storage from <code>char[]</code> to <code>byte[]</code> plus a coder flag halved the footprint of such strings, with no API change. For you, the takeaway is that <code>String</code> memory is roughly 1 byte per ASCII character plus ~40 bytes of overhead (object + array headers), not 2 bytes per character.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Strengths and Limits</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Structure</th><th>Access by index</th><th>Search</th><th>Insert / delete</th><th>Ordered iteration</th><th>Memory</th><th>Main limitation</th></tr></thead>
+    <tbody>
+      <tr><td>Static array</td><td>Θ(1)</td><td>Θ(n); Θ(log n) if sorted</td><td>Θ(n) (shift)</td><td>by index</td><td>minimal</td><td>fixed size</td></tr>
+      <tr><td>Dynamic array</td><td>Θ(1)</td><td>Θ(n)</td><td>append O(1) amortized; middle Θ(n)</td><td>by index</td><td>up to r× slack</td><td>resize spikes; middle edits</td></tr>
+      <tr><td>Sorted array</td><td>Θ(1)</td><td>Θ(log n)</td><td>Θ(n)</td><td>yes</td><td>minimal</td><td>slow updates</td></tr>
+      <tr><td>Hash map (chaining)</td><td>—</td><td>Θ(1) expected; Θ(log n) worst (treeified)</td><td>Θ(1) expected amortized</td><td>no (LinkedHashMap: insertion)</td><td>~3–5× raw data in Java</td><td>no range queries; hash quality matters</td></tr>
+      <tr><td>Hash map (open addressing)</td><td>—</td><td>Θ(1) expected</td><td>Θ(1) expected amortized</td><td>no (Python: insertion)</td><td>lower; no per-entry nodes</td><td>load factor must stay low; tombstones</td></tr>
+      <tr><td>TreeMap (red-black)</td><td>—</td><td>Θ(log n) worst</td><td>Θ(log n) worst</td><td>yes, plus floor/ceiling</td><td>node per entry</td><td>slower constants</td></tr>
+      <tr><td>Prefix-sum array</td><td>—</td><td>range sum Θ(1)</td><td>point update Θ(n)</td><td>—</td><td>n+1 values</td><td>static data only (use Fenwick tree for updates)</td></tr>
+    </tbody>
+  </table></div>
+  <p>Operational costs worth naming: hash maps keep every key in memory (cardinality explosions such as per-user-agent maps leak memory); resize pauses are proportional to size (a 50-million-entry <code>HashMap</code> resize allocates and walks a 64M-slot table); and hash iteration order is unspecified, which breaks tests that assume an order.</p>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs and Decisions</h2>
+  <h3>11.1 Which lookup structure?</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  Q["Need lookup by key"] --> R{"Need order, ranges, floor/ceiling?"}
+  R -- yes --> S{"Data mostly static?"}
+  S -- yes --> SA["Sorted array + binary search"]
+  S -- no --> TM["TreeMap / ConcurrentSkipListMap"]
+  R -- no --> C{"Concurrent writers?"}
+  C -- yes --> CHM["ConcurrentHashMap"]
+  C -- no --> K{"Keys are small ints in a dense range?"}
+  K -- yes --> ARR["Plain array indexed by key"]
+  K -- no --> P{"Primitive keys, hot path, millions of entries?"}
+  P -- yes --> PM["Primitive open-addressing map (fastutil, Eclipse Collections)"]
+  P -- no --> HM["HashMap (presized)"]
+</pre>
+    <figcaption>Figure 3.4 — Choosing a lookup structure.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the first question is about <em>order</em>, because it eliminates hash tables entirely. The "dense small ints" branch is the most underused optimisation in interviews: counting lowercase letters with <code>int[26]</code> is faster and simpler than a <code>HashMap&lt;Character, Integer&gt;</code>.</p>
+
+  <h3>11.2 Chaining vs open addressing</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Criterion</th><th>Chaining</th><th>Open addressing</th></tr></thead>
+    <tbody>
+      <tr><td>Cache behaviour</td><td>pointer chase per entry</td><td>contiguous probes (best with linear probing / SIMD groups)</td></tr>
+      <tr><td>Max load factor</td><td>≥ 1 tolerated</td><td>~0.5–0.875</td></tr>
+      <tr><td>Deletion</td><td>trivial unlink</td><td>tombstones or backward shift</td></tr>
+      <tr><td>Entry stability</td><td>nodes never move (safe to hand out references)</td><td>entries move on resize</td></tr>
+      <tr><td>Adversarial worst case</td><td>can treeify (Java)</td><td>needs keyed hashing</td></tr>
+      <tr><td>Concurrency</td><td>per-bin locking natural (CHM)</td><td>harder; lock-free designs exist but are complex</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>11.3 Which string search?</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Need</th><th>Choose</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>One pattern, trusted input</td><td><code>String.indexOf</code> / <code>str.find</code></td><td>intrinsified, fastest in practice</td></tr>
+      <tr><td>Worst-case guarantee, or borders/periods</td><td>KMP or Z</td><td>Θ(n+m) deterministic</td></tr>
+      <tr><td>Many patterns of equal length, or substring equality queries</td><td>Rabin–Karp / polynomial hashing</td><td>O(1) per window, hash sets of fingerprints</td></tr>
+      <tr><td>Many patterns of varied length</td><td>Aho–Corasick</td><td>one pass over text for all patterns</td></tr>
+      <tr><td>Arbitrary regex over untrusted input</td><td>RE2-style automata (e.g. RE2/J)</td><td>backtracking engines like <code>java.util.regex</code> can be exponential (ReDoS)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>11.4 Prefix sums vs sliding window vs Fenwick tree</h3>
+  <p>If all numbers are non-negative and you need a contiguous range meeting a sum condition, a <em>sliding window</em> (Chapter 3) is O(n) with O(1) memory. With negatives, windows break (shrinking might increase the sum) and you need prefix sums + hashing. If the array is updated between queries, use a <em>Fenwick tree</em> (binary indexed tree) for O(log n) update and query, or a segment tree when you need min/max or lazy range updates.</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Misconceptions</h2>
+  <ul>
+    <li><strong>"O(1) means fast."</strong> A hash lookup of a 10 KB string key is O(key length) to hash and compare; an O(1) operation with a cache miss is slower than an O(log n) binary search in L1 for small n.</li>
+    <li><strong>Hidden linear costs inside loops.</strong> <code>list.contains</code>, <code>list.remove(Object)</code>, <code>list.indexOf</code>, <code>String.substring</code>, Python <code>x in list</code>, <code>s[i:]</code> and <code>list.pop(0)</code> are all Θ(n). Two of them inside a loop over n make the loop Θ(n²).</li>
+    <li><strong>Mutable keys.</strong> Mutating a field used in <code>hashCode</code> after insertion strands the entry in the wrong bucket: <code>get</code> returns null and <code>remove</code> fails while <code>size</code> still counts it. Use records or immutable value objects as keys.</li>
+    <li><strong>Broken equals/hashCode contract.</strong> Overriding <code>equals</code> without <code>hashCode</code> (or JPA entities whose hash changes when the ID is assigned on persist) puts "equal" objects in different buckets.</li>
+    <li><strong>Negative modulo.</strong> <code>hashCode() % n</code> can be negative in Java; <code>Math.abs(Integer.MIN_VALUE)</code> is still negative. Use <code>Math.floorMod</code> or a bit mask.</li>
+    <li><strong>Integer overflow in prefix sums</strong> (10⁵ values of 10⁹ overflow <code>int</code>) and in binary-search midpoints (<code>(lo + hi) / 2</code>). Use <code>long</code> and <code>lo + (hi − lo) / 2</code> or <code>(lo + hi) &gt;&gt;&gt; 1</code>.</li>
+    <li><strong>Comparing boxed integers with <code>==</code>.</strong> <code>Integer</code> caches −128..127, so <code>map.get(a) == map.get(b)</code> "works" in tests and fails in production for larger counts.</li>
+    <li><strong>String concatenation in loops</strong> — Θ(n²). Also <code>stream().reduce("", String::concat)</code>.</li>
+    <li><strong>Treating <code>char</code> as a character.</strong> Reversing, truncating or indexing by <code>char</code> splits surrogate pairs; use <code>codePoints()</code> or a <code>BreakIterator</code> for user-visible text.</li>
+    <li><strong>Modifying a collection while iterating</strong> → <code>ConcurrentModificationException</code> (fail-fast iterators check <code>modCount</code>). Use <code>Iterator.remove</code> or <code>removeIf</code>.</li>
+    <li><strong><code>Arrays.asList</code> is fixed-size</strong> and write-through to the array; <code>List.of</code> is immutable and rejects nulls.</li>
+    <li><strong>Assuming HashMap iteration order</strong>, then a JDK upgrade or a capacity change reorders output and snapshot tests fail.</li>
+    <li><strong>Forgetting the empty prefix</strong> (<code>seen.put(0, 1)</code>) in subarray-sum problems, which misses subarrays starting at index 0.</li>
+    <li><strong>Misusing amortized bounds</strong> for latency-critical paths — a single 100-million-element <code>ArrayList</code> resize copies 400 MB of references.</li>
+    <li><strong>Calling Rabin–Karp "O(n) worst case"</strong> — it is expected linear; worst case with adversarial collisions is Θ(nm) unless you skip verification (then it is Monte Carlo, possibly wrong).</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Performance</h3>
+  <ul>
+    <li><strong>Presize.</strong> Java 19 added <code>HashMap.newHashMap(int numMappings)</code>, which computes the right capacity for the load factor; before that, <code>new HashMap&lt;&gt;(n)</code> is a <em>capacity</em>, not an expected size, and will resize at 0.75n. Likewise <code>new ArrayList&lt;&gt;(n)</code> and <code>StringBuilder(n)</code>.</li>
+    <li><strong>Avoid boxing on hot paths.</strong> <code>int[]</code> counts, <code>IntStream</code>, or primitive collections. Profiling with async-profiler's allocation mode will show <code>Integer.valueOf</code> as a hotspot.</li>
+    <li><strong>Choose good hashCodes</strong> for composite keys: <code>record</code>s generate a well-mixed hash from all components; hand-rolled <code>a * 31 + b</code> is fine; <code>a + b</code> or <code>a ^ b</code> collides massively (every (x, x) pair XORs to 0).</li>
+  </ul>
+  <h3>13.2 Security</h3>
+  <ul>
+    <li><strong>Hash flooding:</strong> cap the number of request parameters, headers and JSON object fields (Jackson has <code>StreamReadConstraints</code> since 2.15 for nesting depth, number and string lengths); prefer keyed hashes for untrusted string keys in custom tables.</li>
+    <li><strong>ReDoS:</strong> catastrophic backtracking in regexes like <code>(a+)+$</code>; validate with linear-time engines for untrusted patterns or inputs, and set input length limits.</li>
+    <li><strong>Unicode normalization</strong> before comparing identifiers (NFC/NFKC), otherwise visually identical usernames are different keys.</li>
+  </ul>
+  <h3>13.3 Scalability and reliability</h3>
+  <ul>
+    <li>Unbounded in-memory maps are memory leaks waiting for traffic. Use bounded caches (Caffeine with <code>maximumSize</code>) and monitor heap after GC.</li>
+    <li><code>ConcurrentHashMap.size()</code> under heavy contention is approximate; use <code>mappingCount()</code> for long counts and do not use it for correctness decisions.</li>
+    <li>Huge arrays need contiguous heap: G1 allocates objects larger than half a region as <em>humongous</em> objects, which can fragment the heap and trigger full GCs. Chunk very large arrays.</li>
+  </ul>
+  <h3>13.4 Monitoring and maintainability</h3>
+  <ul>
+    <li>Track collection sizes as gauges (Micrometer can bind cache and map sizes) and alert on growth trends.</li>
+    <li>Document complexity assumptions on public methods ("O(n) in the number of line items") and add a performance regression test with a realistic n.</li>
+    <li>Prefer clear, standard structures; a custom hash table needs a strong reason and thorough tests (deletion with tombstones is where bugs hide).</li>
+  </ul>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises: Three Problem Ladders</h2>
+  <p>Each ladder climbs from easy to hard. Attempt each problem for 15–25 minutes before opening the solution; say the brute force and its complexity out loud first, then optimise. Problem statements are paraphrased; common names are given so you can find them on practice sites.</p>
+
+  <h3>14.1 Ladder A — Hashing ("have I seen something compatible?")</h3>
+  <div class="callout insight"><p class="callout-title">How to recognise the hashing pattern</p>
+  <ul>
+    <li>The brute force has a nested loop where the inner loop <em>searches</em> for a partner or a duplicate.</li>
+    <li>You need membership, counting or grouping by an exact key, and order does not matter.</li>
+    <li>Items are "equivalent" under some canonical form (sorted letters, normalised slope, character counts).</li>
+    <li>Constraints say n up to 10⁵–10⁶, so Θ(n²) is too slow but Θ(n) extra memory is acceptable.</li>
+    <li>The phrase "pair/complement/target" or "exists two elements such that…".</li>
+  </ul></div>
+
+  <div class="exercise">
+    <p class="exercise-title">A1 · Easy — "Contains Duplicate"</p>
+    <p>Given an integer array, report whether any value appears at least twice. Then state how your answer changes if memory must be O(1).</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> a hash set; <code>Set.add</code> returns false on a repeat, so we can exit early. Θ(n) expected time, Θ(n) space. With O(1) extra memory, sort in place (Θ(n log n)) and compare neighbours.</p>
+<pre data-file="A1ContainsDuplicate.java"><code class="language-java">import java.util.*;
+
+class A1ContainsDuplicate {
+    static boolean containsDuplicate(int[] a) {
+        var seen = HashSet.&lt;Integer&gt;newHashSet(a.length);   // JDK 19+: presized
+        for (int x : a) if (!seen.add(x)) return true;
+        return false;
+    }
+    static boolean containsDuplicateInPlace(int[] a) {
+        Arrays.sort(a);                                      // dual-pivot quicksort, O(1)-ish extra
+        for (int i = 1; i &lt; a.length; i++) if (a[i] == a[i - 1]) return true;
+        return false;
+    }
+    public static void main(String[] args) {
+        if (!containsDuplicate(new int[]{1, 2, 3, 1}) || containsDuplicate(new int[]{1, 2, 3})) throw new AssertionError();
+        if (!containsDuplicateInPlace(new int[]{4, 1, 4})) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">A2 · Easy — "Valid Anagram"</p>
+    <p>Decide whether two strings are rearrangements of each other. Follow-up: what if they contain arbitrary Unicode?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> count characters. For lowercase ASCII an <code>int[26]</code> beats a map. Θ(n) time, Θ(1) space (alphabet-bounded). For Unicode, count <em>code points</em> in a <code>HashMap&lt;Integer,Integer&gt;</code> (and normalise first if visually equal forms should match).</p>
+<pre data-file="A2ValidAnagram.java"><code class="language-java">import java.util.*;
+
+class A2ValidAnagram {
+    static boolean isAnagram(String s, String t) {
+        if (s.length() != t.length()) return false;
+        int[] c = new int[26];
+        for (int i = 0; i &lt; s.length(); i++) { c[s.charAt(i) - 'a']++; c[t.charAt(i) - 'a']--; }
+        for (int x : c) if (x != 0) return false;
+        return true;
+    }
+    static boolean isAnagramUnicode(String s, String t) {
+        var m = new HashMap&lt;Integer, Integer&gt;();
+        s.codePoints().forEach(cp -&gt; m.merge(cp, 1, Integer::sum));
+        t.codePoints().forEach(cp -&gt; m.merge(cp, -1, Integer::sum));
+        return m.values().stream().allMatch(v -&gt; v == 0);
+    }
+    public static void main(String[] args) {
+        if (!isAnagram("anagram", "nagaram") || isAnagram("rat", "car")) throw new AssertionError();
+        if (!isAnagramUnicode("a😀b", "b😀a")) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">A3 · Easy — "Two Sum"</p>
+    <p>Given an array and a target, return indices of two distinct positions whose values add to the target (exactly one answer exists).</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> one pass; before inserting x, ask whether <code>target − x</code> was seen. Looking up before inserting prevents pairing an element with itself. Θ(n) expected time and space. If the array were sorted, two pointers give Θ(1) space (Chapter 3).</p>
+<pre data-file="A3TwoSum.java"><code class="language-java">import java.util.*;
+
+class A3TwoSum {
+    static int[] twoSum(int[] a, int target) {
+        var indexOf = new HashMap&lt;Integer, Integer&gt;();
+        for (int i = 0; i &lt; a.length; i++) {
+            Integer j = indexOf.get(target - a[i]);
+            if (j != null) return new int[]{j, i};
+            indexOf.put(a[i], i);
+        }
+        throw new IllegalArgumentException("no pair");
+    }
+    public static void main(String[] args) {
+        System.out.println(Arrays.toString(twoSum(new int[]{2, 7, 11, 15}, 9)));   // [0, 1]
+        if (!Arrays.equals(twoSum(new int[]{3, 3}, 6), new int[]{0, 1})) throw new AssertionError();
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">A4 · Medium — "Group Anagrams"</p>
+    <p>Partition a list of lowercase words into groups of anagrams.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> map each word to a canonical key. Sorting letters costs Θ(k log k) per word; a 26-count signature costs Θ(k). Total Θ(n·k). Using a <code>String</code> built from counts as the key is safe; using <code>int[]</code> directly as a key is a bug (arrays use identity hashCode).</p>
+<pre data-file="A4GroupAnagrams.java"><code class="language-java">import java.util.*;
+
+class A4GroupAnagrams {
+    static List&lt;List&lt;String&gt;&gt; group(String[] words) {
+        var groups = new HashMap&lt;String, List&lt;String&gt;&gt;();
+        for (String w : words) {
+            int[] c = new int[26];
+            for (int i = 0; i &lt; w.length(); i++) c[w.charAt(i) - 'a']++;
+            String key = Arrays.toString(c);                 // canonical form, O(26)
+            groups.computeIfAbsent(key, k -&gt; new ArrayList&lt;&gt;()).add(w);
+        }
+        return new ArrayList&lt;&gt;(groups.values());
+    }
+    public static void main(String[] args) {
+        var g = group(new String[]{"eat", "tea", "tan", "ate", "nat", "bat"});
+        if (g.size() != 3) throw new AssertionError(g);
+        System.out.println(g);
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">A5 · Medium — "Longest Consecutive Sequence"</p>
+    <p>Given an unsorted integer array, return the length of the longest run of consecutive integers (values, not positions) in Θ(n) time.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> put all values in a set. Only start counting from x if x−1 is absent (x is a run start); then walk x+1, x+2… Each value is visited by at most one walk, so total work is Θ(n) despite the nested loop — an aggregate amortized argument. Sorting would be Θ(n log n).</p>
+<pre data-file="A5LongestConsecutive.java"><code class="language-java">import java.util.*;
+
+class A5LongestConsecutive {
+    static int longest(int[] a) {
+        var s = new HashSet&lt;Integer&gt;();
+        for (int x : a) s.add(x);
+        int best = 0;
+        for (int x : s) {
+            if (s.contains(x - 1)) continue;        // not the start of a run
+            int len = 1;
+            while (s.contains(x + len)) len++;
+            best = Math.max(best, len);
+        }
+        return best;
+    }
+    public static void main(String[] args) {
+        if (longest(new int[]{100, 4, 200, 1, 3, 2}) != 4) throw new AssertionError();
+        if (longest(new int[]{0, 3, 7, 2, 5, 8, 4, 6, 0, 1}) != 9) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">A6 · Medium — "4Sum II" (count tuples)</p>
+    <p>Given four arrays of length n, count tuples (i, j, k, l) with A[i]+B[j]+C[k]+D[l] = 0. n ≤ 200.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> meet in the middle. Count all sums A[i]+B[j] in a map (n² entries), then for every C[k]+D[l] add the count of its negation. Θ(n²) instead of Θ(n⁴). The same split-in-half trick powers "subset sum" for n ≈ 40 (2<sup>20</sup> per half).</p>
+<pre data-file="A6FourSumCount.java"><code class="language-java">import java.util.*;
+
+class A6FourSumCount {
+    static int count(int[] a, int[] b, int[] c, int[] d) {
+        var ab = new HashMap&lt;Integer, Integer&gt;();
+        for (int x : a) for (int y : b) ab.merge(x + y, 1, Integer::sum);
+        int total = 0;
+        for (int x : c) for (int y : d) total += ab.getOrDefault(-(x + y), 0);
+        return total;
+    }
+    public static void main(String[] args) {
+        if (count(new int[]{1, 2}, new int[]{-2, -1}, new int[]{-1, 2}, new int[]{0, 2}) != 2) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">A7 · Hard — "Max Points on a Line"</p>
+    <p>Given up to 300 integer points, find the largest number that lie on one straight line.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> fix an anchor point; every other point defines a direction. Points on the same line through the anchor share a <em>normalised</em> direction (dx, dy) divided by gcd, with a sign convention so (1,2) and (−1,−2) match. Count directions in a hash map. Θ(n²) time, Θ(n) space. Never use floating-point slopes as keys (precision, −0.0 vs 0.0, vertical lines). Duplicates of the anchor add to every line.</p>
+<pre data-file="A7MaxPoints.java"><code class="language-java">import java.util.*;
+
+class A7MaxPoints {
+    record Dir(int dx, int dy) {}
+    static int gcd(int a, int b) { return b == 0 ? Math.abs(a) : gcd(b, a % b); }
+
+    static int maxPoints(int[][] p) {
+        int n = p.length, best = Math.min(n, 1);
+        for (int i = 0; i &lt; n; i++) {
+            var count = new HashMap&lt;Dir, Integer&gt;();
+            int dup = 0, local = 0;
+            for (int j = i + 1; j &lt; n; j++) {
+                int dx = p[j][0] - p[i][0], dy = p[j][1] - p[i][1];
+                if (dx == 0 &amp;&amp; dy == 0) { dup++; continue; }
+                int g = gcd(dx, dy);
+                dx /= g; dy /= g;
+                if (dx &lt; 0 || (dx == 0 &amp;&amp; dy &lt; 0)) { dx = -dx; dy = -dy; }   // canonical sign
+                local = Math.max(local, count.merge(new Dir(dx, dy), 1, Integer::sum));
+            }
+            best = Math.max(best, local + dup + 1);
+        }
+        return best;
+    }
+    public static void main(String[] args) {
+        if (maxPoints(new int[][]{{1, 1}, {3, 2}, {5, 3}, {4, 1}, {2, 3}, {1, 4}}) != 4) throw new AssertionError();
+        if (maxPoints(new int[][]{{0, 0}, {0, 0}, {1, 1}}) != 3) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <h3>14.2 Ladder B — Prefix sums</h3>
+  <div class="callout insight"><p class="callout-title">How to recognise the prefix-sum pattern</p>
+  <ul>
+    <li>Many queries for the sum (or XOR, or count) over a contiguous range of a fixed array.</li>
+    <li>"Number of subarrays whose sum equals / is divisible by k" — especially when values can be negative (sliding window fails).</li>
+    <li>"Balance" problems: equal numbers of 0s and 1s, of vowels and consonants — map one class to +1 and the other to −1.</li>
+    <li>Many range <em>updates</em> applied before reading the result → difference array.</li>
+    <li>2-D rectangles: summed-area table; "count submatrices" → fix a pair of rows, collapse to 1-D.</li>
+  </ul></div>
+
+  <div class="exercise">
+    <p class="exercise-title">B1 · Easy — "Range Sum Query – Immutable"</p>
+    <p>Design a class that answers many sum(l, r) queries on a fixed array.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> precompute P with P[0] = 0. Θ(n) build, Θ(1) per query. If updates are added, switch to a Fenwick tree (Θ(log n) both).</p>
+<pre data-file="B1RangeSum.java"><code class="language-java">class B1RangeSum {
+    private final long[] p;
+    B1RangeSum(int[] a) {
+        p = new long[a.length + 1];
+        for (int i = 0; i &lt; a.length; i++) p[i + 1] = p[i] + a[i];
+    }
+    long sum(int l, int r) { return p[r + 1] - p[l]; }
+    public static void main(String[] args) {
+        var q = new B1RangeSum(new int[]{-2, 0, 3, -5, 2, -1});
+        if (q.sum(0, 2) != 1 || q.sum(2, 5) != -1 || q.sum(0, 5) != -3) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">B2 · Easy — "Find Pivot Index"</p>
+    <p>Return the leftmost index where the sum of elements strictly left equals the sum strictly right, or −1.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> right = total − left − a[i]. Keep a running left sum; no array needed. Θ(n) time, Θ(1) space.</p>
+<pre data-file="B2PivotIndex.java"><code class="language-java">import java.util.stream.IntStream;
+
+class B2PivotIndex {
+    static int pivot(int[] a) {
+        long total = IntStream.of(a).asLongStream().sum(), left = 0;
+        for (int i = 0; i &lt; a.length; i++) {
+            if (left == total - left - a[i]) return i;
+            left += a[i];
+        }
+        return -1;
+    }
+    public static void main(String[] args) {
+        if (pivot(new int[]{1, 7, 3, 6, 5, 6}) != 3 || pivot(new int[]{1, 2, 3}) != -1) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">B3 · Medium — "Product of Array Except Self"</p>
+    <p>Return an array where each position holds the product of all other elements, without division, in Θ(n) time.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> prefix <em>products</em> from the left and suffix products from the right; out[i] = left[i] × right[i]. Store the left products in the output array and fold the right product in a single variable: Θ(1) extra space beyond the output. Division fails with zeros, which is why it is excluded.</p>
+<pre data-file="B3ProductExceptSelf.java"><code class="language-java">import java.util.Arrays;
+
+class B3ProductExceptSelf {
+    static int[] product(int[] a) {
+        int n = a.length;
+        int[] out = new int[n];
+        out[0] = 1;
+        for (int i = 1; i &lt; n; i++) out[i] = out[i - 1] * a[i - 1];     // product of a[0..i)
+        int right = 1;
+        for (int i = n - 1; i &gt;= 0; i--) { out[i] *= right; right *= a[i]; }
+        return out;
+    }
+    public static void main(String[] args) {
+        if (!Arrays.equals(product(new int[]{1, 2, 3, 4}), new int[]{24, 12, 8, 6})) throw new AssertionError();
+        if (!Arrays.equals(product(new int[]{-1, 1, 0, -3, 3}), new int[]{0, 0, 9, 0, 0})) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">B4 · Medium — "Subarray Sum Equals K"</p>
+    <p>Count contiguous subarrays summing to k; values may be negative. (Implemented as <code>subarraySum</code> in §7.4 — reproduce it without looking, then explain why a sliding window is wrong here.)</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> count of earlier prefixes equal to run − k, seeded with {0: 1}. A sliding window assumes that extending the window never decreases the sum, which negative values violate. Θ(n) expected time, Θ(n) space.</p>
+<pre data-file="B4SubarraySumK.java"><code class="language-java">import java.util.*;
+
+class B4SubarraySumK {
+    static int count(int[] a, int k) {
+        var freq = new HashMap&lt;Long, Integer&gt;(Map.of(0L, 1));
+        long run = 0; int res = 0;
+        for (int x : a) {
+            run += x;
+            res += freq.getOrDefault(run - k, 0);   // look up first
+            freq.merge(run, 1, Integer::sum);       // then record
+        }
+        return res;
+    }
+    public static void main(String[] args) {
+        if (count(new int[]{1, 1, 1}, 2) != 2 || count(new int[]{3, 4, 7, 2, -3, 1, 4, 2}, 7) != 4) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">B5 · Medium — "Contiguous Array"</p>
+    <p>In a binary array, find the longest contiguous subarray with equal numbers of 0s and 1s.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> map 0 → −1; we need the longest subarray with sum 0, i.e. two equal prefix values as far apart as possible. Store the <em>first</em> index of each prefix value (seed {0: −1}). Θ(n) time; the prefix range is [−n, n] so an <code>int[2n+1]</code> can replace the map.</p>
+<pre data-file="B5ContiguousArray.java"><code class="language-java">import java.util.Arrays;
+
+class B5ContiguousArray {
+    static int findMaxLength(int[] a) {
+        int n = a.length;
+        int[] first = new int[2 * n + 1];
+        Arrays.fill(first, Integer.MIN_VALUE);
+        first[n] = -1;                               // prefix 0 seen "before" index 0
+        int run = 0, best = 0;
+        for (int i = 0; i &lt; n; i++) {
+            run += a[i] == 1 ? 1 : -1;
+            if (first[run + n] == Integer.MIN_VALUE) first[run + n] = i;
+            else best = Math.max(best, i - first[run + n]);
+        }
+        return best;
+    }
+    public static void main(String[] args) {
+        if (findMaxLength(new int[]{0, 1, 0}) != 2 || findMaxLength(new int[]{0, 0, 1, 0, 0, 0, 1, 1}) != 6) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">B6 · Medium — "Subarray Sums Divisible by K"</p>
+    <p>Count non-empty subarrays whose sum is divisible by k (values may be negative).</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> P[j] − P[i] ≡ 0 (mod k) ⇔ P[j] ≡ P[i] (mod k). Count prefix residues; each new residue r adds count[r]. Use <code>Math.floorMod</code> so negative sums map into [0, k). Θ(n + k).</p>
+<pre data-file="B6DivisibleByK.java"><code class="language-java">class B6DivisibleByK {
+    static int count(int[] a, int k) {
+        int[] cnt = new int[k];
+        cnt[0] = 1;
+        int run = 0, res = 0;
+        for (int x : a) {
+            run = Math.floorMod(run + x, k);
+            res += cnt[run]++;
+        }
+        return res;
+    }
+    public static void main(String[] args) {
+        if (count(new int[]{4, 5, 0, -2, -3, 1}, 5) != 7 || count(new int[]{-1, 2, 9}, 2) != 2) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">B7 · Hard — "Number of Submatrices That Sum to Target"</p>
+    <p>Count all non-empty rectangular submatrices (r × c ≤ 100 × 100) whose sum equals a target.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> fix a top row and a bottom row (Θ(r²) pairs); maintain column sums between them, which collapses the rectangle to a 1-D array of length c; then run B4 on it. Θ(r² · c) time, Θ(c) space. Always iterate the smaller dimension in the outer pair (transpose if needed).</p>
+<pre data-file="B7SubmatrixTarget.java"><code class="language-java">import java.util.*;
+
+class B7SubmatrixTarget {
+    static int count(int[][] g, int target) {
+        int r = g.length, c = g[0].length, res = 0;
+        for (int top = 0; top &lt; r; top++) {
+            int[] col = new int[c];
+            for (int bot = top; bot &lt; r; bot++) {
+                for (int j = 0; j &lt; c; j++) col[j] += g[bot][j];   // column sums rows top..bot
+                var freq = new HashMap&lt;Integer, Integer&gt;();
+                freq.put(0, 1);
+                int run = 0;
+                for (int j = 0; j &lt; c; j++) {
+                    run += col[j];
+                    res += freq.getOrDefault(run - target, 0);
+                    freq.merge(run, 1, Integer::sum);
+                }
+            }
+        }
+        return res;
+    }
+    public static void main(String[] args) {
+        if (count(new int[][]{{0, 1, 0}, {1, 1, 1}, {0, 1, 0}}, 0) != 4) throw new AssertionError();
+        if (count(new int[][]{{1, -1}, {-1, 1}}, 0) != 5) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <h3>14.3 Ladder C — Strings and string matching</h3>
+  <div class="callout insight"><p class="callout-title">How to recognise string-matching patterns</p>
+  <ul>
+    <li>"Find a pattern in a text", "does the string consist of repeats", "longest prefix that is also a suffix" → KMP prefix function or Z-function.</li>
+    <li>"Compare many substrings for equality" or "longest repeated substring" → rolling hash, often with binary search on the length (monotone: if a length-L repeat exists, a length L−1 one does too).</li>
+    <li>Palindrome-at-the-start problems → KMP on s + separator + reverse(s).</li>
+    <li>Character-frequency constraints → counting arrays (A2) or sliding windows (Chapter 3).</li>
+  </ul></div>
+
+  <div class="exercise">
+    <p class="exercise-title">C1 · Easy — "Valid Palindrome"</p>
+    <p>Ignoring case and non-alphanumeric characters, decide whether a string reads the same both ways, in Θ(1) extra space.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> two pointers converging, skipping non-alphanumerics. Avoid building a cleaned copy (Θ(n) space) — interviewers often ask for the in-place version.</p>
+<pre data-file="C1ValidPalindrome.java"><code class="language-java">class C1ValidPalindrome {
+    static boolean isPalindrome(String s) {
+        int i = 0, j = s.length() - 1;
+        while (i &lt; j) {
+            if (!Character.isLetterOrDigit(s.charAt(i))) i++;
+            else if (!Character.isLetterOrDigit(s.charAt(j))) j--;
+            else if (Character.toLowerCase(s.charAt(i++)) != Character.toLowerCase(s.charAt(j--))) return false;
+        }
+        return true;
+    }
+    public static void main(String[] args) {
+        if (!isPalindrome("A man, a plan, a canal: Panama") || isPalindrome("race a car")) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">C2 · Easy — "Longest Common Prefix"</p>
+    <p>Return the longest prefix shared by every string in an array.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> vertical scan: compare column by column, stop at the first mismatch or end of the shortest string. Θ(S) where S is the total characters examined (at most n × min length). A trie also works but is overkill unless queries repeat.</p>
+<pre data-file="C2LongestCommonPrefix.java"><code class="language-java">class C2LongestCommonPrefix {
+    static String lcp(String[] a) {
+        if (a.length == 0) return "";
+        for (int col = 0; col &lt; a[0].length(); col++) {
+            char ch = a[0].charAt(col);
+            for (int r = 1; r &lt; a.length; r++)
+                if (col == a[r].length() || a[r].charAt(col) != ch) return a[0].substring(0, col);
+        }
+        return a[0];
+    }
+    public static void main(String[] args) {
+        if (!lcp(new String[]{"flower", "flow", "flight"}).equals("fl") || !lcp(new String[]{"dog", "car"}).isEmpty()) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">C3 · Medium — "Find the Index of the First Occurrence" with a worst-case guarantee</p>
+    <p>Return the first index of a needle in a haystack, or −1, in Θ(n + m) worst case.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> KMP, stopping at the first full match. Mention that <code>haystack.indexOf(needle)</code> is the production answer, then justify KMP by the worst-case requirement.</p>
+<pre data-file="C3StrStr.java"><code class="language-java">class C3StrStr {
+    static int strStr(String t, String p) {
+        if (p.isEmpty()) return 0;
+        int m = p.length();
+        int[] pi = new int[m];
+        for (int i = 1, k = 0; i &lt; m; i++) {
+            while (k &gt; 0 &amp;&amp; p.charAt(i) != p.charAt(k)) k = pi[k - 1];
+            if (p.charAt(i) == p.charAt(k)) k++;
+            pi[i] = k;
+        }
+        for (int i = 0, q = 0; i &lt; t.length(); i++) {
+            while (q &gt; 0 &amp;&amp; t.charAt(i) != p.charAt(q)) q = pi[q - 1];
+            if (t.charAt(i) == p.charAt(q)) q++;
+            if (q == m) return i - m + 1;
+        }
+        return -1;
+    }
+    public static void main(String[] args) {
+        if (strStr("sadbutsad", "sad") != 0 || strStr("leetcode", "leeto") != -1 || strStr("aaaaab", "aab") != 3) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">C4 · Medium — "Repeated Substring Pattern"</p>
+    <p>Decide whether a string can be built by concatenating two or more copies of one of its substrings.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> let b = π[n−1], the longest border. The smallest period is p = n − b. The string is a repetition iff b &gt; 0 and n is divisible by p. Θ(n). (The famous one-liner <code>(s + s).substring(1, 2n − 1).contains(s)</code> is also correct — s is a rotation of itself at a non-trivial shift iff it is periodic — but its complexity depends on the search algorithm.)</p>
+<pre data-file="C4RepeatedSubstring.java"><code class="language-java">class C4RepeatedSubstring {
+    static boolean repeated(String s) {
+        int n = s.length();
+        int[] pi = new int[n];
+        for (int i = 1, k = 0; i &lt; n; i++) {
+            while (k &gt; 0 &amp;&amp; s.charAt(i) != s.charAt(k)) k = pi[k - 1];
+            if (s.charAt(i) == s.charAt(k)) k++;
+            pi[i] = k;
+        }
+        int border = n == 0 ? 0 : pi[n - 1];
+        return border &gt; 0 &amp;&amp; n % (n - border) == 0;
+    }
+    public static void main(String[] args) {
+        if (!repeated("abab") || repeated("aba") || !repeated("abcabcabcabc") || repeated("abac")) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">C5 · Hard — "Shortest Palindrome"</p>
+    <p>Prepend the fewest characters to a string to make it a palindrome; return the result.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> we need the longest palindromic <em>prefix</em> of s. Build t = s + "#" + reverse(s); the last value of π on t is the length of the longest prefix of s that equals a suffix of reverse(s), i.e. the longest palindromic prefix. The separator stops borders from crossing the middle. Prepend the reverse of the remaining suffix. Θ(n), versus Θ(n²) for checking every prefix.</p>
+<pre data-file="C5ShortestPalindrome.java"><code class="language-java">class C5ShortestPalindrome {
+    static String shortest(String s) {
+        String rev = new StringBuilder(s).reverse().toString();
+        String t = s + "#" + rev;
+        int[] pi = new int[t.length()];
+        for (int i = 1, k = 0; i &lt; t.length(); i++) {
+            while (k &gt; 0 &amp;&amp; t.charAt(i) != t.charAt(k)) k = pi[k - 1];
+            if (t.charAt(i) == t.charAt(k)) k++;
+            pi[i] = k;
+        }
+        int palPrefix = pi[t.length() - 1];
+        return rev.substring(0, s.length() - palPrefix) + s;
+    }
+    public static void main(String[] args) {
+        if (!shortest("aacecaaa").equals("aaacecaaa") || !shortest("abcd").equals("dcbabcd") || !shortest("").isEmpty()) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">C6 · Hard — "Longest Duplicate Substring"</p>
+    <p>Return any longest substring that occurs at least twice (possibly overlapping) in a string of length up to 3 × 10⁴.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> the predicate "a duplicate of length L exists" is monotone in L, so binary search L. For a fixed L, compute all window hashes with a rolling hash and look for a repeat in a hash set — Θ(n) expected. Total Θ(n log n) expected. Use two moduli combined into one <code>long</code> key to make false positives negligible (or verify with <code>regionMatches</code>, kept here for safety). A suffix array/automaton gives a deterministic Θ(n log n)/Θ(n) alternative.</p>
+<pre data-file="C6LongestDupSubstring.java"><code class="language-java">import java.util.*;
+
+class C6LongestDupSubstring {
+    static final long B = 131, M1 = 1_000_000_007L, M2 = 998_244_353L;
+
+    /** start index of some duplicated substring of length len, or -1 */
+    static int find(String s, int len) {
+        if (len == 0) return 0;
+        long h1 = 0, h2 = 0, p1 = 1, p2 = 1;
+        for (int i = 0; i &lt; len; i++) {
+            h1 = (h1 * B + s.charAt(i)) % M1; h2 = (h2 * B + s.charAt(i)) % M2;
+            if (i &gt; 0) { p1 = p1 * B % M1; p2 = p2 * B % M2; }
+        }
+        var seen = new HashMap&lt;Long, Integer&gt;();
+        seen.put(h1 &lt;&lt; 32 | h2, 0);
+        for (int i = 1; i + len &lt;= s.length(); i++) {
+            h1 = (Math.floorMod(h1 - s.charAt(i - 1) * p1 % M1, M1) * B + s.charAt(i + len - 1)) % M1;
+            h2 = (Math.floorMod(h2 - s.charAt(i - 1) * p2 % M2, M2) * B + s.charAt(i + len - 1)) % M2;
+            Integer prev = seen.putIfAbsent(h1 &lt;&lt; 32 | h2, i);
+            if (prev != null &amp;&amp; s.regionMatches(prev, s, i, len)) return i;
+        }
+        return -1;
+    }
+
+    static String longestDup(String s) {
+        int lo = 0, hi = s.length() - 1, bestStart = 0, bestLen = 0;
+        while (lo &lt;= hi) {
+            int mid = (lo + hi) &gt;&gt;&gt; 1;
+            int at = find(s, mid);
+            if (at &gt;= 0) { bestStart = at; bestLen = mid; lo = mid + 1; } else hi = mid - 1;
+        }
+        return s.substring(bestStart, bestStart + bestLen);
+    }
+
+    public static void main(String[] args) {
+        if (!longestDup("banana").equals("ana") || !longestDup("abcd").isEmpty()) throw new AssertionError(longestDup("banana"));
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is the difference between amortized O(1) and expected O(1)? Give a structure that has each.</summary><div>
+    <p>Amortized is a deterministic guarantee about <em>sequences</em>: any m operations cost O(m) total, though one operation may cost Θ(n) (dynamic array append, hash table insertion including resize). Expected is a probabilistic guarantee about <em>each operation</em>, averaged over the algorithm's random choices (hash lookup under universal hashing, randomized quicksort's partition). Hash table insertion is both: expected over hashing, amortized over resizing. In a latency discussion, point out that neither bounds the worst single operation; Go 1.24 maps and incremental rehashing in Redis exist to bound that tail.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Walk me through HashMap.put in Java 8+, including resize and treeification.</summary><div>
+    <p>Spread hash (h ^ h&gt;&gt;&gt;16), mask with (n−1) because capacity is a power of two, CAS-free insert into an empty bin or walk the chain comparing hash then equals; replace or append at tail. If the chain hits 8 and capacity ≥ 64, convert the bin to a red-black tree ordered by hash, then compareTo, then a tie-breaker; if capacity &lt; 64 resize instead. After insertion, if size exceeds 0.75 × capacity, double the table and split each bin into lo/hi lists by the bit (hash &amp; oldCap) — no rehashing needed. Trees untreeify at 6. Bonus points: Java 7 head insertion plus unsynchronised concurrent resize could form a cycle; never share a HashMap across threads without synchronisation.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why do Java's HashMap capacities use powers of two while many textbooks recommend prime table sizes?</summary><div>
+    <p>Primes make <code>h mod m</code> depend on all bits of h, protecting against hash functions with patterns in low bits. Powers of two make indexing a single AND and make resize splitting trivial (one bit decides lo/hi), but they only use low bits — so the JDK compensates by XOR-ing high bits into low bits, and falls back on treeification for bad hashes. Open-addressing tables using powers of two usually add a multiplicative mix (Fibonacci hashing) for the same reason.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Apply the master theorem to T(n) = 4T(n/2) + n², and to T(n) = 2T(n/2) + n log n.</summary><div>
+    <p>First: log₂4 = 2 and f = n² = Θ(n²), so every level of the recursion tree does n² work across log n levels: Θ(n² log n). Second: log₂2 = 1 and f = n log n = Θ(n¹ log¹ n), the extended case 2 with k = 1: Θ(n log² n). Explain via the recursion tree: level i contributes n·log(n/2ⁱ), and summing log(n) − i over log n levels gives Θ(log² n) per n.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Given a stream of transactions (id, amount), find whether any two distinct transactions sum to exactly a target, using O(n) time. Then: what if the stream is too large for memory?</summary><div>
+    <p>In-memory: the Two Sum pattern — a hash set of seen amounts, check target − amount before inserting (see A3). Θ(n) expected time and space. Too large for memory: partition by amount into buckets on disk such that complements land in predictable buckets (e.g. range-partition by amount; bucket for x pairs with the bucket containing target − x), then solve each pair of buckets in memory — this is how a distributed hash join works. Alternatively, external sort and two pointers from both ends (Θ(n log n) I/O-efficient). A Bloom filter can prefilter candidates but needs a verification pass because of false positives.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Count subarrays with sum k. Why doesn't a sliding window work, and what is your complexity?</summary><div>
+    <p>Prefix sums with a hash map of prefix counts, seeded with {0:1}, look up run − k before inserting run: Θ(n) expected time, Θ(n) space. A sliding window requires monotonicity — extending the right end never decreases the sum, shrinking the left never increases it — which holds only for non-negative values. With negatives, you cannot decide which pointer to move. Follow-up "longest such subarray": store the first index of each prefix instead of a count.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Implement strStr. The interviewer says "now make it worst-case linear". Explain why KMP is linear.</summary><div>
+    <p>Build the prefix function, then scan with a match-length variable q (code in C3). Linear because q increases by at most one per text character and each fallback strictly decreases q, while q never drops below zero: the number of fallbacks is bounded by the number of increments, at most n. Same argument for building π (at most m). Total Θ(n + m), and the text pointer never moves backward — so KMP works on streams (e.g. scanning a socket for a delimiter).</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> A batch job that reconciles two lists of 2 million orders went from 5 minutes to 6 hours after a refactor. What do you look for?</summary><div>
+    <p>A complexity regression, most likely a quadratic pattern: a <code>List.contains</code>/<code>stream().filter(...).findFirst()</code> inside a loop (2M × 2M = 4 × 10¹² comparisons), a <code>remove(Object)</code> in a loop, repeated string concatenation, or a JPA lazy load per item (N+1). Confirm with a profiler (async-profiler flame graph) rather than guessing; reproduce with n = 10⁴ and 2 × 10⁴ and check whether time quadruples. Fix by indexing one side in a presized <code>HashMap</code> keyed by order id (hash join) or sorting both and merging. Also check for a mutable key or poor <code>hashCode</code> (e.g. one that returns a constant or uses only a low-cardinality field), which makes a HashMap degrade toward O(log n) per op with treeification or O(n) for non-Comparable keys.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Your service's p99 latency spikes every few minutes; heap is large and you keep a 30-million-entry in-memory index in a HashMap that grows during the day. Hypotheses?</summary><div>
+    <p>Resize pauses: each doubling allocates a new table (a 64M-slot reference array is 256 MB with compressed oops) and rehashes all entries on the inserting thread, blocking that request; the huge array may be a G1 humongous allocation causing GC pressure. Mitigations: presize with <code>HashMap.newHashMap(expected)</code>, build the index off the request path and swap atomically (copy-on-write), shard into several smaller maps, or use a structure with incremental resizing. Also review whether a primitive map would cut memory by 2–3×, and monitor GC logs to confirm.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How would you defend a public API against hash-flooding attacks?</summary><div>
+    <p>Defence in depth: limit request size, number of parameters/headers/JSON fields and nesting depth at the edge (Tomcat <code>maxParameterCount</code>, Jackson <code>StreamReadConstraints</code>); rely on JDK 8+ treeified bins (worst case O(log n) for <code>Comparable</code> keys like String); for custom hash tables keyed by untrusted strings use a keyed hash (SipHash with a per-process random key) so attackers cannot precompute collisions; rate-limit expensive endpoints; monitor CPU per request. Mention that the same class of issue exists for regexes (ReDoS) and XML entity expansion.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Python dict vs Java HashMap: name three internal differences.</summary><div>
+    <p>(1) Collision resolution: open addressing with a perturbation-based probe sequence vs separate chaining with treeified bins. (2) Layout and ordering: compact split layout (sparse indices + dense insertion-ordered entries), so iteration follows insertion order; HashMap order is unspecified (LinkedHashMap adds a doubly linked list for order). (3) Load factor: ≤ 2/3 vs 0.75; and string hashing: randomised SipHash per process (PYTHONHASHSEED) vs deterministic polynomial hash cached in the String. Both resize geometrically and both require key immutability in practice.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> Tell me about a time you found a performance problem by reasoning about complexity rather than profiling.</summary><div>
+    <p>Structure with STAR, and make the reasoning explicit: the input-size growth you anticipated, the operation you identified as Θ(n) inside a loop, the back-of-envelope estimate (n = 10⁶, 10¹² operations ≈ hours), the fix (index with a map, presized), and how you verified (benchmark at two sizes, profiler confirmation, a regression test). Senior signal: you also added a guardrail — a code review checklist item or a performance test — so the pattern does not recur.</p>
+  </div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Name the cost model and the input size before stating a bound; strings and big integers are not O(1) to compare or hash.</li>
+    <li>O, Ω, Θ bound functions; worst, average, expected and amortized choose which function — they are different promises with different operational meanings.</li>
+    <li>Multiplicative growth gives amortized O(1) appends (cost 1 + r/(r−1)); additive growth gives Θ(n). Shrink at ¼, not ½.</li>
+    <li>Master theorem: compare f(n) with n<sup>log_b a</sup>; leaves, all levels, or root dominate.</li>
+    <li>Java HashMap: power-of-two table, hash spreading, chaining, treeify at 8 (capacity ≥ 64), untreeify at 6, resize at 0.75 with lo/hi split. ConcurrentHashMap: CAS empty bins, lock first node, cooperative resize, no nulls.</li>
+    <li>CPython dict: open addressing with perturbation, compact insertion-ordered entries, ≤ 2/3 load.</li>
+    <li>KMP is Θ(n+m) worst case via the prefix function; Rabin–Karp is expected linear and shines for many patterns and substring-equality checks.</li>
+    <li>Prefix sums turn range sums into O(1) and, with a hash map of earlier prefixes, solve subarray-sum problems with negatives in Θ(n).</li>
+  </ul>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">A dynamic array grows by a factor of 1.5 when full. What is the amortized cost of append and the total number of element copies for n appends (approximately)?</p>
+    <ol>
+      <li data-k="a">O(log n) amortized; about n log n copies</li>
+      <li data-k="b">O(1) amortized; about n copies</li>
+      <li data-k="c">O(1) amortized; about 2n copies</li>
+      <li data-k="d">O(n) amortized; about n²/2 copies</li>
+    </ol>
+    <div class="explain">Copies form a geometric series n(1 + 2/3 + 4/9 + …) ≈ n/(1.5 − 1) = 2n, so amortized O(1). Doubling gives about n copies; additive growth gives Θ(n²).</div>
+  </div>
+
+  <div class="quiz" data-answer="b">
+    <p class="q">In OpenJDK's HashMap, a bin has accumulated 9 colliding entries but the table capacity is 32. What happens on the insertion that made it 9?</p>
+    <ol>
+      <li data-k="a">The bin is converted to a red-black tree</li>
+      <li data-k="b">The table is resized instead of treeifying, because capacity is below MIN_TREEIFY_CAPACITY (64)</li>
+      <li data-k="c">The insertion throws an exception</li>
+      <li data-k="d">Nothing; HashMap never changes bin structure</li>
+    </ol>
+    <div class="explain">treeifyBin checks the table length first; below 64 it calls resize(), on the theory that a small table, not a bad hash, is the cause.</div>
+  </div>
+
+  <div class="quiz" data-answer="d">
+    <p class="q">T(n) = 3T(n/3) + n. What is T(n)?</p>
+    <ol>
+      <li data-k="a">Θ(n)</li>
+      <li data-k="b">Θ(n²)</li>
+      <li data-k="c">Θ(n^1.58)</li>
+      <li data-k="d">Θ(n log n)</li>
+    </ol>
+    <div class="explain">log₃3 = 1 and f(n) = n = Θ(n¹): every level of the recursion tree costs n and there are log₃ n levels.</div>
+  </div>
+
+  <div class="quiz" data-answer="a">
+    <p class="q">Why does "count subarrays with sum k" require prefix sums + hashing instead of a sliding window when values may be negative?</p>
+    <ol>
+      <li data-k="a">Window sums are no longer monotone in window size, so you cannot decide which end to move</li>
+      <li data-k="b">Sliding windows require sorted input</li>
+      <li data-k="c">Hash maps are always faster than two pointers</li>
+      <li data-k="d">Sliding windows are O(n²)</li>
+    </ol>
+    <div class="explain">The window technique relies on "growing increases, shrinking decreases"; negatives break that invariant.</div>
+  </div>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">Which statement about Rabin–Karp is correct?</p>
+    <ol>
+      <li data-k="a">It is Θ(n + m) in the worst case for any input</li>
+      <li data-k="b">It never needs to compare characters</li>
+      <li data-k="c">With verification it is always correct and expected Θ(n + m); adversarial collisions can make it Θ(nm)</li>
+      <li data-k="d">It requires the pattern's prefix function</li>
+    </ol>
+    <div class="explain">Rolling hashes give O(1) window updates; equal hashes must be verified (Las Vegas) or accepted with a small error probability (Monte Carlo).</div>
+  </div>
+
+  <div class="quiz" data-answer="b">
+    <p class="q">You use a Java record <code>Point(int x, int y)</code> as a HashMap key, but a teammate replaces it with a class whose hashCode returns <code>x ^ y</code>. Which keys now all collide?</p>
+    <ol>
+      <li data-k="a">Points with equal x</li>
+      <li data-k="b">All points on the diagonal x = y (they all hash to 0), and more generally many symmetric pairs</li>
+      <li data-k="c">None; XOR is a perfect hash</li>
+      <li data-k="d">Only negative coordinates</li>
+    </ol>
+    <div class="explain">x ^ x = 0, and (a, b) collides with (b, a). Records combine components with a 31-multiplier style hash that avoids this symmetry.</div>
+  </div>
+
+  <div class="quiz" data-answer="a">
+    <p class="q">In Java, what does <code>"😀".length()</code> return, and why?</p>
+    <ol>
+      <li data-k="a">2, because length counts UTF-16 code units and the emoji is a surrogate pair</li>
+      <li data-k="b">1, because it is one character</li>
+      <li data-k="c">4, because it is four UTF-8 bytes</li>
+      <li data-k="d">It depends on Compact Strings being enabled</li>
+    </ol>
+    <div class="explain">U+1F600 is outside the BMP; Java represents it with two chars. Use codePointCount for code points. Compact Strings changes storage, not semantics.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Cormen, Leiserson, Rivest, Stein, <em>Introduction to Algorithms</em>, 4th ed., MIT Press, 2022 — ch. 3 (growth), 4 (recurrences, master theorem), 11 (hash tables), 16 (amortized analysis), 32 (string matching).</li>
+    <li><span class="ref-kind">Book</span> Robert Sedgewick and Kevin Wayne, <em>Algorithms</em>, 4th ed., Addison-Wesley, 2011 — §1.4, §3.4, §5.3; companion site <a href="https://algs4.cs.princeton.edu/home/">algs4.cs.princeton.edu</a>.</li>
+    <li><span class="ref-kind">Book</span> Aditya Bhargava, <em>Grokking Algorithms</em>, 2nd ed., Manning, 2024 — gentle visual intuition for Big O and hash tables.</li>
+    <li><span class="ref-kind">Course</span> <a href="https://ocw.mit.edu/courses/6-006-introduction-to-algorithms-spring-2020/">MIT 6.006 Introduction to Algorithms (Spring 2020), MIT OpenCourseWare</a>.</li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/HashMap.java">OpenJDK HashMap.java source</a> — read the implementation notes comment at the top.</li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/concurrent/ConcurrentHashMap.java">OpenJDK ConcurrentHashMap.java source</a>.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://openjdk.org/jeps/180">JEP 180: Handle Frequent HashMap Collisions with Balanced Trees</a> and <a href="https://openjdk.org/jeps/254">JEP 254: Compact Strings</a>.</li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/python/cpython/blob/main/Objects/dictobject.c">CPython dictobject.c</a> (see the long comment on probing) and <a href="https://github.com/python/cpython/blob/main/Objects/listobject.c">listobject.c</a>.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://peps.python.org/pep-0456/">PEP 456: Secure and interchangeable hash algorithm</a> and <a href="https://peps.python.org/pep-0393/">PEP 393: Flexible String Representation</a>.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://go.dev/blog/swisstable">Michael Pratt, "Faster Go maps with Swiss Tables", The Go Blog, 2025</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://abseil.io/about/design/swisstables">Abseil: Swiss Tables Design Notes</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://ocert.org/advisories/ocert-2011-003.html">oCERT-2011-003: multiple implementations denial-of-service via hash algorithm collision</a>.</li>
+    <li><span class="ref-kind">Paper</span> D. E. Knuth, J. H. Morris, V. R. Pratt, "Fast Pattern Matching in Strings", <em>SIAM J. Computing</em> 6(2), 1977 — <a href="https://doi.org/10.1137/0206024">doi:10.1137/0206024</a>.</li>
+    <li><span class="ref-kind">Paper</span> R. M. Karp, M. O. Rabin, "Efficient randomized pattern-matching algorithms", <em>IBM J. Research and Development</em> 31(2), 1987 — <a href="https://doi.org/10.1147/rd.312.0249">doi:10.1147/rd.312.0249</a>.</li>
+    <li><span class="ref-kind">Paper</span> A. Tridgell, P. Mackerras, "The rsync algorithm", ANU technical report TR-CS-96-05, 1996 — <a href="https://rsync.samba.org/tech_report/">rsync.samba.org/tech_report</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://cp-algorithms.com/string/prefix-function.html">cp-algorithms: Prefix function / KMP</a> and <a href="https://cp-algorithms.com/string/string-hashing.html">String hashing</a>.</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

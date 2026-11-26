@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12-Month Learning Roadmap — AI-Era Software Engineering</title>
+<meta name="description" content="A sustainable, 10–15 hours/week, 12-month study plan for an experienced Java/Spring Boot engineer.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="roadmap" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Start here</p>
+  <h1>The 12-Month Learning Roadmap</h1>
+  <p class="lede">A progressive, sustainable plan for 10–15 hours per week. It is ordered by leverage for an experienced Java/Spring Boot backend engineer: distributed systems first, then the AI application layer, then the theory beneath it, then the platform around it.</p>
+  <ul class="chapter-meta">
+    <li><strong>Time budget:</strong> about 12 hours/week on average: three weekday sessions of 1.5–2 h plus one 4–6 h weekend block.</li>
+    <li><strong>Tracks:</strong> a <em>main track</em> (about 9–11 h) and a <em>DSA thread</em> (about 3 h) that runs through months 1–7, then drops to maintenance.</li>
+    <li><strong>Progress:</strong> tick assessment criteria below; they are saved in your browser.</li>
+  </ul>
+</header>
+
+<section id="principles">
+  <h2>How the plan is designed</h2>
+  <h3>Prioritisation logic</h3>
+  <p>The order follows three questions: <em>what compounds</em>, <em>what you can apply immediately</em>, and <em>what interviews and promotions actually test</em>.</p>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  A["M1-M4: System design and distributed systems, plus DSA thread"] --> B["M5: Production Python and Kubernetes"]
+  B --> C["M6-M7: LLM engineering, RAG, agents, AI security"]
+  C --> D["M8-M9: ML and deep learning theory"]
+  D --> E["M10: Go, CI/CD, infrastructure security"]
+  E --> F["M11: Data engineering and MLOps"]
+  F --> G["M12: AI infrastructure, SRE, capstone"]
+</pre>
+  <figcaption>The critical path through the book. Each stage builds on the one before.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> months 1–4 strengthen what you already partly know (backend systems) into senior-level depth, so the return is immediate. Month 5 gives you Python and containers, the two prerequisites for AI work. Months 6–7 put you to work on LLM systems early. Months 8–9 then supply the ML theory, which lands better once you have hands-on context. Months 10–12 round out the platform: Go, delivery pipelines, data, MLOps and infrastructure.</p>
+  <div class="callout insight"><p class="callout-title">Why LLM engineering comes before ML theory</p><p><span class="tag opinion">Opinion</span> Many curricula teach maths → ML → deep learning → LLMs. For an engineer whose goal is to <em>build</em> AI-powered systems, building first and studying theory second is usually more motivating and more marketable. Part 8 recaps every transformer concept it relies on. If you prefer theory first, swap months 6–7 with months 8–9; nothing breaks.</p></div>
+
+  <h3>A typical week</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Slot</th><th>Duration</th><th>Use it for</th></tr></thead>
+    <tbody>
+      <tr><td>Weekday session 1</td><td>1.5–2 h</td><td>Read the next chapter sections; work through diagrams and widgets.</td></tr>
+      <tr><td>Weekday session 2</td><td>1.5–2 h</td><td>Finish the reading; do exercises; take the knowledge check.</td></tr>
+      <tr><td>Weekday session 3</td><td>1–1.5 h</td><td>DSA thread: 2–3 problems, timed, in Java (sometimes Python or Go).</td></tr>
+      <tr><td>Weekend block</td><td>4–6 h</td><td>Coding assignments and the monthly mini project.</td></tr>
+      <tr><td>Optional</td><td>0–2 h</td><td>Further reading, papers, or a mock interview with a peer.</td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout tip"><p class="callout-title">When a week goes badly</p><p>Protect the order <strong>Must → Should → Could</strong>: (1) the chapter's core sections 1–7 and the quiz; (2) the coding assignment; (3) exercises and further reading. Missing the mini project for one month is fine. Missing the fundamentals sections is not, because later months build on them.</p></div>
+
+  <h3>Monthly assessment rhythm</h3>
+  <p>Every month ends with the same four checks: (1) each knowledge-check quiz at ≥ 80%; (2) the mini project working end to end, with a README; (3) the month's assessment criteria ticked honestly; (4) a 15-minute explanation of one concept to a colleague, or a written blog-style summary. If you can't explain it, you don't know it yet.</p>
+</section>
+
+<section id="overview">
+  <h2>The year at a glance</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Month</th><th>Theme</th><th>Chapters</th><th>Mini project</th></tr></thead>
+    <tbody>
+      <tr><td><a href="#month-1">1</a></td><td>Orientation, System Design Foundations & Traffic</td><td>7</td><td>Rate-limited API edge</td></tr>
+      <tr><td><a href="#month-2">2</a></td><td>The Data Layer: Caching, Databases, Replication & Security Basics</td><td>6</td><td>High-traffic product catalog</td></tr>
+      <tr><td><a href="#month-3">3</a></td><td>Distributed Correctness: Consistency, Kafka, Microservices & Identity</td><td>5</td><td>Event-driven order platform</td></tr>
+      <tr><td><a href="#month-4">4</a></td><td>Reliability at Scale & Nine System Design Case Studies</td><td>7</td><td>Payment service, production grade</td></tr>
+      <tr><td><a href="#month-5">5</a></td><td>Production Python & Container Foundations</td><td>7</td><td>Polyglot service on Kubernetes</td></tr>
+      <tr><td><a href="#month-6">6</a></td><td>LLM Engineering I: Foundations, Prompting, Tools & RAG</td><td>5</td><td>Enterprise document Q&amp;A</td></tr>
+      <tr><td><a href="#month-7">7</a></td><td>LLM Engineering II: Models, Reliability, Agents & AI Security</td><td>5</td><td>Spring Boot + LLM operations assistant</td></tr>
+      <tr><td><a href="#month-8">8</a></td><td>Machine Learning Foundations</td><td>5</td><td>Fraud / churn scoring service</td></tr>
+      <tr><td><a href="#month-9">9</a></td><td>Model Evaluation & Deep Learning</td><td>5</td><td>Mini-GPT from scratch</td></tr>
+      <tr><td><a href="#month-10">10</a></td><td>High-Performance Go, CI/CD, GitOps & Infrastructure Security</td><td>6</td><td>Go event-ingestion gateway with a secure delivery pipeline</td></tr>
+      <tr><td><a href="#month-11">11</a></td><td>Data Engineering, Data Science & MLOps</td><td>7</td><td>Feature pipeline → model → monitoring loop</td></tr>
+      <tr><td><a href="#month-12">12</a></td><td>AI Infrastructure, SRE & Capstones</td><td>8</td><td>Capstone (pick one to build)</td></tr>
+    </tbody>
+  </table></div>
+  <figure class="diagram">
+<pre class="mermaid">
+gantt
+  title Study plan (months from your start date)
+  dateFormat YYYY-MM-DD
+  axisFormat M%m
+  section Systems
+  System design and distributed systems :a1, 2027-01-01, 120d
+  section DSA
+  DSA thread (3 h/week)                 :a2, 2027-01-01, 210d
+  DSA maintenance                       :a3, after a2, 150d
+  section Languages and platform
+  Python and Kubernetes                 :b1, 2027-05-01, 31d
+  Go, CI/CD, infra security             :b2, 2027-10-01, 31d
+  section AI
+  LLM engineering                       :c1, 2027-06-01, 61d
+  ML and deep learning                  :c2, 2027-08-01, 61d
+  Data and MLOps                        :c3, 2027-11-01, 30d
+  AI infra, SRE, capstone               :c4, 2027-12-01, 31d
+</pre>
+  <figcaption>Gantt view. The dates are placeholders: read them as “month N from your start”.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the DSA thread runs in parallel with the main track for seven months, so interview fluency is in place before the AI-heavy months. After that it drops to two problems a week to stay sharp.</p>
+</section>
+
+<section id="month-1">
+  <h2>Month 1: Orientation, System Design Foundations & Traffic</h2>
+  <div class="month">
+    <header><span class="m-num">MONTH 01</span><h3>Orientation, System Design Foundations & Traffic</h3><span class="m-hours">10–14 h/week</span></header>
+    <div class="m-body">
+      <p>System design is the highest-leverage skill for a senior backend engineer and it frames everything that follows. You already build services; this month teaches you to reason about them quantitatively.</p>
+      <h4>Learning objectives</h4><ul><li>Explain how AI is reshaping engineering work and decide where you want to position yourself.</li><li>Run a structured design interview: requirements → estimates → API → data → architecture → deep dives.</li><li>Do back-of-envelope capacity estimates and availability arithmetic without notes.</li><li>Choose L4 vs L7 load balancing, gateway vs reverse proxy, and a rate-limiting algorithm with reasons.</li></ul>
+      <h4>Chapters to complete</h4><ul><li><a href="roadmap.html">The 12-Month Learning Roadmap</a> <small>(~25 min read)</small></li><li><a href="p1-01-evolution-ai-native.html">From Mainframes to AI-Native Engineering</a> <small>(~45 min read)</small></li><li><a href="p1-02-ai-assisted-development.html">The Modern Backend Landscape &amp; AI-Assisted Development</a> <small>(~50 min read)</small></li><li><a href="p1-03-career-strategy.html">Durable Skills, Emerging Roles &amp; Career Positioning</a> <small>(~40 min read)</small></li><li><a href="p2-01-system-design-foundations.html">System Design Foundations: Requirements, Estimation &amp; SLOs</a> <small>(~70 min read)</small></li><li><a href="p2-02-scaling-traffic.html">Scaling &amp; Traffic: Load Balancers, Proxies, Gateways, Rate Limits</a> <small>(~80 min read)</small></li></ul>
+      <h4>DSA thread</h4><ul><li><a href="p3-01-complexity-arrays-hashing.html">Complexity, Arrays, Strings &amp; Hashing</a></li></ul>
+      <h4>Weekly schedule</h4>
+      <div class="table-wrap"><table class="week-table"><thead><tr><th>Week</th><th>Main track</th><th>DSA / notes</th></tr></thead><tbody><tr><td>Week 1</td><td>Roadmap + Part 1 ch. 1–2; set up a study repo; first 6 array/hash problems</td><td>Part 1 is reading-heavy: skim history, read the AI-workflow sections closely</td></tr><tr><td>Week 2</td><td>P1 ch. 3 (career plan, write your own) + P2 ch. 1 sections 1–7</td><td>Do every estimation exercise by hand</td></tr><tr><td>Week 3</td><td>P2 ch. 1 rest + P2 ch. 2 sections 1–7; play with the load-balancer and rate-limiter widgets</td><td>6 hashing / prefix-sum problems</td></tr><tr><td>Week 4</td><td>P2 ch. 2 rest; build the mini project; take both knowledge checks</td><td>Review weak quiz answers</td></tr></tbody></table></div>
+      <h4>Concepts to master</h4><p>Functional vs non-functional requirements, QPS / storage / bandwidth estimation, p50/p99 latency, Little&#x27;s Law, Availability nines and serial/parallel composition, SLI/SLO/error budgets, L4/L7 load balancing, P2C, API gateway vs reverse proxy vs BFF, Token bucket, sliding window, distributed rate limiting with Redis + Lua, Big-O, amortised analysis, hashing.</p>
+      <h4>Practical coding assignments</h4><ol><li>Write a one-page capacity estimate for a service you run at work (QPS, storage growth, peak bandwidth).</li><li>Implement a Redis + Lua token-bucket limiter as a Spring Cloud Gateway filter and an equivalent Go middleware with golang.org/x/time/rate.</li><li>Solve 12 array/string/hash problems in Java; re-solve 4 of them in Python.</li></ol>
+      <h4>Mini project: Rate-limited API edge</h4><p>Spring Cloud Gateway in front of two Spring Boot services, per-API-key token bucket in Redis, health-checked routing, and a k6 load test showing p50/p99 and 429 behaviour. Write a 2-page design doc with your estimates.</p>
+      <h4>Assessment criteria</h4><ul class="check-list"><li><input type="checkbox" id="m1-a0"><label for="m1-a0">I can estimate QPS, storage and bandwidth for a new system in under 10 minutes.</label></li><li><input type="checkbox" id="m1-a1"><label for="m1-a1">I can explain why p99 matters more than average latency and how fan-out amplifies tail latency.</label></li><li><input type="checkbox" id="m1-a2"><label for="m1-a2">My rate limiter is correct across two gateway replicas (shared state) and I can explain the race it avoids.</label></li><li><input type="checkbox" id="m1-a3"><label for="m1-a3">Both chapter quizzes ≥ 80%.</label></li><li><input type="checkbox" id="m1-a4"><label for="m1-a4">12 DSA problems solved, each with complexity stated.</label></li></ul>
+      <h4>Recommended resources</h4><ul><li>Martin Kleppmann, <em>Designing Data-Intensive Applications</em> (O'Reilly), ch. 1.</li><li>Google, <a href="https://sre.google/sre-book/service-level-objectives/"><em>Site Reliability Engineering</em> — Service Level Objectives</a> (free online).</li><li><a href="https://docs.spring.io/spring-cloud-gateway/reference/">Spring Cloud Gateway reference</a></li><li><a href="https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers">Envoy load-balancing documentation</a></li></ul>
+      <h4>Expected outcome</h4><p>You can lead the first half of any design discussion with numbers, and you have a working, load-tested edge layer in your portfolio.</p>
+    </div>
+  </div>
+</section>
+
+<section id="month-2">
+  <h2>Month 2: The Data Layer: Caching, Databases, Replication & Security Basics</h2>
+  <div class="month">
+    <header><span class="m-num">MONTH 02</span><h3>The Data Layer: Caching, Databases, Replication & Security Basics</h3><span class="m-hours">11–14 h/week</span></header>
+    <div class="m-body">
+      <p>Most production incidents and most interview deep-dives end up in the data layer. You know JPA; this month is about what happens underneath it.</p>
+      <h4>Learning objectives</h4><ul><li>Pick a caching pattern and an invalidation strategy, and defend it against stampedes, hot keys and inconsistency.</li><li>Explain Redis internals: event loop, encodings, persistence, replication and Cluster slots.</li><li>Read EXPLAIN ANALYZE output, design composite and covering indexes, and remove N+1 queries in Hibernate.</li><li>Compare single-leader, multi-leader and leaderless replication; choose a sharding key.</li><li>Threat-model a service with STRIDE and map findings to the OWASP Top 10.</li></ul>
+      <h4>Chapters to complete</h4><ul><li><a href="p2-03-caching-redis.html">Caching Strategies &amp; Redis Internals</a> <small>(~80 min read)</small></li><li><a href="p2-04-databases-indexing.html">Database Selection, SQL vs NoSQL, Indexing &amp; Query Optimization</a> <small>(~90 min read)</small></li><li><a href="p2-05-replication-sharding.html">Replication, Partitioning &amp; Sharding</a> <small>(~80 min read)</small></li><li><a href="p11-01-security-foundations-owasp.html">Security Foundations, Threat Modeling &amp; the OWASP Top 10</a> <small>(~80 min read)</small></li></ul>
+      <h4>DSA thread</h4><ul><li><a href="p3-02-linked-lists-stacks-queues.html">Linked Lists, Stacks, Queues &amp; Monotonic Structures</a></li><li><a href="p3-03-two-pointers-window-search.html">Two Pointers, Sliding Window, Sorting &amp; Binary Search</a></li></ul>
+      <h4>Weekly schedule</h4>
+      <div class="table-wrap"><table class="week-table"><thead><tr><th>Week</th><th>Main track</th><th>DSA / notes</th></tr></thead><tbody><tr><td>Week 1</td><td>P2 ch. 3 (caching + Redis); cache-eviction & consistent-hashing widgets</td><td>5 linked-list problems; implement an LRU cache</td></tr><tr><td>Week 2</td><td>P2 ch. 4 (databases, B-tree vs LSM, indexing); B-tree widget</td><td>Two pointers & sliding-window problems</td></tr><tr><td>Week 3</td><td>P2 ch. 5 (replication & sharding); quorum widget</td><td>Binary search patterns</td></tr><tr><td>Week 4</td><td>P11 ch. 1 (security foundations); mini project; quizzes</td><td>Threat-model your mini project</td></tr></tbody></table></div>
+      <h4>Concepts to master</h4><p>Cache-aside / read-through / write-through / write-behind, Stampede protection, negative caching, Redis RDB/AOF, Sentinel vs Cluster, MOVED/ASK, Isolation levels and anomalies, MVCC, B+tree vs LSM-tree, amplification, Composite / covering / partial indexes, keyset pagination, Replication lag anomalies and fixes, Hash vs range partitioning, hot spots, STRIDE, trust boundaries, OWASP Top 10.</p>
+      <h4>Practical coding assignments</h4><ol><li>Instrument a Spring Data JPA endpoint, find an N+1 problem with Hibernate statistics, fix it with an entity graph or a fetch join, and prove the gain with EXPLAIN ANALYZE.</li><li>Add Caffeine (L1) + Redis (L2) caching with request coalescing; measure hit ratio and p99 before and after.</li><li>Implement read/write routing with AbstractRoutingDataSource against a PostgreSQL primary and a replica in Docker Compose, then reproduce a read-your-writes anomaly and fix it.</li></ol>
+      <h4>Mini project: High-traffic product catalog</h4><p>Spring Boot + PostgreSQL (primary + replica) + Redis. Keyset-paginated search, two-level cache with stampede protection, an index-tuning log showing before and after plans, and a STRIDE threat model as a Markdown appendix.</p>
+      <h4>Assessment criteria</h4><ul class="check-list"><li><input type="checkbox" id="m2-a0"><label for="m2-a0">I can draw how a Redis Cluster client finds a key's node and what happens during resharding.</label></li><li><input type="checkbox" id="m2-a1"><label for="m2-a1">I can explain why OFFSET pagination degrades and implement keyset pagination.</label></li><li><input type="checkbox" id="m2-a2"><label for="m2-a2">I can state the anomaly each isolation level permits, with a concrete example.</label></li><li><input type="checkbox" id="m2-a3"><label for="m2-a3">My threat model lists at least 8 threats with mitigations mapped to OWASP categories.</label></li><li><input type="checkbox" id="m2-a4"><label for="m2-a4">Quizzes ≥ 80%; 20+ DSA problems total.</label></li></ul>
+      <h4>Recommended resources</h4><ul><li>Kleppmann, <em>DDIA</em>, ch. 3, 5, 6, 7.</li><li><a href="https://redis.io/docs/latest/">Redis documentation</a></li><li><a href="https://use-the-index-luke.com/">Markus Winand — Use The Index, Luke</a></li><li><a href="https://www.postgresql.org/docs/current/using-explain.html">PostgreSQL docs — Using EXPLAIN</a></li><li><a href="https://owasp.org/www-project-top-ten/">OWASP Top 10</a></li></ul>
+      <h4>Expected outcome</h4><p>You can design and defend the storage layer of a service and diagnose slow queries from first principles.</p>
+    </div>
+  </div>
+</section>
+
+<section id="month-3">
+  <h2>Month 3: Distributed Correctness: Consistency, Kafka, Microservices & Identity</h2>
+  <div class="month">
+    <header><span class="m-num">MONTH 03</span><h3>Distributed Correctness: Consistency, Kafka, Microservices & Identity</h3><span class="m-hours">12–15 h/week</span></header>
+    <div class="m-body">
+      <p>This is where senior engineers separate from mid-level ones: knowing what can go wrong between services and designing so it doesn't matter.</p>
+      <h4>Learning objectives</h4><ul><li>Distinguish linearizability, causal and eventual consistency; state CAP and PACELC precisely.</li><li>Implement a saga with the transactional outbox and idempotent consumers.</li><li>Explain Kafka from the log segment up: ISR, high watermark, rebalancing, transactions, compaction.</li><li>Apply timeouts, retries with jitter, circuit breakers, bulkheads and fencing-token locks correctly.</li><li>Implement OAuth 2.0 + OIDC with Spring Security and validate JWTs correctly.</li></ul>
+      <h4>Chapters to complete</h4><ul><li><a href="p2-06-consistency-transactions.html">Consistency, CAP, Distributed Transactions, Sagas, Outbox &amp; Idempotency</a> <small>(~100 min read)</small></li><li><a href="p2-07-kafka-event-driven.html">Kafka Internals, Message Queues &amp; Event-Driven Architecture</a> <small>(~110 min read)</small></li><li><a href="p2-08-microservices-resilience.html">Microservices, Discovery, Circuit Breakers &amp; Distributed Locks</a> <small>(~90 min read)</small></li><li><a href="p11-02-identity-oauth-oidc-jwt.html">Authentication, Authorization, OAuth 2.0, OIDC, JWT &amp; Sessions</a> <small>(~90 min read)</small></li></ul>
+      <h4>DSA thread</h4><ul><li><a href="p3-04-trees-heaps-tries.html">Trees, BSTs, Heaps &amp; Tries</a></li></ul>
+      <h4>Weekly schedule</h4>
+      <div class="table-wrap"><table class="week-table"><thead><tr><th>Week</th><th>Main track</th><th>DSA / notes</th></tr></thead><tbody><tr><td>Week 1</td><td>P2 ch. 6 (consistency, sagas, outbox, idempotency); saga + quorum widgets</td><td>Tree traversals, BST problems</td></tr><tr><td>Week 2</td><td>P2 ch. 7 (Kafka) sections 1–7; consumer-group widget</td><td>Heaps: top-k, merge k lists</td></tr><tr><td>Week 3</td><td>P2 ch. 7 rest + P2 ch. 8 (microservices, resilience); circuit-breaker widget</td><td>Tries</td></tr><tr><td>Week 4</td><td>P11 ch. 2 (identity); mini project</td><td>Mixed review set</td></tr></tbody></table></div>
+      <h4>Concepts to master</h4><p>Linearizability vs serializability, Raft basics, quorums, 2PC and its blocking failure, Choreography vs orchestration sagas, compensation, Outbox with polling vs Debezium CDC, Idempotency keys, exactly-once myths, Kafka partitions, ISR, acks, idempotent producer, transactions, KRaft, Cooperative rebalancing, consumer lag, Retries + jitter + budgets, circuit breaker states, bulkheads, Redlock critique, fencing tokens, OAuth 2.0 code + PKCE, OIDC ID tokens, JWT validation.</p>
+      <h4>Practical coding assignments</h4><ol><li>Build order → payment → inventory as three Spring Boot services coordinated by an orchestrated saga; inject failures at each step and show the compensations in logs.</li><li>Publish events through an outbox table and Debezium; prove that duplicate delivery is harmless with an inbox / dedup table.</li><li>Secure all three services as OAuth 2.0 resource servers behind Keycloak; add method-level authorization.</li></ol>
+      <h4>Mini project: Event-driven order platform</h4><p>Three services, Kafka (KRaft), outbox + Debezium, idempotent consumers, a retry topic and DLQ with Spring Kafka, Resilience4j around synchronous calls, Keycloak for identity, and a Grafana panel showing consumer lag.</p>
+      <h4>Assessment criteria</h4><ul class="check-list"><li><input type="checkbox" id="m3-a0"><label for="m3-a0">I can explain exactly what acks=all + min.insync.replicas=2 + RF=3 guarantees and what it doesn't.</label></li><li><input type="checkbox" id="m3-a1"><label for="m3-a1">I can show, with a failure injection, that my system never double-charges.</label></li><li><input type="checkbox" id="m3-a2"><label for="m3-a2">I can explain why Redlock is unsafe without fencing tokens.</label></li><li><input type="checkbox" id="m3-a3"><label for="m3-a3">I can walk through the OAuth authorization-code + PKCE flow from memory and list the JWT validation checks.</label></li><li><input type="checkbox" id="m3-a4"><label for="m3-a4">Quizzes ≥ 80%; heap/trie problems solved.</label></li></ul>
+      <h4>Recommended resources</h4><ul><li>Kleppmann, <em>DDIA</em>, ch. 7, 8, 9, 11.</li><li>Chris Richardson, <em>Microservices Patterns</em> (Manning) — sagas and outbox chapters.</li><li><a href="https://kafka.apache.org/documentation/">Apache Kafka documentation</a></li><li><a href="https://raft.github.io/">The Raft consensus algorithm (paper and visualisation)</a></li><li><a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">Kleppmann — How to do distributed locking</a></li><li><a href="https://docs.spring.io/spring-security/reference/">Spring Security reference</a></li></ul>
+      <h4>Expected outcome</h4><p>You can design multi-service workflows that stay correct under partial failure, and you have a portfolio project that proves it.</p>
+    </div>
+  </div>
+</section>
+
+<section id="month-4">
+  <h2>Month 4: Reliability at Scale & Nine System Design Case Studies</h2>
+  <div class="month">
+    <header><span class="m-num">MONTH 04</span><h3>Reliability at Scale & Nine System Design Case Studies</h3><span class="m-hours">12–15 h/week</span></header>
+    <div class="m-body">
+      <p>Case studies turn concepts into judgement. Each one is practice for a 45-minute senior design interview and for real architecture reviews.</p>
+      <h4>Learning objectives</h4><ul><li>Design for high availability and disaster recovery with explicit RPO/RTO targets.</li><li>Complete nine end-to-end designs, each with estimates, APIs, data models, bottlenecks and failure analysis.</li><li>Find and fix API security flaws: BOLA, injection, XSS, CSRF, SSRF.</li></ul>
+      <h4>Chapters to complete</h4><ul><li><a href="p2-09-ha-dr-multiregion.html">Observability, High Availability, Disaster Recovery &amp; Multi-Region</a> <small>(~80 min read)</small></li><li><a href="p2-10-case-studies-messaging.html">Case Studies I: URL Shortener, Messaging, Notifications</a> <small>(~100 min read)</small></li><li><a href="p2-11-case-studies-commerce.html">Case Studies II: E-Commerce, Payments, Video Streaming</a> <small>(~110 min read)</small></li><li><a href="p2-12-case-studies-realtime-ai.html">Case Studies III: Ride-Sharing, Real-Time Analytics, AI Chatbot</a> <small>(~110 min read)</small></li><li><a href="p11-03-appsec-vulnerabilities.html">API Security, Injection, XSS, CSRF, SSRF &amp; Secure Coding</a> <small>(~90 min read)</small></li></ul>
+      <h4>DSA thread</h4><ul><li><a href="p3-05-graphs.html">Graphs: Traversal, Topological Sort, Union-Find &amp; Shortest Paths</a></li><li><a href="p3-06-recursion-backtracking-greedy.html">Recursion, Backtracking &amp; Greedy</a></li></ul>
+      <h4>Weekly schedule</h4>
+      <div class="table-wrap"><table class="week-table"><thead><tr><th>Week</th><th>Main track</th><th>DSA / notes</th></tr></thead><tbody><tr><td>Week 1</td><td>P2 ch. 9 (HA/DR/multi-region) + case study: URL shortener</td><td>Graph BFS/DFS, topological sort</td></tr><tr><td>Week 2</td><td>Case studies: messaging + notifications; whiteboard each in 45 min <em>before</em> reading the chapter's design</td><td>Union-find, Dijkstra</td></tr><tr><td>Week 3</td><td>Case studies: e-commerce, payments, video streaming</td><td>Backtracking set</td></tr><tr><td>Week 4</td><td>Case studies: ride-sharing, real-time analytics, AI chatbot + P11 ch. 3</td><td>Greedy set; one mock design interview with a peer</td></tr></tbody></table></div>
+      <h4>Concepts to master</h4><p>RPO/RTO, backup vs pilot light vs warm standby vs active-active, Cell-based architecture, static stability, GeoDNS, anycast, data residency, Snowflake IDs, base62, WebSocket fan-out, presence, Inventory reservation, double-entry ledgers, reconciliation, Transcoding pipelines, ABR streaming, CDN, Geospatial indexing (geohash/H3), dispatch, Stream processing, watermarks, OLAP stores, LLM gateway, semantic cache, tenant quotas, OWASP API Top 10, SSRF defences.</p>
+      <h4>Practical coding assignments</h4><ol><li>For each case study, first produce your own design (timed, 45 minutes), then compare it with the chapter and write down three things you missed.</li><li>Write a DR runbook for your Month 3 project, including a restore drill you actually perform.</li><li>Fix five intentionally vulnerable endpoints in a local OWASP Juice Shop / WebGoat lab, and write a regression test for each fix.</li></ol>
+      <h4>Mini project: Payment service, production grade</h4><p>Spring Boot payment-intent API with idempotency keys, a double-entry ledger in PostgreSQL, a provider adapter with timeouts, retries and a circuit breaker, daily reconciliation job, audit log, and a one-page DR plan.</p>
+      <h4>Assessment criteria</h4><ul class="check-list"><li><input type="checkbox" id="m4-a0"><label for="m4-a0">I completed nine timed designs and a written self-review for each.</label></li><li><input type="checkbox" id="m4-a1"><label for="m4-a1">I can explain the trade-off between active-active and active-passive for a stateful service.</label></li><li><input type="checkbox" id="m4-a2"><label for="m4-a2">My payment service survives client retries, provider timeouts and a duplicate webhook without inconsistency.</label></li><li><input type="checkbox" id="m4-a3"><label for="m4-a3">Quizzes ≥ 80%; 40+ DSA problems total.</label></li></ul>
+      <h4>Recommended resources</h4><ul><li>Alex Xu, <em>System Design Interview</em> Vol. 1 &amp; 2 (ByteByteGo) — compare approaches, don't memorise.</li><li><a href="https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html">AWS Well-Architected — Reliability Pillar</a></li><li><a href="https://stripe.com/blog/idempotency">Stripe — Designing robust and predictable APIs with idempotency</a></li><li><a href="https://owasp.org/API-Security/">OWASP API Security Top 10</a></li></ul>
+      <h4>Expected outcome</h4><p>You are interview-ready for senior system design rounds and have a fault-tolerant payment system to show.</p>
+    </div>
+  </div>
+</section>
+
+<section id="month-5">
+  <h2>Month 5: Production Python & Container Foundations</h2>
+  <div class="month">
+    <header><span class="m-num">MONTH 05</span><h3>Production Python & Container Foundations</h3><span class="m-hours">11–14 h/week</span></header>
+    <div class="m-body">
+      <p>Python is the language of the AI ecosystem. You will integrate with it, and increasingly own services written in it. Containers and Kubernetes are how all of it ships.</p>
+      <h4>Learning objectives</h4><ul><li>Explain CPython's memory model, the GIL and the free-threaded build, and pick threads, processes or asyncio correctly.</li><li>Build typed FastAPI services with Pydantic v2, async SQLAlchemy 2.0 and Celery, tested with pytest and Testcontainers.</li><li>Package with uv and pyproject.toml; profile and optimise hot paths.</li><li>Debug Linux and network issues with ss, strace, dig and tcpdump.</li><li>Containerise Java, Python and Go services and deploy them to Kubernetes with Helm.</li></ul>
+      <h4>Chapters to complete</h4><ul><li><a href="p4-01-python-internals-concurrency.html">Python Internals, Memory, the GIL &amp; Concurrency</a> <small>(~80 min read)</small></li><li><a href="p4-02-typing-pydantic-fastapi.html">Type Hints, Pydantic, FastAPI &amp; Dependency Injection</a> <small>(~80 min read)</small></li><li><a href="p4-03-data-access-background-jobs.html">SQLAlchemy, Database Integration, Celery &amp; Task Queues</a> <small>(~70 min read)</small></li><li><a href="p4-04-production-python.html">Production Python: Testing, Packaging, Performance, Deployment &amp; Java Interop</a> <small>(~90 min read)</small></li><li><a href="p12-01-linux-networking.html">Linux &amp; Networking Fundamentals for Backend Engineers</a> <small>(~80 min read)</small></li><li><a href="p12-02-docker-kubernetes-helm.html">Docker, Kubernetes &amp; Helm</a> <small>(~100 min read)</small></li></ul>
+      <h4>DSA thread</h4><ul><li><a href="p3-07-dynamic-programming.html">Dynamic Programming</a></li></ul>
+      <h4>Weekly schedule</h4>
+      <div class="table-wrap"><table class="week-table"><thead><tr><th>Week</th><th>Main track</th><th>DSA / notes</th></tr></thead><tbody><tr><td>Week 1</td><td>P4 ch. 1 (internals, GIL, asyncio) + P4 ch. 2 first half</td><td>DP: 1-D problems</td></tr><tr><td>Week 2</td><td>P4 ch. 2 rest + P4 ch. 3 (SQLAlchemy, Celery)</td><td>DP: 2-D grid and string DP</td></tr><tr><td>Week 3</td><td>P4 ch. 4 (production Python) + P12 ch. 1 (Linux &amp; networking)</td><td>Knapsack family</td></tr><tr><td>Week 4</td><td>P12 ch. 2 (Docker, Kubernetes, Helm); deploy the mini project to a local kind cluster</td><td>LIS / LCS / edit distance</td></tr></tbody></table></div>
+      <h4>Concepts to master</h4><p>Refcounting + cyclic GC, pymalloc, GIL, free-threaded CPython, asyncio event loop, TaskGroup, cancellation, Protocols and generics in type hints, Pydantic v2 validation and settings, FastAPI Depends vs Spring IoC, SQLAlchemy unit of work and loading strategies, Celery acks_late, idempotent tasks, uv, lockfiles, wheels, cgroups and namespaces, TCP, DNS, TLS, HTTP/2, Pods, Deployments, Services, probes, HPA, Helm charts.</p>
+      <h4>Practical coding assignments</h4><ol><li>Benchmark the same CPU-bound and I/O-bound workloads with threads, processes and asyncio, and explain the results.</li><li>Build the chapter's document-ingestion service: FastAPI + async SQLAlchemy + Celery/Redis, with 85%+ test coverage.</li><li>Call the Python service from your Spring Boot app over REST and over Kafka; define a shared schema.</li><li>Write a Helm chart that deploys the Spring and Python services with probes, resource limits, HPA and a PodDisruptionBudget.</li></ol>
+      <h4>Mini project: Polyglot service on Kubernetes</h4><p>Spring Boot API + FastAPI ingestion service + Celery workers + PostgreSQL + Redis, deployed with Helm to kind, with readiness/liveness probes, HPA and a smoke-test job.</p>
+      <h4>Assessment criteria</h4><ul class="check-list"><li><input type="checkbox" id="m5-a0"><label for="m5-a0">I can explain, with measurements, when asyncio beats threads and when multiprocessing is required.</label></li><li><input type="checkbox" id="m5-a1"><label for="m5-a1">My FastAPI service has typed settings, DI-overridden tests and Testcontainers integration tests.</label></li><li><input type="checkbox" id="m5-a2"><label for="m5-a2">I can troubleshoot a failing pod (CrashLoopBackOff, OOMKilled, failing readiness) without searching.</label></li><li><input type="checkbox" id="m5-a3"><label for="m5-a3">Quizzes ≥ 80%; 15 DP problems solved.</label></li></ul>
+      <h4>Recommended resources</h4><ul><li>Luciano Ramalho, <em>Fluent Python</em>, 2nd ed. (O'Reilly).</li><li><a href="https://docs.python.org/3/library/asyncio.html">Python docs — asyncio</a></li><li><a href="https://fastapi.tiangolo.com/">FastAPI documentation</a></li><li><a href="https://docs.sqlalchemy.org/en/20/">SQLAlchemy 2.0 documentation</a></li><li><a href="https://kubernetes.io/docs/home/">Kubernetes documentation</a></li></ul>
+      <h4>Expected outcome</h4><p>You can own a production Python service and ship polyglot systems to Kubernetes.</p>
+    </div>
+  </div>
+</section>
+
+<section id="month-6">
+  <h2>Month 6: LLM Engineering I: Foundations, Prompting, Tools & RAG</h2>
+  <div class="month">
+    <header><span class="m-num">MONTH 06</span><h3>LLM Engineering I: Foundations, Prompting, Tools & RAG</h3><span class="m-hours">12–15 h/week</span></header>
+    <div class="m-body">
+      <p>Opinion: an experienced backend engineer gets the fastest return by building with LLMs before studying ML theory in depth. Months 8–9 then explain why what you built works. Part 8 includes a transformer recap so this order is self-contained.</p>
+      <h4>Learning objectives</h4><ul><li>Explain next-token prediction, tokenisation, context windows and sampling well enough to predict model behaviour and cost.</li><li>Produce reliable structured outputs and tool calls, with validation and retries, from Spring Boot and Python.</li><li>Build a RAG pipeline with deliberate choices of chunking, embeddings, hybrid retrieval and reranking, and measure it.</li><li>Ship the enterprise document Q&amp;A project with citations and ACL-aware retrieval.</li></ul>
+      <h4>Chapters to complete</h4><ul><li><a href="p8-01-llm-foundations.html">LLM Foundations: Training, Tokenization, Context &amp; Sampling</a> <small>(~90 min read)</small></li><li><a href="p8-02-prompting-structured-tools.html">Prompt Engineering, Structured Outputs, Tool Use &amp; LLM APIs</a> <small>(~90 min read)</small></li><li><a href="p8-04-rag-retrieval.html">RAG: Chunking, Vector Databases, Hybrid Search, Reranking &amp; Evaluation</a> <small>(~120 min read)</small></li><li><a href="p8-07-projects-knowledge-support-search.html">Projects I: Document Q&amp;A, Knowledge Assistant, Support Platform, AI Search</a> <small>(~130 min read)</small></li></ul>
+      <h4>DSA thread</h4><ul><li><a href="p3-08-problem-solving-playbook.html">The Senior Interview Problem-Solving Playbook</a></li></ul>
+      <h4>Weekly schedule</h4>
+      <div class="table-wrap"><table class="week-table"><thead><tr><th>Week</th><th>Main track</th><th>DSA / notes</th></tr></thead><tbody><tr><td>Week 1</td><td>P8 ch. 1; tokenizer, sampling and attention widgets</td><td>Playbook: pattern-recognition drill</td></tr><tr><td>Week 2</td><td>P8 ch. 2; build a resilient LLM client in Spring Boot (timeouts, retries, structured output)</td><td>Timed medium problems ×4</td></tr><tr><td>Week 3</td><td>P8 ch. 4 (RAG); rag-retrieval widget; build a golden evaluation set of 50 questions</td><td>One mock coding interview</td></tr><tr><td>Week 4</td><td>P8 ch. 7, project 1 (document Q&amp;A) end to end</td><td>Timed medium/hard ×4</td></tr></tbody></table></div>
+      <h4>Concepts to master</h4><p>Pretraining, SFT, preference tuning, BPE tokens and cost, KV cache and context limits, Temperature, top-p, min-p, System prompts, few-shot, prompt versioning, prompt caching, JSON schema outputs, tool-use loop, Chunking strategies, embedding choice, HNSW and filtered ANN search, pgvector, BM25 + vector + RRF, cross-encoder reranking, Recall@k, MRR, nDCG, faithfulness.</p>
+      <h4>Practical coding assignments</h4><ol><li>Measure token counts and cost for the same document under two tokenisers; explain the difference.</li><li>Implement structured extraction into Java records with Spring AI and into Pydantic models in Python; add schema-violation retries.</li><li>Build an evaluation harness that reports recall@5 and MRR for three chunking strategies on your golden set.</li></ol>
+      <h4>Mini project: Enterprise document Q&amp;A</h4><p>Spring AI (or FastAPI) + PostgreSQL/pgvector: ingestion pipeline, hybrid search with RRF, reranker, cited answers, per-user ACL filtering, an evaluation report, and a cost-per-query estimate.</p>
+      <h4>Assessment criteria</h4><ul class="check-list"><li><input type="checkbox" id="m6-a0"><label for="m6-a0">I can explain why the model produced a given wrong answer: retrieval miss, context overflow, or generation error.</label></li><li><input type="checkbox" id="m6-a1"><label for="m6-a1">My RAG system has a measured retrieval recall and a regression test that runs in CI.</label></li><li><input type="checkbox" id="m6-a2"><label for="m6-a2">Users never see documents they lack permission for, and I have a test proving it.</label></li><li><input type="checkbox" id="m6-a3"><label for="m6-a3">Quizzes ≥ 80%.</label></li></ul>
+      <h4>Recommended resources</h4><ul><li>Chip Huyen, <em>AI Engineering</em> (O'Reilly, 2025).</li><li><a href="https://docs.anthropic.com/">Anthropic API documentation</a> and <a href="https://docs.spring.io/spring-ai/reference/">Spring AI reference</a></li><li><a href="https://arxiv.org/abs/2005.11401">Lewis et al., Retrieval-Augmented Generation (2020)</a></li><li><a href="https://arxiv.org/abs/1603.09320">Malkov &amp; Yashunin, HNSW (2016)</a></li><li><a href="https://github.com/pgvector/pgvector">pgvector</a></li></ul>
+      <h4>Expected outcome</h4><p>You can build and measure a production-grade RAG system from a Java codebase.</p>
+    </div>
+  </div>
+</section>
+
+<section id="month-7">
+  <h2>Month 7: LLM Engineering II: Models, Reliability, Agents & AI Security</h2>
+  <div class="month">
+    <header><span class="m-num">MONTH 07</span><h3>LLM Engineering II: Models, Reliability, Agents & AI Security</h3><span class="m-hours">12–15 h/week</span></header>
+    <div class="m-body">
+      <p>Moving from demos to products means evaluation, guardrails, cost control, agents with bounded authority, and an explicit AI threat model.</p>
+      <h4>Learning objectives</h4><ul><li>Choose between prompting, RAG and fine-tuning; run a LoRA/QLoRA fine-tune and quantise a model for serving.</li><li>Set up LLM evaluation, tracing and cost dashboards; add guardrails.</li><li>Build an agent with MCP tools, a step budget, persisted state and human approval for risky actions.</li><li>Defend against direct and indirect prompt injection, data leakage and unsafe tool execution.</li></ul>
+      <h4>Chapters to complete</h4><ul><li><a href="p8-03-models-finetuning-quantization.html">Model Selection, Open Models, Fine-Tuning, LoRA/QLoRA &amp; Quantization</a> <small>(~90 min read)</small></li><li><a href="p8-05-llm-reliability-operations.html">Hallucination, Guardrails, Evaluation, Observability, Cost &amp; Multimodal</a> <small>(~90 min read)</small></li><li><a href="p8-06-agents-mcp-security.html">Agentic AI, Multi-Agent Systems, MCP &amp; AI Application Security</a> <small>(~100 min read)</small></li><li><a href="p11-05-ai-llm-security.html">AI/LLM Security: Prompt Injection, Data Leakage, Tool Execution &amp; Agent Security</a> <small>(~80 min read)</small></li><li><a href="p8-08-projects-agents-java-integration.html">Projects II: Coding Assistant, Multi-Step Agent, Spring Boot + LLM, Python AI Service</a> <small>(~130 min read)</small></li></ul>
+      <p><em>DSA: maintenance mode, about two problems a week, mixed topics.</em></p>
+      <h4>Weekly schedule</h4>
+      <div class="table-wrap"><table class="week-table"><thead><tr><th>Week</th><th>Main track</th><th>DSA / notes</th></tr></thead><tbody><tr><td>Week 1</td><td>P8 ch. 3; run a small LoRA fine-tune (free GPU tier or rented GPU for a few hours)</td><td>2 maintenance problems</td></tr><tr><td>Week 2</td><td>P8 ch. 5; add tracing (OpenTelemetry GenAI conventions / Langfuse) and an LLM-as-judge eval to your Month 6 project</td><td>2 problems</td></tr><tr><td>Week 3</td><td>P8 ch. 6 + P11 ch. 5; write an MCP server in Java or Python</td><td>2 problems</td></tr><tr><td>Week 4</td><td>P8 ch. 8 projects; red-team your own agent in a local lab</td><td>Mock interview: AI system design</td></tr></tbody></table></div>
+      <h4>Concepts to master</h4><p>Open-weight licences, model selection matrix, LoRA rank maths, QLoRA NF4, DPO, GPTQ/AWQ/GGUF/FP8 quantisation, Hallucination types and mitigations, Guardrails: input/output, PII, topical, LLM-as-judge pitfalls, pairwise eval, Model routing, semantic caching, prompt caching, Agent loop, ReAct, workflows vs agents, MCP hosts/clients/servers, transports, OAuth, OWASP LLM Top 10, indirect prompt injection, excessive agency.</p>
+      <h4>Practical coding assignments</h4><ol><li>Fine-tune a small open model with QLoRA on a narrow extraction task; compare it with few-shot prompting of a frontier model on quality, latency and cost.</li><li>Add a model-routing cascade (small model first, escalate on low confidence) and measure the saving.</li><li>Build an MCP server exposing two read-only tools and one write tool gated by human approval; write tests for injection attempts embedded in tool results.</li></ol>
+      <h4>Mini project: Spring Boot + LLM operations assistant</h4><p>A Spring AI service that calls your existing @Service beans as tools, streams over SSE, traces every call, enforces per-tenant token budgets, and runs an evaluation suite in CI. A separate Python microservice handles embeddings and reranking over gRPC.</p>
+      <h4>Assessment criteria</h4><ul class="check-list"><li><input type="checkbox" id="m7-a0"><label for="m7-a0">I can justify fine-tuning vs RAG vs prompting for a given requirement with numbers.</label></li><li><input type="checkbox" id="m7-a1"><label for="m7-a1">Every LLM call in my system is traced with tokens, latency and cost.</label></li><li><input type="checkbox" id="m7-a2"><label for="m7-a2">My agent cannot perform a destructive action without approval, even under prompt injection, and I can prove it with a test.</label></li><li><input type="checkbox" id="m7-a3"><label for="m7-a3">Quizzes ≥ 80%.</label></li></ul>
+      <h4>Recommended resources</h4><ul><li><a href="https://arxiv.org/abs/2106.09685">Hu et al., LoRA (2021)</a> and <a href="https://arxiv.org/abs/2305.14314">Dettmers et al., QLoRA (2023)</a></li><li><a href="https://modelcontextprotocol.io/">Model Context Protocol documentation</a></li><li><a href="https://genai.owasp.org/llm-top-10/">OWASP Top 10 for LLM Applications</a></li><li><a href="https://www.anthropic.com/engineering/building-effective-agents">Anthropic — Building effective agents</a></li><li><a href="https://huggingface.co/docs/peft/">Hugging Face PEFT documentation</a></li></ul>
+      <h4>Expected outcome</h4><p>You can take an AI feature from prototype to an evaluated, observable, secure, cost-controlled production service.</p>
+    </div>
+  </div>
+</section>
+
+<section id="month-8">
+  <h2>Month 8: Machine Learning Foundations</h2>
+  <div class="month">
+    <header><span class="m-num">MONTH 08</span><h3>Machine Learning Foundations</h3><span class="m-hours">11–14 h/week</span></header>
+    <div class="m-body">
+      <p>Now that you have built AI systems, the mathematics has somewhere to land. This month gives you enough foundations to read papers, debug models and talk to data scientists as a peer.</p>
+      <h4>Learning objectives</h4><ul><li>Use linear algebra, probability, statistics and calculus fluently for ML: dot products, SVD, Bayes, MLE, gradients, the chain rule.</li><li>Build leakage-free preprocessing pipelines.</li><li>Implement linear and logistic regression from scratch, then train trees, random forests and gradient boosting with scikit-learn and XGBoost.</li><li>Apply clustering and PCA to real data.</li><li>Instrument models in production with Prometheus/Grafana and OpenTelemetry.</li></ul>
+      <h4>Chapters to complete</h4><ul><li><a href="p6-01-math-for-ml.html">Mathematics for ML: Linear Algebra, Probability, Statistics, Calculus</a> <small>(~100 min read)</small></li><li><a href="p6-02-data-preprocessing-features.html">Data Preprocessing &amp; Feature Engineering</a> <small>(~70 min read)</small></li><li><a href="p6-03-supervised-learning.html">Supervised Learning: Regression, Classification, Trees &amp; Boosting</a> <small>(~110 min read)</small></li><li><a href="p6-04-unsupervised-learning.html">Unsupervised Learning: Clustering &amp; Dimensionality Reduction</a> <small>(~70 min read)</small></li><li><a href="p12-05-observability-otel.html">Observability: Prometheus, Grafana, OpenTelemetry, Tracing &amp; Logging</a> <small>(~80 min read)</small></li></ul>
+      <p><em>DSA: maintenance mode, about two problems a week, mixed topics.</em></p>
+      <h4>Weekly schedule</h4>
+      <div class="table-wrap"><table class="week-table"><thead><tr><th>Week</th><th>Main track</th><th>DSA / notes</th></tr></thead><tbody><tr><td>Week 1</td><td>P6 ch. 1 (maths) with pen and paper; gradient-descent widget</td><td>Keep 2 DSA problems/week as maintenance</td></tr><tr><td>Week 2</td><td>P6 ch. 2 + P6 ch. 3 first half (regression, logistic regression from scratch)</td><td></td></tr><tr><td>Week 3</td><td>P6 ch. 3 rest (trees, forests, boosting, XGBoost) + P6 ch. 4; kmeans widget</td><td></td></tr><tr><td>Week 4</td><td>P12 ch. 5 (observability); mini project</td><td></td></tr></tbody></table></div>
+      <h4>Concepts to master</h4><p>Vectors, matrices, eigen-decomposition, SVD, Bayes&#x27; theorem, MLE vs MAP, CLT, Gradients, chain rule, convexity, Entropy, cross-entropy, KL divergence, Scaling, encoding, target leakage, OLS, regularisation, logistic loss, Gini/entropy splits, bagging, boosting, XGBoost objective, k-means++, DBSCAN, PCA, Prometheus metric types, PromQL, OpenTelemetry.</p>
+      <h4>Practical coding assignments</h4><ol><li>Derive the gradient of logistic loss by hand, then verify it numerically with finite differences in NumPy.</li><li>Train logistic regression, random forest and XGBoost on a tabular dataset; compare them with a proper validation protocol.</li><li>Export the best model to ONNX and serve it inside a Spring Boot service with ONNX Runtime for Java; add latency and prediction-distribution metrics.</li></ol>
+      <h4>Mini project: Fraud / churn scoring service</h4><p>An end-to-end tabular model (sklearn pipeline + XGBoost), exported to ONNX, served from Spring Boot, with Grafana dashboards for latency, request volume and score distribution.</p>
+      <h4>Assessment criteria</h4><ul class="check-list"><li><input type="checkbox" id="m8-a0"><label for="m8-a0">I can explain the bias of a model's coefficients and the effect of L1 vs L2 regularisation.</label></li><li><input type="checkbox" id="m8-a1"><label for="m8-a1">My pipeline has no leakage, and I can explain how I verified that.</label></li><li><input type="checkbox" id="m8-a2"><label for="m8-a2">My Spring service serves the ONNX model with p99 under 20 ms on my machine and exports metrics.</label></li><li><input type="checkbox" id="m8-a3"><label for="m8-a3">Quizzes ≥ 80%.</label></li></ul>
+      <h4>Recommended resources</h4><ul><li>Aurélien Géron, <em>Hands-On Machine Learning with Scikit-Learn, Keras &amp; TensorFlow</em>, 3rd ed. (O'Reilly).</li><li><a href="https://mml-book.github.io/">Deisenroth, Faisal &amp; Ong, <em>Mathematics for Machine Learning</em> (free PDF)</a></li><li><a href="https://www.3blue1brown.com/topics/linear-algebra">3Blue1Brown — Essence of Linear Algebra</a></li><li><a href="https://scikit-learn.org/stable/user_guide.html">scikit-learn user guide</a></li><li><a href="https://arxiv.org/abs/1603.02754">Chen &amp; Guestrin, XGBoost (2016)</a></li></ul>
+      <h4>Expected outcome</h4><p>You understand classical ML deeply enough to build, evaluate and serve models, and to integrate them into JVM services.</p>
+    </div>
+  </div>
+</section>
+
+<section id="month-9">
+  <h2>Month 9: Model Evaluation & Deep Learning</h2>
+  <div class="month">
+    <header><span class="m-num">MONTH 09</span><h3>Model Evaluation & Deep Learning</h3><span class="m-hours">12–15 h/week</span></header>
+    <div class="m-body">
+      <p>Evaluation discipline is what makes models trustworthy, and deep learning, transformers above all, is the foundation of every LLM you used in months 6–7.</p>
+      <h4>Learning objectives</h4><ul><li>Choose metrics that match the business cost of errors; run cross-validation and hyperparameter search properly; explain predictions with SHAP.</li><li>Derive backpropagation and implement an MLP from scratch, then in PyTorch.</li><li>Train CNNs and LSTMs and explain why transformers replaced RNNs.</li><li>Implement a minimal transformer; reason about GPU memory, mixed precision and training cost.</li></ul>
+      <h4>Chapters to complete</h4><ul><li><a href="p6-05-evaluation-tuning-interpretability.html">Evaluation, Bias–Variance, Cross-Validation, Tuning &amp; Interpretability</a> <small>(~90 min read)</small></li><li><a href="p7-01-neural-network-fundamentals.html">Neural Networks: Perceptrons, Backpropagation &amp; Optimizers</a> <small>(~100 min read)</small></li><li><a href="p7-02-cnn-rnn-lstm.html">CNNs, RNNs &amp; LSTMs</a> <small>(~80 min read)</small></li><li><a href="p7-03-attention-transformers-embeddings.html">Attention, Transformers &amp; Embeddings</a> <small>(~100 min read)</small></li><li><a href="p7-04-gpu-training-evaluation.html">GPU Computing, Model Training &amp; Evaluation</a> <small>(~70 min read)</small></li></ul>
+      <p><em>DSA: maintenance mode, about two problems a week, mixed topics.</em></p>
+      <h4>Weekly schedule</h4>
+      <div class="table-wrap"><table class="week-table"><thead><tr><th>Week</th><th>Main track</th><th>DSA / notes</th></tr></thead><tbody><tr><td>Week 1</td><td>P6 ch. 5; bias-variance widget</td><td>Maintenance problems</td></tr><tr><td>Week 2</td><td>P7 ch. 1; neural-net widget; NumPy MLP from scratch</td><td></td></tr><tr><td>Week 3</td><td>P7 ch. 2 + P7 ch. 3 first half</td><td></td></tr><tr><td>Week 4</td><td>P7 ch. 3 rest (build a mini transformer) + P7 ch. 4</td><td></td></tr></tbody></table></div>
+      <h4>Concepts to master</h4><p>Precision/recall/F1, ROC vs PR AUC, calibration, Bias–variance decomposition, Stratified, grouped and time-series CV, Bayesian optimisation, early stopping, SHAP and permutation importance, Backprop on a computational graph, Adam/AdamW, initialisation, normalisation, Convolutions, residual connections, LSTM gates, Q/K/V attention, multi-head, RoPE, causal masking, Roofline, BF16/FP8, DDP, FLOPs ≈ 6ND.</p>
+      <h4>Practical coding assignments</h4><ol><li>Show, on an imbalanced dataset, a model with high ROC-AUC but poor PR-AUC, and explain the gap.</li><li>Implement a 2-layer MLP with manual backprop in NumPy; check your gradients numerically.</li><li>Train a small CNN on Fashion-MNIST and a small transformer on a character-level dataset; profile GPU or CPU utilisation.</li></ol>
+      <h4>Mini project: Mini-GPT from scratch</h4><p>A character-level decoder-only transformer in PyTorch (a few million parameters) with a training loop, checkpointing, LR schedule, an evaluation-loss curve, sampling with temperature and top-p, and a write-up connecting every component to Part 8.</p>
+      <h4>Assessment criteria</h4><ul class="check-list"><li><input type="checkbox" id="m9-a0"><label for="m9-a0">I can derive backprop for a 2-layer network on paper.</label></li><li><input type="checkbox" id="m9-a1"><label for="m9-a1">I can explain every tensor shape in a multi-head attention block.</label></li><li><input type="checkbox" id="m9-a2"><label for="m9-a2">My mini-GPT trains, and I can explain its loss curve and sampling behaviour.</label></li><li><input type="checkbox" id="m9-a3"><label for="m9-a3">Quizzes ≥ 80%.</label></li></ul>
+      <h4>Recommended resources</h4><ul><li>Goodfellow, Bengio &amp; Courville, <a href="https://www.deeplearningbook.org/"><em>Deep Learning</em></a> (free online), ch. 6–10.</li><li><a href="https://d2l.ai/">Zhang et al., <em>Dive into Deep Learning</em></a></li><li><a href="https://karpathy.ai/zero-to-hero.html">Andrej Karpathy — Neural Networks: Zero to Hero</a></li><li><a href="https://arxiv.org/abs/1706.03762">Vaswani et al., Attention Is All You Need (2017)</a></li><li><a href="https://pytorch.org/tutorials/">PyTorch tutorials</a></li></ul>
+      <h4>Expected outcome</h4><p>You can open any LLM architecture diagram and explain it mechanically, from tokens to logits.</p>
+    </div>
+  </div>
+</section>
+
+<section id="month-10">
+  <h2>Month 10: High-Performance Go, CI/CD, GitOps & Infrastructure Security</h2>
+  <div class="month">
+    <header><span class="m-num">MONTH 10</span><h3>High-Performance Go, CI/CD, GitOps & Infrastructure Security</h3><span class="m-hours">11–14 h/week</span></header>
+    <div class="m-body">
+      <p>Go dominates cloud-native infrastructure and is a strong fit for gateways and high-throughput services. CI/CD, GitOps and supply-chain security are table stakes for owning systems end to end.</p>
+      <h4>Learning objectives</h4><ul><li>Explain the Go scheduler, channels, the memory model and the GC; write leak-free concurrent code with context.</li><li>Build and profile a production Go service with HTTP, gRPC, pgx and a worker pool.</li><li>Know when to choose Go over Java or Python, and when not to.</li><li>Build CI/CD with GitOps (Argo CD) and Terraform-managed infrastructure.</li><li>Harden secrets, TLS, IAM, containers, Kubernetes and the software supply chain.</li></ul>
+      <h4>Chapters to complete</h4><ul><li><a href="p5-01-go-runtime-concurrency.html">The Go Runtime, Goroutines, Channels &amp; Context</a> <small>(~90 min read)</small></li><li><a href="p5-02-go-memory-interfaces-errors.html">Go Memory, Garbage Collection, Interfaces &amp; Errors</a> <small>(~70 min read)</small></li><li><a href="p5-03-go-services-grpc.html">Go Services: HTTP, Middleware, gRPC, Databases &amp; Worker Pools</a> <small>(~90 min read)</small></li><li><a href="p5-04-go-production-comparison.html">Production Go, Profiling &amp; the Java vs Go vs Python Decision</a> <small>(~70 min read)</small></li><li><a href="p12-03-cicd-gitops-terraform.html">CI/CD, GitOps, Infrastructure as Code &amp; Terraform</a> <small>(~80 min read)</small></li><li><a href="p11-04-crypto-cloud-supply-chain.html">Secrets, Encryption, TLS, IAM, Cloud, Container, Kubernetes &amp; Supply-Chain Security</a> <small>(~100 min read)</small></li></ul>
+      <p><em>DSA: maintenance mode, about two problems a week, mixed topics.</em></p>
+      <h4>Weekly schedule</h4>
+      <div class="table-wrap"><table class="week-table"><thead><tr><th>Week</th><th>Main track</th><th>DSA / notes</th></tr></thead><tbody><tr><td>Week 1</td><td>P5 ch. 1 + ch. 2</td><td>Re-solve 4 earlier problems in Go</td></tr><tr><td>Week 2</td><td>P5 ch. 3 + ch. 4; pprof a real benchmark</td><td></td></tr><tr><td>Week 3</td><td>P12 ch. 3 (CI/CD, GitOps, Terraform)</td><td></td></tr><tr><td>Week 4</td><td>P11 ch. 4 (crypto, cloud, containers, supply chain); mini project</td><td></td></tr></tbody></table></div>
+      <h4>Concepts to master</h4><p>GMP scheduler, preemption, netpoller, Channel semantics, select, errgroup, Happens-before, race detector, Escape analysis, GOGC, GOMEMLIMIT, Small interfaces, error wrapping, gRPC deadlines, interceptors, streaming, pprof CPU/heap/block, benchstat, Pipeline stages, progressive delivery, Argo CD, environment promotion, Terraform state and modules, AEAD, envelope encryption, KMS, TLS 1.3, mTLS, SBOM, SLSA, Sigstore signing.</p>
+      <h4>Practical coding assignments</h4><ol><li>Write the same fan-out/fan-in pipeline in Go (goroutines + channels), Java (virtual threads) and Python (asyncio); compare code, throughput and memory.</li><li>Profile the chapter's event-ingestion gateway, find one allocation hot spot and remove it with benchmark evidence.</li><li>Build a GitHub Actions pipeline that tests, builds, scans, generates an SBOM, signs the image with cosign, and lets Argo CD deploy it.</li></ol>
+      <h4>Mini project: Go event-ingestion gateway with a secure delivery pipeline</h4><p>A Go service (net/http + gRPC + pgx + worker pool + graceful shutdown + Prometheus + pprof) in front of your Kafka platform, delivered through a signed, SBOM-producing CI pipeline and Argo CD, with Terraform-managed infrastructure.</p>
+      <h4>Assessment criteria</h4><ul class="check-list"><li><input type="checkbox" id="m10-a0"><label for="m10-a0">I can find a goroutine leak with pprof and explain its cause.</label></li><li><input type="checkbox" id="m10-a1"><label for="m10-a1">I can argue Go vs Java for a given service with concrete criteria, not taste.</label></li><li><input type="checkbox" id="m10-a2"><label for="m10-a2">My pipeline refuses to deploy unsigned images.</label></li><li><input type="checkbox" id="m10-a3"><label for="m10-a3">Quizzes ≥ 80%.</label></li></ul>
+      <h4>Recommended resources</h4><ul><li>Alan Donovan &amp; Brian Kernighan, <em>The Go Programming Language</em> (Addison-Wesley).</li><li><a href="https://go.dev/doc/effective_go">Effective Go</a> and <a href="https://go.dev/ref/mem">The Go Memory Model</a></li><li><a href="https://grpc.io/docs/languages/go/">gRPC Go documentation</a></li><li><a href="https://argo-cd.readthedocs.io/">Argo CD documentation</a></li><li><a href="https://slsa.dev/">SLSA framework</a></li></ul>
+      <h4>Expected outcome</h4><p>You can build and operate high-performance Go services and ship any service through a secure, automated pipeline.</p>
+    </div>
+  </div>
+</section>
+
+<section id="month-11">
+  <h2>Month 11: Data Engineering, Data Science & MLOps</h2>
+  <div class="month">
+    <header><span class="m-num">MONTH 11</span><h3>Data Engineering, Data Science & MLOps</h3><span class="m-hours">12–15 h/week</span></header>
+    <div class="m-body">
+      <p>AI systems are data systems. This month connects your Kafka and database knowledge to analytical pipelines, lakehouses and the ML lifecycle.</p>
+      <h4>Learning objectives</h4><ul><li>Do EDA and applied statistics with pandas, Polars and DuckDB.</li><li>Design dimensional models and lakehouse tables (Iceberg or Delta); write advanced analytical SQL.</li><li>Build batch and streaming pipelines with Spark and Kafka; orchestrate with Airflow; model with dbt.</li><li>Track experiments, register models and deploy them with MLflow; detect drift.</li><li>Know the AWS building blocks for all of the above.</li></ul>
+      <h4>Chapters to complete</h4><ul><li><a href="p9-01-data-science-lifecycle.html">The Data Science Lifecycle, EDA, Statistics, Pandas &amp; NumPy</a> <small>(~80 min read)</small></li><li><a href="p9-02-analytical-sql-storage.html">Analytical SQL, Warehouses, Lakes &amp; the Lakehouse</a> <small>(~80 min read)</small></li><li><a href="p9-03-pipelines-spark-streaming.html">ETL/ELT, Apache Spark, Kafka Pipelines, Batch vs Streaming</a> <small>(~90 min read)</small></li><li><a href="p9-04-quality-governance-orchestration.html">Data Quality, Governance, Feature Stores, Airflow, dbt &amp; Analytics Engineering</a> <small>(~90 min read)</small></li><li><a href="p10-01-ml-lifecycle-mlflow.html">The ML Lifecycle, Experiment Tracking, Registries, MLflow &amp; CI/CD for ML</a> <small>(~80 min read)</small></li><li><a href="p10-02-serving-monitoring-drift.html">Model Serving, Deployment, Monitoring, Drift &amp; Retraining</a> <small>(~80 min read)</small></li><li><a href="p12-04-aws-cloud-networking-serverless.html">AWS Fundamentals, Cloud Networking &amp; Serverless</a> <small>(~80 min read)</small></li></ul>
+      <p><em>DSA: maintenance mode, about two problems a week, mixed topics.</em></p>
+      <h4>Weekly schedule</h4>
+      <div class="table-wrap"><table class="week-table"><thead><tr><th>Week</th><th>Main track</th><th>DSA / notes</th></tr></thead><tbody><tr><td>Week 1</td><td>P9 ch. 1 + ch. 2</td><td>Analytical SQL drills (window functions)</td></tr><tr><td>Week 2</td><td>P9 ch. 3 + ch. 4</td><td></td></tr><tr><td>Week 3</td><td>P10 ch. 1 + ch. 2</td><td></td></tr><tr><td>Week 4</td><td>P12 ch. 4 (AWS); mini project</td><td></td></tr></tbody></table></div>
+      <h4>Concepts to master</h4><p>EDA, hypothesis tests, A/B pitfalls, Columnar formats, predicate pushdown, Star schemas, SCDs, Iceberg/Delta snapshots and time travel, Spark DAGs, shuffles, AQE, skew, Event time, watermarks, exactly-once, Data contracts, lineage, feature stores, Airflow scheduling and idempotent tasks, dbt models and tests, MLflow tracking and registry, Shadow/canary model deployment, PSI/KS drift, VPC design, IAM, serverless trade-offs.</p>
+      <h4>Practical coding assignments</h4><ol><li>Analyse NYC TLC trip data with DuckDB and Polars; write five window-function queries that answer real business questions.</li><li>Build an Airflow DAG that lands Kafka events into an Iceberg/Delta table and runs dbt models with tests.</li><li>Track three training runs in MLflow, promote the best model with an alias, and deploy it behind a canary with a drift monitor.</li></ol>
+      <h4>Mini project: Feature pipeline → model → monitoring loop</h4><p>Kafka → Spark Structured Streaming → lakehouse table → dbt → feature table → MLflow-tracked training → registered model → canary deployment → drift alerts in Grafana.</p>
+      <h4>Assessment criteria</h4><ul class="check-list"><li><input type="checkbox" id="m11-a0"><label for="m11-a0">I can explain the difference between ETL and ELT and when each wins.</label></li><li><input type="checkbox" id="m11-a1"><label for="m11-a1">My pipeline is idempotent: re-running a day produces identical outputs.</label></li><li><input type="checkbox" id="m11-a2"><label for="m11-a2">I can show a drift alert firing on a synthetic distribution shift.</label></li><li><input type="checkbox" id="m11-a3"><label for="m11-a3">Quizzes ≥ 80%.</label></li></ul>
+      <h4>Recommended resources</h4><ul><li>Joe Reis &amp; Matt Housley, <em>Fundamentals of Data Engineering</em> (O'Reilly).</li><li>Chip Huyen, <em>Designing Machine Learning Systems</em> (O'Reilly).</li><li><a href="https://spark.apache.org/docs/latest/">Apache Spark documentation</a></li><li><a href="https://iceberg.apache.org/docs/latest/">Apache Iceberg documentation</a></li><li><a href="https://mlflow.org/docs/latest/">MLflow documentation</a></li><li><a href="https://papers.nips.cc/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html">Sculley et al., Hidden Technical Debt in ML Systems (NeurIPS 2015)</a></li></ul>
+      <h4>Expected outcome</h4><p>You can design the data and ML platform an AI product depends on, and collaborate fluently with data and ML teams.</p>
+    </div>
+  </div>
+</section>
+
+<section id="month-12">
+  <h2>Month 12: AI Infrastructure, SRE & Capstones</h2>
+  <div class="month">
+    <header><span class="m-num">MONTH 12</span><h3>AI Infrastructure, SRE & Capstones</h3><span class="m-hours">12–15 h/week</span></header>
+    <div class="m-body">
+      <p>The capstone months prove integration: one system that uses most of what you learned, deployed, observed, secured and documented, ready to show in interviews.</p>
+      <h4>Learning objectives</h4><ul><li>Serve and scale LLMs and models on GPUs cost-effectively.</li><li>Apply SRE practice: SLOs, burn-rate alerts, incident response and blameless postmortems.</li><li>Build one capstone end to end and write it up as a portfolio case study; design a second on paper.</li></ul>
+      <h4>Chapters to complete</h4><ul><li><a href="p10-03-ai-infrastructure-gpus.html">AI Infrastructure: Kubernetes, GPUs, Inference Optimization, Distributed Training &amp; Cost</a> <small>(~90 min read)</small></li><li><a href="p12-06-sre-incident-response.html">Reliability Engineering, SRE Principles &amp; Incident Response</a> <small>(~60 min read)</small></li><li><a href="p13-01-ai-saas-platform.html">Capstone: Scalable AI-Powered SaaS Platform</a> <small>(~90 min read)</small></li><li><a href="p13-02-enterprise-rag-platform.html">Capstone: Enterprise RAG Platform</a> <small>(~90 min read)</small></li><li><a href="p13-03-realtime-event-processing.html">Capstone: Real-Time Event Processing System</a> <small>(~80 min read)</small></li><li><a href="p13-04-ai-analytics-platform.html">Capstone: AI-Powered Analytics Platform</a> <small>(~80 min read)</small></li><li><a href="p13-05-secure-microservices.html">Capstone: Secure Microservices Architecture</a> <small>(~80 min read)</small></li><li><a href="p13-06-developer-productivity-platform.html">Capstone: Intelligent Developer Productivity Platform</a> <small>(~80 min read)</small></li></ul>
+      <p><em>DSA: maintenance mode, about two problems a week, mixed topics.</em></p>
+      <h4>Weekly schedule</h4>
+      <div class="table-wrap"><table class="week-table"><thead><tr><th>Week</th><th>Main track</th><th>DSA / notes</th></tr></thead><tbody><tr><td>Week 1</td><td>P10 ch. 3 + P12 ch. 6; read all six capstone chapters' requirements and architecture sections</td><td>Two full mock interviews (design + coding)</td></tr><tr><td>Week 2</td><td>Build capstone milestones M1–M2</td><td></td></tr><tr><td>Week 3</td><td>Build capstone milestones M3–M4; load test; game-day incident drill</td><td></td></tr><tr><td>Week 4</td><td>Harden, document, record a 10-minute architecture walkthrough; design (paper only) a second capstone</td><td>Final review of all quiz misses</td></tr></tbody></table></div>
+      <h4>Concepts to master</h4><p>GPU memory budgeting, MIG, time-slicing, Continuous batching, PagedAttention, speculative decoding, vLLM on Kubernetes, autoscaling on queue depth, Data, tensor and pipeline parallelism, FSDP, API vs self-host break-even, Multi-window burn-rate alerts, Incident roles, postmortems, Capstone integration: tenancy, quotas, governance, zero trust.</p>
+      <h4>Practical coding assignments</h4><ol><li>Compute the break-even point between a hosted LLM API and self-hosting an open model for your capstone's traffic profile (label your assumptions).</li><li>Define three SLOs for your capstone with burn-rate alerts; run a game day and write a blameless postmortem.</li><li>Write the capstone README: problem, architecture diagram, key trade-offs, evaluation results, cost, what you'd do next.</li></ol>
+      <h4>Mini project: Capstone (pick one to build)</h4><p>Recommended: Enterprise RAG Platform (P13 ch. 2) or Scalable AI SaaS Platform (P13 ch. 1). They exercise system design, Java + Python services, LLM engineering, security, Kubernetes and observability together.</p>
+      <h4>Assessment criteria</h4><ul class="check-list"><li><input type="checkbox" id="m12-a0"><label for="m12-a0">My capstone runs end to end from a single <code>make up</code> or <code>helm install</code>.</label></li><li><input type="checkbox" id="m12-a1"><label for="m12-a1">It has SLOs, dashboards, an evaluation report, a threat model and a cost model.</label></li><li><input type="checkbox" id="m12-a2"><label for="m12-a2">I can present it in 10 minutes and defend three design trade-offs under questioning.</label></li><li><input type="checkbox" id="m12-a3"><label for="m12-a3">Every chapter is marked complete, and my overall quiz average is ≥ 85%.</label></li></ul>
+      <h4>Recommended resources</h4><ul><li>Google, <a href="https://sre.google/books/"><em>Site Reliability Engineering</em> and <em>The Site Reliability Workbook</em></a> (free online).</li><li><a href="https://docs.vllm.ai/">vLLM documentation</a></li><li><a href="https://arxiv.org/abs/2309.06180">Kwon et al., PagedAttention / vLLM (SOSP 2023)</a></li><li><a href="https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/">Kubernetes — Scheduling GPUs</a></li></ul>
+      <h4>Expected outcome</h4><p>You have a portfolio-grade AI system, operated like production, and the vocabulary and judgement of a senior AI-era engineer.</p>
+    </div>
+  </div>
+</section>
+
+<section id="after">
+  <h2>After the twelve months</h2>
+  <p>A year of this plan gives you breadth at a senior level and depth in the areas that pay most: distributed systems and LLM application engineering. From there, specialise by choosing one direction and going deeper:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Direction</th><th>Go deeper into</th><th>Signal to build</th></tr></thead>
+    <tbody>
+      <tr><td>AI application / platform engineer</td><td>Part 8, Part 13, evaluation research, agent frameworks</td><td>An open-source RAG/agent tool or a production AI feature with published evaluation results</td></tr>
+      <tr><td>ML platform / MLOps engineer</td><td>Parts 9–10, Kubernetes operators, GPU scheduling</td><td>A model-serving or feature platform used by other teams</td></tr>
+      <tr><td>Staff backend / distributed systems</td><td>Part 2 papers (Raft, Spanner, Dynamo), storage engines</td><td>Design documents for org-wide systems; contributions to Kafka, Postgres or similar</td></tr>
+      <tr><td>Security engineer for AI systems</td><td>Part 11, especially AI/LLM security, and threat-modelling practice</td><td>Red-team reports from authorised labs, security tooling for LLM apps</td></tr>
+    </tbody>
+  </table></div>
+  <p>Revisit <a href="p1-03-career-strategy.html">Durable Skills, Emerging Roles &amp; Career Positioning</a> at month 6 and month 12 to adjust the plan to the market as it is then, not as it was when you started.</p>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

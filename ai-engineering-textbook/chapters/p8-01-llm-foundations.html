@@ -1,0 +1,1081 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Foundations: Training, Tokenization, Context &amp; Sampling — AI-Era Software Engineering</title>
+<meta name="description" content="How large language models are trained and how they generate text: next-token prediction, scaling laws, post-training, tokenization and its cost impact, embeddings, the transformer and KV cache, context windows and sampling — explained for backend engineers who will put LLMs into production.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p8-01-llm-foundations" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 8 · Chapter 1</p>
+  <h1>LLM Foundations: Training, Tokenization, Context &amp; Sampling</h1>
+  <p class="lede">A large language model is, mechanically, a function that maps a sequence of tokens to a probability distribution over the next token, called in a loop. Everything you will fight with in production — cost, latency, nondeterminism, context limits, truncated JSON, weird behaviour on non-English input — falls out of that one sentence. This chapter builds the mental model an engineer needs to reason about those behaviours from first principles instead of from folklore.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Comfort with probability basics and vectors; Part 7 Chapter 3 (attention &amp; transformers) is helpful but not required — this chapter recaps what an engineer needs and links there for the full derivation.</li>
+    <li><strong>You will be able to:</strong> explain how a model is pretrained and post-trained; predict token counts and cost for a workload; size a KV cache; reason about why long contexts are slow and lossy; choose decoding settings deliberately; and explain why two identical requests can return different answers.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: The Most Expensive Function Call in Your Stack</h2>
+  <p>For most of your career, a remote dependency has been something with a contract: a REST endpoint with an OpenAPI schema, a JDBC driver returning typed rows, a Kafka topic with an Avro schema. You know what you send and you know, to a high degree of certainty, what comes back. A large language model (LLM) breaks almost every one of those assumptions. Its input is free text (or images, audio, documents) chopped into <em>tokens</em>; its output is generated one token at a time by sampling from a probability distribution; the same input can produce different outputs; the response can take anywhere from a few hundred milliseconds to several minutes; and you pay per token, in both directions.</p>
+  <p>Yet LLMs solve a class of problem that no amount of clever Spring code could solve before: turning unstructured language into structured decisions. Classifying a support ticket by intent, extracting fields from a contract PDF, summarising a 40-page incident report, translating a business question into SQL, deciding which internal API to call next — these were previously either impossible or required a dedicated ML team with labelled data and months of work. Now they are a prompt and an HTTPS call away. That shift is why "AI engineering" exists as a discipline: the model is a commodity component, and the engineering work is everything around it.</p>
+  <p>This chapter is the foundation for the rest of Part 8. We will not train a frontier model — you never will, and neither will your employer — but you need to understand how they are trained, because training explains behaviour. A model that was rewarded for sounding helpful will confidently produce plausible-looking nonsense when it does not know the answer. A model whose tokenizer was built mostly on English text will cost you more, and perform worse, on Hindi or Japanese. A model that attends to all previous tokens on every step will slow down and get more expensive as the conversation grows. These are not bugs in a particular vendor's product; they are properties of the architecture.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>You have integrated slow, flaky, metered third-party APIs: payment gateways, address validation, SMS providers. You wrapped them in a <code>RestClient</code> or <code>WebClient</code>, added Resilience4j timeouts, retries and circuit breakers, cached aggressively, and tracked cost per call. You have also used Elasticsearch, where text is analysed into tokens and scored — conceptually close to how an LLM sees text.</dd>
+      <dt>Why that is not enough</dt><dd>An LLM call is a remote dependency whose <em>output is probabilistic</em>. Retrying the same request can yield a different answer; "success" (HTTP 200) does not mean the answer is correct; latency scales with how much the model writes; and cost scales with how much text you send. The contract is a natural-language instruction, not a schema, so you cannot unit-test it the way you test a <code>@Service</code>. You also cannot reason about failure modes like hallucination, truncation at the context limit, or token-count blow-ups without knowing how the model works inside.</dd>
+      <dt>The modern approach</dt><dd>Treat the model as a stochastic, expensive function with known mechanics: estimate tokens before you call, budget context deliberately, choose decoding behaviour on purpose, stream output to hide latency, constrain outputs with schemas, and evaluate quality statistically rather than with assertions. Know which levers you control (prompt, context, decoding, model choice) and which you do not (weights, tokenizer, training data).</dd>
+      <dt>Where Python and Go fit</dt><dd>Python is where the model ecosystem lives: tokenizers, Hugging Face <code>transformers</code>, evaluation tooling and every research paper's reference code. You will prototype and analyse in Python. Go is a strong fit for the infrastructure around models — LLM gateways, token-counting proxies, rate limiters — because it handles many concurrent long-lived streaming connections cheaply. Java/Spring remains the natural home for business integration (Spring AI, LangChain4j, the official Anthropic Java SDK).</dd>
+      <dt>In production</dt><dd>You will monitor input/output tokens per request, time-to-first-token (TTFT) and time-per-output-token (TPOT), cost per feature, cache hit rates, context-length distributions and truncation (<code>max_tokens</code>) stop reasons — the LLM equivalents of p99 latency and error rate.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use an LLM when the input is unstructured language and an approximate, reviewable answer creates value. Avoid it when a deterministic rule, a SQL query, a regex or a small classifier would do the job — those are cheaper, faster, testable and explainable. "Could a junior engineer write an <code>if</code> statement for this?" is a good first filter.</dd>
+    </dl>
+  </div>
+
+  <p>The rest of the chapter follows the life of a model: how it is built (pretraining and post-training), how it reads (tokenization and embeddings), how it thinks (the transformer, attention, the KV cache), how much it can hold (context windows), and how it speaks (decoding and sampling). Each piece ends with the production consequence, because that is what you will be paged for.</p>
+</section>
+
+<section id="history">
+  <h2>2. History: From n-grams to Reasoning Models</h2>
+  <p>Language modelling — assigning probabilities to sequences of words — is older than deep learning. What changed between 2013 and 2025 was not the objective (predict the next word) but the capacity of the function doing the predicting and the amount of data it was trained on.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Year</th><th>Milestone</th><th>Why it mattered for engineers</th></tr></thead>
+    <tbody>
+      <tr><td>1990s–2000s</td><td>Statistical n-gram language models (count how often word <em>w</em> follows the previous <em>n</em>−1 words), used in speech recognition and machine translation.</td><td>Established next-word prediction and perplexity as the core objective and metric. Could not generalise beyond seen word combinations.</td></tr>
+      <tr><td>2013</td><td>word2vec (Mikolov et al.) learns dense word vectors from co-occurrence.</td><td>"Meaning as a vector" — the idea behind every embedding and vector database you will use.</td></tr>
+      <tr><td>2014–2015</td><td>Sequence-to-sequence RNNs and the attention mechanism (Bahdanau et al.) for translation.</td><td>Attention lets a model look back at relevant input positions instead of compressing everything into one vector.</td></tr>
+      <tr><td>2015–2016</td><td>Subword tokenization with byte-pair encoding (Sennrich et al., 2015) for neural translation.</td><td>Solved the open-vocabulary problem; the direct ancestor of the tokenizers that bill you today.</td></tr>
+      <tr><td>2017</td><td>"Attention Is All You Need" introduces the Transformer.</td><td>Fully parallel training over sequences made scaling to huge datasets on GPUs practical.</td></tr>
+      <tr><td>2018</td><td>GPT (decoder-only, generative pretraining) and BERT (encoder-only, masked language modelling); SentencePiece released.</td><td>Pretrain once on unlabelled text, adapt cheaply to many tasks. BERT-style encoders still power many embedding and reranking models.</td></tr>
+      <tr><td>2019</td><td>GPT-2 (1.5B parameters) shows coherent long-form generation; nucleus (top-p) sampling paper published.</td><td>Generation quality depended heavily on decoding strategy, not just the model.</td></tr>
+      <tr><td>2020</td><td>GPT-3 (175B) demonstrates in-context (few-shot) learning; Kaplan et al. publish neural scaling laws; RAG paper (Lewis et al.).</td><td>Prompting replaced fine-tuning for many tasks. Loss falls predictably with scale — the economic logic behind the frontier labs.</td></tr>
+      <tr><td>2022</td><td>Chinchilla (Hoffmann et al.) revises scaling laws toward more data per parameter; InstructGPT describes SFT + RLHF; chain-of-thought prompting; ChatGPT launches on 30 November.</td><td>Post-training turned raw predictors into instruction followers; the chat interface made LLMs a mainstream product overnight.</td></tr>
+      <tr><td>2023</td><td>GPT-4; Meta's LLaMA and Llama 2 kick off the open-weight ecosystem; QLoRA and DPO papers; Anthropic's Constitutional AI (published Dec 2022) popularises AI feedback.</td><td>Fine-tuning moved within reach of a single GPU; preference tuning became simpler than full RL.</td></tr>
+      <tr><td>2024</td><td>Mixture-of-experts open models (e.g. Mixtral); context windows of hundreds of thousands to a million tokens; OpenAI's o1 (September) popularises "reasoning" models that spend extra tokens thinking; Anthropic releases the Model Context Protocol (November).</td><td>Test-time compute became a knob you pay for; tool integration began to standardise.</td></tr>
+      <tr><td>2025</td><td>DeepSeek-R1 (January) shows reinforcement learning on verifiable rewards can produce strong open reasoning models; agentic coding tools and agent SDKs go mainstream.</td><td>Reasoning moved from a premium feature to a default; providers start hiding raw chain-of-thought and exposing an "effort" control instead.</td></tr>
+      <tr><td>2026</td><td>Frontier families from Anthropic, OpenAI, Google, Meta, Mistral, Alibaba (Qwen) and DeepSeek iterate rapidly; 1M-token windows are common at the top end; some APIs remove user-facing sampling controls in favour of provider defaults. <span class="tag version">Version-sensitive · checked Nov 2026</span></td><td>Model choice became a quarterly — not yearly — decision, so your architecture must make swapping models cheap and measurable.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Two threads matter most for you. First, the <strong>bitter economics of scale</strong>: performance improved mainly by adding compute and data, which concentrated frontier model training in a handful of labs and turned models into API products. Second, <strong>post-training changed the interface</strong>: GPT-3 had to be coaxed with carefully formatted few-shot examples; instruction-tuned chat models accept plain instructions, which is what made LLMs usable by ordinary application developers — and what makes prompt engineering an engineering discipline rather than a dark art.</p>
+  <div class="callout insight"><p class="callout-title">Insight</p><p>Notice how many "new" ideas are old: next-token prediction (1950s Shannon), attention (2014), subword tokenization (2015), retrieval-augmented generation (2020). What changes quickly is the <em>packaging</em> — model names, context sizes, API parameters. Invest your learning in the slow-moving mechanics; treat the fast-moving names as configuration.</p></div>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals: Every Concept You Need Before Going Deeper</h2>
+
+  <h3>3.1 Next-token prediction</h3>
+  <p>Strip away the chat interface and an LLM does exactly one thing: given a sequence of tokens \( x_1, \dots, x_t \), it outputs a probability distribution \( P(x_{t+1} \mid x_1, \dots, x_t) \) over its entire vocabulary — typically 32,000 to a few hundred thousand entries. It does not output "an answer"; it outputs a score for every possible next token. Everything else — conversations, tool calls, JSON — is built by choosing one token from that distribution, appending it, and asking again.</p>
+  <p>Why should predicting the next token produce something that looks like understanding? Because to predict text well across trillions of tokens of code, textbooks, forums, legal filings and fiction, the cheapest internal strategy is to model the processes that generated the text: grammar, facts, arithmetic patterns, the conventions of a stack trace, the logic of a proof. The model is never told to learn these; they are side-effects of minimising prediction error. That also explains the failure modes: the model learned what <em>plausible</em> text looks like, and plausibility is not truth.</p>
+
+  <h3>3.2 Autoregressive decoding</h3>
+  <p><em>Autoregressive</em> means each output becomes part of the next input. Generation is a loop:</p>
+  <ol>
+    <li>Tokenize the prompt into IDs.</li>
+    <li>Run the model over all prompt tokens to get the distribution for the next position (this first pass is called <strong>prefill</strong>).</li>
+    <li>Pick a token from that distribution (the <strong>decoding strategy</strong>: greedy, sampling, etc.).</li>
+    <li>Append it, run the model for just that one new position (a <strong>decode step</strong>), and repeat.</li>
+    <li>Stop on an end-of-sequence token, a stop sequence, or the <code>max_tokens</code> limit.</li>
+  </ol>
+  <p>Three production consequences follow directly. <strong>Output latency is linear in output length</strong>: a 2,000-token answer takes roughly 20 times longer to generate than a 100-token answer, so asking for concise output is a performance optimisation. <strong>Streaming is natural</strong>: tokens exist one at a time, so you can forward them to the user as they are produced, which is why every LLM API supports server-sent events. <strong>Errors compound</strong>: an early wrong token (a wrong function name, a hallucinated fact) becomes context for everything after it, and the model will usually rationalise rather than retract it.</p>
+
+  <h3>3.3 Pretraining: data and objective</h3>
+  <p>Pretraining is where nearly all of the compute — and the model's knowledge — goes. The recipe:</p>
+  <ul>
+    <li><strong>Data.</strong> Trillions of tokens drawn from filtered web crawls (Common Crawl derivatives), books, academic papers, code repositories, and increasingly synthetic data generated by earlier models. Labs invest heavily in deduplication, quality filtering (classifiers that score "educational value" or similarity to reference text), toxicity and PII filtering, and data mixing (what fraction is code vs. maths vs. multilingual text). Data composition is the most closely guarded part of most frontier recipes.</li>
+    <li><strong>Objective.</strong> Causal language modelling: for every position in every training sequence, maximise the log-probability the model assigns to the actual next token. Equivalently, minimise cross-entropy loss. No labels are needed — the text is its own supervision, which is why it scales to the whole internet.</li>
+    <li><strong>Result.</strong> A <em>base model</em>: an excellent document completer that will happily continue your prompt as if it were a web page. Ask a base model "What is the capital of France?" and it may respond with three more quiz questions, because that is what follows such a line on the web.</li>
+  </ul>
+  <p>Two engineering facts come from pretraining. The model has a <strong>knowledge cutoff</strong> — it knows nothing after its training data was collected, and it does not reliably know <em>where</em> its cutoff is. And its knowledge is <strong>lossy and frequency-weighted</strong>: facts seen thousands of times (the syntax of <code>@Transactional</code>) are robust; facts seen once (your company's internal API) are absent or confabulated. That is the core argument for retrieval-augmented generation (Chapter 4).</p>
+
+  <h3>3.4 Scaling laws</h3>
+  <p>Scaling laws are empirical regularities: as you increase parameters <em>N</em>, training tokens <em>D</em> and compute <em>C</em>, the pretraining loss decreases as a smooth power law. Kaplan et al. (2020) first measured this for transformers; Hoffmann et al. (2022, "Chinchilla") showed that, for a fixed compute budget, many earlier models were too large and undertrained, and that parameters and tokens should grow roughly in proportion — on the order of twenty training tokens per parameter for compute-optimal training. In practice, modern labs deliberately "over-train" smaller models far beyond that ratio, because a smaller model that is cheaper to <em>serve</em> is worth extra one-off training compute when it will answer billions of requests. This is why small open models of a few billion parameters became surprisingly capable.</p>
+  <p>Why should you, an application engineer, care? Because scaling laws explain the product line-up every provider offers: a large, slow, expensive model; a mid-size workhorse; and a small, fast, cheap one. They share training recipes and differ mainly in scale, so capability differences are smooth, and routing easy requests to the small model (Chapter 5) is a predictable cost lever.</p>
+
+  <h3>3.5 Post-training: supervised fine-tuning (instruction tuning)</h3>
+  <p>Post-training turns the document completer into an assistant. The first step is <strong>supervised fine-tuning (SFT)</strong>, also called instruction tuning: continue training on tens of thousands to millions of curated examples of the form <em>(instruction, ideal response)</em>, formatted with a <strong>chat template</strong> — special tokens that mark system, user and assistant turns. After SFT, the model has learned the "shape" of being an assistant: answer the question, follow formatting instructions, stop when done.</p>
+  <p>The chat template matters operationally. When you call a messages API, the provider serialises your <code>system</code>, <code>user</code> and <code>assistant</code> messages into one token sequence using its template. When you self-host an open model, <em>you</em> are responsible for applying the right template — use the wrong one and quality silently degrades. Tool calls and structured outputs are also learned during post-training: the model sees examples of emitting a tool-call block in a specific format, which is why tool-use reliability varies so much between models.</p>
+
+  <h3>3.6 Preference tuning: RLHF</h3>
+  <p>SFT teaches imitation, but writing ideal answers is expensive and humans are better at <em>comparing</em> answers than writing them. <strong>Reinforcement learning from human feedback (RLHF)</strong>, as described in OpenAI's InstructGPT paper (Ouyang et al., 2022), adds two stages:</p>
+  <ol>
+    <li><strong>Reward model.</strong> Sample several responses to each prompt, have human labellers rank them, and train a model to predict a scalar "how much would a human prefer this?" score.</li>
+    <li><strong>Policy optimisation.</strong> Use reinforcement learning (classically PPO) to update the LLM to produce responses the reward model scores highly, with a KL-divergence penalty that keeps it close to the SFT model so it does not drift into gibberish that happens to fool the reward model.</li>
+  </ol>
+  <p>RLHF is why chat models are polite, structured and eager to help. It is also a source of failure modes: <strong>sycophancy</strong> (agreeing with the user because labellers preferred agreeable answers), <strong>verbosity</strong> (longer answers were often rated higher), and <strong>confident tone regardless of certainty</strong>. When your application needs a model to say "I don't know," you are pushing against this training pressure, which is why grounding instructions and evaluation matter so much.</p>
+
+  <h3>3.7 RLAIF and constitutional approaches</h3>
+  <p>Human preference labels are slow and expensive. <strong>Reinforcement learning from AI feedback (RLAIF)</strong> replaces some or all human comparisons with judgements from a model following a written set of principles. Anthropic's Constitutional AI paper (Bai et al., 2022) is the best-known example: the model critiques and revises its own outputs against a "constitution," and those AI-generated preferences train the reward signal for harmlessness. For you, the takeaway is practical: the same technique — an LLM judging outputs against a rubric — is what you will use to <em>evaluate</em> your own application (Chapter 5), with the same strengths (scale) and weaknesses (bias toward the judge's own style).</p>
+
+  <h3>3.8 Direct preference optimisation (DPO)</h3>
+  <p>DPO (Rafailov et al., 2023) showed that the RLHF objective can be optimised directly on preference pairs <em>(prompt, chosen, rejected)</em> with a simple classification-style loss, without training a separate reward model or running an RL loop. It is more stable and far cheaper, which made preference tuning accessible to anyone who can fine-tune a model — including you, with the Hugging Face TRL library (Chapter 3 of this Part). Many open models now use DPO or one of its many variants as part of post-training.</p>
+
+  <h3>3.9 Reasoning models and test-time compute</h3>
+  <p>Classic chat models answer immediately: the first output token is already part of the answer. <strong>Reasoning models</strong> are trained to first produce a long internal chain of thought — exploring, checking, backtracking — and only then write the answer. They are typically trained with reinforcement learning on tasks with <em>verifiable</em> rewards (maths problems with known answers, code with unit tests), which rewards whatever reasoning process reaches correct answers. DeepSeek-R1's technical report (2025) documented this openly for an open-weight model.</p>
+  <p>The economic idea is <strong>test-time compute</strong>: instead of a bigger model, spend more tokens per request. Accuracy on hard problems rises with the thinking budget, but so do latency and cost — thinking tokens are billed as output tokens. Providers expose this as a knob: Anthropic's current API uses <em>adaptive thinking</em> with an <code>effort</code> level (<code>low</code> through <code>max</code>) rather than a fixed token budget, and returns either a summary of the reasoning or nothing at all rather than the raw chain of thought. <span class="tag version">Version-sensitive · checked Nov 2026</span> For engineers, reasoning is a per-route setting: high effort for a complex code migration plan, low effort for intent classification.</p>
+
+  <h3>3.10 Tokenization</h3>
+  <p>Models do not see characters or words; they see integer token IDs from a fixed vocabulary. A tokenizer is a deterministic, reversible mapping between text and IDs, trained once before pretraining and frozen forever after. Four families matter:</p>
+  <ul>
+    <li><strong>Byte-pair encoding (BPE).</strong> Start with individual characters; repeatedly find the most frequent adjacent pair in the training corpus and merge it into a new symbol; stop at the target vocabulary size. Common words become single tokens; rare words split into frequent fragments. You will implement this in §7.</li>
+    <li><strong>Byte-level BPE.</strong> Run BPE over UTF-8 <em>bytes</em> instead of Unicode characters (popularised by GPT-2). The base vocabulary is just 256 byte values, so any string — emoji, Devanagari, binary garbage — is encodable with no "unknown" token. OpenAI's <code>tiktoken</code> encodings and most modern LLM tokenizers are byte-level BPE variants.</li>
+    <li><strong>SentencePiece.</strong> A library (Kudo &amp; Richardson, 2018) that treats input as a raw stream including spaces (encoded as a visible marker, <code>▁</code>), so it works for languages without whitespace word boundaries. It supports both BPE and the <strong>Unigram</strong> algorithm, which starts with a large vocabulary and prunes tokens that least reduce corpus likelihood. Llama 1 and 2, T5 and many multilingual models use SentencePiece.</li>
+    <li><strong>WordPiece.</strong> BERT's variant, similar to BPE but choosing merges by likelihood gain. You meet it mostly in older encoder-based embedding and reranking models.</li>
+  </ul>
+  <p>A rule of thumb for English prose with modern tokenizers is roughly four characters, or three-quarters of a word, per token — but treat this as a planning estimate only. Code, JSON, numbers, URLs, UUIDs and non-Latin scripts tokenize very differently, and every provider's tokenizer is different (Anthropic, for instance, does not publish its tokenizer and offers a token-counting API instead; its documentation also notes that tokenizers can change between model generations).</p>
+
+  <h4>Token counting and cost</h4>
+  <p>Every commercial API bills per token, usually with different prices for input, output, cached input and cache writes, and output tokens cost several times more than input tokens. Token counts therefore drive three things you care about: <strong>cost</strong> (tokens × price), <strong>latency</strong> (output tokens dominate generation time; input tokens dominate time-to-first-token for long prompts), and <strong>feasibility</strong> (whether the request fits in the context window). Practical consequences:</p>
+  <ul>
+    <li>Pretty-printed JSON with indentation can cost noticeably more than minified JSON, and verbose key names are paid on every request. Measure with your provider's counter before optimising.</li>
+    <li>Numbers are often split into multi-digit chunks inconsistently, which is one reason models are weak at exact arithmetic — delegate maths to a tool.</li>
+    <li>Long identifiers (UUIDs, hashes, base64 blobs) are token-expensive and carry no semantic value for the model. Strip or shorten them before sending.</li>
+    <li>Switching models can change your token counts for identical text, so re-baseline costs when you migrate.</li>
+  </ul>
+
+  <h4>Multilingual effects</h4>
+  <p>Tokenizers trained on English-heavy corpora fragment other scripts into many more tokens per word. Petrov et al. (2023) measured that the same content can require several times more tokens in some languages than in English across popular tokenizers — and in extreme cases more than ten times. The consequences compound: users of those languages pay more per request, hit context limits sooner, wait longer, and often get lower quality, because the model saw less data in their language and has to reason over longer, less meaningful fragments. If you serve a multilingual user base (for example, Indian languages alongside English), measure token ratios per language early; it can change your cost model and your choice of model.</p>
+
+  <h3>3.11 Embeddings: token vs. sentence embeddings</h3>
+  <p>Inside the model, the first operation is a lookup: each token ID indexes a row in an <strong>embedding matrix</strong>, producing a dense vector (a few thousand dimensions in large models). These <em>token embeddings</em> are learned during training; similar tokens end up nearby. As the vectors flow through the transformer layers they become <em>contextual</em>: the vector for "bank" in "river bank" diverges from "bank" in "bank account".</p>
+  <p>A <strong>sentence (or text) embedding</strong> is different: a single fixed-size vector representing a whole passage, produced by a model trained specifically so that semantically similar passages map to nearby vectors (typically with contrastive learning on pairs of related texts, as in Sentence-BERT). You get one by calling an embedding model — a separate, much cheaper model than the chat LLM — and you store those vectors in a vector database for semantic search. Do not confuse the two: you cannot meaningfully average a chat model's token vectors and expect good retrieval. Chapter 4 covers choosing and operating embedding models.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Aspect</th><th>Token embedding</th><th>Sentence/text embedding</th></tr></thead>
+    <tbody>
+      <tr><td>Granularity</td><td>One vector per token, per layer</td><td>One vector per passage</td></tr>
+      <tr><td>Produced by</td><td>The LLM's embedding matrix and layers, internally</td><td>A dedicated embedding model (API or self-hosted)</td></tr>
+      <tr><td>Trained for</td><td>Predicting the next token</td><td>Similar meaning → high cosine similarity</td></tr>
+      <tr><td>You use it for</td><td>Nothing directly (unless doing interpretability)</td><td>Semantic search, clustering, deduplication, classification features, RAG</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>3.12 The transformer, recapped for engineers</h3>
+  <p>Part 7 Chapter 3 derives the transformer in full; here is the operational summary. Modern LLMs are <strong>decoder-only transformers</strong>: a stack of identical blocks (dozens to over a hundred), each containing two sub-layers with residual connections and normalisation:</p>
+  <ul>
+    <li><strong>Causal self-attention</strong>: every position computes a weighted mixture of information from all <em>earlier</em> positions (never later — that would be cheating at next-token prediction). This is how "it" gets linked to the noun it refers to, or a closing bracket to its opening one.</li>
+    <li><strong>Feed-forward network (MLP)</strong>: a per-position transformation where much of the model's factual "storage" is thought to live. In <strong>mixture-of-experts (MoE)</strong> models, this sub-layer is replaced by many expert MLPs and a router that sends each token to only a few of them, so a model can have a very large total parameter count while activating only a fraction per token.</li>
+  </ul>
+  <p>Positional information is injected with schemes such as rotary position embeddings (RoPE), which also determine how well a model extrapolates to sequences longer than it was trained on. Attention variants such as <strong>multi-query</strong> and <strong>grouped-query attention (GQA)</strong> share key/value projections across heads to shrink the KV cache — a serving optimisation you will see in model cards.</p>
+
+  <h3>3.13 Self-attention and the KV cache</h3>
+  <p>In self-attention, each position produces three vectors: a <strong>query</strong> ("what am I looking for?"), a <strong>key</strong> ("what do I contain?") and a <strong>value</strong> ("what will I contribute if selected?"). A position's output is the softmax-weighted average of all earlier values, weighted by how well its query matches each key. The Java analogy is a fuzzy <code>Map</code> lookup: instead of an exact <code>get(key)</code> returning one value, you get a weighted blend of every value whose key resembles your query.</p>
+  <p>During generation, the keys and values for earlier positions never change — position 5's key is the same whether you are generating token 6 or token 600. So inference engines cache them: the <strong>KV cache</strong>. Each decode step computes Q, K, V only for the new token, appends K and V to the cache, and attends over the cache. Without it, generating <em>n</em> tokens would redo all prior work every step. With it, generation is fast, but memory grows linearly with sequence length and batch size — and GPU memory for the KV cache, not compute, is often what limits how many concurrent requests a server can handle. §6 shows how to size it; Chapter 3 covers how vLLM's PagedAttention manages it like virtual memory pages.</p>
+
+  <h3>3.14 Context windows</h3>
+  <p>The <strong>context window</strong> is the maximum number of tokens (input plus output) a model can process in one request. It is bounded by the positions the model was trained on and by the memory and compute cost of attention. In late 2026 the largest frontier windows are around one million tokens, with output caps far lower (Anthropic's current models, for example, list 1M-token context and up to 128K output tokens). <span class="tag version">Version-sensitive · checked Nov 2026</span></p>
+  <p>Three facts temper the marketing number:</p>
+  <ul>
+    <li><strong>Lost in the middle.</strong> Liu et al. (2023) showed that models use information at the beginning and end of a long context more reliably than information buried in the middle. Newer models have improved substantially, but "fits in the window" still does not mean "will be used correctly." Put the most important instructions and evidence near the start or end, and evaluate on realistic long inputs.</li>
+    <li><strong>Effective vs. advertised length.</strong> Simple "needle in a haystack" retrieval tests are easy; benchmarks such as RULER (Hsieh et al., 2024) that require multi-hop reasoning over long inputs show performance degrading well before the advertised limit for many models.</li>
+    <li><strong>Long contexts are expensive.</strong> You pay for every input token on every request, and prefill time grows with prompt length (attention cost grows faster than linearly in principle). A chatbot that resends a 200K-token history on every turn is burning money; prompt caching (Chapter 2) and retrieval (Chapter 4) exist largely to avoid this.</li>
+  </ul>
+
+  <h3>3.15 Temperature and sampling</h3>
+  <p>The model outputs <em>logits</em> — unnormalised scores — for every vocabulary entry. A <strong>decoding strategy</strong> turns them into a chosen token:</p>
+  <ul>
+    <li><strong>Greedy</strong>: always pick the highest-probability token. Deterministic in theory, prone to repetitive loops in long generations, and often not the best overall sequence.</li>
+    <li><strong>Temperature</strong> \(T\): divide logits by \(T\) before the softmax. \(T &lt; 1\) sharpens the distribution (more conservative), \(T &gt; 1\) flattens it (more diverse, more errors), \(T \to 0\) approaches greedy.</li>
+    <li><strong>Top-k</strong>: keep only the <em>k</em> most likely tokens, renormalise, sample. A fixed <em>k</em> is too permissive when the model is confident and too restrictive when it is not.</li>
+    <li><strong>Top-p (nucleus)</strong>: keep the smallest set of tokens whose cumulative probability reaches <em>p</em> (Holtzman et al., 2019). Adapts to the shape of the distribution.</li>
+    <li><strong>Min-p</strong>: keep tokens whose probability is at least a fraction of the top token's probability (e.g. 0.05 × p<sub>max</sub>). A newer, popular choice in open-model runtimes because it scales the cut-off with the model's confidence.</li>
+    <li><strong>Beam search</strong>: keep the <em>b</em> best partial sequences and expand each, choosing by total sequence probability. Standard in translation and speech; rarely used for open-ended chat because it produces bland, repetitive text and multiplies compute.</li>
+    <li><strong>Penalties</strong>: frequency/presence/repetition penalties down-weight tokens already generated. Useful against loops in small open models.</li>
+  </ul>
+  <p>Two important caveats for production. First, <strong>temperature 0 is not a determinism guarantee</strong>: floating-point non-associativity, batching with other users' requests, different GPU kernels and MoE routing can all change logits slightly between calls, and a tiny change can flip an argmax. Second, <strong>providers increasingly control sampling for you</strong>: reasoning models often fix sampling parameters, and Anthropic's API version <code>2026-10-21</code> rejects <code>temperature</code>, <code>top_p</code> and <code>top_k</code> on Messages requests entirely (Claude 4.7 and later models already accepted only the defaults). <span class="tag version">Version-sensitive · checked Nov 2026</span> If your design depends on "temperature 0 makes it reproducible," redesign it: get consistency from structured outputs, clear instructions, validation and caching of results — not from decoding knobs.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working: The Life of One Request</h2>
+  <p>Let us follow a single request — "Summarise this incident report" with a 6,000-token report attached — from your <code>RestClient</code> to the GPU and back. Knowing these stages lets you attribute latency correctly and explains the metrics providers expose.</p>
+
+  <h3>4.1 Serialisation and tokenization</h3>
+  <p>The provider's API gateway authenticates you, applies rate limits, and renders your structured request (system prompt, tool definitions, message list, images) into a single token sequence using the model's chat template. Tool schemas are converted into text the model was trained to read, which is why defining twenty tools costs input tokens on every request even when none is used. The text is tokenized; images are converted into patches and then into embedding vectors that occupy context positions just like tokens.</p>
+
+  <h3>4.2 Scheduling and continuous batching</h3>
+  <p>Your request joins a queue on an inference server. Modern servers use <strong>continuous (in-flight) batching</strong>: rather than waiting for a whole batch to finish, the scheduler adds new requests and evicts finished ones at every decode step, so the GPU is always working on as many sequences as memory allows. This is why your latency depends on other customers' traffic, and why providers sell priority tiers and enforce rate limits in tokens per minute rather than requests per second.</p>
+
+  <h3>4.3 Prefill: compute-bound</h3>
+  <p>The server runs the full model over all 6,000 input tokens in parallel, producing logits for the first output position and populating the KV cache for every layer. Prefill is <strong>compute-bound</strong>: lots of matrix multiplications that GPUs do efficiently. Its duration dominates <strong>time to first token (TTFT)</strong>, and it scales with prompt length. Prompt caching helps precisely here: if the first 5,000 tokens match a cached prefix, the server loads their KV entries instead of recomputing them, cutting TTFT and cost.</p>
+
+  <h3>4.4 Decode: memory-bandwidth-bound</h3>
+  <p>Each subsequent step processes a single new token per sequence. The arithmetic is small, but the server must stream every model weight and the sequence's entire KV cache from GPU memory for every step. Decode is therefore <strong>memory-bandwidth-bound</strong>, and its speed is measured as <strong>time per output token (TPOT)</strong> or its inverse, output tokens per second. Batching many sequences together amortises the weight reads, which is why throughput-oriented servers batch aggressively and why a lightly loaded self-hosted server can feel faster per user than a busy one.</p>
+
+  <h3>4.5 Sampling, constraints and stopping</h3>
+  <p>For each step, the logits pass through a processing pipeline: temperature scaling, top-k/top-p/min-p truncation, repetition penalties, and — if you requested a JSON schema or a strict tool call — a <strong>grammar mask</strong> that sets the logits of tokens that would violate the schema to negative infinity (constrained decoding, Chapter 2). A token is selected, checked against stop conditions (end-of-turn token, stop sequences, <code>max_tokens</code>), detokenized into bytes, and — if you are streaming — flushed to you as a server-sent event. Note that a single token may be an incomplete UTF-8 character; streaming clients must buffer bytes until a character is complete, which the official SDKs do for you.</p>
+
+  <h3>4.6 Response and accounting</h3>
+  <p>When generation stops, the API returns the content blocks and a <code>stop_reason</code> (end of turn, max tokens, a stop sequence, a tool call, or a refusal) plus a <code>usage</code> object with input, output, cache-read and cache-write token counts. Those two fields are the most important observability data you will ever log for an LLM call: <code>stop_reason = max_tokens</code> means the answer was truncated (and any JSON is probably broken); the usage numbers are your bill.</p>
+
+<pre class="ascii">Time ─────────────────────────────────────────────────────────────────────────▶
+ client     gateway/queue      prefill (6,000 tok)          decode (400 tok)
+   │──req──▶│ auth, ratelimit │███████████████████│ t1 t2 t3 t4 ... t400 │──done
+   │        │ template+tokens │  compute-bound    │ memory-bandwidth-bound │
+   │◀───────────────────────────────────────────── first token (TTFT)
+   │◀──────────────────────────────────────────────────── tokens stream (TPOT each)
+   total latency ≈ queue + prefill(input_len) + output_len × TPOT
+</pre>
+  <p>The ASCII timeline shows why the two latency metrics behave differently: TTFT depends on input length and queueing; total time depends mostly on how many tokens the model writes. An engineer who wants a faster endpoint should first shorten the <em>output</em>, then cache or shorten the <em>input</em>, and only then consider a smaller model.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: Diagrams and Interactive Explorations</h2>
+
+  <h3>5.1 From raw text to deployed assistant</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  A["Raw corpora: web, code, books, papers"] --&gt; B["Filtering, dedup, PII removal, mixing"]
+  B --&gt; T["Tokenizer training (BPE / SentencePiece)"]
+  T --&gt; C["Pretraining: next-token prediction, trillions of tokens"]
+  C --&gt; D["Base model"]
+  D --&gt; E["SFT on instruction / chat data"]
+  E --&gt; F["Preference tuning: RLHF, RLAIF or DPO"]
+  F --&gt; G["RL on verifiable rewards (reasoning)"]
+  G --&gt; H["Safety evals, red teaming, system card"]
+  H --&gt; I["Serving: quantization, KV cache, batching"]
+  I --&gt; J["API / open weights"]
+</pre>
+<figcaption>Figure 8.1 — The model lifecycle, from data to an API you can call.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> the left half (data, tokenizer, pretraining) produces raw capability and knowledge and consumes the vast majority of compute; the middle (SFT, preference tuning, reasoning RL) shapes behaviour — instruction following, tone, tool use, refusal style, reasoning habits; the right half is engineering for deployment. Note that the tokenizer is fixed <em>before</em> pretraining: it cannot be changed later without retraining, which is why tokenizer inefficiencies for certain languages persist through a model's lifetime. When a provider ships a "new version" of a model, changes can occur at any stage, so treat every model upgrade as a behavioural change requiring re-evaluation.</p>
+
+  <h3>5.2 Inference request sequence</h3>
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant App as Spring Boot service
+  participant GW as Provider gateway
+  participant S as Scheduler
+  participant GPU as GPU workers
+  App-&gt;&gt;GW: POST /v1/messages (stream=true)
+  GW-&gt;&gt;GW: auth, rate limit, render chat template, tokenize
+  GW-&gt;&gt;S: enqueue sequence
+  S-&gt;&gt;GPU: prefill all prompt tokens, fill KV cache
+  GPU--&gt;&gt;App: SSE message_start, first content delta (TTFT)
+  loop until stop condition
+    S-&gt;&gt;GPU: decode step (batched with other sequences)
+    GPU--&gt;&gt;App: SSE content_block_delta (one or more tokens)
+  end
+  GPU--&gt;&gt;App: SSE message_delta (stop_reason, usage) and message_stop
+</pre>
+<figcaption>Figure 8.2 — A streamed inference request across gateway, scheduler and GPU workers.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> your service sees a single HTTP response, but it is really a long-lived stream whose first event arrives after prefill and whose subsequent events arrive at the decode rate. The final event carries the stop reason and token usage, so a client that aborts the stream early loses that accounting data — log what you have when you cancel. Because the stream can stay open for minutes, your HTTP client's read timeout must be much longer than for a normal REST call, or configured as an idle timeout between events.</p>
+
+  <h3>5.3 A decoder block</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  X["Input vectors (one per token)"] --&gt; N1["RMSNorm"]
+  N1 --&gt; ATT["Causal self-attention (Q, K, V; reads/writes KV cache)"]
+  ATT --&gt; R1(("+ residual"))
+  X --&gt; R1
+  R1 --&gt; N2["RMSNorm"]
+  N2 --&gt; FF["Feed-forward MLP or MoE experts"]
+  FF --&gt; R2(("+ residual"))
+  R1 --&gt; R2
+  R2 --&gt; OUT["To next block (repeated L times), then LM head and softmax"]
+</pre>
+<figcaption>Figure 8.3 — One transformer decoder block as used in most current LLMs (pre-normalisation layout).</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> each block adds ("residual") the output of attention and then of the MLP back onto its input, so information flows along a "residual stream" that every layer reads and writes. Only the attention sub-layer mixes information <em>between</em> positions, and only it needs the KV cache. After the last block, a final projection (the LM head) maps each position's vector to one logit per vocabulary entry. Full derivations — scaling by \(\sqrt{d_k}\), multi-head projections, positional encodings — are in <a href="p7-03-attention-transformers-embeddings.html">Part 7 Chapter 3</a>.</p>
+
+  <h3>5.4 Interactive: byte-pair encoding</h3>
+<figure class="diagram">
+<div class="widget" data-widget="tokenizer"></div>
+<figcaption>Figure 8.4 — Watch BPE learn merges from a small text corpus.</figcaption>
+</figure>
+  <p><strong>What to try:</strong> start with a short English sentence and step through the merges: frequent pairs such as "t"+"h" and then "th"+"e" merge first, so common words collapse into a single token. Now paste repeated technical vocabulary ("transaction transactional transactions") and see how a shared stem becomes one token with suffixes left over. Finally, type text in a script that is absent from the training text and observe it staying fragmented — that is the multilingual cost penalty from §3.10, in miniature.</p>
+
+  <h3>5.5 Interactive: self-attention</h3>
+<figure class="diagram">
+<div class="widget" data-widget="attention"></div>
+<figcaption>Figure 8.5 — A scaled dot-product self-attention heatmap over a sentence.</figcaption>
+</figure>
+  <p><strong>What to try:</strong> pick a sentence with a pronoun ("The service crashed because it ran out of memory") and inspect the row for "it": the attention weights show how strongly that position draws from each earlier word. Rows sum to 1 because they are softmax outputs. In a causal LLM, the upper triangle (attention to future tokens) would be masked to zero; every row you inspect is a weighted lookup into the KV cache described in §3.13.</p>
+
+  <h3>5.6 Interactive: temperature, top-k and top-p</h3>
+<figure class="diagram">
+<div class="widget" data-widget="sampling"></div>
+<figcaption>Figure 8.6 — How decoding settings reshape a next-token distribution.</figcaption>
+</figure>
+  <p><strong>What to try:</strong> set temperature to 0.2 and watch nearly all probability mass collapse onto the top token — effectively greedy. Raise it to 1.5 and see long-tail tokens become plausible picks. Then apply top-p 0.9 at high temperature: the tail is cut off, giving diversity without nonsense. Compare with top-k 3 on a flat distribution (where the model is unsure) versus a peaked one (where it is confident) to see why top-p adapts better than a fixed k.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math: Probabilities, Loss, Scaling and Memory</h2>
+
+  <h3>6.1 Softmax with temperature</h3>
+  <p>Intuition: the model produces a raw score per token; softmax turns scores into probabilities that sum to 1, exaggerating differences exponentially; temperature controls how much exaggeration. For logits \(z_i\) and temperature \(T &gt; 0\):</p>
+  \[ p_i = \frac{\exp(z_i / T)}{\sum_{j=1}^{|V|} \exp(z_j / T)} \]
+  <p>Worked example: logits \([2.0, 1.0, 0.1]\). At \(T=1\): \(e^{2}=7.39, e^{1}=2.72, e^{0.1}=1.11\), sum 11.22, so \(p \approx [0.66, 0.24, 0.10]\). At \(T=0.5\) the logits become \([4, 2, 0.2]\): \(54.6, 7.39, 1.22\), so \(p \approx [0.87, 0.12, 0.02]\). At \(T=2\): \([1, 0.5, 0.05]\) gives \(p \approx [0.50, 0.30, 0.19]\). Halving the temperature made the top token much more dominant; doubling it nearly equalised the options.</p>
+
+  <h3>6.2 Top-p and min-p, formally</h3>
+  <p>Sort probabilities in descending order \(p_{(1)} \ge p_{(2)} \ge \dots\). Top-p keeps the smallest prefix set \(S\) such that \(\sum_{i \in S} p_{(i)} \ge p\), then renormalises. Min-p keeps \(\{ i : p_i \ge \alpha \cdot p_{(1)} \}\). With \(p = [0.66, 0.24, 0.10]\): top-p 0.9 keeps the first two tokens (0.66 + 0.24 = 0.90), renormalised to \([0.73, 0.27]\); min-p with \(\alpha = 0.2\) keeps tokens with probability at least 0.132 — again the first two.</p>
+
+  <h3>6.3 Training loss and perplexity</h3>
+  <p>Pretraining minimises the average negative log-likelihood of the true next token — cross-entropy:</p>
+  \[ \mathcal{L}(\theta) = -\frac{1}{N}\sum_{t=1}^{N} \log p_\theta(x_t \mid x_{&lt;t}) \]
+  <p><strong>Perplexity</strong> is \(\exp(\mathcal{L})\): the effective number of equally likely choices the model is "torn between" at each step. A perplexity of 8 means the model is, on average, as uncertain as if choosing uniformly among 8 tokens. Perplexity is comparable only between models with the same tokenizer, since a different vocabulary changes what "one step" means — a subtle trap when reading model comparisons.</p>
+
+  <h3>6.4 Scaling laws and training compute</h3>
+  <p>A widely used approximation for training compute of a dense transformer is \(C \approx 6ND\) floating-point operations (forward and backward passes over \(D\) tokens with \(N\) parameters). Chinchilla fitted loss as</p>
+  \[ L(N, D) = E + \frac{A}{N^{\alpha}} + \frac{B}{D^{\beta}} \]
+  <p>where \(E\) is irreducible loss (the entropy of natural text) and the two other terms are penalties for too few parameters and too few tokens; the fitted exponents were both roughly 0.3. Minimising \(L\) under fixed \(C\) yields \(N\) and \(D\) growing in roughly equal proportion — the "about 20 tokens per parameter" heuristic. Back-of-envelope <span class="tag illus">Illustrative</span>: a 7-billion-parameter model trained compute-optimally would see about 140 billion tokens, costing \(6 \times 7\times10^{9} \times 1.4\times10^{11} \approx 5.9\times10^{21}\) FLOPs. Modern small open models are trained on trillions of tokens — tens of times past this point — because inference cost, not training cost, dominates their lifetime economics.</p>
+
+  <h3>6.5 Attention cost</h3>
+  <p>For a sequence of length \(n\) and head dimension \(d_k\), attention computes</p>
+  \[ \text{Attention}(Q,K,V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}} + M\right)V \]
+  <p>where \(M\) is the causal mask (\(-\infty\) above the diagonal). The \(QK^\top\) matrix has \(n^2\) entries, so naive prefill attention costs \(O(n^2 d)\) time; kernels like FlashAttention avoid materialising the full matrix in slow memory, making memory use roughly linear, but the arithmetic remains quadratic. During decode with a KV cache, each new token costs \(O(n d)\) for attention, so generating \(m\) tokens after an \(n\)-token prompt costs roughly \(O(m \cdot n \cdot d)\) for attention plus \(O(m \cdot N)\) for the rest of the model.</p>
+
+  <h3>6.6 Sizing the KV cache</h3>
+  <p>The KV cache stores one key and one value vector per layer, per KV head, per token:</p>
+  \[ \text{bytes per token} = 2 \times L \times n_{kv} \times d_{head} \times b \]
+  <p>with \(L\) layers, \(n_{kv}\) key/value heads, head dimension \(d_{head}\), and \(b\) bytes per element. Worked example <span class="tag illus">Illustrative</span> for a model shaped like many ~8B open models (32 layers, 8 KV heads via GQA, head dimension 128, FP16 so \(b = 2\)): \(2 \times 32 \times 8 \times 128 \times 2 = 131{,}072\) bytes = 128 KiB per token. A single 32K-token conversation needs 4 GiB of KV cache; 32 such concurrent conversations need 128 GiB — more than one 80 GB GPU, before counting the ~16 GB of weights. Without GQA (32 KV heads instead of 8) it would be four times worse. This arithmetic is why long-context self-hosting is expensive, why KV-cache quantization (FP8) exists, and why providers charge more for long prompts.</p>
+
+  <h3>6.7 Cost arithmetic for an API workload</h3>
+  <p>For a feature with \(R\) requests per day, average input \(I\) tokens, cache-read fraction \(h\), output \(O\) tokens, and prices \(p_{in}, p_{cache}, p_{out}\) per million tokens:</p>
+  \[ \text{daily cost} = \frac{R}{10^6}\Big( I\,(1-h)\,p_{in} + I\,h\,p_{cache} + O\,p_{out} \Big) \]
+  <p>Worked example <span class="tag illus">Illustrative</span>: 200,000 requests/day, 3,000 input tokens of which 2,500 are a cacheable system prompt and tool definitions (\(h \approx 0.83\)), 300 output tokens, with hypothetical prices \(p_{in}=\$2\), \(p_{cache}=\$0.20\), \(p_{out}=\$10\) per million. Uncached input: \(0.2 \times 500 \times 2 = \$200\); cached input: \(0.2 \times 2{,}500 \times 0.2 = \$100\); output: \(0.2 \times 300 \times 10 = \$600\). Total about \$900/day. Without caching the input term would be \$1,200, giving \$1,800/day. Note that output dominates even though it is a tenth of the tokens: <strong>shorter answers are usually the biggest cost lever</strong>. (Real prices vary by model and change often; always pull them from the provider's pricing page.) Cache writes typically cost a premium over normal input, so include that term when the cache churns.</p>
+
+  <h3>6.8 Back-of-envelope latency</h3>
+  <p>If a model streams at around 50–100 output tokens per second for a single request (a common order of magnitude for hosted mid-size models; measure your own) then a 1,000-token answer takes 10–20 seconds to finish. TTFT for a short prompt is often well under a second, but can grow to many seconds for very long prompts or when reasoning tokens are generated before the visible answer. <span class="tag illus">Illustrative</span> These numbers make the case for streaming in any user-facing feature, and for asynchronous job patterns (queue + callback) for anything that may exceed an HTTP gateway's timeout.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code: Tokenizers, Samplers and Token Budgets You Can Run</h2>
+  <p>The examples below are complete programs. The Python ones need Python 3.11+; install dependencies with <code>pip install tiktoken numpy "transformers&gt;=5" torch anthropic</code>. Library versions move quickly; the code was written against the versions current in November 2026. <span class="tag version">Version-sensitive · checked Nov 2026</span></p>
+
+  <h3>7.1 Byte-pair encoding from scratch (Python)</h3>
+  <p>Implementing BPE once removes all mystery from "tokens." This trainer works on UTF-8 bytes (byte-level BPE), learns merges, and encodes/decodes text losslessly.</p>
+<pre data-file="bpe.py"><code class="language-python">"""Minimal byte-level BPE trainer/encoder. Educational, not optimised."""
+from collections import Counter
+
+
+def get_pair_counts(ids: list[int]) -&gt; Counter:
+    return Counter(zip(ids, ids[1:]))
+
+
+def merge(ids: list[int], pair: tuple[int, int], new_id: int) -&gt; list[int]:
+    out, i = [], 0
+    while i &lt; len(ids):
+        if i &lt; len(ids) - 1 and (ids[i], ids[i + 1]) == pair:
+            out.append(new_id)
+            i += 2
+        else:
+            out.append(ids[i])
+            i += 1
+    return out
+
+
+class ByteBPE:
+    def __init__(self) -&gt; None:
+        self.merges: dict[tuple[int, int], int] = {}
+        self.vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+
+    def train(self, text: str, vocab_size: int, verbose: bool = False) -&gt; None:
+        assert vocab_size &gt;= 256
+        ids = list(text.encode("utf-8"))
+        for new_id in range(256, vocab_size):
+            counts = get_pair_counts(ids)
+            if not counts:
+                break
+            pair, freq = counts.most_common(1)[0]
+            if freq &lt; 2:
+                break  # nothing worth merging
+            ids = merge(ids, pair, new_id)
+            self.merges[pair] = new_id
+            self.vocab[new_id] = self.vocab[pair[0]] + self.vocab[pair[1]]
+            if verbose:
+                print(f"merge {new_id}: {self.vocab[new_id]!r} (seen {freq}x)")
+
+    def encode(self, text: str) -&gt; list[int]:
+        ids = list(text.encode("utf-8"))
+        while len(ids) &gt;= 2:
+            counts = get_pair_counts(ids)
+            # apply the earliest-learned merge first, exactly as in training
+            pair = min(counts, key=lambda p: self.merges.get(p, float("inf")))
+            if pair not in self.merges:
+                break
+            ids = merge(ids, pair, self.merges[pair])
+        return ids
+
+    def decode(self, ids: list[int]) -&gt; str:
+        return b"".join(self.vocab[i] for i in ids).decode("utf-8", errors="replace")
+
+
+if __name__ == "__main__":
+    corpus = (
+        "the transaction manager commits the transaction. "
+        "transactional outbox patterns keep transactions consistent. "
+    ) * 50
+    bpe = ByteBPE()
+    bpe.train(corpus, vocab_size=300, verbose=True)
+    for sample in ["the transactional outbox", "नमस्ते दुनिया", "transaction-id 9f3c2a"]:
+        ids = bpe.encode(sample)
+        assert bpe.decode(ids) == sample
+        print(f"{sample!r}: {len(sample)} chars -&gt; {len(ids)} tokens")</code></pre>
+  <p>Run it and you will see English words from the corpus compress to one or two tokens, while the Hindi greeting (never seen in training) stays at one token per UTF-8 byte — three bytes per Devanagari character. That is exactly the multilingual penalty in production tokenizers, just exaggerated by a tiny corpus.</p>
+
+  <h3>7.2 Measuring real tokenizers and cost (Python)</h3>
+  <p><code>tiktoken</code> exposes OpenAI's published encodings and is handy for quick experiments on how text <em>shape</em> affects token counts. For Claude models, use Anthropic's token-counting endpoint, since the tokenizer is not published — never estimate Claude costs with <code>tiktoken</code>.</p>
+<pre data-file="count_tokens.py"><code class="language-python">"""Compare token counts for different text shapes.
+pip install tiktoken anthropic ; export ANTHROPIC_API_KEY=..."""
+import json
+
+import anthropic
+import tiktoken
+
+order = {"orderId": "9f3c2a7e-1b44-4c1e-9a0b-6d2f8e3c1a77", "customer": {"name": "Asha Rao",
+         "tier": "GOLD"}, "items": [{"sku": "SKU-1001", "qty": 2, "price": 1499.00}]}
+
+samples = {
+    "english": "The payment service timed out while calling the fraud check API.",
+    "hindi": "धोखाधड़ी जांच एपीआई को कॉल करते समय भुगतान सेवा का समय समाप्त हो गया।",
+    "json_pretty": json.dumps(order, indent=4),
+    "json_minified": json.dumps(order, separators=(",", ":")),
+    "uuid": "9f3c2a7e-1b44-4c1e-9a0b-6d2f8e3c1a77",
+    "java": "Map&lt;String, List&lt;Order&gt;&gt; byCustomer = orders.stream().collect(groupingBy(Order::customerId));",
+}
+
+enc = tiktoken.get_encoding("o200k_base")   # one of OpenAI's published encodings
+print(f"{'sample':15} {'chars':&gt;6} {'tiktoken':&gt;9}")
+for name, text in samples.items():
+    print(f"{name:15} {len(text):6d} {len(enc.encode(text)):9d}")
+
+# Claude: ask the API (token counting is free of generation cost; check current rate limits)
+client = anthropic.Anthropic()
+for name in ("english", "hindi", "json_pretty", "json_minified"):
+    resp = client.messages.count_tokens(
+        model="claude-sonnet-5-5",  # Version-sensitive model ID, checked Nov 2026
+        messages=[{"role": "user", "content": samples[name]}],
+    )
+    # includes a few tokens of message framing overhead
+    print(f"claude {name:15} input_tokens={resp.input_tokens}")</code></pre>
+  <p>Typical observations: minified JSON is measurably cheaper than pretty-printed; the UUID costs many tokens for zero semantic value; the Hindi sentence costs several times more than its English equivalent on an English-centric tokenizer. Exact numbers differ per tokenizer — which is the point: measure with the tokenizer of the model you deploy.</p>
+
+  <h3>7.3 Implementing the decoding strategies (Python)</h3>
+<pre data-file="sampling.py"><code class="language-python">"""Greedy, temperature, top-k, top-p and min-p over a logits vector."""
+import numpy as np
+
+rng = np.random.default_rng(42)
+
+
+def softmax(z: np.ndarray, temperature: float = 1.0) -&gt; np.ndarray:
+    if temperature &lt;= 0:
+        raise ValueError("use greedy() for temperature 0")
+    z = z / temperature
+    z = z - z.max()  # numerical stability: exp of large numbers overflows
+    e = np.exp(z)
+    return e / e.sum()
+
+
+def greedy(logits: np.ndarray) -&gt; int:
+    return int(np.argmax(logits))
+
+
+def top_k_filter(p: np.ndarray, k: int) -&gt; np.ndarray:
+    keep = np.argsort(p)[-k:]
+    out = np.zeros_like(p)
+    out[keep] = p[keep]
+    return out / out.sum()
+
+
+def top_p_filter(p: np.ndarray, top_p: float) -&gt; np.ndarray:
+    order = np.argsort(p)[::-1]
+    cumulative = np.cumsum(p[order])
+    cutoff = int(np.searchsorted(cumulative, top_p)) + 1  # smallest prefix reaching top_p
+    out = np.zeros_like(p)
+    out[order[:cutoff]] = p[order[:cutoff]]
+    return out / out.sum()
+
+
+def min_p_filter(p: np.ndarray, min_p: float) -&gt; np.ndarray:
+    out = np.where(p &gt;= min_p * p.max(), p, 0.0)
+    return out / out.sum()
+
+
+def sample(logits, temperature=1.0, top_k=None, top_p=None, min_p=None) -&gt; int:
+    if temperature == 0:
+        return greedy(logits)
+    p = softmax(np.asarray(logits, dtype=np.float64), temperature)
+    if top_k is not None:
+        p = top_k_filter(p, top_k)
+    if top_p is not None:
+        p = top_p_filter(p, top_p)
+    if min_p is not None:
+        p = min_p_filter(p, min_p)
+    return int(rng.choice(len(p), p=p))
+
+
+if __name__ == "__main__":
+    vocab = ["Paris", "paris", "Lyon", "France", "the", "banana"]
+    logits = np.array([6.0, 3.5, 2.0, 1.5, 0.5, -2.0])
+    for t in (0.3, 1.0, 1.8):
+        print(f"T={t}:", dict(zip(vocab, np.round(softmax(logits, t), 3))))
+    for settings in ({"temperature": 0}, {"temperature": 1.5},
+                     {"temperature": 1.5, "top_p": 0.9}, {"temperature": 1.5, "min_p": 0.1}):
+        picks = [vocab[sample(logits, **settings)] for _ in range(1000)]
+        counts = {w: picks.count(w) for w in vocab if picks.count(w)}
+        print(settings, counts)</code></pre>
+  <p>At temperature 1.5 without truncation, "banana" occasionally appears; adding top-p 0.9 or min-p 0.1 removes the absurd tail while keeping plausible variants. Self-hosted runtimes (vLLM, llama.cpp, Ollama) expose these same knobs; many hosted APIs now expose fewer of them.</p>
+
+  <h3>7.4 Watching autoregression and the KV cache (Python, Hugging Face)</h3>
+  <p>This script runs a small open-weight model locally (CPU is fine, a GPU is faster), shows the chat template the provider normally hides from you, and measures the effect of the KV cache.</p>
+<pre data-file="generate_demo.py"><code class="language-python">"""pip install "transformers&gt;=5" torch ; downloads ~1.2 GB on first run."""
+import time
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+MODEL = "Qwen/Qwen3-0.6B"  # small open-weight model (Apache-2.0); any causal LM works
+tok = AutoTokenizer.from_pretrained(MODEL)
+model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32)
+model.eval()
+
+messages = [
+    {"role": "system", "content": "You are a terse assistant for Java engineers."},
+    {"role": "user", "content": "In one sentence: what does @Transactional(readOnly = true) do?"},
+]
+prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
+                                 enable_thinking=False)  # Qwen3-specific template flag
+print("---- rendered chat template ----\n" + prompt)
+inputs = tok(prompt, return_tensors="pt")
+print("prompt tokens:", inputs["input_ids"].shape[1])
+
+# 1) Manual greedy loop WITH a KV cache: one forward pass per new token
+with torch.no_grad():
+    out = model(**inputs, use_cache=True)
+    past, next_id = out.past_key_values, out.logits[:, -1, :].argmax(-1, keepdim=True)
+    generated = [next_id]
+    for _ in range(40):
+        out = model(input_ids=next_id, past_key_values=past, use_cache=True)
+        past = out.past_key_values
+        next_id = out.logits[:, -1, :].argmax(-1, keepdim=True)
+        if next_id.item() == tok.eos_token_id:
+            break
+        generated.append(next_id)
+print("greedy:", tok.decode(torch.cat(generated, dim=1)[0], skip_special_tokens=True))
+
+# 2) Library generate(): compare speed with and without the cache
+for use_cache in (True, False):
+    start = time.perf_counter()
+    with torch.no_grad():
+        ids = model.generate(**inputs, max_new_tokens=64, do_sample=False, use_cache=use_cache)
+    print(f"use_cache={use_cache}: {time.perf_counter() - start:.2f}s")
+
+# 3) Sampling: run twice, observe different outputs
+for run in range(2):
+    with torch.no_grad():
+        ids = model.generate(**inputs, max_new_tokens=40, do_sample=True,
+                             temperature=0.9, top_p=0.95, min_p=0.05)
+    print(f"sample {run}:", tok.decode(ids[0, inputs['input_ids'].shape[1]:],
+                                       skip_special_tokens=True))</code></pre>
+  <p>The printed template reveals the special tokens (such as <code>&lt;|im_start|&gt;</code>) that delimit roles — the thing you must get right when self-hosting. The cache-off run is noticeably slower and the gap grows with output length, because every step recomputes attention over the full sequence.</p>
+
+  <h3>7.5 A token-budget guard in Spring Boot (Java)</h3>
+  <p>In production, check that a request fits your budget <em>before</em> sending it: oversized prompts fail with a 400 after you have already paid latency, or silently blow your cost model. This service uses the official Anthropic Java SDK's token-counting endpoint and rejects or trims requests that exceed a per-route budget.</p>
+<pre data-file="TokenBudgetGuard.java"><code class="language-java">package com.example.llm;
+
+import com.anthropic.client.AnthropicClient;
+import com.anthropic.client.okhttp.AnthropicOkHttpClient;
+import com.anthropic.models.messages.MessageCountTokensParams;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+
+// Maven: com.anthropic:anthropic-java (3.x, Version-sensitive · checked Nov 2026)
+@Configuration
+class AnthropicConfig {
+    @Bean
+    AnthropicClient anthropicClient() {
+        return AnthropicOkHttpClient.fromEnv(); // reads ANTHROPIC_API_KEY
+    }
+}
+
+class TokenBudgetExceededException extends RuntimeException {
+    TokenBudgetExceededException(long actual, long budget) {
+        super("Prompt needs " + actual + " input tokens; budget is " + budget);
+    }
+}
+
+@Service
+public class TokenBudgetGuard {
+    private final AnthropicClient client;
+    private final String model;
+    private final long maxInputTokens;
+
+    public TokenBudgetGuard(AnthropicClient client,
+                            @Value("${llm.model:claude-sonnet-5-5}") String model,
+                            @Value("${llm.max-input-tokens:50000}") long maxInputTokens) {
+        this.client = client;
+        this.model = model;
+        this.maxInputTokens = maxInputTokens;
+    }
+
+    public long count(String system, String userText) {
+        return client.messages().countTokens(
+                MessageCountTokensParams.builder()
+                        .model(model)
+                        .system(system)
+                        .addUserMessage(userText)
+                        .build())
+                .inputTokens();
+    }
+
+    /** Throws if the prompt exceeds budget; callers map this to HTTP 413 or trim and retry. */
+    public long enforce(String system, String userText) {
+        long tokens = count(system, userText);
+        if (tokens &gt; maxInputTokens) {
+            throw new TokenBudgetExceededException(tokens, maxInputTokens);
+        }
+        return tokens;
+    }
+
+    /** Keeps the most recent documents that fit; older context is dropped first. */
+    public List&lt;String&gt; fitNewestFirst(String system, String question, List&lt;String&gt; docsNewestFirst) {
+        var kept = new java.util.ArrayList&lt;String&gt;();
+        for (String doc : docsNewestFirst) {
+            kept.add(doc);
+            String candidate = String.join("\n\n", kept) + "\n\nQuestion: " + question;
+            if (count(system, candidate) &gt; maxInputTokens) {
+                kept.remove(kept.size() - 1);
+                break;
+            }
+        }
+        return kept;
+    }
+}</code></pre>
+  <p>Calling the counter once per document is simple but chatty; in a hot path, cache counts per document hash, or estimate locally with a conservative characters-per-token ratio and call the counter only near the boundary. Map <code>TokenBudgetExceededException</code> to an HTTP 413 in a <code>@RestControllerAdvice</code> so clients get a clear error instead of an opaque upstream 400.</p>
+
+  <h3>7.6 A fast, conservative estimator for a gateway (Go)</h3>
+  <p>An LLM gateway often needs to reject obviously oversized requests in microseconds, without a network call. A deliberately pessimistic heuristic is good enough as a first gate; the exact count is the provider's.</p>
+<pre data-file="estimate.go"><code class="language-go">package main
+
+import (
+	"fmt"
+	"unicode"
+	"unicode/utf8"
+)
+
+// EstimateTokens returns a pessimistic token estimate: ASCII text at ~3 chars/token,
+// digits and punctuation counted heavily, and non-ASCII runes at ~1 token each.
+// Calibrate the constants against your provider's counter on real traffic.
+func EstimateTokens(s string) int {
+	var ascii, digitsPunct, nonASCII int
+	for _, r := range s {
+		switch {
+		case r &gt;= utf8.RuneSelf:
+			nonASCII++
+		case unicode.IsDigit(r) || unicode.IsPunct(r):
+			digitsPunct++
+		default:
+			ascii++
+		}
+	}
+	return ascii/3 + digitsPunct/2 + nonASCII + 4 // +4 for message framing
+}
+
+func main() {
+	for _, s := range []string{
+		"The payment service timed out while calling the fraud check API.",
+		"भुगतान सेवा का समय समाप्त हो गया",
+		`{"orderId":"9f3c2a7e-1b44-4c1e-9a0b-6d2f8e3c1a77","qty":2}`,
+	} {
+		fmt.Printf("%4d est. tokens  %q\n", EstimateTokens(s), s)
+	}
+}</code></pre>
+  <p>Use the estimate to fail fast and to choose a route (for example, send very long inputs to a model with a larger window or to a summarise-first pipeline), and record both estimated and actual usage so you can recalibrate the constants.</p>
+</section>
+
+<section id="applications">
+  <h2>8. Applications: How Teams Use These Foundations Day to Day</h2>
+  <p>Foundational knowledge pays off in mundane engineering decisions far more often than in research. Patterns that show up repeatedly in production teams <span class="tag opinion">Opinion</span>:</p>
+  <ul>
+    <li><strong>Capacity and cost planning.</strong> Before a feature launches, teams sample real inputs, count tokens with the target model's counter, estimate output length, and multiply by traffic — the formula in §6.7. This turns "will this be expensive?" into a spreadsheet the finance partner can read, and it frequently changes the design (cache the static prefix, summarise history, shorten answers).</li>
+    <li><strong>Choosing reasoning effort per route.</strong> A support assistant might use low effort for intent classification, medium for drafting replies, and high effort for a nightly job that analyses escalations. The knowledge that thinking tokens are output tokens — the expensive kind — keeps this decision grounded.</li>
+    <li><strong>Prompt layout for long contexts.</strong> Knowing about position effects ("lost in the middle"), teams place instructions at the start, the user's question at the end, and rank retrieved evidence so the most relevant chunks are not buried in the middle.</li>
+    <li><strong>Streaming everywhere users wait.</strong> Because output time is linear in length, any interactive feature streams tokens over SSE or WebSocket, and server-to-server calls with long outputs move to asynchronous job patterns.</li>
+    <li><strong>Multilingual budgeting.</strong> Products serving non-English markets measure tokens-per-character per language and sometimes select models with more efficient tokenizers for those languages, or translate-then-process when quality allows.</li>
+    <li><strong>Self-hosting decisions.</strong> Teams considering open models size GPU memory with the KV-cache formula from §6.6 to decide how many concurrent long conversations a node can serve — the dominant cost driver for self-hosting.</li>
+    <li><strong>Embeddings for search, not the chat model.</strong> Teams use cheap embedding models for semantic search, clustering and deduplication, reserving the chat LLM for generation — orders of magnitude cheaper per document.</li>
+    <li><strong>Reproducibility engineering.</strong> Instead of relying on temperature 0, teams store the exact prompt, model ID, parameters and output for every call (for audit and debugging), cache results for identical inputs, and evaluate with multiple samples to measure variance.</li>
+  </ul>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies: What Published Work Shows</h2>
+  <p>Each case below is drawn from a primary source you can read. Where a number is quoted, it is the authors' own claim.</p>
+
+  <h3>9.1 Chinchilla: a smaller model trained on more data wins</h3>
+  <p><span class="tag fact">Verified</span> DeepMind's "Training Compute-Optimal Large Language Models" (Hoffmann et al., 2022) trained over 400 models to fit the relationship between parameters, tokens and loss. Their 70B-parameter Chinchilla, trained on about 1.4 trillion tokens with the same compute as their earlier 280B-parameter Gopher, outperformed Gopher across a large range of benchmarks. <strong>Lesson for engineers:</strong> parameter count is a poor proxy for capability; training data and recipe matter as much. When you compare models, compare measured performance on <em>your</em> task, not size. (<a href="https://arxiv.org/abs/2203.15556">arXiv:2203.15556</a>)</p>
+
+  <h3>9.2 Tokenizer unfairness across languages</h3>
+  <p><span class="tag fact">Verified</span> Petrov, La Malfa, Torr and Bibi (NeurIPS 2023), "Language Model Tokenizers Introduce Unfairness Between Languages," measured how many tokens popular tokenizers need for the same parallel text in different languages, finding large disparities — some languages needing many times more tokens than English for the same content, which translates directly into higher cost, higher latency and less usable context. <strong>Lesson:</strong> if you operate in India, Southeast Asia, or any non-English market, your per-request cost model must be per language. (<a href="https://arxiv.org/abs/2305.15425">arXiv:2305.15425</a>)</p>
+
+  <h3>9.3 Lost in the middle</h3>
+  <p><span class="tag fact">Verified</span> Liu et al. (2023, published in TACL 2024) tested multi-document question answering and key-value retrieval while moving the relevant information to different positions in a long input. Performance was highest when the relevant document was at the beginning or end of the context and dropped notably when it was in the middle — even for models marketed for long contexts. <strong>Lesson:</strong> long windows are not free retrieval; order your context and keep it lean. Later models have reduced the effect, so re-test on your model rather than assuming either way. (<a href="https://arxiv.org/abs/2307.03172">arXiv:2307.03172</a>)</p>
+
+  <h3>9.4 Character.AI: the KV cache is the bill</h3>
+  <p><span class="tag fact">Verified</span> In a June 2024 engineering post, "Optimizing AI Inference at Character.AI," the company described serving very long chat histories by attacking KV-cache size: multi-query attention in every layer, interleaving local (sliding-window) and global attention layers, and sharing KV caches across neighbouring layers — together reported to shrink the cache by more than 20x — plus keeping conversation KV caches in host memory between turns so most turns avoid recomputing the prefix (they reported a 95% cache rate). <strong>Lesson:</strong> the memory arithmetic in §6.6 is not academic; at chat scale it dominates serving cost, and prefix reuse across turns is the same idea as provider-side prompt caching. (<a href="https://research.character.ai/optimizing-inference/">Character.AI research blog</a>)</p>
+
+  <h3>9.5 Why temperature 0 is not deterministic</h3>
+  <p><span class="tag fact">Verified</span> In "Defeating Nondeterminism in LLM Inference" (Thinking Machines Lab, September 2025), Horace He and colleagues argue that the main user-visible cause of nondeterminism at temperature 0 is not GPU concurrency per se but inference kernels that are not <em>batch-invariant</em>: the numeric result for your request depends on how many other requests share the batch, which changes with server load. They released batch-invariant kernels that make inference reproducible at some throughput cost. <strong>Lesson:</strong> on a shared hosted API, you cannot control batch composition, so treat outputs as samples and design for variance. (<a href="https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/">Thinking Machines blog</a>)</p>
+
+  <h3>9.6 DeepSeek-R1: reasoning from reinforcement learning</h3>
+  <p><span class="tag fact">Verified</span> DeepSeek's January 2025 report described R1-Zero, trained with large-scale reinforcement learning directly on a base model using rule-based rewards (answer correctness and format), which developed long chains of reasoning, self-verification and reflection without supervised reasoning examples; the released R1 added a small amount of cold-start SFT data to improve readability. They also distilled R1's reasoning into smaller open models. <strong>Lesson:</strong> "reasoning" is a trained behaviour paid for at inference time in tokens; distillation can move some of it into cheaper models. (<a href="https://arxiv.org/abs/2501.12948">arXiv:2501.12948</a>)</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages, Limitations and Operational Cost</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Property</th><th>Advantage</th><th>Limitation</th><th>Operational cost / mitigation</th></tr></thead>
+    <tbody>
+      <tr><td>Next-token generality</td><td>One model handles classification, extraction, summarisation, code, translation</td><td>No built-in notion of truth; produces plausible text when ignorant</td><td>Grounding (RAG), validation, evaluation pipelines</td></tr>
+      <tr><td>Pretrained knowledge</td><td>Broad world and programming knowledge with zero setup</td><td>Knowledge cutoff; weak on rare or private facts</td><td>Retrieval, tools for live data</td></tr>
+      <tr><td>Post-training (RLHF/DPO)</td><td>Follows instructions, polite, tool-capable</td><td>Sycophancy, verbosity, overconfidence</td><td>Explicit instructions to abstain; length limits; judge-based evals</td></tr>
+      <tr><td>Reasoning / test-time compute</td><td>Large gains on maths, code, planning</td><td>Latency and output-token cost rise sharply</td><td>Per-route effort settings; cap with budgets</td></tr>
+      <tr><td>Subword tokenization</td><td>Open vocabulary, any input encodable</td><td>Uneven cost across languages; weak character-level and arithmetic skills</td><td>Per-language cost models; tools for maths and string ops</td></tr>
+      <tr><td>Self-attention</td><td>Flexible long-range dependencies</td><td>Quadratic prefill compute; KV memory linear in length</td><td>Prompt caching, shorter contexts, GQA/quantized KV when self-hosting</td></tr>
+      <tr><td>Large context windows</td><td>Whole documents or codebases in one request</td><td>Position effects, higher cost, slower TTFT</td><td>Retrieval and summarisation; put key info at edges</td></tr>
+      <tr><td>Sampling</td><td>Diversity, creativity, multiple candidates</td><td>Nondeterminism even at temperature 0; some APIs no longer expose knobs</td><td>Structured outputs, caching results, multi-sample evaluation</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs: Choosing Deliberately</h2>
+  <p>Most foundation-level decisions reduce to a handful of trade-offs. The table frames them as decisions you will actually make.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Decision</th><th>Option A</th><th>Option B</th><th>Choose A when</th><th>Choose B when</th></tr></thead>
+    <tbody>
+      <tr><td>Reasoning effort</td><td>Low effort / non-reasoning model</td><td>High effort reasoning</td><td>Classification, extraction, short rewrites, latency-sensitive UX</td><td>Multi-step planning, code changes, maths, analysis where errors are costly</td></tr>
+      <tr><td>Long context vs. retrieval</td><td>Stuff the whole document into context</td><td>Retrieve relevant chunks (RAG)</td><td>One-off analysis of a single document under the window; need global view</td><td>Large or changing corpora, many queries per document, cost or latency pressure</td></tr>
+      <tr><td>Decoding</td><td>Provider defaults</td><td>Tuned temperature/top-p (where allowed)</td><td>Hosted frontier models, structured outputs, most production work</td><td>Self-hosted open models, creative generation, generating diverse candidates</td></tr>
+      <tr><td>Model size</td><td>Small/fast model</td><td>Large/frontier model</td><td>High volume, simple tasks, tight latency; validated on your eval set</td><td>Hard tasks, low volume, quality is the product</td></tr>
+      <tr><td>Output style</td><td>Free text</td><td>Schema-constrained JSON</td><td>Human-facing prose</td><td>Anything parsed by code</td></tr>
+      <tr><td>Token estimation</td><td>Local heuristic</td><td>Provider counting API</td><td>Fast pre-filtering in a gateway</td><td>Budget enforcement near limits; billing reconciliation</td></tr>
+    </tbody>
+  </table></div>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  Q["New LLM feature"] --&gt; A{"Deterministic rule or small model enough?"}
+  A -- yes --&gt; R["Do not use an LLM"]
+  A -- no --&gt; B{"Output parsed by code?"}
+  B -- yes --&gt; S["Use structured outputs + validation"]
+  B -- no --&gt; C{"Hard multi-step reasoning?"}
+  S --&gt; C
+  C -- yes --&gt; H["Higher effort / reasoning model; stream or run async"]
+  C -- no --&gt; L["Low effort, smaller model candidate"]
+  H --&gt; D{"Input larger than ~20% of window or reused often?"}
+  L --&gt; D
+  D -- yes --&gt; E["Retrieval, summarisation, prompt caching"]
+  D -- no --&gt; F["Send directly; measure tokens and latency"]
+</pre>
+<figcaption>Figure 8.7 — A first-pass decision flow for a new LLM-backed feature.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> the flow starts by questioning whether an LLM is needed at all, then fixes the output contract (structured or free text), then sets the compute level, and finally decides how to feed context. The 20%-of-window threshold is an <span class="tag opinion">Opinion</span> heuristic, not a law: it marks the point where cost, latency and position effects usually justify retrieval or caching. Every "candidate" choice must then be validated against an evaluation set (Chapter 5).</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes, Misconceptions and Production Failures</h2>
+  <ul>
+    <li><strong>"Temperature 0 makes it deterministic."</strong> It reduces variance but does not eliminate it on shared infrastructure (§9.5), and some current APIs reject the parameter outright. Tests that assert exact output strings will flake.</li>
+    <li><strong>Estimating Claude or Gemini tokens with <code>tiktoken</code>.</strong> Different tokenizers, different counts. Use each provider's counter or the <code>usage</code> field from real responses.</li>
+    <li><strong>Ignoring <code>stop_reason</code>.</strong> A response truncated at <code>max_tokens</code> looks like success (HTTP 200) but contains half an answer or invalid JSON. Always check it, alert on it, and size <code>max_tokens</code> generously for structured output.</li>
+    <li><strong>Treating the context window as memory.</strong> Models are stateless between API calls; "memory" is whatever you resend. Resending ever-growing histories leads to cost explosions and eventually hard failures when the window is exceeded.</li>
+    <li><strong>Assuming "fits in context" means "will be used."</strong> Burying the critical instruction in the middle of a 100K-token prompt is a reliability bug.</li>
+    <li><strong>Forgetting the chat template when self-hosting.</strong> Feeding raw text to an instruction-tuned open model without its template yields degraded, rambling output that teams misdiagnose as "the model is bad."</li>
+    <li><strong>Asking LLMs to do arithmetic, counting or character manipulation.</strong> Tokenization hides characters and splits numbers; use code or tools for these.</li>
+    <li><strong>Assuming model upgrades are drop-in.</strong> A new version can change tokenization, verbosity, refusal behaviour and tool-call formatting. Pin model IDs, and promote new ones through your evaluation suite like any dependency upgrade.</li>
+    <li><strong>Mixing up embedding models.</strong> Querying a vector index with vectors from a different embedding model (or version) than the one used to build it returns garbage silently.</li>
+    <li><strong>Unbounded read timeouts or too-short ones.</strong> Default HTTP client timeouts (often 30–60 s) kill long generations; infinite timeouts tie up threads forever. Use streaming with idle timeouts and an overall deadline.</li>
+    <li><strong>Believing the model knows today's date or its own version.</strong> Inject the current date and relevant facts into the prompt when they matter.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Engineering: Performance, Security, Reliability</h2>
+  <h3>13.1 Performance</h3>
+  <ul>
+    <li><strong>Measure TTFT and TPOT separately.</strong> Record time to first streamed event and tokens per second after it, per model and route. A regression in TTFT points to longer prompts, cache misses or queueing; a regression in TPOT points to provider load or longer reasoning.</li>
+    <li><strong>Cap output.</strong> Set <code>max_tokens</code> per route based on observed distributions (for example, p99 of successful outputs plus headroom), and instruct the model on length. Output length is the dominant latency and cost driver.</li>
+    <li><strong>Stabilise prefixes.</strong> Keep system prompts and tool definitions byte-identical across requests (no timestamps or request IDs at the top) so prompt caching works; Chapter 2 shows the mechanics.</li>
+  </ul>
+  <h3>13.2 Cost governance</h3>
+  <ul>
+    <li>Log <code>usage</code> (input, output, cache read, cache write) with tenant, feature and model tags; aggregate into cost dashboards and alerts, exactly as you would for cloud spend.</li>
+    <li>Enforce per-tenant token budgets in a gateway (Go is well suited) to contain runaway loops and abusive clients — this is "unbounded consumption," one of the OWASP LLM Top 10 risks covered in Chapter 6.</li>
+    <li>Track tokens per language and per input type so you notice when a new customer segment changes your unit economics.</li>
+  </ul>
+  <h3>13.3 Reliability</h3>
+  <ul>
+    <li>Treat the model as an unreliable remote dependency: timeouts, bounded retries with jittered backoff on 429/5xx/overloaded errors, circuit breakers, and fallbacks to another model or a degraded non-LLM path (Chapter 2 implements this with Resilience4j).</li>
+    <li>Alert on abnormal stop reasons (<code>max_tokens</code>, refusals) as you would on 5xx rates.</li>
+    <li>Pin model versions; canary new ones behind a flag with an evaluation gate.</li>
+  </ul>
+  <h3>13.4 Security and privacy</h3>
+  <ul>
+    <li>Everything in the context window is visible to the model and can influence it — including retrieved documents and tool outputs, which may contain injected instructions. This is the root of prompt injection (Chapter 6 and Part 11 Chapter 5).</li>
+    <li>Tokens you send leave your trust boundary. Classify data, redact PII where possible, and check provider data-retention and regional-processing options before sending regulated data.</li>
+    <li>Model weights encode training data; do not assume a fine-tuned model cannot regurgitate sensitive examples it was trained on.</li>
+  </ul>
+  <h3>13.5 Maintainability</h3>
+  <ul>
+    <li>Externalise model IDs, effort levels and token limits into configuration (<code>application.yml</code>), not code, so swaps are reviewable and reversible.</li>
+    <li>Keep a small, versioned set of representative inputs for each feature; re-run it on every model or prompt change to detect drift. Chapter 5 turns this into a CI regression suite.</li>
+  </ul>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>Given logits \([3.0, 2.0, 0.0]\) compute the probabilities at temperatures 1.0 and 0.5. Then state which tokens survive top-p = 0.8 at temperature 1.0.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>At \(T=1\): \(e^3=20.09, e^2=7.39, e^0=1\); sum 28.48 → \([0.705, 0.259, 0.035]\). At \(T=0.5\) logits become \([6, 4, 0]\): \(403.4, 54.6, 1\); sum 459.0 → \([0.879, 0.119, 0.002]\). Top-p 0.8 at \(T=1\): the first token alone gives 0.705 &lt; 0.8, adding the second reaches 0.964 ≥ 0.8, so the first two survive, renormalised to \([0.731, 0.269]\).</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Extend the <code>ByteBPE</code> class from §7.1 with a <code>save()</code>/<code>load()</code> pair that persists merges as JSON, and add a pre-tokenization step that splits text on whitespace and punctuation before applying BPE (so merges never cross word boundaries). Explain why production tokenizers pre-tokenize.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-python">import json, re
+
+PRETOKENIZE = re.compile(r"\s?\w+|\s?[^\w\s]+|\s+")
+
+class PretokBPE(ByteBPE):
+    def train(self, text, vocab_size, verbose=False):
+        chunks = [list(m.encode("utf-8")) for m in PRETOKENIZE.findall(text)]
+        for new_id in range(256, vocab_size):
+            counts = Counter()
+            for ids in chunks:
+                counts.update(zip(ids, ids[1:]))
+            if not counts:
+                break
+            pair, freq = counts.most_common(1)[0]
+            if freq &lt; 2:
+                break
+            chunks = [merge(ids, pair, new_id) for ids in chunks]
+            self.merges[pair] = new_id
+            self.vocab[new_id] = self.vocab[pair[0]] + self.vocab[pair[1]]
+
+    def encode(self, text):
+        out = []
+        for piece in PRETOKENIZE.findall(text):
+            out.extend(super().encode(piece))
+        return out
+
+    def save(self, path):
+        with open(path, "w") as f:
+            json.dump([[a, b, i] for (a, b), i in self.merges.items()], f)
+
+    def load(self, path):
+        with open(path) as f:
+            for a, b, i in json.load(f):
+                self.merges[(a, b)] = i
+                self.vocab[i] = self.vocab[a] + self.vocab[b]  # merges are saved in creation order</code></pre>
+      <p>Pre-tokenization stops merges like "dog." + "The" that span punctuation or words, which would waste vocabulary on accidental combinations and make tokenization of a word depend on its neighbours. GPT-2-style tokenizers use a regex for exactly this; leading spaces are kept attached to words, which is why " the" and "the" are usually different tokens.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>A self-hosted model has 48 layers, 8 KV heads, head dimension 128, and stores the KV cache in FP8 (1 byte). Your GPU has 80 GB, of which the weights use 40 GB and runtime overhead uses 8 GB. How many concurrent 16K-token sequences can you hold? How does the answer change with FP16 KV cache?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Bytes per token = 2 × 48 × 8 × 128 × 1 = 98,304 B = 96 KiB. One 16,384-token sequence = 16,384 × 96 KiB = 1.5 GiB. Free memory ≈ 80 − 40 − 8 = 32 GB ≈ 29.8 GiB → about 19 concurrent full-length sequences. With FP16 the cache doubles to 3 GiB per sequence → about 9. In practice paged allocation (vLLM) lets you serve more sequences because most do not reach full length simultaneously, but this worst-case number is what you size for when users can all paste long documents.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>Write a Spring Boot <code>@RestController</code> endpoint <code>POST /estimate</code> that accepts <code>{ "texts": [...], "expectedOutputTokens": n, "requestsPerDay": r }</code>, uses the <code>TokenBudgetGuard</code> from §7.5 to count input tokens per text, and returns the p50/p95 input tokens and a projected daily cost using prices loaded from configuration. Explain how you would keep the prices correct over time.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-java">package com.example.llm;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.web.bind.annotation.*;
+import java.util.List;
+
+@ConfigurationProperties(prefix = "llm.pricing")
+record Pricing(double inputPerMillion, double outputPerMillion) {}
+
+record EstimateRequest(List&lt;String&gt; texts, long expectedOutputTokens, long requestsPerDay) {}
+record EstimateResponse(long p50Input, long p95Input, double projectedDailyCost) {}
+
+@RestController
+class EstimateController {
+    private final TokenBudgetGuard guard;
+    private final Pricing pricing;
+
+    EstimateController(TokenBudgetGuard guard, Pricing pricing) {
+        this.guard = guard;
+        this.pricing = pricing;
+    }
+
+    @PostMapping("/estimate")
+    EstimateResponse estimate(@RequestBody EstimateRequest req) {
+        List&lt;Long&gt; counts = req.texts().stream()
+                .map(t -&gt; guard.count("You are a helpful assistant.", t))
+                .sorted().toList();
+        long p50 = counts.get((int) Math.floor(0.50 * (counts.size() - 1)));
+        long p95 = counts.get((int) Math.floor(0.95 * (counts.size() - 1)));
+        double perRequest = p50 * pricing.inputPerMillion() / 1e6
+                + req.expectedOutputTokens() * pricing.outputPerMillion() / 1e6;
+        return new EstimateResponse(p50, p95, perRequest * req.requestsPerDay());
+    }
+}
+// Register with @EnableConfigurationProperties(Pricing.class) on a @Configuration class.</code></pre>
+      <p>Keep prices in configuration with the model ID and an "as of" date; review them when you change models and reconcile monthly against the provider's invoice or usage/cost reporting API. Using the median for cost is a simplification — for budgets, also compute the mean, since cost is linear in tokens and long-tail inputs matter.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>Design an experiment to measure output variance for a classification prompt on a hosted model whose API does not let you set temperature. What do you measure, how many samples, and how do you turn the result into a production decision?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Take a labelled set of, say, 200 representative inputs. Call the model <em>k</em> = 5 times per input (randomise order and time of day to vary batch conditions). Measure per-input agreement (fraction of runs matching the majority label), overall accuracy of the majority vote vs. single-run accuracy, and the set of inputs with disagreement. If single-run accuracy and agreement are high (for example, &gt;98% agreement), ship a single call. If disagreement concentrates on ambiguous inputs, either clarify the label definitions in the prompt, constrain output with an enum schema, route low-agreement cases to a human, or use majority voting (self-consistency) for that route and accept the cost multiplier. Re-run the experiment on every model upgrade.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain how a chat model generates a response, from the moment the request arrives.</summary><div><p>The request is rendered with the chat template and tokenized. The server runs prefill over all prompt tokens in parallel, computing logits for the next position and filling the KV cache. It then decodes autoregressively: sample one token from the (processed) distribution, append it, run a single-position forward pass that reuses the KV cache, repeat until an end-of-turn token, stop sequence or <code>max_tokens</code>. Tokens are detokenized and streamed. Prefill drives TTFT and is compute-bound; decode drives per-token latency and is memory-bandwidth-bound.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is the difference between pretraining, SFT, RLHF and DPO?</summary><div><p>Pretraining learns language and knowledge by next-token prediction on huge unlabelled corpora, producing a base model. SFT fine-tunes on curated instruction–response pairs so the model behaves like an assistant. RLHF trains a reward model from human preference comparisons and optimises the policy against it with RL under a KL constraint. DPO optimises the same preference objective directly on chosen/rejected pairs with a classification-style loss, avoiding the reward model and RL loop. Reasoning models add RL on verifiable rewards.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why are LLMs bad at counting letters in a word or exact arithmetic?</summary><div><p>They operate on subword tokens, not characters, so "strawberry" may be two or three opaque IDs; the model must have memorised spellings. Numbers are split into arbitrary multi-digit chunks, so digit-wise algorithms are not naturally represented. The fix is architectural: give the model a code-execution or calculator tool.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Your chat feature's cost doubled after customers started pasting long logs. What do you change?</summary><div><p>Measure first: token distributions per request, cache hit rates, output lengths. Then: truncate or summarise logs before sending (keep error lines, stack traces, time window around the failure); move static instructions and tool definitions into a cacheable prefix; summarise older conversation turns instead of resending them; cap output with <code>max_tokens</code> and length instructions; route simple questions to a smaller model; enforce per-tenant token budgets at the gateway. Consider retrieval over logs instead of inlining them.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How would you size GPU memory for self-hosting an open 8B model serving 64 concurrent 8K-token conversations?</summary><div><p>Weights: about 16 GB in BF16 (8B × 2 bytes), or roughly 5 GB at 4-bit. KV cache per token for a typical 8B GQA model (32 layers, 8 KV heads, head dim 128, FP16) is 128 KiB; 8K tokens is 1 GiB per conversation; 64 conversations is 64 GiB. Total ≈ 80 GB plus runtime overhead — so either one 80 GB GPU with an FP8 KV cache, or two GPUs. Paged attention lets you oversubscribe because most conversations are shorter than the maximum, but plan for the worst case or apply admission control.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> A test asserting the exact LLM output passes locally and fails in CI intermittently. Why, and what do you do?</summary><div><p>LLM outputs are samples; even at temperature 0, hosted inference is not batch-invariant and can vary, and some APIs no longer accept temperature at all. Replace exact-match assertions with property checks: schema validity, required fields, label in an allowed set, semantic checks via an evaluator, or tolerance-based metrics over a dataset. For unit tests of your own code, stub the model client with recorded responses.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain top-p vs. top-k and when min-p helps.</summary><div><p>Top-k keeps a fixed number of candidates regardless of confidence, so it includes junk when the model is sure and cuts good options when it is unsure. Top-p keeps the smallest set covering probability mass p, adapting to the distribution's shape. Min-p keeps tokens with at least a fraction of the top token's probability, which scales the cut-off with confidence and behaves well at higher temperatures; it is popular in open-model runtimes.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Implement nucleus (top-p) filtering over a probability array.</summary><div><p>Sort indices by probability descending; take the cumulative sum; find the first index where the cumulative sum reaches p; keep those indices; zero the rest; renormalise. See <code>top_p_filter</code> in §7.3. Edge cases: always keep at least one token; handle ties deterministically; operate in float64 to avoid cumulative sums slightly below 1.0.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Your product expands to Hindi and Tamil users; latency and cost per request jump. Explain and propose fixes.</summary><div><p>English-centric tokenizers fragment Indic scripts into many more tokens per word, so inputs and outputs are longer in tokens, raising cost, TTFT and generation time, and consuming context faster. Measure tokens per character per language; evaluate models whose tokenizers handle these scripts efficiently; keep system prompts in English (cheaper) while instructing responses in the user's language; cap response length; and price per language if needed.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why do reasoning models cost more, and how do you control it?</summary><div><p>They generate thinking tokens before the answer, billed as output tokens and adding latency. Control it with provider effort settings (for example, low/medium/high), choose effort per route, set output limits, and evaluate whether higher effort improves your metric enough to justify cost. Use non-reasoning or low-effort settings for simple tasks.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>An LLM outputs a probability distribution over the next token; generation is a loop of sampling and appending.</li>
+    <li>Pretraining gives knowledge and capability; SFT and preference tuning (RLHF, RLAIF, DPO) shape behaviour; RL on verifiable rewards produces reasoning models that trade tokens for accuracy.</li>
+    <li>Tokens are the unit of cost, latency and context; tokenizers differ by provider and penalise some languages heavily.</li>
+    <li>Sentence embeddings come from dedicated embedding models and power semantic search; token embeddings are internal.</li>
+    <li>Prefill (compute-bound) sets TTFT; decode (memory-bound) sets per-token latency; output length dominates total latency and usually cost.</li>
+    <li>The KV cache makes decoding fast but its memory grows with sequence length and concurrency — the key self-hosting constraint.</li>
+    <li>Long context windows suffer position effects and cost; fitting is not the same as using.</li>
+    <li>Temperature 0 is not a determinism guarantee, and some APIs now remove sampling knobs; design for variance.</li>
+  </ul>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">Which phase of inference primarily determines time-to-first-token for a long prompt?</p>
+    <ol>
+      <li data-k="a">Decode, because it is memory-bandwidth-bound</li>
+      <li data-k="b">Detokenization of the output</li>
+      <li data-k="c">Prefill over all prompt tokens</li>
+      <li data-k="d">Sampling with top-p</li>
+    </ol>
+    <div class="explain">Prefill processes the entire prompt before the first output token can be produced, and its cost grows with prompt length. Decode governs per-token latency after the first token; detokenization and sampling are negligible.</div>
+  </div>
+
+  <div class="quiz" data-answer="b">
+    <p class="q">A model has 40 layers, 8 KV heads, head dimension 128 and an FP16 KV cache. Roughly how much KV memory does one 10,000-token sequence need?</p>
+    <ol>
+      <li data-k="a">About 160 MB</li>
+      <li data-k="b">About 1.6 GB</li>
+      <li data-k="c">About 16 GB</li>
+      <li data-k="d">About 160 KB</li>
+    </ol>
+    <div class="explain">2 × 40 × 8 × 128 × 2 bytes = 163,840 bytes per token; × 10,000 tokens ≈ 1.64 GB.</div>
+  </div>
+
+  <div class="quiz" data-answer="d">
+    <p class="q">Why can the same text cost several times more tokens in Hindi than in English?</p>
+    <ol>
+      <li data-k="a">Providers charge a surcharge for non-English languages</li>
+      <li data-k="b">Hindi text is always longer in characters</li>
+      <li data-k="c">The model translates to English internally first</li>
+      <li data-k="d">The tokenizer's vocabulary was learned mostly from English-heavy data, so other scripts split into more, smaller tokens</li>
+    </ol>
+    <div class="explain">Subword vocabularies favour frequent strings in the tokenizer's training data. Scripts underrepresented there fragment into many tokens (down to raw bytes in byte-level BPE), increasing token counts, cost and latency.</div>
+  </div>
+
+  <div class="quiz" data-answer="a">
+    <p class="q">What does DPO remove compared with classic RLHF?</p>
+    <ol>
+      <li data-k="a">The separately trained reward model and the RL optimisation loop</li>
+      <li data-k="b">The need for preference data</li>
+      <li data-k="c">Supervised fine-tuning</li>
+      <li data-k="d">The reference model</li>
+    </ol>
+    <div class="explain">DPO optimises the preference objective directly from chosen/rejected pairs with a closed-form loss. It still needs preference data and uses a reference policy in the loss; SFT usually precedes it.</div>
+  </div>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">You need consistent, machine-parseable classification labels from a hosted model whose API rejects the temperature parameter. What is the best primary approach?</p>
+    <ol>
+      <li data-k="a">Retry until two consecutive outputs match</li>
+      <li data-k="b">Set top_k=1 instead</li>
+      <li data-k="c">Constrain output with a JSON schema enum, give clear label definitions, and validate</li>
+      <li data-k="d">Switch to beam search</li>
+    </ol>
+    <div class="explain">Consistency should come from the output contract (schema/enum), clear instructions and validation, not from decoding knobs — which may be unavailable and do not guarantee determinism anyway. top_k is rejected along with temperature on such APIs, and hosted APIs do not offer beam search.</div>
+  </div>
+
+  <div class="quiz" data-answer="b">
+    <p class="q">Which statement about the "lost in the middle" finding is most accurate?</p>
+    <ol>
+      <li data-k="a">Models ignore everything after the first 4,000 tokens</li>
+      <li data-k="b">Models tended to use information at the start and end of long inputs more reliably than information in the middle</li>
+      <li data-k="c">It only affects models without positional encodings</li>
+      <li data-k="d">It means long-context models cannot be used for retrieval</li>
+    </ol>
+    <div class="explain">Liu et al. found a U-shaped accuracy curve over the position of relevant information. Newer models improved, but the practical advice — put critical content at the edges and evaluate — still holds.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/1706.03762">Vaswani et al., "Attention Is All You Need" (2017)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/1508.07909">Sennrich, Haddow &amp; Birch, "Neural Machine Translation of Rare Words with Subword Units" (BPE, 2015)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/1808.06226">Kudo &amp; Richardson, "SentencePiece" (2018)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2001.08361">Kaplan et al., "Scaling Laws for Neural Language Models" (2020)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2203.15556">Hoffmann et al., "Training Compute-Optimal Large Language Models" (Chinchilla, 2022)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2203.02155">Ouyang et al., "Training language models to follow instructions with human feedback" (InstructGPT, 2022)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2212.08073">Bai et al., "Constitutional AI: Harmlessness from AI Feedback" (2022)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2305.18290">Rafailov et al., "Direct Preference Optimization" (2023)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2501.12948">DeepSeek-AI, "DeepSeek-R1" (2025)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/1904.09751">Holtzman et al., "The Curious Case of Neural Text Degeneration" (nucleus sampling, 2019)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2407.01082">Nguyen et al., "Turning Up the Heat: Min-p Sampling" (2024)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2307.03172">Liu et al., "Lost in the Middle" (2023)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2305.15425">Petrov et al., "Language Model Tokenizers Introduce Unfairness Between Languages" (2023)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2305.13245">Ainslie et al., "GQA: Training Generalized Multi-Query Transformer Models" (2023)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2205.14135">Dao et al., "FlashAttention" (2022)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/1908.10084">Reimers &amp; Gurevych, "Sentence-BERT" (2019)</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://platform.claude.com/docs/en/build-with-claude/token-counting">Anthropic — Token counting</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://huggingface.co/docs/transformers/main/en/generation_strategies">Hugging Face — Text generation strategies</a></li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/openai/tiktoken">openai/tiktoken</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/">Thinking Machines — Defeating Nondeterminism in LLM Inference (2025)</a></li>
+    <li><span class="ref-kind">Course</span> <a href="https://huggingface.co/learn/llm-course">Hugging Face LLM Course</a></li>
+  </ul>
+  <p>Within this book: <a href="p7-03-attention-transformers-embeddings.html">Part 7 Chapter 3</a> for the full transformer derivation; <a href="p8-02-prompting-structured-tools.html">Chapter 2</a> for using these mechanics in prompts and APIs.</p>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

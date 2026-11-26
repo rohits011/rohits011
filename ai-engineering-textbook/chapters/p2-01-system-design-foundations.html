@@ -1,0 +1,1176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>System Design Foundations: Requirements, Estimation &amp; SLOs — AI-Era Software Engineering</title>
+<meta name="description" content="A repeatable system design method, capacity estimation with worked numbers, latency percentiles and tail latency, availability and durability math, SLIs/SLOs/SLAs with error budgets, and Little's Law for engineers coming from Spring Boot.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p2-01-system-design-foundations" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 2 · Chapter 1</p>
+  <h1>System Design Foundations: Requirements, Estimation &amp; SLOs</h1>
+  <p class="lede">Every later chapter in this part (load balancers, caches, shards, Kafka, multi-region) is an answer to a question this chapter teaches you to ask precisely: how much load, how fast, how available, how durable, and at what cost. You will leave with a repeatable design method, the arithmetic to size a system on a whiteboard in five minutes, and the reliability vocabulary (percentiles, nines, SLOs, error budgets, Little's Law) that separates a senior design discussion from a box-drawing exercise.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> You have shipped and operated Spring Boot services behind a load balancer, used a relational database through JPA, and looked at an Actuator/Micrometer dashboard. High-school algebra and a little probability.</li>
+    <li><strong>You will be able to:</strong> run a structured design session from vague prompt to justified architecture; turn "100 million users" into QPS, storage, bandwidth and memory numbers; reason about p50/p99/p99.9 and fan-out amplification; compute composite availability for serial and redundant components; write SLIs, SLOs and burn-rate alerts; and use Little's Law to size thread pools, connection pools and queues.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: Design Is Quantified Trade-off</h2>
+  <p>As a Spring Boot engineer you already make design decisions every week: whether a call to the pricing service should be synchronous, whether a <code>@Cacheable</code> is safe on a method, how big the Hikari pool should be, whether an endpoint needs pagination. What changes as you become the person responsible for a <em>system</em> rather than a service is that these decisions stop being local. A 40 ms regression in one dependency becomes a 400 ms regression at the edge because of fan-out. A pool size that was fine for one instance exhausts the database when the autoscaler adds thirty instances. A "99.9% available" dependency turns your 99.99% target into fiction.</p>
+  <p><strong>System design</strong> is the discipline of choosing components, data layouts and interaction patterns so that a system meets explicit functional and non-functional requirements within a cost envelope, and of being able to <em>defend</em> those choices with numbers. The second half of that sentence is what this chapter is about. Diagrams with boxes labelled "Cache", "Queue" and "DB" are cheap; what is expensive, and what interviewers and architecture review boards actually probe, is whether you know <em>why</em> the cache is there, how big it needs to be, what hit ratio makes it worthwhile, what happens to the database when the cache is cold, and which SLO the whole arrangement serves.</p>
+  <p>The problems this chapter's toolkit solves are concrete:</p>
+  <ul>
+    <li><strong>Ambiguity.</strong> Real prompts ("build a notifications platform", "add AI summaries to tickets") arrive underspecified. A structured method forces the clarifying questions that decide the architecture.</li>
+    <li><strong>Mis-sizing.</strong> Teams either over-build (Kafka plus Cassandra for 30 writes per second) or under-build (a single Postgres primary for a write-heavy telemetry stream). Back-of-envelope estimation catches both in minutes.</li>
+    <li><strong>Wrong reliability targets.</strong> "As available as possible" is not a requirement. SLOs and error budgets convert reliability into a number that product and engineering can trade against feature velocity.</li>
+    <li><strong>Averages that lie.</strong> Mean latency hides the users who wait three seconds. Percentiles and tail-latency reasoning expose them.</li>
+    <li><strong>Mysterious saturation.</strong> Little's Law and basic queueing explain why latency explodes at 85% utilisation, why your Tomcat thread pool fills, and how to size every pool in the request path.</li>
+  </ul>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>You have tuned <code>server.tomcat.threads.max</code> and <code>spring.datasource.hikari.maximum-pool-size</code>, read Micrometer timers in Grafana, set <code>management.metrics.distribution.percentiles</code>, written Resilience4j timeouts, and probably sat in an incident review where "the database was slow". You know what a p99 graph looks like when things go wrong.</dd>
+      <dt>Why that is not enough</dt><dd>Those knobs are tuned per service, usually by trial and error after an incident. System design requires reasoning <em>before</em> the system exists: deriving pool sizes from arrival rate and service time, deriving the number of instances from peak QPS, deriving the database tier from storage growth, and deriving alerting from an explicit error budget. It also requires reasoning across services: availability multiplies, latency adds and fans out, and capacity is bounded by the narrowest pipe.</dd>
+      <dt>The modern approach</dt><dd>Start from user-visible requirements, quantify them (QPS, data size, latency percentiles, availability, durability, RPO/RTO), estimate capacity with powers of two and known latency costs, sketch a minimal architecture that meets the numbers, then deepen the components whose numbers are tight. Operate it against SLOs with error budgets and multi-window burn-rate alerts rather than static thresholds.</dd>
+      <dt>Where Python and Go fit</dt><dd>Python is the fastest way to build a throwaway capacity model or queueing simulation (a notebook with ten lines of NumPy settles many debates). Go is a common choice for load generators and sidecars where you need to drive tens of thousands of concurrent requests with tiny memory overhead. Both appear in §7.</dd>
+      <dt>In production</dt><dd>Estimation numbers become capacity plans and autoscaling policies; percentiles become Micrometer histograms exported to Prometheus; SLOs become recording rules and burn-rate alerts; error budgets become release-gating policy. The estimates are revisited quarterly against real telemetry.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use the full method for any new system, any 10x growth event, any new critical dependency (including an LLM provider), and every design interview. Do not spend an hour on capacity estimation for an internal tool with fifty users; a two-minute sanity check is enough, and the saved time is better spent on correctness and security.</dd>
+    </dl>
+  </div>
+
+  <div class="callout insight"><p class="callout-title">Why this matters more in the AI era</p><p>LLM-backed features break many inherited intuitions. A single model call can take 2–30 seconds, costs real money per token, has provider-imposed rate limits measured in tokens per minute, and has a latency distribution with a very long tail. Every technique in this chapter (Little's Law for concurrency, percentiles for tail latency, availability math for a third-party dependency, error budgets for a flaky provider) applies directly, and the numbers are often an order of magnitude more extreme than for a typical CRUD service. Part 8 builds on this foundation.</p></div>
+</section>
+
+<section id="history">
+  <h2>2. History: From Telephone Exchanges to Error Budgets</h2>
+  <p>The vocabulary of this chapter was not invented by web companies. Most of it comes from telephony, operations research and reliability engineering, and was adopted by internet-scale companies as they hit the same problems.</p>
+  <h3>2.1 Queueing theory (1909–1960s)</h3>
+  <p>Agner Krarup Erlang, working for the Copenhagen Telephone Company, published his first work on telephone traffic in 1909 and the formulas that still bear his name (Erlang B and Erlang C) shortly after. The question he answered, "how many circuits do we need so that only a small fraction of calls are blocked?", is exactly the question you answer when sizing a connection pool. In 1961 John D. C. Little published a proof of the relationship \(L = \lambda W\) that now carries his name; its generality (it holds for almost any stable system regardless of arrival distribution) is why it is the single most useful formula in capacity planning. David Kendall's 1953 notation (M/M/1, M/M/c, M/G/1) gave the field its shorthand.</p>
+  <h3>2.2 Reliability engineering (1950s–1980s)</h3>
+  <p>Availability as a probability, mean time between failures (MTBF), mean time to repair (MTTR) and the series/parallel composition rules came out of military and aerospace reliability work in the 1950s and 1960s and were standardised in telecom, where "five nines" (99.999%) became the folklore target for switching equipment. The mainframe and fault-tolerant computing era (Tandem NonStop, 1970s onwards) brought redundancy and failover into commercial computing.</p>
+  <h3>2.3 The web-scale era (late 1990s–2010s)</h3>
+  <p>Internet companies discovered that commodity hardware fails constantly at scale and that designing for failure is cheaper than preventing it. Amazon's 2007 Dynamo paper is notable for this chapter because it framed its service-level agreements in terms of the <strong>99.9th percentile</strong> of latency rather than mean or median, explicitly to protect the experience of all customers rather than the typical one. Jeff Dean popularised the "latency numbers every programmer should know" table in talks around 2009–2010, and in 2013 Dean and Luiz André Barroso published <em>The Tail at Scale</em> in Communications of the ACM, explaining why tail latency dominates in fan-out systems and describing mitigations such as hedged requests.</p>
+  <h3>2.4 SRE, SLOs and error budgets (2003–present)</h3>
+  <p>Google's Site Reliability Engineering function (founded in 2003 under Ben Treynor Sloss) formalised the practice of setting explicit service-level objectives and spending the gap between the objective and 100% as an <strong>error budget</strong> on releases and experiments. The 2016 O'Reilly book <em>Site Reliability Engineering</em> and the 2018 <em>Site Reliability Workbook</em> (both free online) took these ideas mainstream, including multi-window, multi-burn-rate alerting. Today SLOs are built into most observability products, and OpenTelemetry (a CNCF project formed in 2019 from the merger of OpenTracing and OpenCensus) has become the vendor-neutral way to emit the telemetry SLIs are computed from.</p>
+  <h3>2.5 The system design interview (2010s–present)</h3>
+  <p>As distributed systems became normal, the "system design interview" became a standard part of senior hiring loops. Its format (open-ended prompt, requirements, estimation, high-level design, deep dive, trade-offs) is effectively a compressed version of a real design review. That is why this chapter treats the interview method and the real-world method as the same method at different time scales.</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+  <p>This section defines every concept the rest of Part 2 relies on. Read it once carefully; the rest of the book uses these terms precisely.</p>
+
+  <h3>3.1 A repeatable design method</h3>
+  <p>Whether you have 45 minutes in an interview or six weeks before an architecture review, the same sequence of questions works. The only thing that changes is how deep each step goes. The method below is the one used throughout this book; the step names are ours, not a standard.</p>
+  <ol>
+    <li><strong>Frame the problem.</strong> Who are the users, what is the core job-to-be-done, and what is explicitly out of scope? Restate the prompt in one sentence and get agreement.</li>
+    <li><strong>Functional requirements.</strong> List the three to six capabilities that define the product (e.g. "create a short URL", "redirect", "see click analytics"). Prioritise ruthlessly; each one you keep costs design time.</li>
+    <li><strong>Non-functional requirements.</strong> Quantify scale (users, DAU, requests per user), read/write ratio, latency targets as percentiles, availability, durability, consistency needs, data retention, compliance, cost ceiling.</li>
+    <li><strong>Estimate.</strong> Convert NFRs into peak QPS (read and write separately), storage over the retention horizon, network bandwidth in and out, and the working set that must live in memory.</li>
+    <li><strong>API and data model.</strong> Define the few external APIs (resource, verb, idempotency, pagination) and the core entities with their access patterns. The access patterns, not the entities, drive storage choice.</li>
+    <li><strong>High-level design.</strong> Draw the simplest architecture that satisfies the numbers: clients, edge (DNS/CDN), load balancer or gateway, stateless services, data stores, caches, async pipelines.</li>
+    <li><strong>Deep dives.</strong> Pick the two or three components where the numbers are tight or the correctness risk is highest, and design them properly: partitioning scheme, cache strategy, consistency model, failure handling.</li>
+    <li><strong>Failure, scale and evolution.</strong> Walk through what happens when each component fails, what changes at 10x load, how you deploy, observe and secure it, and what you would do differently with more time.</li>
+  </ol>
+  <div class="callout tip"><p class="callout-title">Tip: time-box in interviews</p><p>For a 45-minute interview, a workable budget is roughly 5 minutes on framing and requirements, 5 on estimation, 10 on API, data model and high-level design, 20 on deep dives and failure modes, and 5 on wrap-up. <span class="tag opinion">Opinion</span> Candidates most often fail by spending 20 minutes on requirements and never reaching a deep dive, or by skipping requirements and designing the wrong system.</p></div>
+
+  <h3>3.2 Functional versus non-functional requirements</h3>
+  <p><strong>Functional requirements</strong> describe <em>what</em> the system does: behaviours a user or another system can observe. They map roughly to your controller endpoints and domain use cases. <strong>Non-functional requirements</strong> (also called quality attributes, or "-ilities") describe <em>how well</em> it does it: performance, scalability, availability, durability, consistency, security, privacy, operability, cost, and compliance.</p>
+  <p>The crucial insight is that <em>architecture is driven almost entirely by non-functional requirements</em>. Two systems with identical functional requirements ("users post messages; other users read them") can have completely different architectures if one has 500 users and the other has 500 million, or if one tolerates seconds of staleness and the other must show a message to its sender immediately. A Spring Boot monolith with a single Postgres database is a perfectly correct design for the first; it is negligent for the second.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>NFR</th><th>Vague (useless) form</th><th>Quantified (designable) form</th></tr></thead>
+    <tbody>
+      <tr><td>Scale</td><td>"Lots of users"</td><td>50M DAU, 20 reads and 2 writes per user per day, 3x diurnal peak</td></tr>
+      <tr><td>Latency</td><td>"Fast"</td><td>p50 &lt; 50 ms, p99 &lt; 300 ms for reads measured at the load balancer</td></tr>
+      <tr><td>Availability</td><td>"Always up"</td><td>99.95% of valid requests succeed over a rolling 28 days</td></tr>
+      <tr><td>Durability</td><td>"Never lose data"</td><td>Acknowledged writes survive loss of one availability zone; RPO 0, RTO 15 min</td></tr>
+      <tr><td>Consistency</td><td>"Correct"</td><td>Read-your-writes for the author; other readers may lag up to 5 s</td></tr>
+      <tr><td>Cost</td><td>"Cheap"</td><td>Infrastructure under $0.002 per monthly active user</td></tr>
+    </tbody>
+  </table></div>
+  <p>NFRs also conflict. Strong consistency across regions costs latency and availability (Chapter 6 covers CAP and PACELC). Higher durability costs write latency (synchronous replication). Lower latency costs money (more cache, more replicas, closer edges). A good design states which NFRs win when they conflict.</p>
+
+  <h3>3.3 Capacity estimation</h3>
+  <p>Capacity estimation (back-of-the-envelope calculation) turns NFRs into four numbers that decide the architecture: <strong>requests per second</strong>, <strong>storage</strong>, <strong>bandwidth</strong>, and <strong>memory</strong> (working set). The goal is the right order of magnitude, not precision. If your estimate says 40 writes per second, one Postgres primary is fine and anything more elaborate needs a separate justification; if it says 400,000 writes per second, you need partitioning and you should say so early.</p>
+  <p>The discipline is simple: write assumptions down explicitly, round aggressively to powers of ten, keep units visible, and sanity-check against known references (a modern Postgres primary on good hardware handles thousands to tens of thousands of simple writes per second; a single Redis node handles on the order of 100k simple operations per second; a Spring Boot instance on a few cores handles hundreds to a few thousand simple requests per second; all <span class="tag illus">Illustrative</span> orders of magnitude that vary widely with workload). Section 6 provides the tables and a full worked example.</p>
+  <ul>
+    <li><strong>QPS.</strong> Daily requests divided by 86,400 seconds (round to 10<sup>5</sup>), then multiplied by a peak factor (commonly 2–10x depending on diurnal pattern and events).</li>
+    <li><strong>Storage.</strong> Writes per day times record size times retention, times replication factor, plus index overhead (often 20–100% of data size for OLTP tables).</li>
+    <li><strong>Bandwidth.</strong> QPS times payload size, separately for ingress and egress; egress usually dominates and is what cloud providers charge for.</li>
+    <li><strong>Memory.</strong> The hot working set you want cached, often estimated with the 80/20 heuristic: cache the 20% of objects that serve 80% of reads.</li>
+  </ul>
+
+  <h3>3.4 Latency and throughput</h3>
+  <p><strong>Latency</strong> is the time a single operation takes from the perspective of whoever is waiting for it. Always say <em>where</em> it is measured: client-observed latency includes DNS, TLS handshake, network round trips and queueing at every hop; server-side latency measured by a Micrometer timer in your controller excludes all of that. The difference is often larger than the server time itself. <strong>Response time</strong> is sometimes distinguished from latency (latency being the time a request waits to be handled, response time the total), but most engineers use the terms interchangeably; this book uses "latency" for total time observed at a stated point.</p>
+  <p><strong>Throughput</strong> is the rate of completed work: requests per second, messages per second, bytes per second. Latency and throughput are related but not inverses. A pipeline can have high throughput and high latency (a batch ETL job), and adding parallelism raises throughput without lowering per-request latency. The connection between them is Little's Law (§3.9): for a fixed amount of concurrency, lower latency means higher throughput.</p>
+  <p><strong>Bandwidth</strong> is the maximum capacity of a channel; throughput is what you actually push through it. <strong>Goodput</strong> is the useful portion of throughput, excluding retries, protocol overhead and work that will be thrown away (e.g. a response computed after the client timed out). During overload, throughput can stay high while goodput collapses, which is why load shedding (Chapter 2) matters.</p>
+
+  <h3>3.5 Percentiles and tail latency</h3>
+  <p>Latency is a distribution, not a number. The <strong>p-th percentile</strong> is the value below which p% of observations fall: p50 (the median) is the typical experience, p99 is the experience of the unluckiest 1 in 100 requests, p99.9 the unluckiest 1 in 1,000. The mean is a poor summary because latency distributions are right-skewed: a handful of multi-second requests (GC pauses, cache misses, lock waits, retries) pull the mean up while the median stays put, and the mean says nothing about how bad the bad cases are.</p>
+  <p>The tail matters more than intuition suggests for three reasons:</p>
+  <ul>
+    <li><strong>Users make many requests.</strong> A page that triggers 50 backend calls, each with a 1% chance of being slow, is slow for about 40% of page views (§6.5). The p99 of a component becomes the median experience of the product.</li>
+    <li><strong>Your most valuable users hit it most.</strong> Heavy users have more data (bigger carts, longer histories), which makes their queries slower. Amazon's Dynamo paper cites this as a reason to target the 99.9th percentile.</li>
+    <li><strong>Tails cause cascades.</strong> Slow requests hold threads and connections longer, which by Little's Law raises concurrency, which exhausts pools, which makes more requests slow.</li>
+  </ul>
+  <div class="callout warn"><p class="callout-title">Warning: you cannot average percentiles</p><p>The p99 of a service is <em>not</em> the average of each instance's p99, and a daily p99 is not the average of hourly p99s. Percentiles must be computed from the merged distribution. This is why Micrometer's client-side <code>percentiles</code> (pre-computed per instance) cannot be aggregated across pods, while <code>percentiles-histogram</code> (bucket counts) can be summed in Prometheus and then turned into a percentile with <code>histogram_quantile</code>. Always use histograms for SLOs.</p></div>
+  <p>Common causes of tail latency, each addressed later in the book: garbage collection pauses (JVM tuning, generational ZGC); head-of-line blocking in queues and connection pools; cache misses and cold starts; lock contention and hot rows; noisy neighbours on shared hosts; retries and timeouts; background work (compaction, vacuum, snapshotting); and network packet loss with TCP retransmission timeouts (on the order of 200 ms minimum on Linux by default).</p>
+
+  <h3>3.6 Availability</h3>
+  <p><strong>Availability</strong> is the fraction of time (or of requests) for which the system does its job. The two definitions differ. <em>Time-based</em> availability is \(\frac{\text{uptime}}{\text{uptime}+\text{downtime}}\), or equivalently \(\frac{MTBF}{MTBF+MTTR}\). <em>Request-based</em> availability is \(\frac{\text{good requests}}{\text{valid requests}}\). Request-based measurement is usually more meaningful for online services because a partial outage affecting 5% of requests for an hour is neither "up" nor "down", and because an outage at 3 a.m. affects fewer users than one at noon.</p>
+  <p>Availability is expressed in "nines". The table in §6.3 converts nines to allowed downtime; the key intuition is that each extra nine costs roughly ten times less allowed downtime and usually much more than ten times the engineering effort. 99.9% allows about 43 minutes of downtime a month, which a single manual failover can consume. 99.99% (about 4.3 minutes a month) is effectively impossible without automated failover, because humans cannot be paged, diagnose, and act in four minutes. 99.999% generally requires multi-region active-active architecture and extremely disciplined change management.</p>
+  <p>Two equations dominate availability reasoning, both derived in §6.4: components in <strong>series</strong> (all must work) multiply availabilities, so the result is lower than the weakest component; redundant components in <strong>parallel</strong> (any one suffices) multiply <em>unavailabilities</em>, so the result is higher than the strongest component, provided failures are independent. That last proviso is where most real outages live: shared power, a shared configuration push, a shared DNS provider, or a shared bug makes "redundant" replicas fail together.</p>
+
+  <h3>3.7 Reliability, durability and resilience</h3>
+  <p>These words are used loosely; here they have specific meanings:</p>
+  <ul>
+    <li><strong>Reliability</strong> is the probability that the system performs correctly over a period of time under stated conditions. It includes correctness, not just liveness: a service that returns HTTP 200 with wrong prices is available but not reliable. MTBF is the classic reliability metric.</li>
+    <li><strong>Durability</strong> is the probability that data, once acknowledged as stored, is not lost. It is measured over long periods (often per object per year). Amazon S3, for example, documents that it is designed for 99.999999999% (eleven nines) durability of objects over a given year <span class="tag version">Version-sensitive · checked Nov 2026</span>. Durability and availability are independent: a system can be unavailable (you cannot read your data right now) yet perfectly durable (the data still exists), and vice versa (an in-memory cache is highly available until it restarts and loses everything).</li>
+    <li><strong>Fault tolerance</strong> is the ability to continue operating when components fail. <strong>Resilience</strong> is broader: the ability to absorb faults, degrade gracefully, and recover. Chapter 8 covers the Resilience4j patterns that implement it.</li>
+    <li><strong>RPO and RTO.</strong> Recovery Point Objective is the maximum acceptable data loss measured in time (RPO 0 means no acknowledged write may be lost; RPO 5 min means you can restore to a point at most five minutes old). Recovery Time Objective is the maximum acceptable time to restore service. They drive replication mode (Chapter 5) and disaster recovery design (Chapter 9).</li>
+  </ul>
+  <p>Faults are not failures. A <em>fault</em> is a component deviating from spec (a disk dies, a pod is OOM-killed); a <em>failure</em> is the system as a whole failing to provide service. Good design converts faults into non-events. Netflix's Chaos Monkey, which deliberately kills instances in production, exists precisely to verify that faults stay faults.</p>
+
+  <h3>3.8 SLIs, SLOs, SLAs and error budgets</h3>
+  <p>A <strong>Service Level Indicator</strong> is a carefully defined quantitative measure of some aspect of service quality, almost always expressed as a ratio of good events to valid events so that it lies between 0 and 100%. Examples: "proportion of HTTP requests to <code>/api/orders/**</code> that return a non-5xx status, measured at the load balancer"; "proportion of checkout requests served in under 400 ms"; "proportion of Kafka events processed into the search index within 60 s of being produced".</p>
+  <p>A <strong>Service Level Objective</strong> is a target for an SLI over a compliance window: "99.9% of checkout requests succeed, measured over a rolling 28-day window." It is an internal engineering commitment. A <strong>Service Level Agreement</strong> is a contract with customers that specifies consequences (usually service credits) if a level is not met. SLAs should always be looser than SLOs, so that you breach your internal objective (and react) long before you owe anyone money.</p>
+  <p>The <strong>error budget</strong> is \(1 - \text{SLO}\): the amount of unreliability you are allowed. A 99.9% SLO over 28 days with 100 million requests gives a budget of 100,000 failed requests, or about 40 minutes of full outage. The budget turns reliability from a moral argument into an accounting one. If budget remains, teams can ship faster, run riskier migrations, and experiment. If the budget is exhausted, the agreed policy kicks in: for example, freeze non-critical releases and redirect effort to reliability work until the budget recovers. The SLO is the contract between product velocity and operational stability.</p>
+  <p>Good SLOs have these properties:</p>
+  <ul>
+    <li>They measure what users experience, as close to the user as practical (load balancer or client telemetry rather than JVM internals).</li>
+    <li>They are few: two to four per user journey (typically availability and latency, sometimes freshness and correctness).</li>
+    <li>They are achievable and slightly below current performance, not aspirational. An SLO you already miss is just noise.</li>
+    <li>They exclude invalid events (4xx from client errors, health checks, load tests) explicitly.</li>
+    <li>Latency SLOs use thresholds on a distribution ("99% under 300 ms"), not averages.</li>
+  </ul>
+  <div class="callout java"><p class="callout-title">Spring angle</p><p>In a Spring Boot 3.x/4.x service, the raw material for SLIs is the <code>http.server.requests</code> timer that Micrometer's observation instrumentation records automatically, tagged with <code>uri</code>, <code>method</code>, <code>status</code> and <code>outcome</code>. Enabling <code>percentiles-histogram</code> and declaring <code>slo</code> bucket boundaries that match your latency thresholds (for example 100 ms, 300 ms, 1 s) lets Prometheus compute "fraction under 300 ms" exactly rather than by interpolation. Section 7.1 shows the configuration.</p></div>
+
+  <h3>3.9 Little's Law and queueing intuition</h3>
+  <p><strong>Little's Law</strong> states that in any stable system, the average number of items in the system \(L\) equals the average arrival rate \(\lambda\) times the average time each item spends in the system \(W\): \(L = \lambda W\). "Stable" means that, over the long run, items leave as fast as they arrive. It holds regardless of arrival distribution, service distribution, scheduling order or number of servers, which is why it is so useful.</p>
+  <p>Applied to a service: if your Spring Boot instance receives 200 requests per second and each takes 50 ms on average, then on average \(200 \times 0.05 = 10\) requests are in flight. With a Tomcat pool of 200 threads you are nowhere near the limit. If a downstream dependency slows to 2 s, in-flight requests rise to \(200 \times 2 = 400\): the thread pool saturates, new requests queue in the accept backlog, and latency rises further. Nothing about your code changed; the arithmetic did. The same law sizes database connection pools (concurrent queries = query rate times query time), Kafka consumer concurrency, and LLM call concurrency against a provider's rate limit.</p>
+  <p>Queueing theory adds the second essential intuition: <strong>latency grows non-linearly with utilisation</strong>. For the simplest model (one server, random arrivals, random service times, called M/M/1), the average time in system is \(W = \frac{S}{1-\rho}\), where \(S\) is service time and \(\rho\) is utilisation. At 50% utilisation requests take on average twice the service time; at 80%, five times; at 90%, ten times; at 95%, twenty times. Real systems differ in detail but share the shape: a knee somewhere between 70% and 85% after which small increases in load cause large increases in latency. This is why capacity plans target peak utilisation well below 100%, and why autoscaling on CPU at 70% is a common default. Section 6.6 develops this with multi-server queues.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working: Where the Milliseconds and the Nines Go</h2>
+  <p>This section opens up a single request and a single month of operation to show, step by step, how latency accumulates, how tails amplify, how queues build, and how an error budget is consumed. These mechanics are what your estimates are approximating.</p>
+
+  <h3>4.1 Anatomy of one request</h3>
+  <p>Consider a mobile client calling <code>GET /api/feed</code> on a Spring Boot service behind a cloud load balancer, with the service reading from Redis and Postgres. The approximate stages, with <span class="tag illus">Illustrative</span> timings for a client 40 ms RTT away from the region:</p>
+  <ol>
+    <li><strong>DNS resolution</strong> (0–100 ms). Usually cached on the device; a cold lookup may traverse recursive resolvers. TTLs and resolver caching decide how often this cost is paid.</li>
+    <li><strong>TCP handshake</strong> (1 RTT, ~40 ms) and <strong>TLS 1.3 handshake</strong> (1 additional RTT, ~40 ms; 0 with session resumption and 0-RTT data). HTTP/2 and HTTP/3 connection reuse amortise these across many requests, which is why connection reuse is the cheapest latency win at the edge.</li>
+    <li><strong>Request transit</strong> (0.5 RTT, ~20 ms) to the load balancer, which terminates TLS, picks a backend (Chapter 2) and forwards over a pooled connection (&lt;1 ms within a zone).</li>
+    <li><strong>Accept and dispatch</strong>. Tomcat's acceptor hands the socket to a worker thread (or, with virtual threads enabled via <code>spring.threads.virtual.enabled=true</code>, a virtual thread). If all workers are busy, the request waits in a queue; this wait is invisible to a controller-level timer.</li>
+    <li><strong>Filters and security</strong>: Spring Security filter chain, JWT signature verification (tens to hundreds of microseconds), tracing context extraction.</li>
+    <li><strong>Business logic</strong> with dependency calls: Redis GET (~0.5 ms in-zone), Postgres query (1–5 ms for an indexed lookup, longer on a miss to disk), possibly a downstream HTTP call (5–50 ms). Each call must first acquire a connection from a pool; pool waits are another hidden queue.</li>
+    <li><strong>Serialisation</strong>: Jackson writes JSON (sub-millisecond for small payloads, measurable for large ones).</li>
+    <li><strong>Response transit</strong> (0.5 RTT plus transmission time, which depends on payload size and congestion window).</li>
+  </ol>
+  <p>For a new connection, network setup alone (2–3 RTTs, ~100 ms) can exceed server processing (~10 ms). This is the quantitative argument for CDNs and edge termination (moving the RTT closer), connection reuse, and payload minimisation, and why an SLO measured only inside the JVM can look excellent while users are unhappy.</p>
+
+  <h3>4.2 How serial and parallel calls compose</h3>
+  <p>When a request calls dependencies <em>sequentially</em>, latencies add: if A calls B then C, the request takes at least \(t_B + t_C\). The tail of the sum is worse than either tail alone, but not by much when the tails are independent. When a request calls dependencies <em>in parallel</em> (fan-out) and must wait for all of them, latency is the <em>maximum</em> of the branches. The maximum of many random variables is dominated by the tail: with 100 parallel calls, the request almost always waits for at least one call at that dependency's p99. This is the mechanism behind §3.5's "p99 becomes the median" claim, and it is why search, feed, and recommendation systems (which fan out to many shards) care obsessively about shard tail latency.</p>
+  <p>Mitigations, previewed here and covered in later chapters:</p>
+  <ul>
+    <li><strong>Hedged requests</strong>: send the request to one replica; if it has not answered by the p95 latency, send a second copy to another replica and use whichever answers first. Costs a few percent extra load and cuts the tail sharply.</li>
+    <li><strong>Tied requests</strong>: send to two replicas at once, each told about the other; the first to start executing cancels the other.</li>
+    <li><strong>Partial results</strong>: return what arrived by a deadline (common in search and feeds) and mark the response as degraded.</li>
+    <li><strong>Reducing fan-out</strong>: denormalise or co-locate data so one request touches fewer partitions (Chapter 5).</li>
+  </ul>
+
+  <h3>4.3 How a queue forms and why latency explodes</h3>
+  <p>Every pool in your request path (Tomcat workers, Hikari connections, the HTTP client's connection pool, Kafka consumer threads) is a queueing system with \(c\) servers. Requests arrive randomly, not evenly: even when the average arrival rate is below capacity, short bursts exceed it and a queue forms. When utilisation is low, bursts drain quickly. As utilisation rises, the queue is still draining from the last burst when the next one arrives, so waiting time compounds. At 100% utilisation the queue grows without bound: the system is no longer stable and Little's Law no longer describes a steady state but a growing backlog.</p>
+  <p>Two practical consequences follow. First, a pool that is "too small" shows up as latency long before it shows up as errors, because requests wait for a connection (Hikari's <code>connectionTimeout</code> defaults to 30 seconds, so a pool-starved service can hang for half a minute before failing). Second, unbounded queues convert overload into latency for everyone, whereas bounded queues with rejection convert it into fast failures for some. For user-facing systems, fast failure plus retry with backoff is usually the better trade.</p>
+
+  <h3>4.4 How an error budget is consumed in practice</h3>
+  <p>Suppose a checkout API has an availability SLO of 99.9% over 28 days and serves on average 1,000 requests per second. Over 28 days that is about 2.42 billion requests, so the budget is about 2.42 million failed requests. Three incidents happen in the month:</p>
+  <ul>
+    <li>A bad deploy returns 100% errors for 6 minutes before automatic rollback: about 360,000 failures (15% of budget).</li>
+    <li>A database failover causes 30% errors for 2 minutes: about 36,000 failures (1.5%).</li>
+    <li>A slow memory leak causes 0.5% errors for 3 days until noticed: about 1.3 million failures (54%).</li>
+  </ul>
+  <p>The third incident is the instructive one. It never triggered a threshold alert ("error rate above 5%") yet consumed more than half the budget. This is the motivation for <strong>burn-rate alerting</strong>: alert on how fast the budget is being consumed relative to the rate that would exactly exhaust it by the end of the window. A burn rate of 1 consumes the budget exactly over 28 days; a burn rate of 5 (0.5% errors against a 0.1% budget) exhausts it in under six days and deserves a ticket; a burn rate of 14.4 sustained for an hour consumes 2% of a 30-day budget and deserves a page. Section 6.7 gives the formulas and the standard multi-window scheme.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: A Reference System and the Method as a Flow</h2>
+  <p>The diagrams in this section are the mental scaffolding for the whole of Part 2. Each later chapter zooms into one or two boxes.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  U["Clients (web, mobile, partners)"] --> DNS["DNS / GeoDNS"]
+  U --> CDN["CDN edge (static + cacheable API)"]
+  CDN --> LB["L7 load balancer / API gateway"]
+  DNS --> LB
+  LB --> S1["Stateless service pods (Spring Boot)"]
+  S1 --> C["Distributed cache (Redis / Valkey)"]
+  S1 --> DBP[("Primary DB")]
+  DBP --> DBR[("Read replicas")]
+  S1 --> DBR
+  S1 --> MQ["Log / queue (Kafka)"]
+  MQ --> W["Async workers"]
+  W --> OBJ[("Object storage")]
+  W --> SRCH[("Search / vector index")]
+  S1 --> LLM["External AI provider"]
+  S1 -.-> OBS["Telemetry: metrics, logs, traces"]
+</pre>
+  <figcaption>Figure 1.1 — A reference architecture for a modern read-heavy web/API system with AI features.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> traffic enters through DNS and, for cacheable content, a CDN (Chapter 3). An L7 load balancer or API gateway (Chapter 2) terminates TLS, authenticates, rate-limits and routes to <em>stateless</em> service instances, which can therefore be scaled horizontally. Hot reads are served from a distributed cache; authoritative state lives in a primary database with read replicas (Chapters 4 and 5). Work that need not complete within the request (indexing, notifications, embedding generation) is published to a log such as Kafka and processed by workers (Chapter 7). External AI providers are treated as a slow, rate-limited, partially available dependency, which is exactly the kind of dependency the availability and Little's Law maths in this chapter exist for. Every component emits telemetry, from which SLIs are computed (Chapter 9). When you are asked to "design X", this skeleton is the default starting point; your requirements decide which boxes you delete.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A["Frame the problem"] --> B["Functional requirements"]
+  B --> C["Non-functional requirements (quantified)"]
+  C --> D["Capacity estimation: QPS, storage, bandwidth, memory"]
+  D --> E["API and data model (access patterns)"]
+  E --> F["High-level design"]
+  F --> G{"Do the numbers fit?"}
+  G -- "No: a component is over capacity" --> H["Deep dive: partition, cache, replicate, async"]
+  H --> F
+  G -- "Yes" --> I["Failure modes, security, observability, SLOs"]
+  I --> J["Evolution: 10x load, cost, what you would change"]
+</pre>
+  <figcaption>Figure 1.2 — The design method as a feedback loop rather than a waterfall.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the key feature is the loop between high-level design and deep dives. Estimation produces numbers; each component in the high-level design has a known approximate capacity; any component whose required load exceeds its capacity triggers a deep dive (shard it, cache in front of it, replicate it, or move work off the request path). You iterate until every box fits, then examine failure and evolution. In an interview, explicitly saying "the write path needs 50k writes per second, which is beyond one Postgres primary, so let's deep-dive the storage layer" is the signal that you are designing from numbers rather than from habit.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant LB as Load balancer
+  participant API as Feed service
+  participant R as Redis
+  participant P as Profile svc
+  participant G as Graph svc
+  participant DB as Postgres
+  C->>LB: GET /feed (TLS, HTTP/2)
+  LB->>API: forward (pooled conn)
+  API->>R: GET feed:user42
+  R-->>API: miss
+  par fan-out
+    API->>P: profile(user42)
+    API->>G: following(user42)
+  end
+  P-->>API: 8 ms
+  G-->>API: 35 ms (p99 tail)
+  API->>DB: posts by followed, keyset page
+  DB-->>API: 12 ms
+  API->>R: SET feed:user42 EX 30
+  API-->>LB: 200 JSON
+  LB-->>C: response
+</pre>
+  <figcaption>Figure 1.3 — A read request with a cache miss, parallel fan-out and a database query.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the request's server time is roughly the cache lookup, plus the <em>maximum</em> of the two parallel calls (35 ms, not 43 ms), plus the database query, plus serialisation. If the graph service has a heavy tail, it dominates the feed service's tail regardless of how fast everything else is. On a cache hit, the request skips the fan-out and the database entirely, so the latency distribution of the feed endpoint is bimodal: a fast hit mode and a slow miss mode. The hit ratio therefore directly determines which percentile falls into which mode, which is a useful way to reason about cache sizing in Chapter 3.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> Healthy
+  Healthy --> Burning: burn rate above 1
+  Burning --> Healthy: burn rate falls
+  Burning --> TicketAlert: 6h and 30m windows above 6x
+  Burning --> PageAlert: 1h and 5m windows above 14.4x
+  PageAlert --> Mitigated: rollback, failover, shed load
+  TicketAlert --> Mitigated: fix in working hours
+  Mitigated --> Healthy
+  Healthy --> Exhausted: budget spent
+  Exhausted --> Healthy: window rolls forward
+  Exhausted: Release freeze per policy
+</pre>
+  <figcaption>Figure 1.4 — Error-budget states and the alerting that drives transitions.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> a service spends most of its time healthy, consuming budget slower than the sustainable rate. Burn-rate alerts fire at two severities: fast burns page a human immediately; slow burns open a ticket. Each alert requires both a long window (to be significant) and a short window (to confirm it is still happening, so the alert resets quickly after mitigation). When the budget is exhausted, the policy agreed in advance (not negotiated during the incident) takes effect. The numbers on the arrows are the commonly used values from the Google SRE Workbook for a 30-day window, derived in §6.7.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math: Estimation, Nines, Tails and Queues</h2>
+
+  <h3>6.1 Powers of two and handy constants</h3>
+  <p>Estimation is mostly unit conversion. Memorise this table and the handful of constants below it.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Power</th><th>Exact value</th><th>Approx.</th><th>Name</th><th>Bytes</th></tr></thead>
+    <tbody>
+      <tr><td>2<sup>10</sup></td><td>1,024</td><td>10<sup>3</sup> (thousand)</td><td>Kilo</td><td>1 KB</td></tr>
+      <tr><td>2<sup>20</sup></td><td>1,048,576</td><td>10<sup>6</sup> (million)</td><td>Mega</td><td>1 MB</td></tr>
+      <tr><td>2<sup>30</sup></td><td>1,073,741,824</td><td>10<sup>9</sup> (billion)</td><td>Giga</td><td>1 GB</td></tr>
+      <tr><td>2<sup>40</sup></td><td>≈1.1 × 10<sup>12</sup></td><td>10<sup>12</sup> (trillion)</td><td>Tera</td><td>1 TB</td></tr>
+      <tr><td>2<sup>50</sup></td><td>≈1.13 × 10<sup>15</sup></td><td>10<sup>15</sup></td><td>Peta</td><td>1 PB</td></tr>
+      <tr><td>2<sup>32</sup></td><td>4,294,967,296</td><td>4 × 10<sup>9</sup></td><td colspan="2">Range of a 32-bit int; IPv4 addresses</td></tr>
+      <tr><td>2<sup>63</sup></td><td>≈9.2 × 10<sup>18</sup></td><td>9 × 10<sup>18</sup></td><td colspan="2">Max signed 64-bit (Java <code>long</code>)</td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li>Seconds per day: 86,400 ≈ 10<sup>5</sup>. Per month ≈ 2.6 × 10<sup>6</sup>. Per year ≈ 3.15 × 10<sup>7</sup> (π × 10<sup>7</sup> is a handy mnemonic).</li>
+    <li>1 million requests per day ≈ 12 requests per second average. 1 billion per day ≈ 12,000 per second.</li>
+    <li>Common sizes: UUID 16 bytes (36 as text); <code>long</code>/timestamp 8 bytes; a short JSON API response 1–5 KB; a compressed web image 100–500 KB; one minute of 1080p video on the order of 10–100 MB depending on codec; an embedding of 1,536 float32 dimensions = 6 KB.</li>
+  </ul>
+
+  <h3>6.2 Latency numbers (orders of magnitude)</h3>
+  <p>The figures below are <span class="tag illus">Illustrative</span> orders of magnitude in the spirit of the widely circulated "latency numbers every programmer should know" (Jeff Dean, Peter Norvig and later community updates). Exact values vary by hardware generation; what matters is the ratios.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Operation</th><th>Approximate time</th><th>Relative to L1</th></tr></thead>
+    <tbody>
+      <tr><td>L1 cache reference</td><td>~1 ns</td><td>1x</td></tr>
+      <tr><td>Branch mispredict</td><td>~3 ns</td><td>3x</td></tr>
+      <tr><td>L2 cache reference</td><td>~4 ns</td><td>4x</td></tr>
+      <tr><td>Mutex lock/unlock (uncontended)</td><td>~15–25 ns</td><td>~20x</td></tr>
+      <tr><td>Main memory reference</td><td>~100 ns</td><td>100x</td></tr>
+      <tr><td>Compress 1 KB with a fast codec</td><td>~1–3 µs</td><td>~10<sup>3</sup>x</td></tr>
+      <tr><td>Read 1 MB sequentially from memory</td><td>~10–50 µs</td><td>~10<sup>4</sup>x</td></tr>
+      <tr><td>NVMe SSD random 4 KB read</td><td>~20–100 µs</td><td>~10<sup>4</sup>–10<sup>5</sup>x</td></tr>
+      <tr><td>Round trip within a datacenter/zone</td><td>~100–500 µs</td><td>~10<sup>5</sup>x</td></tr>
+      <tr><td>Read 1 MB sequentially from NVMe</td><td>~100–300 µs</td><td>~10<sup>5</sup>x</td></tr>
+      <tr><td>Round trip between zones in a region</td><td>~0.5–2 ms</td><td>~10<sup>6</sup>x</td></tr>
+      <tr><td>HDD seek</td><td>~5–10 ms</td><td>~10<sup>7</sup>x</td></tr>
+      <tr><td>Round trip US East ↔ US West</td><td>~60–80 ms</td><td>~10<sup>8</sup>x</td></tr>
+      <tr><td>Round trip US ↔ Europe</td><td>~70–150 ms</td><td>~10<sup>8</sup>x</td></tr>
+      <tr><td>LLM API call, short completion</td><td>~0.5–10 s</td><td>~10<sup>9</sup>–10<sup>10</sup>x</td></tr>
+    </tbody>
+  </table></div>
+  <p>Three lessons fall out. Memory is roughly 1,000x faster than an in-zone network round trip, which is why an in-process Caffeine cache beats Redis for very hot keys (Chapter 3). A cross-region round trip costs as much as hundreds of in-zone ones, which is why synchronous cross-region replication is expensive (Chapter 5). And a single LLM call can cost more latency than thousands of database queries, which changes how you design AI features: stream tokens, cache aggressively, and move generation off the synchronous path where possible.</p>
+
+  <h3>6.3 Nines to downtime</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Availability</th><th>Downtime per year</th><th>Per 30-day month</th><th>Per week</th><th>Per day</th></tr></thead>
+    <tbody>
+      <tr><td>99% ("two nines")</td><td>3.65 days</td><td>7.2 h</td><td>1.68 h</td><td>14.4 min</td></tr>
+      <tr><td>99.5%</td><td>1.83 days</td><td>3.6 h</td><td>50.4 min</td><td>7.2 min</td></tr>
+      <tr><td>99.9% ("three nines")</td><td>8.77 h</td><td>43.2 min</td><td>10.1 min</td><td>1.44 min</td></tr>
+      <tr><td>99.95%</td><td>4.38 h</td><td>21.6 min</td><td>5.04 min</td><td>43.2 s</td></tr>
+      <tr><td>99.99% ("four nines")</td><td>52.6 min</td><td>4.32 min</td><td>1.01 min</td><td>8.64 s</td></tr>
+      <tr><td>99.999% ("five nines")</td><td>5.26 min</td><td>25.9 s</td><td>6.05 s</td><td>0.86 s</td></tr>
+    </tbody>
+  </table></div>
+  <p>Formally, allowed downtime \(D = (1 - A) \times T\). For \(A = 0.9995\) and \(T = 30 \times 86{,}400\) s, \(D = 0.0005 \times 2{,}592{,}000 = 1{,}296\) s \(= 21.6\) min.</p>
+
+  <h3>6.4 Composite availability: series and parallel</h3>
+  <p><strong>Intuition.</strong> If a request needs every component in a chain to work, any one failing breaks it, so the chain is weaker than its weakest link. If a request can be served by any one of several redundant replicas, all of them must fail together to break it, which (if independent) is very unlikely.</p>
+  <p><strong>Series.</strong> For \(n\) components with availabilities \(A_1, \dots, A_n\), all required:</p>
+  \[ A_{\text{series}} = \prod_{i=1}^{n} A_i \]
+  <p>Example: load balancer 99.99%, service 99.95%, Redis 99.9%, Postgres 99.95%, all on the critical path: \(0.9999 \times 0.9995 \times 0.999 \times 0.9995 \approx 0.9979\), about 99.79%, which is below every individual component and allows over 90 minutes of downtime a month. A useful approximation for high availabilities is that unavailabilities add: \(1 - A_{\text{series}} \approx \sum (1 - A_i) = 0.0001 + 0.0005 + 0.001 + 0.0005 = 0.0021\).</p>
+  <p><strong>Parallel (redundant).</strong> For \(n\) independent replicas where any one suffices:</p>
+  \[ A_{\text{parallel}} = 1 - \prod_{i=1}^{n} (1 - A_i) \]
+  <p>Two replicas at 99.9% each: \(1 - 0.001^2 = 0.999999\), six nines, <em>if</em> failures are independent and failover is instantaneous. Neither is true in practice. Correlated failures (same AZ, same deploy, same bug) and imperfect failover detection dominate. A more honest model multiplies in the availability of the failover mechanism itself, and treats a shared dependency as a series component that redundancy cannot fix.</p>
+  <p><strong>Making the cache optional.</strong> If the service can fall back to the database when Redis is down (accepting higher latency), Redis leaves the critical path for availability, and the chain becomes \(0.9999 \times 0.9995 \times 0.9995 \approx 0.9989\). Designing dependencies to be optional (graceful degradation) is often a cheaper availability win than adding redundancy.</p>
+
+  <h3>6.5 Tail amplification under fan-out</h3>
+  <p>If each of \(n\) independent parallel calls has probability \(p\) of exceeding some latency threshold, the probability that the overall request exceeds it (because it waits for the slowest) is:</p>
+  \[ P(\text{request slow}) = 1 - (1 - p)^n \]
+  <p>With \(p = 0.01\) (each call's p99) and \(n = 100\): \(1 - 0.99^{100} \approx 0.634\). Sixty-three percent of requests experience at least one p99-or-worse call. With \(n = 10\): about 9.6%. Inverting the formula tells you how good each leaf must be: for at most 1% of requests to be slow with \(n = 100\), each leaf needs \(p \approx 1 - 0.99^{1/100} \approx 0.0001\), i.e. you must engineer the leaf p99.99 to meet the root p99.</p>
+
+  <h3>6.6 Little's Law and utilisation</h3>
+  <p><strong>Little's Law:</strong> \(L = \lambda W\). Rearranged for pool sizing: the number of concurrent workers needed is \(c \geq \lambda \times S\), where \(S\) is the time a worker is held per request. If your service handles 800 requests per second at peak and each request holds a database connection for 8 ms in total, the average number of connections in use is \(800 \times 0.008 = 6.4\). A pool of 10–15 per instance across your fleet is ample; a pool of 100 per instance across 30 instances (3,000 connections to one Postgres) is not just wasteful but harmful (Chapter 4 discusses why Postgres degrades with too many connections).</p>
+  <p><strong>Utilisation:</strong> \(\rho = \frac{\lambda S}{c}\) for \(c\) servers. Stability requires \(\rho &lt; 1\).</p>
+  <p><strong>M/M/1 waiting:</strong> for a single server with Poisson arrivals and exponential service times, the mean time in system is</p>
+  \[ W = \frac{S}{1 - \rho}, \qquad W_q = \frac{\rho S}{1 - \rho} \]
+  <div class="table-wrap"><table>
+    <thead><tr><th>Utilisation ρ</th><th>Mean time in system W (in units of S)</th><th>Mean queue wait</th></tr></thead>
+    <tbody>
+      <tr><td>0.50</td><td>2.0</td><td>1.0 S</td></tr>
+      <tr><td>0.70</td><td>3.3</td><td>2.3 S</td></tr>
+      <tr><td>0.80</td><td>5.0</td><td>4.0 S</td></tr>
+      <tr><td>0.90</td><td>10.0</td><td>9.0 S</td></tr>
+      <tr><td>0.95</td><td>20.0</td><td>19.0 S</td></tr>
+      <tr><td>0.99</td><td>100.0</td><td>99.0 S</td></tr>
+    </tbody>
+  </table></div>
+  <p>With \(c\) parallel servers (M/M/c), queueing delay at a given utilisation is much lower because a burst is spread over many servers; the Erlang C formula gives the probability of waiting. The practical message is unchanged: there is a knee, and pools with many workers can run at higher utilisation before hitting it than pools with few. This is one reason why consolidating many small pools into fewer large ones (or using virtual threads instead of a small fixed pool) improves tail latency.</p>
+  <details class="deep"><summary>Deep dive: the Erlang C formula</summary><div>
+  <p>For \(c\) servers, offered load \(a = \lambda S\) (in Erlangs) and \(\rho = a / c\), the probability that an arriving request must wait is</p>
+  \[ C(c, a) = \frac{\dfrac{a^c}{c!}\dfrac{1}{1-\rho}}{\displaystyle\sum_{k=0}^{c-1}\frac{a^k}{k!} + \dfrac{a^c}{c!}\dfrac{1}{1-\rho}} \]
+  <p>and the mean wait is \(W_q = \frac{C(c,a)\, S}{c(1-\rho)}\). For example, with \(a = 8\) and \(c = 10\) (\(\rho = 0.8\)), \(C \approx 0.41\) and \(W_q \approx 0.2 S\), far better than the single-server 4 S at the same utilisation. The Python script in §7.3 computes this; it is the right tool for sizing call-centre-like resources such as LLM concurrency slots.</p>
+  </div></details>
+
+  <h3>6.7 Error budgets and burn rates</h3>
+  <p>For SLO target \(s\) (e.g. 0.999) over a window \(T\), the error budget fraction is \(b = 1 - s\). If the observed error ratio over some lookback window is \(e\), the <strong>burn rate</strong> is</p>
+  \[ r = \frac{e}{b} \]
+  <p>A burn rate \(r\) sustained for time \(t\) consumes a fraction \(\frac{r\,t}{T}\) of the budget. To page when 2% of a 30-day budget is consumed within 1 hour: \(r = 0.02 \times 720 / 1 = 14.4\). To page when 5% is consumed within 6 hours: \(r = 0.05 \times 720 / 6 = 6\). To ticket when 10% is consumed within 3 days: \(r = 0.1 \times 720 / 72 = 1\). For a 99.9% SLO, a burn rate of 14.4 corresponds to an error ratio of 1.44% over the hour.</p>
+
+  <h3>6.8 Worked example: a URL shortener at scale</h3>
+  <p><span class="tag illus">Illustrative</span> assumptions: 100 million new short URLs per month; read:write ratio 100:1; 5-year retention; each record (short code, long URL averaging 200 bytes, owner, timestamps) about 500 bytes including overhead; peak factor 3x; 20% of URLs receive 80% of clicks.</p>
+  <ul>
+    <li><strong>Write QPS:</strong> \(10^8 / 2.6\times10^6 \approx 40\) per second average, ~120 at peak. One relational primary handles this easily.</li>
+    <li><strong>Read QPS:</strong> 100 × 40 = 4,000 per second average, ~12,000 at peak. Within reach of a few replicas, easily within reach of a cache.</li>
+    <li><strong>Storage:</strong> \(10^8 \times 12 \times 5 = 6 \times 10^9\) records × 500 B = 3 TB raw; with indexes (~1.5x) and 3x replication, about 13.5 TB provisioned. Large but not exotic; a partitioned relational store or a key-value store both work.</li>
+    <li><strong>Short-code space:</strong> base-62 with 7 characters gives \(62^7 \approx 3.5 \times 10^{12}\) codes, roughly 580x the 6 billion needed. Six characters (\(\approx 5.7 \times 10^{10}\)) would also suffice with less headroom.</li>
+    <li><strong>Bandwidth:</strong> reads return a 301/302 redirect of ~500 B: \(12{,}000 \times 500\) B ≈ 6 MB/s at peak egress. Trivial.</li>
+    <li><strong>Cache memory:</strong> daily reads \(4{,}000 \times 86{,}400 \approx 3.5\times10^8\); if the hot set is 20% of URLs touched per day and we size by daily distinct URLs (assume 50 million distinct per day), 20% × 50M × 500 B ≈ 5 GB. One modest Redis node, or a few GB of Caffeine per instance for the hottest subset.</li>
+  </ul>
+  <p>Conclusion from the numbers: the hard parts are not throughput but unique ID generation without coordination, cache hit ratio for the redirect path, analytics ingestion (which, at one event per click, is 12k events per second and belongs in a log like Kafka), and abuse prevention. That is where a deep dive should go.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code: Measuring, Estimating and Alerting</h2>
+  <p>The code in this section turns the chapter's concepts into tooling you can drop into a real project: SLO-grade latency histograms in Spring Boot, Prometheus recording and burn-rate alert rules, a capacity/availability/queueing calculator, and a small load generator that reports percentiles correctly.</p>
+
+  <h3>7.1 Spring Boot: SLO-ready latency histograms</h3>
+  <p>The following configuration works with Spring Boot 3.x and 4.x <span class="tag version">Version-sensitive · checked Nov 2026</span> with <code>spring-boot-starter-actuator</code> and <code>micrometer-registry-prometheus</code> on the classpath. It publishes histogram buckets (aggregatable across pods) and adds exact bucket boundaries at the SLO thresholds.</p>
+<pre data-file="application.yml"><code class="language-yaml">spring:
+  application:
+    name: checkout-service
+  threads:
+    virtual:
+      enabled: true          # Java 21+: requests run on virtual threads
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  metrics:
+    tags:
+      service: ${spring.application.name}
+    distribution:
+      # Publish cumulative buckets so p99 can be computed across ALL pods
+      percentiles-histogram:
+        http.server.requests: true
+      # Guarantee bucket boundaries exactly at the SLO thresholds
+      slo:
+        http.server.requests: 100ms, 300ms, 1s
+      # Bound the histogram range to keep cardinality sane
+      minimum-expected-value:
+        http.server.requests: 5ms
+      maximum-expected-value:
+        http.server.requests: 10s
+
+server:
+  tomcat:
+    threads:
+      max: 200               # ignored for request handling when virtual threads are on
+    accept-count: 100        # OS backlog: requests queue here when workers are saturated</code></pre>
+  <p>For business-level SLIs that are not HTTP requests (for example, "an order event is indexed within 60 seconds"), record your own timer with the same histogram settings:</p>
+<pre data-file="IndexingSli.java"><code class="language-java">package com.example.checkout.sli;
+
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.stereotype.Component;
+
+import java.time.Duration;
+import java.time.Instant;
+
+@Component
+public class IndexingSli {
+
+    private final Timer freshness;
+    private final SearchIndexer indexer;
+
+    public IndexingSli(MeterRegistry registry, SearchIndexer indexer) {
+        this.indexer = indexer;
+        this.freshness = Timer.builder("order.index.freshness")
+                .description("Time from order event creation to searchable")
+                .publishPercentileHistogram()
+                .serviceLevelObjectives(Duration.ofSeconds(10), Duration.ofSeconds(60))
+                .minimumExpectedValue(Duration.ofMillis(100))
+                .maximumExpectedValue(Duration.ofMinutes(10))
+                .register(registry);
+    }
+
+    @KafkaListener(topics = "orders", groupId = "search-indexer")
+    public void onOrder(OrderEvent event) {
+        indexer.index(event);
+        // SLI measured end-to-end from the producer's timestamp, not from consumption
+        freshness.record(Duration.between(event.createdAt(), Instant.now()));
+    }
+
+    public record OrderEvent(String orderId, Instant createdAt, String payload) {}
+
+    public interface SearchIndexer { void index(OrderEvent e); }
+}</code></pre>
+  <div class="callout warn"><p class="callout-title">Clock skew</p><p>Freshness SLIs that subtract a producer timestamp from a consumer clock are only as accurate as clock synchronisation between hosts (typically sub-millisecond to a few milliseconds with NTP or a cloud time-sync service). That is fine for a 60-second SLO and meaningless for a 5 ms one.</p></div>
+
+  <h3>7.2 Prometheus: SLI recording rules and multi-window burn-rate alerts</h3>
+  <p>These rules compute the availability and latency SLIs from the Micrometer metrics above and implement the two-severity, multi-window burn-rate scheme from §6.7 for a 99.9% SLO.</p>
+<pre data-file="checkout-slo-rules.yml"><code class="language-yaml">groups:
+  - name: checkout-slo-recording
+    rules:
+      # Error ratio over several windows: 5xx / all valid (exclude actuator)
+      - record: checkout:error_ratio:rate5m
+        expr: |
+          sum(rate(http_server_requests_seconds_count{service="checkout-service",uri!~"/actuator.*",status=~"5.."}[5m]))
+          /
+          sum(rate(http_server_requests_seconds_count{service="checkout-service",uri!~"/actuator.*"}[5m]))
+      - record: checkout:error_ratio:rate30m
+        expr: |
+          sum(rate(http_server_requests_seconds_count{service="checkout-service",uri!~"/actuator.*",status=~"5.."}[30m]))
+          /
+          sum(rate(http_server_requests_seconds_count{service="checkout-service",uri!~"/actuator.*"}[30m]))
+      - record: checkout:error_ratio:rate1h
+        expr: |
+          sum(rate(http_server_requests_seconds_count{service="checkout-service",uri!~"/actuator.*",status=~"5.."}[1h]))
+          /
+          sum(rate(http_server_requests_seconds_count{service="checkout-service",uri!~"/actuator.*"}[1h]))
+      - record: checkout:error_ratio:rate6h
+        expr: |
+          sum(rate(http_server_requests_seconds_count{service="checkout-service",uri!~"/actuator.*",status=~"5.."}[6h]))
+          /
+          sum(rate(http_server_requests_seconds_count{service="checkout-service",uri!~"/actuator.*"}[6h]))
+      # Latency SLI: fraction of requests faster than 300 ms (exact, thanks to the slo bucket)
+      - record: checkout:latency_good_ratio:rate5m
+        expr: |
+          sum(rate(http_server_requests_seconds_bucket{service="checkout-service",uri!~"/actuator.*",le="0.3"}[5m]))
+          /
+          sum(rate(http_server_requests_seconds_count{service="checkout-service",uri!~"/actuator.*"}[5m]))
+      # p99 across all pods, for dashboards (not for alerting)
+      - record: checkout:latency_p99:5m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(http_server_requests_seconds_bucket{service="checkout-service",uri!~"/actuator.*"}[5m])))
+
+  - name: checkout-slo-alerts
+    rules:
+      - alert: CheckoutErrorBudgetFastBurn
+        # 14.4x burn: 2% of a 30-day budget in 1h. Short window confirms it is ongoing.
+        expr: |
+          checkout:error_ratio:rate1h &gt; (14.4 * 0.001)
+          and
+          checkout:error_ratio:rate5m &gt; (14.4 * 0.001)
+        labels: { severity: page }
+        annotations:
+          summary: "Checkout burning error budget at &gt;14x"
+      - alert: CheckoutErrorBudgetSlowBurn
+        # 6x burn: 5% of budget in 6h
+        expr: |
+          checkout:error_ratio:rate6h &gt; (6 * 0.001)
+          and
+          checkout:error_ratio:rate30m &gt; (6 * 0.001)
+        labels: { severity: ticket }
+        annotations:
+          summary: "Checkout burning error budget at &gt;6x"</code></pre>
+  <p>Note that division by zero (no traffic) yields <code>NaN</code>, which never satisfies a comparison, so the alerts stay quiet overnight on idle services; if silence itself is a failure mode, add a separate absence alert.</p>
+
+  <h3>7.3 A capacity, availability and queueing calculator</h3>
+  <p>The same calculator in three languages. Java is the one to keep in a repository next to a design document; Python is the one to run in a notebook during a design review; Go is the one to compile into a CLI for the team.</p>
+  <div class="code-tabs">
+<pre data-lang="Java" data-file="Capacity.java"><code class="language-java">// Java 21+. Run with: java Capacity.java
+import java.util.List;
+
+public class Capacity {
+
+    record Workload(double dailyActiveUsers, double readsPerUserPerDay, double writesPerUserPerDay,
+                    double peakFactor, double recordBytes, double retentionDays, int replicationFactor) {
+
+        double avgReadQps()  { return dailyActiveUsers * readsPerUserPerDay / 86_400; }
+        double avgWriteQps() { return dailyActiveUsers * writesPerUserPerDay / 86_400; }
+        double peakReadQps() { return avgReadQps() * peakFactor; }
+        double peakWriteQps(){ return avgWriteQps() * peakFactor; }
+        double storageBytes(){
+            return dailyActiveUsers * writesPerUserPerDay * recordBytes * retentionDays * replicationFactor;
+        }
+    }
+
+    static double seriesAvailability(List&lt;Double&gt; parts) {
+        return parts.stream().reduce(1.0, (a, b) -&gt; a * b);
+    }
+
+    static double parallelAvailability(double each, int replicas) {
+        return 1 - Math.pow(1 - each, replicas);
+    }
+
+    /** Erlang C: probability an arrival waits, for c servers and offered load a = lambda * S. */
+    static double erlangC(int c, double a) {
+        double rho = a / c;
+        if (rho &gt;= 1) return 1.0;
+        double sum = 0, term = 1;               // term = a^k / k!
+        for (int k = 0; k &lt; c; k++) { sum += term; term = term * a / (k + 1); }
+        double top = term / (1 - rho);          // term is now a^c / c!
+        return top / (sum + top);
+    }
+
+    static int minServersForWait(double lambda, double serviceSec, double maxMeanWaitSec) {
+        double a = lambda * serviceSec;
+        for (int c = Math.max(1, (int) Math.ceil(a)); c &lt; 100_000; c++) {
+            double rho = a / c;
+            if (rho &gt;= 1) continue;
+            double wq = erlangC(c, a) * serviceSec / (c * (1 - rho));
+            if (wq &lt;= maxMeanWaitSec) return c;
+        }
+        throw new IllegalStateException("no feasible c");
+    }
+
+    public static void main(String[] args) {
+        var w = new Workload(50e6, 20, 2, 3, 1_000, 365, 3);
+        System.out.printf("Peak read QPS   : %,.0f%n", w.peakReadQps());
+        System.out.printf("Peak write QPS  : %,.0f%n", w.peakWriteQps());
+        System.out.printf("Storage (1 yr)  : %.1f TB%n", w.storageBytes() / 1e12);
+
+        double chain = seriesAvailability(List.of(0.9999, 0.9995, 0.999, 0.9995));
+        System.out.printf("Series chain    : %.4f%% (%.0f min/month down)%n",
+                chain * 100, (1 - chain) * 30 * 24 * 60);
+        System.out.printf("2 x 99.9%% (ideal): %.6f%%%n", parallelAvailability(0.999, 2) * 100);
+
+        // LLM gateway: 40 req/s, 3 s average generation, keep mean queue wait under 200 ms
+        int slots = minServersForWait(40, 3.0, 0.2);
+        System.out.printf("Concurrency slots needed for LLM calls: %d%n", slots);
+    }
+}</code></pre>
+<pre data-lang="Python" data-file="capacity.py"><code class="language-python">"""Capacity, availability and queueing helpers. Python 3.10+, standard library only."""
+from dataclasses import dataclass
+from math import prod
+
+
+@dataclass(frozen=True)
+class Workload:
+    dau: float
+    reads_per_user: float
+    writes_per_user: float
+    peak_factor: float
+    record_bytes: float
+    retention_days: float
+    replication: int = 3
+
+    @property
+    def peak_read_qps(self) -&gt; float:
+        return self.dau * self.reads_per_user / 86_400 * self.peak_factor
+
+    @property
+    def peak_write_qps(self) -&gt; float:
+        return self.dau * self.writes_per_user / 86_400 * self.peak_factor
+
+    @property
+    def storage_tb(self) -&gt; float:
+        return (self.dau * self.writes_per_user * self.record_bytes
+                * self.retention_days * self.replication) / 1e12
+
+
+def series(*avail: float) -&gt; float:
+    return prod(avail)
+
+
+def parallel(each: float, n: int) -&gt; float:
+    return 1 - (1 - each) ** n
+
+
+def erlang_c(c: int, a: float) -&gt; float:
+    rho = a / c
+    if rho &gt;= 1:
+        return 1.0
+    term, total = 1.0, 0.0
+    for k in range(c):
+        total += term
+        term *= a / (k + 1)
+    top = term / (1 - rho)
+    return top / (total + top)
+
+
+def min_servers(lam: float, s: float, max_wait: float) -&gt; int:
+    a = lam * s
+    c = max(1, int(a) + 1)
+    while True:
+        rho = a / c
+        wq = erlang_c(c, a) * s / (c * (1 - rho))
+        if wq &lt;= max_wait:
+            return c
+        c += 1
+
+
+def fanout_slow_fraction(p_leaf_slow: float, n: int) -&gt; float:
+    return 1 - (1 - p_leaf_slow) ** n
+
+
+if __name__ == "__main__":
+    w = Workload(50e6, 20, 2, 3, 1_000, 365)
+    print(f"peak reads {w.peak_read_qps:,.0f}/s, peak writes {w.peak_write_qps:,.0f}/s, "
+          f"storage {w.storage_tb:.1f} TB")
+    a = series(0.9999, 0.9995, 0.999, 0.9995)
+    print(f"series availability {a:.4%}, downtime {(1 - a) * 43_200:.0f} min/month")
+    print(f"fan-out 100 at p99 -&gt; {fanout_slow_fraction(0.01, 100):.1%} of requests slow")
+    print("LLM slots:", min_servers(40, 3.0, 0.2))</code></pre>
+<pre data-lang="Go" data-file="capacity.go"><code class="language-go">// go run capacity.go
+package main
+
+import (
+	"fmt"
+	"math"
+)
+
+func erlangC(c int, a float64) float64 {
+	rho := a / float64(c)
+	if rho &gt;= 1 {
+		return 1
+	}
+	term, sum := 1.0, 0.0
+	for k := 0; k &lt; c; k++ {
+		sum += term
+		term *= a / float64(k+1)
+	}
+	top := term / (1 - rho)
+	return top / (sum + top)
+}
+
+func minServers(lambda, s, maxWait float64) int {
+	a := lambda * s
+	for c := int(math.Ceil(a)); ; c++ {
+		rho := a / float64(c)
+		if rho &gt;= 1 {
+			continue
+		}
+		wq := erlangC(c, a) * s / (float64(c) * (1 - rho))
+		if wq &lt;= maxWait {
+			return c
+		}
+	}
+}
+
+func series(parts ...float64) float64 {
+	r := 1.0
+	for _, p := range parts {
+		r *= p
+	}
+	return r
+}
+
+func main() {
+	dau, reads, writes, peak := 50e6, 20.0, 2.0, 3.0
+	fmt.Printf("peak reads %.0f/s, peak writes %.0f/s\n", dau*reads/86400*peak, dau*writes/86400*peak)
+	a := series(0.9999, 0.9995, 0.999, 0.9995)
+	fmt.Printf("series availability %.4f%%\n", a*100)
+	fmt.Printf("fan-out 100 slow fraction %.3f\n", 1-math.Pow(0.99, 100))
+	fmt.Println("LLM slots:", minServers(40, 3.0, 0.2))
+}</code></pre>
+  </div>
+  <p>All three print the same numbers: about 34,700 peak reads per second and 3,470 peak writes per second for the example workload, roughly 110 TB per year of replicated storage at 1 KB per record, a 99.79% series chain, and the number of concurrent LLM calls (slightly above the offered load of 120 Erlangs) needed to keep mean queueing under 200 ms. That last number is the one to compare with your provider's concurrency or tokens-per-minute limit.</p>
+
+  <h3>7.4 A load generator that reports percentiles honestly</h3>
+  <p>Many home-made load tests suffer from <em>coordinated omission</em>: a closed-loop client that waits for each response before sending the next one sends fewer requests exactly when the server is slow, so the slow periods are under-sampled and the reported tail looks better than reality. The Go program below uses an <em>open-loop</em> design: requests are scheduled at a fixed rate regardless of how long earlier ones take, and latency is measured from the <em>scheduled</em> send time.</p>
+<pre data-file="loadgen.go"><code class="language-go">// go run loadgen.go -url http://localhost:8080/api/feed -rps 500 -duration 30s
+package main
+
+import (
+	"flag"
+	"fmt"
+	"net/http"
+	"sort"
+	"sync"
+	"time"
+)
+
+func percentile(sorted []time.Duration, p float64) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+	idx := int(float64(len(sorted)-1) * p)
+	return sorted[idx]
+}
+
+func main() {
+	url := flag.String("url", "http://localhost:8080/actuator/health", "target URL")
+	rps := flag.Int("rps", 200, "requests per second (open loop)")
+	dur := flag.Duration("duration", 20*time.Second, "test duration")
+	flag.Parse()
+
+	client := &amp;http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &amp;http.Transport{MaxIdleConnsPerHost: 1000, MaxConnsPerHost: 0},
+	}
+
+	var (
+		mu        sync.Mutex
+		latencies []time.Duration
+		errors    int
+		wg        sync.WaitGroup
+	)
+	interval := time.Second / time.Duration(*rps)
+	start := time.Now()
+	total := int(dur.Seconds() * float64(*rps))
+
+	for i := 0; i &lt; total; i++ {
+		scheduled := start.Add(time.Duration(i) * interval)
+		time.Sleep(time.Until(scheduled)) // never skip a slot, even if the server is slow
+		wg.Add(1)
+		go func(scheduled time.Time) {
+			defer wg.Done()
+			resp, err := client.Get(*url)
+			lat := time.Since(scheduled) // measured from intended send time
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil || resp.StatusCode &gt;= 500 {
+				errors++
+			}
+			if resp != nil {
+				resp.Body.Close()
+			}
+			latencies = append(latencies, lat)
+		}(scheduled)
+	}
+	wg.Wait()
+
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] &lt; latencies[j] })
+	fmt.Printf("sent=%d errors=%d (%.3f%%)\n", total, errors, 100*float64(errors)/float64(total))
+	for _, p := range []float64{0.5, 0.9, 0.99, 0.999} {
+		fmt.Printf("p%-5v %v\n", p*100, percentile(latencies, p))
+	}
+}</code></pre>
+  <p>For serious work use an established tool that handles coordinated omission (wrk2, Gatling's open workload models, k6 with constant-arrival-rate executors, or Vegeta in Go), but understanding why the scheduled-time measurement matters will keep you from trusting misleading numbers from any tool.</p>
+</section>
+
+<section id="applications">
+  <h2>8. Real-World Applications</h2>
+  <p>How do engineering organisations actually use the ideas in this chapter day to day?</p>
+  <ul>
+    <li><strong>Design documents and architecture reviews.</strong> Mature organisations require a design doc for any new service or major change, with sections that mirror the method in §3.1: context, goals and non-goals, requirements with numbers, proposed design, alternatives considered, failure modes, and an operational plan with SLOs. Estimation tables appear in the requirements section so reviewers can challenge assumptions rather than conclusions.</li>
+    <li><strong>Capacity planning cycles.</strong> Infrastructure teams model growth (often quarterly) from product forecasts, convert it to QPS and storage per tier using per-unit costs derived from production telemetry ("one checkout instance sustains 450 RPS at 60% CPU"), and order or reserve capacity accordingly. Load tests validate the per-unit numbers before peak events.</li>
+    <li><strong>Peak-event readiness.</strong> Retailers before seasonal sales, ticketing platforms before on-sales, and streaming services before major live events run "game days" where they load-test to a multiple of forecast peak and practise failover, explicitly checking that each tier stays below its utilisation knee.</li>
+    <li><strong>SLO-based alerting and release gating.</strong> Teams replace dozens of static threshold alerts with a few burn-rate alerts per user journey, and connect deployment tooling to error-budget status (e.g. pause progressive rollouts if the burn rate exceeds a threshold during canary analysis).</li>
+    <li><strong>Dependency negotiation.</strong> When one team depends on another, they agree an SLO for the dependency. The consuming team uses series-availability maths to decide whether it needs caching, fallbacks, or a second provider; this is especially common with third-party AI APIs.</li>
+    <li><strong>Cost engineering.</strong> Bandwidth and storage estimates feed directly into cloud cost forecasts; egress bandwidth in particular is frequently the surprise line item, and estimating it early often changes architecture (e.g. adding compression or a CDN).</li>
+    <li><strong>AI features.</strong> Teams adding LLM features use Little's Law to size concurrency against provider limits, set separate SLOs for time-to-first-token and total generation time, and treat provider availability as a series component that needs a fallback (a smaller model, a cached answer, or a graceful "summary unavailable").</li>
+  </ul>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+
+  <h3>9.1 Amazon Dynamo: designing to the 99.9th percentile</h3>
+  <p><span class="tag fact">Verified</span> The 2007 SOSP paper <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf"><em>Dynamo: Amazon's Highly Available Key-value Store</em></a> describes how Amazon's internal services expressed their SLAs in terms of the 99.9th percentile of the latency distribution, rather than the mean or median, so that the experience of all customers (including those with long histories who generate more expensive requests) would be good. It explains that a single page render could involve calls to well over a hundred services, so each service's tail directly affects user-perceived latency. The lesson that carries over to a Spring Boot fleet: pick SLO percentiles according to how many times the dependency is invoked per user action, not by habit.</p>
+
+  <h3>9.2 Google: tail latency at scale</h3>
+  <p><span class="tag fact">Verified</span> Jeffrey Dean and Luiz André Barroso's 2013 CACM article <a href="https://research.google/pubs/the-tail-at-scale/"><em>The Tail at Scale</em></a> formalises the fan-out amplification in §6.5 and describes the techniques Google used to build "tail-tolerant" systems: hedged requests issued after a short delay, tied requests that cancel each other, micro-partitioning so load can be rebalanced finely, selective replication of hot items, and putting slow machines on "probation". The article's central argument is that, as with fault tolerance, it is more practical to build systems that tolerate latency variability than to eliminate all sources of it. This is the intellectual origin of the hedging features found today in gRPC and several client libraries.</p>
+
+  <h3>9.3 Google SRE: error budgets as policy</h3>
+  <p><span class="tag fact">Verified</span> The free online <a href="https://sre.google/sre-book/embracing-risk/"><em>Site Reliability Engineering</em> book, chapter "Embracing Risk"</a>, describes how Google sets availability targets per service based on user needs and cost, and how the error budget aligns incentives between product development (which wants velocity) and SRE (which wants stability): launches proceed while budget remains, and are slowed when it is exhausted. The <a href="https://sre.google/workbook/alerting-on-slos/"><em>Site Reliability Workbook</em> chapter "Alerting on SLOs"</a> walks through progressively better alerting strategies ending with the multi-window, multi-burn-rate approach implemented in §7.2, including the 14.4x and 6x thresholds.</p>
+
+  <h3>9.4 Amazon S3: durability as an explicit design target</h3>
+  <p><span class="tag fact">Verified</span> AWS documents that Amazon S3 storage classes are designed for 99.999999999% (eleven nines) of data durability over a given year, achieved by redundantly storing objects across multiple devices and (for most classes) multiple Availability Zones, while availability SLAs for the same classes are far lower (on the order of 99.9%) <span class="tag version">Version-sensitive · checked Nov 2026</span>. See the <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/DataDurability.html">S3 data durability documentation</a>. The contrast is the clearest real-world illustration that durability and availability are separate dimensions with separate engineering (erasure coding, checksums and repair for durability; redundancy and failover for availability).</p>
+
+  <div class="callout note"><p class="callout-title">What we deliberately did not include</p><p>Many blog posts circulate specific numbers such as "every 100 ms of latency costs 1% of sales". Some come from real internal studies presented in talks, but the primary sources are hard to verify today and the results are context-specific. We omit them; measure the effect of latency on your own product with controlled experiments instead.</p></div>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages, Limitations and Costs of the Toolkit</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Technique</th><th>What it buys you</th><th>Limits</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>Back-of-envelope estimation</td><td>Order-of-magnitude sizing in minutes; catches over- and under-engineering early</td><td>Only as good as assumptions; misses non-linear effects (hot keys, lock contention, GC)</td><td>Negligible; revisit with telemetry</td></tr>
+      <tr><td>Percentile-based SLIs</td><td>Reflect real user experience including tails</td><td>Need histograms; cannot be averaged; noisy at low traffic</td><td>Histogram buckets raise metric cardinality (often tens of series per endpoint)</td></tr>
+      <tr><td>Series/parallel availability models</td><td>Quantify the value of redundancy and optional dependencies</td><td>Assume independence; ignore correlated failures and failover time</td><td>None directly; drives redundancy spend</td></tr>
+      <tr><td>SLOs and error budgets</td><td>Objective release/reliability trade-off; fewer, better alerts</td><td>Need organisational buy-in; poorly chosen SLIs measure the wrong thing</td><td>Ongoing review; policy enforcement; dashboards</td></tr>
+      <tr><td>Little's Law and queueing models</td><td>Principled pool and concurrency sizing; explains saturation</td><td>Steady-state averages; real traffic is bursty and service times correlate</td><td>Low; validate with load tests</td></tr>
+      <tr><td>Load testing (open loop)</td><td>Ground truth for per-unit capacity and tail behaviour</td><td>Synthetic traffic differs from real; test environments differ from production</td><td>Environment cost, data setup, engineer time</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs and Decisions</h2>
+  <h3>11.1 Choosing an availability target</h3>
+  <p>Higher availability is not free, and it is not always better. Each additional nine typically requires a qualitative change in architecture and process, not just more of the same.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Target</th><th>Typical architecture</th><th>Process requirements</th><th>Good fit</th></tr></thead>
+    <tbody>
+      <tr><td>99%–99.5%</td><td>Single region, single instance or small cluster, manual failover acceptable</td><td>Business-hours on-call</td><td>Internal tools, batch analytics UIs</td></tr>
+      <tr><td>99.9%</td><td>Multi-AZ, redundant stateless tier, managed DB with automatic failover</td><td>24/7 on-call, rollback within minutes</td><td>Most B2B SaaS and internal platforms</td></tr>
+      <tr><td>99.95%–99.99%</td><td>Multi-AZ everything, automated failover everywhere, progressive delivery, graceful degradation</td><td>Automated rollback, canarying, chaos testing, strict change management</td><td>Payments, auth, core consumer APIs</td></tr>
+      <tr><td>99.999%</td><td>Multi-region active-active, cell-based isolation, static stability</td><td>Very conservative change process, extensive automation</td><td>Telecom-grade, critical infrastructure control planes</td></tr>
+    </tbody>
+  </table></div>
+  <p>The rule of thumb <span class="tag opinion">Opinion</span>: set the SLO slightly above what your most demanding consumer actually needs and slightly below what your dependencies can support. You cannot be more available than the series product of your hard dependencies; if you need more, you must make dependencies optional or redundant.</p>
+
+  <h3>11.2 Which latency percentile to target</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A["How many times is this call made per user action?"] --> B{"Once"}
+  A --> C{"Tens"}
+  A --> D{"Hundreds (fan-out)"}
+  B --> B1["SLO on p95 or p99 is usually enough"]
+  C --> C1["SLO on p99; watch p99.9"]
+  D --> D1["SLO on p99.9 or p99.99; add hedging and partial results"]
+  B1 --> E{"Low traffic, under about 1 rps?"}
+  C1 --> E
+  E -- "Yes" --> E1["Use longer windows or ratio-of-good SLIs; percentiles are noisy"]
+  E -- "No" --> E2["Standard windows (5m to 28d)"]
+</pre>
+  <figcaption>Figure 1.5 — Choosing the latency percentile to put in an SLO.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the percentile you need follows from fan-out (§6.5), not from convention. A leaf service called a hundred times per page needs a much stricter tail target than an edge endpoint called once. At very low traffic, a p99 over five minutes is computed from a handful of samples and will flap; switch to longer windows or to a "fraction of requests faster than X" SLI, which degrades more gracefully.</p>
+
+  <h3>11.3 Estimation depth: when to stop</h3>
+  <p>Estimate until the answer would not change the design. If the read QPS estimate is 2,000 or 8,000, both are "a handful of replicas plus a cache", so stop. If it is 20,000 versus 200,000, that changes whether a single cache node suffices and whether you need a CDN tier, so refine the assumptions (talk to product, look at analogous systems' telemetry).</p>
+
+  <h3>11.4 Availability versus durability versus latency</h3>
+  <p>Synchronous replication across zones improves durability (RPO 0) at the cost of write latency (an inter-zone round trip per commit) and, if the replica is down, availability (writes block or must fall back to async). Asynchronous replication keeps writes fast and available but can lose the last few seconds of writes on failover. Chapter 5 covers the options (including semi-synchronous and quorum commits); the point here is that the NFR table must state which of these wins.</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes, Misconceptions and Production Failures</h2>
+  <ul>
+    <li><strong>Designing before quantifying.</strong> Jumping to "Kafka, Cassandra, Kubernetes" before knowing the write rate. The cure is to refuse to draw boxes until §3.1 steps 2–4 have numbers.</li>
+    <li><strong>Using averages.</strong> Alerting on mean latency or reporting "average response time 80 ms" while p99 is 2 s. Averages are fine for throughput and cost, never for user experience.</li>
+    <li><strong>Averaging percentiles.</strong> Building a dashboard that averages per-pod p99 gauges. The result is not a percentile of anything. Use histogram buckets and <code>histogram_quantile</code>.</li>
+    <li><strong>Measuring only inside the JVM.</strong> A controller timer misses accept-queue wait, TLS, load balancer queuing and network. Measure SLIs at the load balancer or with client telemetry, and use server timers for diagnosis.</li>
+    <li><strong>Coordinated omission in load tests.</strong> Closed-loop tests under-report tails exactly when the system struggles (§7.4).</li>
+    <li><strong>Assuming independence in availability maths.</strong> "Two replicas at 99.9% give six nines" ignores shared failure domains (same AZ, same config, same deploy pipeline, same bug). Real outages are dominated by correlated failure and change-induced failure.</li>
+    <li><strong>Forgetting the critical path includes the "minor" dependencies.</strong> Feature flags service, secrets manager, DNS, the auth provider, the LLM provider. Each hard dependency multiplies into your availability.</li>
+    <li><strong>Unbounded queues and generous timeouts.</strong> A 30-second pool acquisition timeout plus a 60-second HTTP client timeout turns a slow dependency into a full outage via thread exhaustion. Timeouts should be derived from the latency budget (a downstream call's timeout should be a fraction of the caller's SLO), and queues should be bounded.</li>
+    <li><strong>Running hot.</strong> Capacity plans that target 90% CPU at peak operate past the utilisation knee; any burst produces large latency spikes. Leave headroom for the knee and for losing a zone (N+1 or N+2 capacity).</li>
+    <li><strong>SLO theatre.</strong> SLOs defined on what is easy to measure (JVM up, CPU below 80%) rather than what users experience; SLOs set at 99.99% for a service that has never achieved 99.9%; error budgets with no agreed policy, so exhaustion changes nothing.</li>
+    <li><strong>Retry storms.</strong> Clients that retry immediately and indefinitely multiply load during an incident, pushing a degraded system past the knee into collapse. Retries need budgets, exponential backoff with jitter, and server-side load shedding (Chapters 2 and 8).</li>
+    <li><strong>Ignoring the peak factor.</strong> Sizing from daily averages. Diurnal peaks of 2–3x and event peaks of 10x or more are normal; the system must survive the peak, not the average.</li>
+  </ul>
+  <div class="callout danger"><p class="callout-title">A classic failure chain</p><p><span class="tag illus">Illustrative</span> A recommendation service slows from 40 ms to 1.5 s due to a bad index. The product page calls it synchronously with a 10 s timeout. By Little's Law, in-flight requests on each product-page instance rise from 4 to 150; with 200 Tomcat threads per instance and other calls in flight, threads run out, the accept queue fills, the load balancer health checks time out, instances are marked unhealthy and removed, the remaining instances receive more traffic and fail faster. A non-critical dependency has taken down the critical path. Fixes: a 150 ms timeout derived from the latency budget, a circuit breaker, a fallback (popular items), and bulkheading the call into its own bounded pool.</p></div>
+</section>
+
+<section id="production">
+  <h2>13. Production Engineering</h2>
+  <h3>13.1 Performance</h3>
+  <ul>
+    <li>Maintain a <strong>latency budget</strong> per user journey: allocate the end-to-end target across hops (edge, gateway, service, each dependency) and set timeouts accordingly. Revisit when adding a dependency.</li>
+    <li>Know your <strong>per-unit capacity</strong>: requests per second per instance at your target utilisation, measured with open-loop load tests on production-like data. Recompute after major framework upgrades (e.g. moving to virtual threads or a new JDK).</li>
+    <li>Profile the tail, not the median: async-profiler in wall-clock mode, JFR, and GC logs explain p99 behaviour that CPU profiles of the average request miss.</li>
+  </ul>
+  <h3>13.2 Scalability and capacity</h3>
+  <ul>
+    <li>Plan for <strong>N+1 at peak</strong>: if you run in three zones, two zones must carry peak load at acceptable utilisation. That means each zone normally runs at no more than about two-thirds of the per-zone safe capacity.</li>
+    <li>Autoscale on a signal that leads saturation (CPU, in-flight requests, queue depth, or concurrency) rather than on latency, which lags and can cause oscillation.</li>
+    <li>Keep a capacity model (the §7.3 calculator, a spreadsheet, or a notebook) under version control next to the service, with assumptions documented and compared against production telemetry each quarter.</li>
+  </ul>
+  <h3>13.3 Reliability and monitoring</h3>
+  <ul>
+    <li>Two to four SLOs per critical user journey; burn-rate alerts for paging; everything else on dashboards. Every page must be actionable.</li>
+    <li>Track the <strong>four golden signals</strong> (latency, traffic, errors, saturation) for every service, and saturation for every pool (Tomcat threads, Hikari active/pending, HTTP client leased connections, executor queue depth). Micrometer exposes most of these out of the box (<code>hikaricp.connections.pending</code>, <code>tomcat.threads.busy</code>, <code>executor.queued</code>).</li>
+    <li>Write the error-budget policy before you need it, and have product leadership sign it.</li>
+  </ul>
+  <h3>13.4 Security</h3>
+  <ul>
+    <li>Treat abuse traffic as part of capacity planning: credential stuffing, scraping and denial-of-wallet attacks against LLM-backed endpoints can exceed legitimate peak load. Rate limiting and authentication at the edge (Chapter 2) are capacity controls as much as security controls.</li>
+    <li>Exclude security rejections (401/403/429) from availability SLIs deliberately and document it, but monitor them separately, because a spike is often an attack or a broken client release.</li>
+    <li>Do not leak latency side channels unintentionally (e.g. login timing that differs for existing versus non-existing users); constant-time comparison and uniform error paths are cheap.</li>
+  </ul>
+  <h3>13.5 Maintainability</h3>
+  <ul>
+    <li>Record design decisions as Architecture Decision Records (ADRs) including the numbers that drove them, so future engineers know when an assumption has expired.</li>
+    <li>Keep SLO definitions as code (Prometheus rules, OpenSLO or Sloth specs) in the service repository and review them in pull requests like any other change.</li>
+  </ul>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>A photo-sharing app has 20 million DAU. Each user views 60 photos and uploads 0.5 photos per day on average. Photos average 400 KB after compression, plus three thumbnails totalling 60 KB. Peak factor is 2.5x. Estimate (a) peak upload QPS, (b) peak view QPS, (c) new storage per year before replication, and (d) peak egress bandwidth if 90% of views are served by a CDN.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>(a) Uploads: \(2\times10^7 \times 0.5 / 10^5 \approx 100\)/s average (115 exactly), ~290/s peak.</p>
+      <p>(b) Views: \(2\times10^7 \times 60 / 86{,}400 \approx 13{,}900\)/s average, ~35,000/s peak.</p>
+      <p>(c) Storage: \(10^7\) uploads/day × 460 KB ≈ 4.6 TB/day ≈ 1.7 PB/year before replication. This is object storage territory (S3/GCS), not a database; metadata goes in a database.</p>
+      <p>(d) Assume views fetch a thumbnail-sized or full image; if the average served object is ~150 KB, total peak egress is 35,000 × 150 KB ≈ 5.25 GB/s; origin egress at 10% is ≈ 525 MB/s (≈ 4.2 Gbit/s). The CDN is mandatory; the origin must still be sized for cache-miss traffic and cold-start events.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Your API depends synchronously on: an API gateway (99.99%), your service (99.95%), Postgres (99.95%), Redis (99.9%), and a third-party fraud-scoring API (99.5%). (a) What is the best possible availability? (b) If you make Redis optional (fall back to Postgres) and fraud scoring optional (approve low-value orders without it, queue high-value ones), what does the hard-dependency chain become? (c) What new risks did (b) introduce?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>(a) \(0.9999 \times 0.9995 \times 0.9995 \times 0.999 \times 0.995 \approx 0.9929\): about 99.29%, i.e. roughly 5 hours of downtime a month. The fraud API dominates.</p>
+      <p>(b) \(0.9999 \times 0.9995 \times 0.9995 \approx 0.9989\): about 99.89%.</p>
+      <p>(c) Falling back to Postgres when Redis is down shifts the full read load to the database, which may then overload (a cache-failure cascade, Chapter 3); you need capacity headroom or load shedding. Approving orders without fraud checks introduces financial risk and an abuse vector (attackers could try to induce the fallback); bound it with value limits and post-hoc review. Fallback paths are rarely exercised, so test them with fault injection.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>A Spring Boot service runs 12 instances. At peak it handles 3,600 requests per second in total. Each request runs two queries holding a connection for a total of 15 ms, and 20% of requests additionally call a slow reporting query holding a connection for 200 ms. Postgres is configured with <code>max_connections = 300</code> and other services need 100. (a) How many connections are in use on average fleet-wide? (b) Propose a per-instance Hikari pool size. (c) What happens if the reporting query degrades to 2 s?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>(a) Mean connection-hold time per request: \(0.015 + 0.2 \times 0.2 = 0.055\) s. Little's Law: \(3{,}600 \times 0.055 = 198\) connections in use on average fleet-wide, about 16.5 per instance.</p>
+      <p>(b) Budget is 200 connections for this service, about 16 per instance, which is <em>at</em> the average, leaving no headroom for bursts. Better: route the reporting query to a read replica with its own pool (the reporting part alone is \(720 \times 0.2 = 144\) connections), leaving the primary needing \(3{,}600 \times 0.015 = 54\) fleet-wide, ~5 per instance; set the primary pool to ~10 per instance (120 total) for burst headroom.</p>
+      <p>(c) Reporting connections rise to \(720 \times 2 = 1{,}440\): impossible. If both workloads share a pool, the pool saturates and the fast queries queue behind the slow ones (head-of-line blocking), turning a reporting problem into a full outage. Separate pools (bulkheads), a statement timeout on the reporting query, and a circuit breaker contain it.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>Your search endpoint fans out to 40 index shards in parallel and must meet "99% of searches complete in under 250 ms". (a) What per-shard probability of exceeding 250 ms is allowed (assume independence and that the aggregation step is negligible)? (b) Shards currently exceed 250 ms 0.2% of the time. Do you meet the SLO? (c) Describe how hedged requests would change the picture and their cost.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>(a) \(1-(1-p)^{40} \le 0.01 \Rightarrow p \le 1 - 0.99^{1/40} \approx 0.000251\), about 0.025%: the per-shard p99.97 must be under 250 ms.</p>
+      <p>(b) \(1 - 0.998^{40} \approx 0.077\): about 7.7% of searches are slow. You miss the SLO by a wide margin.</p>
+      <p>(c) With a replica per shard, send a hedge to the second replica if the first has not responded by, say, the per-shard p95 (e.g. 60 ms). If replica slowness is independent, the probability that both are slow is roughly \(0.002^2 = 4\times10^{-6}\) (plus the hedge delay), so the per-shard slow probability falls far below 0.025%. Cost: about 5% extra shard requests (those exceeding p95), plus the complexity of cancellation and idempotent reads. Correlated slowness (e.g. a hot query that is slow on every replica) is not fixed by hedging.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced (design)</p>
+    <p>Run the full method from §3.1 for "AI-generated summaries of customer-support tickets, shown to agents when they open a ticket". Assume 5,000 agents, each opening 80 tickets per day, tickets averaging 1,500 tokens of text, summaries of 150 tokens, and a provider limit of 2 million tokens per minute with typical generation taking 4 s. Produce requirements, estimates, a high-level design and SLOs.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Requirements.</strong> Functional: show a summary on ticket open; refresh when the ticket changes materially; agents can flag bad summaries. NFRs: summary visible within 1 s of opening for 95% of opens (implies precomputation, since generation takes 4 s); availability of the ticket view must not depend on the AI provider; per-tenant data isolation; cost ceiling.</p>
+      <p><strong>Estimates.</strong> Opens: 400,000/day ≈ 4.6/s average, perhaps 15/s at business-hour peaks. But summaries should be generated when tickets are created or updated, not on open. If there are ~150,000 ticket create/update events per day, that is ~1.7/s average, ~6/s peak. Tokens per summary ≈ 1,650; at peak ≈ 10,000 tokens/s = 600k tokens/min, within the 2M TPM limit with headroom for reprocessing. Concurrency by Little's Law: 6/s × 4 s = 24 concurrent calls.</p>
+      <p><strong>Design.</strong> Ticket events go to Kafka; a summariser worker pool with a bounded concurrency of ~40 calls the provider, writes summaries with a version (ticket revision) to the database and invalidates a cache. The ticket view reads the precomputed summary; if absent or stale, it shows the ticket without a summary and an "updating" indicator. Debounce rapid edits.</p>
+      <p><strong>SLOs.</strong> (1) Ticket view availability 99.9%, independent of the provider. (2) Freshness: 95% of ticket revisions have a summary within 60 s. (3) Quality: fewer than 2% of summaries flagged by agents per week (tracked, not paged). The provider is a soft dependency with its own error budget tracking and a fallback model.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions and Answers</h2>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why are percentiles preferred over averages for latency SLOs, and why can't you average them?</summary><div>
+    <p>Latency distributions are right-skewed; the mean is pulled by outliers yet still hides how bad they are, and says nothing about the fraction of users with a bad experience. Percentiles directly answer "how slow is it for the worst x%". Percentiles are order statistics of a whole distribution; the average of two p99s is not the p99 of the combined data (imagine one pod with p99 = 10 ms and another with p99 = 2 s handling equal traffic: the combined p99 is near 2 s, the average is ~1 s). Aggregate histograms (bucket counts) and compute the percentile afterwards.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain the difference between an SLI, an SLO and an SLA, and what an error budget is used for.</summary><div>
+    <p>An SLI is a measured ratio of good to valid events (e.g. requests under 300 ms). An SLO is the internal target for that SLI over a window (99% over 28 days). An SLA is an external contract with penalties, deliberately looser than the SLO. The error budget is \(1 - \text{SLO}\), the allowed unreliability; it is spent on releases, experiments and incidents. When exhausted, a pre-agreed policy (e.g. release freeze for non-critical changes) prioritises reliability. It turns "how reliable should we be" into an accounting question both product and engineering accept.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> State Little's Law and give two uses in a Spring Boot system.</summary><div>
+    <p>\(L = \lambda W\): average items in system equals arrival rate times average time in system, for any stable system. Uses: (1) sizing the Hikari pool: connections in use = query rate × connection-hold time, so 1,000 queries/s × 5 ms = 5 connections on average; (2) predicting thread exhaustion: if a dependency slows from 50 ms to 2 s at 200 req/s, in-flight requests rise from 10 to 400, exceeding a 200-thread Tomcat pool. Also for sizing Kafka consumer concurrency and LLM call concurrency against provider limits.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Your service has five hard dependencies each at 99.9%. Product wants 99.95%. What do you do?</summary><div>
+    <p>The series bound is \(0.999^5 \approx 99.5\%\), so the target is impossible as designed. Options: make dependencies soft (cache with stale-while-revalidate, defaults, graceful degradation); add redundancy for dependencies whose failures are independent (multiple providers, multi-AZ replicas); move work off the request path (asynchronous processing via a queue, which turns a hard dependency into a delayed one); negotiate higher SLOs with dependency owners; or renegotiate the target. Present the maths and the cost of each option; choose per dependency.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Walk me through how you would approach "design a rate-limited public API for a payments product" in the first ten minutes.</summary><div>
+    <p>Frame: who calls it (merchants' servers, SDKs), core use cases (create payment, capture, refund, query). Functional requirements in priority order. NFRs: peak QPS by endpoint, latency targets (p99 under ~300–500 ms for create), very high availability for create/capture (99.99%), durability RPO 0 for payment state, idempotency for all mutations, strong consistency for balances, auditability, PCI scope minimisation. Estimate QPS and storage; identify that writes are modest but correctness is critical. Then: API with idempotency keys, a gateway with per-merchant rate limits, stateless services, a strongly consistent primary store with synchronous replication, an outbox to Kafka for downstream events. Deep dives: idempotency and exactly-once effects, rate-limiter design, and failure handling with external card networks.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> p50 latency is flat, but p99 doubled after a release. CPU and error rate are unchanged. How do you investigate?</summary><div>
+    <p>A tail-only regression suggests something affecting a subset of requests: GC (check pause times and allocation rate in JFR; a new code path allocating large objects), lock contention, a new synchronous dependency or a changed timeout/retry, a cache key change lowering hit ratio for some keys, a query plan change for large tenants, or pool contention (check Hikari pending, HTTP client leased). Break the p99 down by endpoint, tenant, instance and zone to localise; compare traces of slow requests before and after; check whether the regression is on all pods (code) or some (node/zone). Roll back if burn rate warrants while investigating.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> During a sale, latency spikes from 80 ms to 4 s at 85% CPU, though load is only 15% above the previous peak. Explain and fix.</summary><div>
+    <p>Queueing non-linearity: near the utilisation knee, small load increases cause large waiting-time increases (\(W = S/(1-\rho)\) grows sharply as \(\rho\) approaches 1), and retries from timed-out clients add more load. Immediate fixes: scale out, shed low-priority traffic, enable or tighten rate limits, reduce retry aggressiveness. Longer term: target lower peak utilisation, autoscale earlier on a leading indicator, load test at 1.5–2x forecast peak, and add admission control so the service rejects excess work fast instead of queueing it.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Write a function to compute the number of servers needed so that mean queueing delay stays below a target, given arrival rate and service time.</summary><div>
+    <p>Use Erlang C: for offered load \(a = \lambda S\), start at \(c = \lceil a \rceil\) and increase \(c\) until \(W_q = C(c,a)\,S / (c(1-\rho)) \le\) target, computing \(C\) with the numerically stable iterative \(a^k/k!\) accumulation rather than factorials. See <code>minServersForWait</code> in §7.3. Mention assumptions (Poisson arrivals, exponential service) and validate with a load test.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is the difference between availability and durability? Give an example of a system with high one and low the other.</summary><div>
+    <p>Availability is the ability to serve requests now; durability is the probability that acknowledged data is not lost. A memory-only cache with many replicas can be highly available yet non-durable (a full restart loses everything). An archival tier such as tape or a deep-archive object storage class is highly durable but has low availability (retrieval takes hours). Most databases target both, with different mechanisms: replication plus failover for availability, synchronous replicated logs and backups for durability.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> Tell me about a time you set or changed an SLO. How did you choose the number?</summary><div>
+    <p>A strong answer structure: the user journey and who consumed it; how you measured current performance (e.g. 28 days of load-balancer logs showed 99.93% success and p99 410 ms); how you chose a target slightly below current performance and aligned with consumer needs (99.9%, 95% under 300 ms after a fix); the error-budget policy agreed with product; what changed in alerting (replaced 14 threshold alerts with 2 burn-rate alerts, fewer pages); and a concrete outcome (budget exhaustion once led to a freeze and a reliability sprint).</p>
+  </div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Architecture follows from quantified non-functional requirements; functional requirements rarely decide it.</li>
+    <li>Estimate QPS (average and peak), storage (with retention, replication and indexes), bandwidth (egress especially) and working-set memory; stop when refining would not change the design.</li>
+    <li>Latency is a distribution. Use percentiles from aggregatable histograms; never average percentiles. Fan-out turns leaf tails into root medians.</li>
+    <li>Series availability multiplies; redundancy multiplies unavailabilities only for independent failures. Making dependencies optional is often the cheapest availability gain.</li>
+    <li>Durability and availability are separate properties with separate mechanisms; RPO and RTO make them concrete.</li>
+    <li>SLIs are good/valid ratios; SLOs are targets; SLAs are contracts; error budgets turn reliability into an accounting trade-off; burn-rate alerts with two windows catch both fast and slow burns.</li>
+    <li>Little's Law (\(L = \lambda W\)) sizes every pool; latency grows non-linearly with utilisation, so keep peak utilisation below the knee and bound your queues.</li>
+  </ul>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">A service has four hard dependencies with availabilities 99.99%, 99.9%, 99.95% and 99.9%. What is the approximate best-case availability of the service?</p>
+    <ol>
+      <li data-k="a">99.9% (the weakest dependency)</li>
+      <li data-k="b">99.94% (the average)</li>
+      <li data-k="c">About 99.74%</li>
+      <li data-k="d">About 99.99% (the strongest dependency)</li>
+    </ol>
+    <div class="explain">Series availabilities multiply; unavailabilities approximately add: 0.01% + 0.1% + 0.05% + 0.1% = 0.26%, so about 99.74%. The result is always below the weakest component.</div>
+  </div>
+
+  <div class="quiz" data-answer="b">
+    <p class="q">A service receives 500 requests per second; each holds a database connection for 20 ms. On average how many connections are in use?</p>
+    <ol>
+      <li data-k="a">25</li>
+      <li data-k="b">10</li>
+      <li data-k="c">500</li>
+      <li data-k="d">It depends on the arrival distribution</li>
+    </ol>
+    <div class="explain">Little's Law: L = λW = 500 × 0.02 = 10. The law holds for the average regardless of arrival distribution; bursts affect the variance (and so the headroom you need), not the mean.</div>
+  </div>
+
+  <div class="quiz" data-answer="d">
+    <p class="q">Each of 50 parallel backend calls exceeds 100 ms with probability 1%. Roughly what fraction of fan-out requests exceed 100 ms?</p>
+    <ol>
+      <li data-k="a">1%</li>
+      <li data-k="b">5%</li>
+      <li data-k="c">50%</li>
+      <li data-k="d">About 40%</li>
+    </ol>
+    <div class="explain">1 − 0.99<sup>50</sup> ≈ 0.395. The request waits for the slowest call, so the probability that at least one is slow dominates.</div>
+  </div>
+
+  <div class="quiz" data-answer="a">
+    <p class="q">Which Micrometer configuration lets you compute a correct fleet-wide p99 in Prometheus?</p>
+    <ol>
+      <li data-k="a"><code>percentiles-histogram</code> enabled, then <code>histogram_quantile</code> over summed buckets</li>
+      <li data-k="b"><code>percentiles: 0.99</code>, then <code>avg()</code> across pods</li>
+      <li data-k="c"><code>percentiles: 0.99</code>, then <code>max()</code> across pods</li>
+      <li data-k="d">Mean timer value multiplied by 2.33</li>
+    </ol>
+    <div class="explain">Client-side percentiles are pre-computed per instance and cannot be combined correctly. Bucket counts can be summed across instances and the percentile estimated from the merged histogram. Max across pods is an upper bound, not the p99.</div>
+  </div>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">For a 99.9% SLO over 30 days, what error ratio sustained over one hour corresponds to the commonly used 14.4x fast-burn threshold?</p>
+    <ol>
+      <li data-k="a">0.1%</li>
+      <li data-k="b">0.6%</li>
+      <li data-k="c">1.44%</li>
+      <li data-k="d">14.4%</li>
+    </ol>
+    <div class="explain">Burn rate = error ratio / budget. Budget = 0.1%, so 14.4 × 0.1% = 1.44%. At that rate one hour consumes 14.4/720 = 2% of the 30-day budget.</div>
+  </div>
+
+  <div class="quiz" data-answer="b">
+    <p class="q">In an M/M/1 queue, how does mean time in system change when utilisation rises from 80% to 90%?</p>
+    <ol>
+      <li data-k="a">It rises by about 12%</li>
+      <li data-k="b">It doubles</li>
+      <li data-k="c">It is unchanged until 100%</li>
+      <li data-k="d">It halves because the server is busier</li>
+    </ol>
+    <div class="explain">W = S/(1 − ρ): 5S at 80%, 10S at 90%. Latency is non-linear in utilisation, which is why capacity plans keep peak utilisation well below 100%.</div>
+  </div>
+
+  <div class="quiz" data-answer="a">
+    <p class="q">Which statement about durability and availability is correct?</p>
+    <ol>
+      <li data-k="a">A system can be highly durable while temporarily unavailable</li>
+      <li data-k="b">Eleven nines of durability implies eleven nines of availability</li>
+      <li data-k="c">Durability is measured as a percentage of successful requests</li>
+      <li data-k="d">Replication improves availability but never durability</li>
+    </ol>
+    <div class="explain">Durability is about not losing acknowledged data; availability is about serving requests now. They are independent: archival storage is durable but slow to access; an in-memory cache can be available but not durable. Replication can improve both.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Betsy Beyer, Chris Jones, Jennifer Petoff, Niall Richard Murphy (eds.), <a href="https://sre.google/sre-book/table-of-contents/"><em>Site Reliability Engineering</em></a>, O'Reilly, 2016 — free online; chapters on embracing risk, SLOs, and handling overload.</li>
+    <li><span class="ref-kind">Book</span> Betsy Beyer et al. (eds.), <a href="https://sre.google/workbook/table-of-contents/"><em>The Site Reliability Workbook</em></a>, O'Reilly, 2018 — free online; "Implementing SLOs" and "Alerting on SLOs".</li>
+    <li><span class="ref-kind">Book</span> Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, O'Reilly, 2017 (a second edition co-authored with Chris Riccomini has been in O'Reilly early release since 2024) — ch. 1 on reliability, scalability, maintainability and percentiles.</li>
+    <li><span class="ref-kind">Book</span> Alex Xu, <em>System Design Interview – An Insider's Guide</em>, vols. 1–2 (2020, 2022) — ch. 2 on back-of-the-envelope estimation and the interview framework.</li>
+    <li><span class="ref-kind">Book</span> Neil J. Gunther, <em>Guerrilla Capacity Planning</em>, Springer, 2007 — practical queueing and the Universal Scalability Law.</li>
+    <li><span class="ref-kind">Paper</span> Jeffrey Dean, Luiz André Barroso, <a href="https://research.google/pubs/the-tail-at-scale/">"The Tail at Scale"</a>, Communications of the ACM 56(2), 2013.</li>
+    <li><span class="ref-kind">Paper</span> Giuseppe DeCandia et al., <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">"Dynamo: Amazon's Highly Available Key-value Store"</a>, SOSP 2007 — §2.2 on SLAs at the 99.9th percentile.</li>
+    <li><span class="ref-kind">Paper</span> John D. C. Little, "A Proof for the Queuing Formula: L = λW", Operations Research 9(3), 1961.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.spring.io/spring-boot/reference/actuator/metrics.html">Spring Boot reference: Metrics</a> — histogram, percentile and SLO configuration.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://prometheus.io/docs/practices/histograms/">Prometheus: Histograms and summaries</a> — why summaries cannot be aggregated.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/DataDurability.html">Amazon S3: data durability</a>.</li>
+    <li><span class="ref-kind">Talk</span> Gil Tene, "How NOT to Measure Latency" (Strange Loop and other conferences, 2015–2016) — coordinated omission and HdrHistogram.</li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/giltene/wrk2">wrk2</a> — a constant-throughput HTTP load generator that accounts for coordinated omission.</li>
+  </ul>
+  <p>Next: <a href="p2-02-scaling-traffic.html">Chapter 2 — Scaling &amp; Traffic</a> turns the capacity numbers from this chapter into load balancers, gateways and rate limiters.</p>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

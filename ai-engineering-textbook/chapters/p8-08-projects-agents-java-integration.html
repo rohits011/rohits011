@@ -1,0 +1,1306 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Projects II: Coding Assistant, Multi-Step Agent, Spring Boot + LLM, Python AI Service — AI-Era Software Engineering</title>
+<meta name="description" content="Four production-grade projects: an AI coding assistant with repo indexing and sandboxed test execution, a budgeted multi-step agent with persistence, HITL approval and MCP tools, a Spring Boot service integrated with an LLM via Spring AI, and a Python AI microservice integrated with a Java backend over gRPC and Kafka.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p8-08-projects-agents-java-integration" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 8 · Chapter 8</p>
+  <h1>Projects II: AI Coding Assistant, Multi-Step Agent, Spring Boot + LLM &amp; Python AI Microservice</h1>
+  <p class="lede">The previous chapter built products that <em>answer</em>. This one builds systems that <em>act</em>: a coding assistant that edits a repository and proves its change with tests, and a general multi-step agent with budgets, approval gates and MCP tools. It ends with the two integration projects most Java teams meet first: adding an LLM to an existing Spring Boot application properly, and running a Python AI service as a first-class citizen next to a Java backend.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> <a href="p8-02-prompting-structured-tools.html">tool use &amp; structured output</a>, <a href="p8-06-agents-mcp-security.html">agents, MCP &amp; AI security</a>, <a href="p8-07-projects-knowledge-support-search.html">Projects I</a> (retrieval core), <a href="p5-03-go-services-grpc.html">gRPC</a>, <a href="p2-07-kafka-event-driven.html">Kafka</a>, <a href="p12-02-docker-kubernetes-helm.html">Kubernetes</a>.</li>
+    <li><strong>You will be able to:</strong> index a codebase with tree-sitter and assemble token-budgeted context; run model-generated code safely in a sandbox and loop on test results; design an agent runtime with a planner and executor, a tool registry, durable state, retries, budgets and human approval; wire Spring AI into existing <code>@Service</code> beans with typed outputs, streaming, resilience and Micrometer; and define, secure and deploy a Python inference/RAG service consumed by Java over gRPC and Kafka.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: From Answering to Acting</h2>
+  <p>An answer can be wrong. An action can be wrong <em>and have consequences</em>. That single difference drives most of the engineering in this chapter. The four projects, numbered as in the book's project list:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>#</th><th>Project</th><th>What it does</th><th>Core engineering problem</th></tr></thead>
+    <tbody>
+      <tr><td>P4</td><td>AI coding assistant</td><td>Takes an issue or instruction, finds relevant code, proposes a patch, runs tests in a sandbox, and presents a reviewed diff</td><td>Context selection over a large repo; safe execution of untrusted code; verifiable output</td></tr>
+      <tr><td>P5</td><td>Multi-step AI agent</td><td>Executes multi-step business tasks ("onboard this vendor") using a registry of tools, including MCP servers</td><td>Durable state, retries without duplicate side effects, budgets, human-in-the-loop approval</td></tr>
+      <tr><td>P7</td><td>Spring Boot app + LLM</td><td>Adds AI features to an existing order-management service: structured extraction, tool calls into existing services, a streaming assistant</td><td>Typed contracts, resilience, observability, testing with a non-deterministic dependency</td></tr>
+      <tr><td>P8</td><td>Python AI microservice + Java backend</td><td>A FastAPI/gRPC service for embeddings, reranking, classification and RAG, called synchronously and via Kafka jobs</td><td>Cross-language contracts, service authentication, GPU deployment, async job semantics</td></tr>
+    </tbody>
+  </table></div>
+  <p>The projects build on each other. P7 and P8 are the integration patterns that P4 and P5 rely on: P4's indexer is a Python service (P8 style) and P5's tools are often Spring beans (P7 style). Concepts such as the ReAct loop, planning patterns, MCP's protocol and agent threat models are covered in <a href="p8-06-agents-mcp-security.html">Chapter 8.6</a>. This chapter assumes them and focuses on runtime design and code.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>You have built workflow-style systems before: Spring Batch jobs with restartable steps, Spring State Machine or Camunda/Temporal processes with persisted state, sagas with compensations, Resilience4j around flaky HTTP clients, and <code>@Async</code> or Kafka for long-running work. You have integrated services across languages over REST and gRPC, and secured them with OAuth2 client credentials or mTLS.</dd>
+      <dt>Why that is not enough</dt><dd>In a classic workflow engine, <em>you</em> write the control flow. In an agent, the model chooses the next step at runtime, so the set of possible executions is open-ended. You cannot enumerate paths in tests. You must instead bound them with budgets, allow-lists, approval gates and idempotent tools, and you must evaluate behaviour statistically. Code assistants add a second twist: the artefact is code that must be executed to be trusted, so you need an isolated sandbox.</dd>
+      <dt>The modern approach</dt><dd>Treat an agent as a durable workflow whose step-selection function is a model. Persist state after every step, and make every tool idempotent and typed. Put policy and approval outside the model. Expose tools through a registry, either in-process (<code>@Tool</code>) or out of process via MCP. For integrations, keep the LLM behind a typed Java interface, with structured output to records, timeouts, fallbacks and Micrometer observations, so the rest of the codebase does not know or care that a model is involved.</dd>
+      <dt>Where Python and Go fit</dt><dd>Python hosts the ML-heavy parts: tree-sitter indexing at scale, embedding and reranking models, vLLM-served open models and the evaluation harnesses. Go suits sandbox supervisors and lightweight MCP servers that wrap internal CLIs. Spring Boot owns the business APIs, transactions, security context and integration with existing domain services.</dd>
+      <dt>In production</dt><dd>You will operate an agent runtime with a database of runs and steps, a queue of pending approvals, a sandbox pool (gVisor or Firecracker-backed containers), per-tenant budgets and a trace for every run. The Spring Boot integrations look like any other dependency on dashboards: latency, error rate, token usage and cost per endpoint.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use agents when the task truly needs open-ended exploration (unknown codebase, unknown number of lookups). Prefer a fixed workflow with one or two LLM calls when the steps are known. That is cheaper, faster and testable, and most "agent" requests in enterprises are really workflows. Avoid autonomous execution for irreversible actions without approval.</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="history">
+  <h2>2. History: From Autocomplete to Agents, and from Model Servers to AI Microservices</h2>
+  <h3>2.1 Code assistance</h3>
+  <p>IDE code completion based on static analysis (symbol tables, type inference) has existed since the 1990s. Microsoft shipped IntelliSense in Visual Studio in the late 1990s, and JetBrains IDEs made deep, type-aware completion the Java norm in the 2000s. Statistical completion arrived in the late 2010s with language models trained on code. OpenAI's Codex paper (2021) and the <strong>GitHub Copilot</strong> technical preview (June 2021) made multi-line generation mainstream. Copilot's 2023 engineering posts (see §9) show the shift of attention to <em>context assembly</em>: which snippets from neighbouring files to include in a limited prompt.</p>
+  <p>From 2023, evaluation moved from "does the completion compile" to "does the change fix a real issue". <strong>SWE-bench</strong> (Jimenez et al., 2023) gave models real GitHub issues from Python repositories and graded them by running the repository's tests. That framing (issue in, patch out, tests decide) is exactly the P4 architecture. Agentic coding tools that read files, run commands and iterate on test failures became widespread products in 2024–2026.</p>
+  <h3>2.2 Agents</h3>
+  <p>The ReAct paper (Yao et al., 2022) popularised interleaving reasoning and tool actions. Early open-source "autonomous agents" in 2023 showed both the promise and the failure modes: loops, runaway cost, compounding errors. Model providers then added native tool calling and parallel tool calls, and frameworks such as LangGraph (2024) modelled agents as explicit graphs with persisted state. Anthropic's "Building effective agents" (December 2024) argued for simple, composable workflow patterns before autonomous agents. Anthropic introduced the <strong>Model Context Protocol (MCP)</strong> in November 2024 as an open standard for connecting models to tools and data. MCP has since moved through several specification revisions, including 2025-11-25, which Spring AI 2.0's MCP Java SDK implements, and has become the de facto way to expose tools across vendors.</p>
+  <h3>2.3 LLMs in Java and model serving in Python</h3>
+  <p>Java teams first called model APIs with raw HTTP clients. LangChain4j (2023) and Spring AI (1.0 GA in May 2025; 2.0 on Spring Boot 4 in June 2026) brought idiomatic abstractions: chat clients, advisors, structured output, tool calling and vector stores. Meanwhile, model serving matured on the Python side: TensorFlow Serving (2016), TorchServe and NVIDIA Triton, then LLM-specific engines such as <strong>vLLM</strong> (2023, PagedAttention) with OpenAI-compatible endpoints. gRPC (open-sourced by Google in 2015) and Kafka became the standard glue between a Java core and Python ML services. P8 follows that well-trodden path.</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals: Requirements, Scope and Success Metrics</h2>
+
+  <h3>3.1 P4 — AI coding assistant</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Type</th><th>Requirement</th></tr></thead>
+    <tbody>
+      <tr><td>FR-1</td><td>Index repositories (Java, Python, Go, TypeScript) into symbols (classes, methods, functions), their source spans, imports and call references. Re-index incrementally on push.</td></tr>
+      <tr><td>FR-2</td><td>Given a task (issue text or instruction plus optional file hints), retrieve relevant code via hybrid search (lexical identifiers + code embeddings + symbol graph neighbours) and assemble a token-budgeted context.</td></tr>
+      <tr><td>FR-3</td><td>Generate a patch as a unified diff or search/replace edits, apply it in an isolated sandbox, build and run the relevant tests, and iterate on failures up to N times.</td></tr>
+      <tr><td>FR-4</td><td>Produce a reviewable result: the diff, test results, an explanation and a self-review (risk notes, untested paths). Open a draft PR. A human always merges.</td></tr>
+      <tr><td>NFR-1</td><td>Sandbox isolation: no network by default, no credentials, CPU, memory and time limits, an ephemeral filesystem and a non-root user.</td></tr>
+      <tr><td>NFR-2</td><td>Task wall-clock budget of 15 min and a cost budget per task (e.g. $2) <span class="tag illus">Illustrative</span>.</td></tr>
+      <tr><td>NFR-3</td><td>Source code never leaves approved providers and regions. Secrets in the repo are masked before prompting.</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Success metrics:</strong> on an internal benchmark of 100 resolved historical issues with their fixing tests (a "mini SWE-bench" from your own repos): the <em>resolved rate</em> (hidden tests pass), patch acceptance by reviewers, median cost and time per task, and the regression rate (other tests broken). Online, track draft-PR merge rate and reviewer edit volume.</p>
+
+  <h3>3.2 P5 — Multi-step agent</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Type</th><th>Requirement</th></tr></thead>
+    <tbody>
+      <tr><td>FR-1</td><td>Accept a goal plus context. Produce a plan (ordered steps with expected tools), then execute with re-planning when a step fails or reveals new information.</td></tr>
+      <tr><td>FR-2</td><td>A tool registry with typed schemas, risk levels (read, write, irreversible) and an owner. In-process tools and MCP servers (Streamable HTTP) are registered per tenant.</td></tr>
+      <tr><td>FR-3</td><td>Durable state: a run survives process restarts and resumes from the last completed step. Every step's inputs and outputs are persisted.</td></tr>
+      <tr><td>FR-4</td><td>Retries with backoff for transient tool errors. Idempotency keys for writes. Compensation hooks where defined.</td></tr>
+      <tr><td>FR-5</td><td>Budgets per run: max steps, max tokens and cost, max wall-clock. On exhaustion, stop gracefully with a partial report.</td></tr>
+      <tr><td>FR-6</td><td>Human-in-the-loop: write or irreversible tools above a risk threshold pause the run with an approval request (approve, reject, edit arguments). Approvals expire.</td></tr>
+      <tr><td>NFR-1</td><td>Every action is attributable to the requesting user (delegated identity, not a god service account) and auditable.</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Success metrics:</strong> task success rate on a scenario suite (graded by checking end state in sandboxed systems, not only by a judge); mean steps and cost per successful task; approval rejection rate (a high rate means the agent proposes bad actions); the rate of runs that end by budget exhaustion; and zero unauthorised write actions.</p>
+
+  <h3>3.3 P7 — Spring Boot application integrated with an LLM</h3>
+  <p>The setting is an existing order-management service with <code>OrderService</code>, <code>CustomerService</code> and <code>ShippingService</code> beans and a PostgreSQL database. The new features:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Type</th><th>Requirement</th></tr></thead>
+    <tbody>
+      <tr><td>FR-1</td><td><strong>Structured extraction</strong>: turn free-text B2B order emails into a validated <code>OrderDraft</code> record (lines, quantities, SKUs, requested date), with per-field confidence.</td></tr>
+      <tr><td>FR-2</td><td><strong>Ops assistant</strong>: support staff ask "why is order 8812 late?" and the assistant calls existing service methods as tools (read-only) and streams an answer over SSE.</td></tr>
+      <tr><td>FR-3</td><td><strong>Summaries</strong>: nightly per-customer account summaries via the provider's batch API at a discount.</td></tr>
+      <tr><td>NFR-1</td><td>The LLM is optional: on provider failure the extraction falls back to a manual review queue and the assistant returns a degraded message. No cascading failure.</td></tr>
+      <tr><td>NFR-2</td><td>Observability on par with other dependencies: latency, errors and token usage per feature via Micrometer, with traces linking HTTP request → LLM call → tool → SQL.</td></tr>
+      <tr><td>NFR-3</td><td>Tests run offline in CI (WireMock or stub ChatModel). A nightly eval runs against the real model.</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Success metrics:</strong> extraction field-level accuracy on 300 labelled emails <span class="tag illus">Illustrative</span>; the share of drafts accepted without edits; assistant answer correctness on scripted scenarios; p95 latency; and cost per extraction.</p>
+
+  <h3>3.4 P8 — Python AI microservice integrated with a Java backend</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Type</th><th>Requirement</th></tr></thead>
+    <tbody>
+      <tr><td>FR-1</td><td>Synchronous API for low-latency inference: <code>Embed</code>, <code>Rerank</code>, <code>Classify</code> (fine-tuned small model) over gRPC; REST/JSON for tooling and debugging.</td></tr>
+      <tr><td>FR-2</td><td>Asynchronous jobs via Kafka: bulk document enrichment (classification, summarisation, embedding) with job status and results published back.</td></tr>
+      <tr><td>FR-3</td><td>A RAG endpoint (<code>Answer</code>) that the Java backend calls with a principal and question. The Python service owns retrieval and generation.</td></tr>
+      <tr><td>FR-4</td><td>Versioned contracts (protobuf in a shared repo; Avro or JSON Schema for Kafka) with backward-compatibility checks in CI.</td></tr>
+      <tr><td>NFR-1</td><td>Service-to-service authentication (mTLS via mesh or SPIFFE, plus a JWT carrying the end-user principal) and authorisation per method.</td></tr>
+      <tr><td>NFR-2</td><td>Embed p95 &lt; 40 ms for batch ≤ 32 on GPU; Kafka jobs at-least-once with idempotent results.</td></tr>
+      <tr><td>NFR-3</td><td>Deployable on Kubernetes with GPU node pools, autoscaling on queue depth or in-flight requests, and zero-downtime model updates.</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Success metrics:</strong> SLOs for latency and availability met; zero contract-breaking deployments (caught in CI); GPU utilisation within the target band (e.g. 50–80%); job end-to-end lag p95 under the target.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internals: Component Design and Key Flows</h2>
+
+  <h3>4.1 P4 — Indexing a repository</h3>
+  <p>Code is not prose, and chunking it by token count cuts methods in half. The indexer parses each file with <strong>tree-sitter</strong>, an incremental parser with grammars for most languages that produces a concrete syntax tree even for files with syntax errors. From the tree it extracts:</p>
+  <ul>
+    <li><strong>Symbols</strong>: fully qualified name, kind, signature, docstring or Javadoc, byte span, and enclosing symbol. One <em>code chunk</em> per method or function. Small classes are kept whole, and large classes get a "skeleton" chunk (fields plus method signatures, without bodies).</li>
+    <li><strong>References</strong>: identifiers used inside each symbol body, resolved heuristically by name and imports. This gives an approximate call graph without a full compiler. For Java you can upgrade to precise resolution with an LSP server (Eclipse JDT LS) or SCIP indexers where available.</li>
+    <li><strong>File metadata</strong>: path, language, test or production, last commit, and churn (how often the file changes). Frequently changed files are more likely to be relevant to new issues.</li>
+  </ul>
+  <p>Each chunk is stored three ways: as text for lexical search (identifiers split by camelCase and snake_case, so <code>getOrderTotal</code> matches "order total"), as a code-embedding vector, and as a node in the symbol graph. Incremental indexing uses the git diff: only changed files are re-parsed, and symbols whose content hash is unchanged keep their embeddings.</p>
+
+  <h3>4.2 P4 — Context assembly</h3>
+  <p>Given a task, the assembler must choose maybe 30–60K tokens from a repository of millions. The algorithm is a scored knapsack:</p>
+  <ol>
+    <li><strong>Seed retrieval</strong>: hybrid search over chunks with the issue text, plus exact matches for identifiers, file paths and stack-trace frames found in the issue. Stack traces are gold. A frame <code>OrderService.java:142</code> pins the exact method.</li>
+    <li><strong>Graph expansion</strong>: add callers and callees of seed symbols (1 hop), the tests that reference them, and the interfaces they implement.</li>
+    <li><strong>Scoring</strong>: \(s = w_1\,\text{retrieval} + w_2\,\text{graph proximity} + w_3\,\text{test relevance} + w_4\,\text{churn}\).</li>
+    <li><strong>Packing</strong>: fill the budget greedily by score per token. Large symbols degrade to skeletons, and a repo map (a tree of paths with one-line summaries of key files) is always included so the model can ask for more.</li>
+    <li><strong>On-demand tools</strong>: the model also gets <code>read_file</code>, <code>search_code</code> and <code>list_dir</code> tools, so it can fetch what the assembler missed. The assembler does not need to be perfect, only to give a good start.</li>
+  </ol>
+
+  <h3>4.3 P4 — The edit–test loop</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  actor Dev as Developer
+  participant O as Orchestrator (Python)
+  participant IX as Code index
+  participant LLM as LLM
+  participant SB as Sandbox (gVisor container)
+  participant GH as Git host
+  Dev->>O: task(issue 4411, repo@sha)
+  O->>IX: seed retrieval + graph expansion
+  IX-->>O: ranked symbols, tests, repo map
+  O->>SB: create from image cache, checkout sha (no network)
+  loop until tests pass or budget spent (max 4 iterations)
+    O->>LLM: context + task + previous test output (tools: read_file, search_code, edit)
+    LLM-->>O: edits (search/replace blocks)
+    O->>SB: apply edits, run build + targeted tests
+    SB-->>O: exit code, failing tests, trimmed logs
+  end
+  O->>SB: run full affected test suite + linters
+  O->>LLM: self-review of final diff (risks, missing tests)
+  O->>GH: open draft PR (diff, test report, review notes)
+  GH-->>Dev: review request
+</pre>
+  <figcaption>Figure 8.8.1 — P4 flow: retrieve context, edit, test in a sandbox, iterate, self-review, open a draft PR.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the sandbox is created <em>before</em> the loop from a pre-built image that has the dependency cache warmed, because downloading Maven dependencies inside a no-network sandbox is impossible and slow even with network. Test output fed back to the model is <em>trimmed</em>: failing test names, assertion messages and the top stack frames, not 5,000 lines of Gradle output, which would waste context and confuse the model. Targeted tests (those that reference changed symbols, from the index) run inside the loop, and the full affected suite runs once at the end. The PR is always a draft. The merge decision belongs to a human reviewer.</p>
+  <div class="callout warn"><p class="callout-title">Edits as search/replace, not whole files</p><p>Asking the model to rewrite whole files wastes output tokens and invites accidental deletions far from the change. Search/replace blocks (an exact old snippet and its replacement) or unified diffs are cheaper and easier to review. When an old snippet does not match exactly, return a precise error ("snippet not found; closest match at line 120") rather than fuzzy-applying it.</p></div>
+
+  <h3>4.4 P5 — Agent runtime: planner, executor, state</h3>
+  <p>The agent runtime is a <strong>durable state machine</strong>. A <em>run</em> has a goal, a plan, a budget, a status and an append-only list of <em>steps</em>. The executor loop is:</p>
+  <ol>
+    <li>Load the run and its steps. If status is <code>WAITING_APPROVAL</code> or <code>DONE</code>, stop.</li>
+    <li>Check the budget (steps, tokens, cost, deadline). If exhausted, set <code>BUDGET_EXHAUSTED</code> and produce a partial report.</li>
+    <li>Call the model with goal, plan, step history (compacted) and the available tool schemas. It returns either tool calls, a plan revision or a final answer.</li>
+    <li>For each tool call: validate the arguments against the schema, check policy (risk level, tenant permissions, rate), and if approval is required, persist an <code>approval_request</code>, set <code>WAITING_APPROVAL</code> and stop. Otherwise execute with an idempotency key <code>runId:stepNo:toolCallId</code> and retry with backoff on retryable errors.</li>
+    <li>Persist the step (model output, tool inputs and outputs, tokens, latency) <em>in the same transaction</em> as the budget counters. Loop.</li>
+  </ol>
+  <figure class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> PLANNING
+  PLANNING --> RUNNING: plan persisted
+  RUNNING --> RUNNING: step completed
+  RUNNING --> WAITING_APPROVAL: risky tool call
+  WAITING_APPROVAL --> RUNNING: approved or edited
+  WAITING_APPROVAL --> REPLANNING: rejected
+  WAITING_APPROVAL --> EXPIRED: no decision in 24h
+  RUNNING --> REPLANNING: step failed permanently
+  REPLANNING --> RUNNING: new plan
+  RUNNING --> DONE: final answer
+  RUNNING --> BUDGET_EXHAUSTED: limit hit
+  RUNNING --> FAILED: unrecoverable error
+  DONE --> [*]
+  BUDGET_EXHAUSTED --> [*]
+  FAILED --> [*]
+  EXPIRED --> [*]
+</pre>
+  <figcaption>Figure 8.8.2 — Run lifecycle in the P5 agent runtime.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> waiting for approval is a first-class state, not a blocked thread. The worker releases the run and a later event (the approval decision) re-enqueues it. Because of that, a run can wait days without holding resources, and a deploy in between is harmless. Rejection leads to re-planning, not failure: the model is told "the user rejected sending this email because X" and can propose an alternative. Terminal states are explicit, so dashboards can count each outcome.</p>
+  <p><strong>Plan-and-execute versus pure ReAct.</strong> A pure ReAct loop decides each step only from the history so far. Plan-and-execute first writes an explicit plan, which (a) can be shown to the user and approved as a whole, (b) gives the executor a checklist, which reduces wandering, and (c) lets a cheaper model execute simple steps while a stronger model plans. The cost is rigidity, which re-planning on failure mitigates. The runtime supports both: the plan is advisory, and the model may revise it with a <code>revise_plan</code> pseudo-tool.</p>
+
+  <h3>4.5 P5 — Tool registry and MCP</h3>
+  <p>Tools come from two places. <strong>In-process tools</strong> are Java or Python functions with schemas. <strong>MCP servers</strong> are remote processes exposing tools over Streamable HTTP, which became the default MCP transport in Spring AI 2.0, replacing the deprecated SSE transport <span class="tag version">Version-sensitive · checked Nov 2026</span>. The registry stores, per tool: the name, schema, description, risk level, owner team, rate limit, the tenants allowed to use it and, for MCP, the server URL and the auth method (OAuth 2.1 as specified by MCP for HTTP transports). At run start, the runtime builds the tool list from the registry filtered by tenant and user permissions. The model never sees tools the user could not use.</p>
+  <div class="callout danger"><p class="callout-title">MCP servers are third-party code paths</p><p>An MCP server's tool <em>descriptions</em> are injected into your model's context, and its tool <em>results</em> are untrusted input. Pin server versions, review descriptions on registration (diff them on every update to catch "tool poisoning"), run third-party servers in isolated network segments, and never forward the user's broad tokens to a server that does not need them. See <a href="p8-06-agents-mcp-security.html">8.6</a> and <a href="p11-05-ai-llm-security.html">11.5</a>.</p></div>
+
+  <h3>4.6 P7 — Inside a Spring AI call</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant C as OpsAssistantController
+  participant CC as ChatClient
+  participant ADV as Advisor chain
+  participant TA as ToolCallingAdvisor
+  participant M as ChatModel (Anthropic SDK)
+  participant OS as OrderService bean
+  C->>CC: prompt().user(q).tools(orderTools).stream()
+  CC->>ADV: SafeGuard, memory, logging advisors (before)
+  ADV->>TA: request with tool definitions
+  TA->>M: call model
+  M-->>TA: tool_use getOrderStatus(8812)
+  TA->>OS: orderTools.getOrderStatus("8812") (same thread, same security context)
+  OS-->>TA: OrderStatus record
+  TA->>M: call model with tool_result
+  M-->>TA: streamed text
+  TA-->>ADV: response (after advisors: usage metrics)
+  ADV-->>C: Flux of tokens
+</pre>
+  <figcaption>Figure 8.8.3 — A Spring AI ChatClient request with tool calling through the advisor chain (Spring AI 2.0 model).</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> in Spring AI 2.0, the tool-call loop moved out of each model implementation into the advisor chain as an auto-registered <code>ToolCallingAdvisor</code> <span class="tag version">Version-sensitive · checked Nov 2026</span>. Advisors are Spring's interceptor idea applied to model calls: they can modify requests (add memory, retrieved context), re-enter the chain (structured output retries) and observe responses (metrics, logging). The tool method is a plain method on a Spring bean, so it runs with your transaction management, method security and caching. That is the main advantage over hand-rolled HTTP integrations. Note the security implication: the tool runs as the calling user only if you propagate the security context into the thread that executes it. With reactive streaming, make that explicit (§7.7).</p>
+
+  <h3>4.7 P8 — Java ↔ Python request paths</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant J as order-service (Java)
+  participant M as Mesh sidecars (mTLS)
+  participant P as ai-service (Python, gRPC)
+  participant G as GPU model (in-process or vLLM)
+  participant K as Kafka
+  participant W as ai-jobs worker (Python)
+  J->>M: Rerank(query, docs) + JWT(user, aud=ai-service), deadline 150ms
+  M->>P: mTLS, SPIFFE ID verified
+  P->>P: authz: caller SPIFFE ID allowed for Rerank, JWT valid
+  P->>G: batched inference (dynamic batcher, max wait 5ms)
+  G-->>P: scores
+  P-->>J: RerankResponse
+  J->>K: enrich.requested(jobId, docIds) key=tenantId
+  K->>W: consume
+  W->>G: classify + summarize + embed
+  W->>K: enrich.completed(jobId, results) idempotent by jobId
+  K->>J: consume, upsert results
+</pre>
+  <figcaption>Figure 8.8.4 — Synchronous gRPC path with deadlines and mTLS, plus asynchronous Kafka job path.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> two identities are in play. The <em>workload</em> identity (SPIFFE ID in the mTLS certificate) answers "which service is calling". The <em>user</em> identity (a short-lived JWT, audience-restricted to <code>ai-service</code>) answers "on whose behalf", which the RAG endpoint needs for ACL filtering. gRPC deadlines propagate, so the Python service can abandon work the caller no longer wants. The async path uses the tenant as the message key, which preserves ordering per tenant and spreads load. Results are keyed by <code>jobId</code> so redelivery overwrites rather than duplicates.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: Diagrams and Technology Selection</h2>
+
+  <h3>5.1 P4 — Coding assistant architecture</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph Triggers
+    IS["Issue tracker webhook"]
+    IDE["IDE / CLI request"]
+  end
+  subgraph Control["Control plane"]
+    API["assistant-api (Spring Boot)"]
+    Q[("Task queue")]
+    DB[("Postgres: tasks, runs, budgets")]
+  end
+  subgraph Workers
+    ORC["orchestrator (Python)"]
+    IDX["indexer (Python, tree-sitter)"]
+  end
+  subgraph Data
+    CI[("Code index: Postgres FTS + pgvector + symbol graph")]
+    IMG[("Sandbox image cache, per repo")]
+  end
+  subgraph Sandbox["Sandbox pool (gVisor nodes)"]
+    SB1["sandbox pod"]
+    SB2["sandbox pod"]
+  end
+  GW["LLM gateway"]
+  GH["Git host API"]
+  IS --> API
+  IDE --> API
+  API --> DB
+  API --> Q
+  Q --> ORC
+  ORC --> CI
+  ORC --> GW
+  ORC --> SB1
+  ORC --> SB2
+  ORC --> GH
+  GH -->|push webhook| IDX
+  IDX --> CI
+  IDX --> IMG
+  IMG --> SB1
+</pre>
+  <figcaption>Figure 8.8.5 — P4 components: control plane, Python workers, code index and an isolated sandbox pool.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the orchestrator is the only component that talks to the sandbox pool, and the sandboxes have no route back to the control plane or the internet. Pushes trigger both re-indexing and an image refresh (dependency cache warm-up), so sandboxes start in seconds. The git host token used to open PRs lives only in the orchestrator, never in a sandbox, so code generated by the model cannot exfiltrate it even if it tries.</p>
+
+  <h3>5.2 P5 — Agent runtime architecture</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  UI["Agent UI / API clients"] --> API["agent-api (Spring Boot)"]
+  API --> RDB[("Postgres: runs, steps, approvals, budgets")]
+  API --> RQ[("Kafka: run.ready")]
+  RQ --> EX["executor workers (stateless)"]
+  EX --> RDB
+  EX --> GW["LLM gateway"]
+  EX --> REG["tool registry"]
+  REG --> LT["in-process tools (Spring beans)"]
+  REG --> MCP1["MCP server: Jira (Streamable HTTP)"]
+  REG --> MCP2["MCP server: internal CLI wrapper (Go)"]
+  EX --> POL["policy engine (OPA)"]
+  API --> APPR["approval inbox (Slack / web)"]
+  APPR --> API
+  EX --> OTEL["OpenTelemetry collector"]
+</pre>
+  <figcaption>Figure 8.8.6 — P5 runtime: stateless executors over durable run state, with a registry fronting local and MCP tools.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> executors are stateless. Any worker can pick up any ready run from Kafka (keyed by run ID for ordering), load its state from PostgreSQL and take one or more steps. Approval decisions come back through the API and re-publish <code>run.ready</code>. The policy engine is consulted before every tool call, so changing a risk threshold is a policy deploy, not a code deploy. If you prefer not to build the runtime yourself, Temporal, LangGraph with a Postgres checkpointer, and hosted agent platforms provide the durable-execution part. The design concerns (budgets, approval, idempotency) stay the same.</p>
+
+  <h3>5.3 P7 and P8 — Integration architecture</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph JavaSide["Java: order-service (Spring Boot 4, Spring AI 2.0)"]
+    CTRL["REST + SSE controllers"]
+    AIF["AI features: OrderExtractor, OpsAssistant"]
+    DOM["existing beans: OrderService, ShippingService"]
+    R4J["Resilience4j: timeouts, CB, bulkhead"]
+    GRPCC["gRPC stubs (generated)"]
+  end
+  subgraph PySide["Python: ai-service (FastAPI + grpcio)"]
+    REST["REST /v1/*"]
+    GRPCS["gRPC AiService"]
+    BAT["dynamic batcher"]
+    MOD["models: embedder, reranker, classifier"]
+    JOBW["Kafka job worker"]
+  end
+  VLLM["vLLM (open model, optional)"]
+  GW["LLM gateway"]
+  KAF[("Kafka")]
+  CTRL --> AIF
+  AIF --> DOM
+  AIF --> R4J
+  R4J --> GW
+  R4J --> GRPCC
+  GRPCC --> GRPCS
+  GRPCS --> BAT
+  REST --> BAT
+  BAT --> MOD
+  AIF --> KAF
+  KAF --> JOBW
+  JOBW --> MOD
+  JOBW --> VLLM
+  JOBW --> KAF
+</pre>
+  <figcaption>Figure 8.8.7 — P7 inside the Java service and P8 as a separate Python service, linked by gRPC and Kafka.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the Java service talks to two kinds of AI dependency: a hosted frontier model via the LLM gateway (for generation and tools), and the in-house Python service (for embeddings, reranking and a fine-tuned classifier). Both go through Resilience4j. The AI features call existing domain beans and never the reverse, so the domain does not depend on AI. The Python service exposes the same models through gRPC (for Java) and REST (for humans and notebooks) behind one batcher, so both paths share GPU batching.</p>
+
+  <h3>5.4 Technology selection</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Concern</th><th>Choice</th><th>Why</th><th>Alternatives</th></tr></thead>
+    <tbody>
+      <tr><td>Code parsing (P4)</td><td>tree-sitter via <code>py-tree-sitter</code> + language packages</td><td>Fast, error-tolerant, many grammars, one API</td><td>LSP servers or SCIP for precise cross-references (slower to run, more accurate); javaparser for Java-only</td></tr>
+      <tr><td>Code search (P4)</td><td>Postgres FTS (identifier-split) + pgvector + symbol tables</td><td>Reuses the Projects I core; transactional incremental updates</td><td>Zoekt (trigram code search at very large scale); OpenSearch</td></tr>
+      <tr><td>Sandbox (P4)</td><td>Kubernetes pods on a gVisor (<code>runsc</code>) RuntimeClass, NetworkPolicy deny-all, resource limits</td><td>Strong syscall isolation without a VM per task; fits existing K8s operations</td><td>Firecracker microVMs (stronger isolation, more ops); hosted code-execution sandboxes</td></tr>
+      <tr><td>Agent runtime (P5)</td><td>Own runtime: Postgres state + Kafka + Python executors with the Anthropic SDK</td><td>Full control of budgets, approvals, audit; small surface</td><td>Temporal (durable execution primitives); LangGraph + checkpointer (graph DSL, Python); Spring AI agent utilities (evolving); hosted agent platforms</td></tr>
+      <tr><td>Tool protocol (P5)</td><td>MCP (Streamable HTTP) + in-process tools</td><td>Vendor-neutral standard; reuse servers across agents and IDEs</td><td>Provider-specific function calling only; OpenAPI-described tools</td></tr>
+      <tr><td>Java LLM integration (P7)</td><td>Spring AI 2.0 (Anthropic SDK-based module)</td><td>Spring idioms: auto-config, advisors, <code>@Tool</code>, Micrometer observations, structured output</td><td>LangChain4j; the Anthropic Java SDK directly (thinnest)</td></tr>
+      <tr><td>Resilience (P7)</td><td>Resilience4j (TimeLimiter, CircuitBreaker, Bulkhead, Retry)</td><td>Standard in Spring shops, Micrometer-integrated</td><td>Spring Retry; mesh-level retries (cannot see semantic errors)</td></tr>
+      <tr><td>Python service (P8)</td><td>FastAPI (REST) + grpcio (gRPC) in one process, uvicorn</td><td>Pydantic validation, OpenAPI docs, async I/O, gRPC for typed low-latency calls</td><td>BentoML, Ray Serve, NVIDIA Triton (heavier but more serving features); KServe on Kubernetes</td></tr>
+      <tr><td>LLM serving (P8, optional)</td><td>vLLM with OpenAI-compatible API</td><td>PagedAttention throughput, continuous batching, wide model support</td><td>SGLang, TGI, TensorRT-LLM; hosted APIs</td></tr>
+      <tr><td>Contracts (P8)</td><td>Protobuf + Buf (lint, breaking-change detection); Avro + Schema Registry for Kafka</td><td>Enforced compatibility in CI across languages</td><td>OpenAPI + JSON Schema (simpler, weaker typing)</td></tr>
+      <tr><td>Service auth (P8)</td><td>Istio/Linkerd mTLS with SPIFFE identities + user JWT (token exchange)</td><td>No shared secrets; per-method authz; user context preserved</td><td>OAuth2 client credentials only (loses end-user context); API keys (avoid)</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="math">
+  <h2>6. Math: Cost, Reliability and Capacity</h2>
+  <p>All figures are <span class="tag illus">Illustrative</span>. Prices assume Claude Opus 5.5 at $4 / $20, Sonnet 5.5 at $2 / $10 and Haiku 5.5 at $0.10 / $0.50 per million input and output tokens, with cache reads at a small fraction of the input price <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+
+  <h3>6.1 Agent loops have quadratic token cost (P4, P5)</h3>
+  <p>Intuition: each step re-sends the whole conversation so far. If the first request has \(C_0\) tokens and each step appends \(\Delta\) tokens (tool call plus result), then step \(i\) sends \(C_0 + i\Delta\), and \(n\) steps send</p>
+  \[ T_{\text{in}}(n) = \sum_{i=0}^{n-1} (C_0 + i\Delta) = nC_0 + \Delta\frac{n(n-1)}{2}. \]
+  <p>For P4 with \(C_0 = 40{,}000\) (assembled context), \(\Delta = 3{,}000\) (edits plus trimmed test output) and \(n = 12\) steps: \(T_{\text{in}} = 480{,}000 + 3{,}000 \cdot 66 = 678{,}000\) tokens. On Sonnet 5.5 with no caching that is about $1.36 of input, plus about 12 × 1,500 output tokens = $0.18, so about $1.54 per task. With prompt caching, everything except the newest \(\Delta\) is a cache read. The input cost then approaches \(n\Delta\) at full price plus the rest at the cache-read price, roughly a 5× reduction here. Two practical rules follow: <strong>keep the prefix stable</strong> (do not edit earlier messages; append) so caching works, and <strong>trim tool results</strong>, because \(\Delta\) enters the quadratic term.</p>
+
+  <h3>6.2 Compounding step reliability (P5)</h3>
+  <p>If each step independently succeeds with probability \(p\), a run needing \(n\) correct steps succeeds with \(p^n\). With \(p = 0.97\): \(n=5 \Rightarrow 0.86\), \(n=15 \Rightarrow 0.63\), \(n=30 \Rightarrow 0.40\). Steps are not really independent, and agents can notice and fix their own mistakes, which raises effective \(p\). Even so, the shape explains three design choices: shorter plans, verification steps after risky actions (a check raises \(p\) for the steps that follow), and narrowly scoped tools that are hard to misuse.</p>
+  <p>With retries on transient tool errors (probability \(q\) per attempt, up to \(r\) retries), a tool's effective success rate is \(1 - q^{r+1}\). With \(q = 0.05\) and \(r = 2\), that is 0.999875. Retries make <em>infrastructure</em> failures negligible but do nothing for <em>reasoning</em> failures, which need re-planning or a human.</p>
+
+  <h3>6.3 Budget enforcement (P5)</h3>
+  <p>Enforce the budget <em>before</em> each call using a worst-case estimate: \(\hat{c}_{\text{next}} = T_{\text{ctx}} \cdot p_{\text{in}} + T_{\max} \cdot p_{\text{out}}\). Stop if \(c_{\text{spent}} + \hat{c}_{\text{next}} &gt; B\). This guarantees the hard cap \(B\) is never exceeded, at the price of sometimes stopping a little early. Models that support a server-side <em>task budget</em> (a token ceiling the model sees and paces itself against) complement this. The model then wraps up instead of being cut off mid-thought, while your check remains the hard limit.</p>
+
+  <h3>6.4 Concurrency for streaming endpoints (P7)</h3>
+  <p>Little's law, \(L = \lambda W\): at 50 assistant requests per second and an 8 s mean stream duration, there are 400 concurrent streams. On a classic Spring MVC thread-per-request model with a 200-thread pool, that saturates the pool, and every other endpoint queues behind LLM streams. Options: (a) WebFlux for the streaming endpoints, where 400 idle streams cost little; (b) Spring MVC with virtual threads (<code>spring.threads.virtual.enabled=true</code>), where 400 blocked virtual threads are cheap; (c) a Resilience4j <code>Bulkhead</code> capping AI concurrency at, say, 300, so overflow fails fast with a 503 rather than starving the service. Use (b) or (a) together with (c).</p>
+
+  <h3>6.5 GPU and Kafka capacity (P8)</h3>
+  <p>Reranker throughput: if one batch of 32 (query, document) pairs takes 25 ms on a GPU, one replica handles about \(32 / 0.025 = 1{,}280\) pairs/s. At a peak of 400 rerank requests/s × 50 candidates = 20,000 pairs/s, you need \(\lceil 20{,}000 / 1{,}280 \rceil = 16\) replica-GPUs at 100% utilisation. At a 70% target, \(16 / 0.7 \approx 23\). That cost is why P8 reranks 50 candidates, not 200, and why the Java side caches rerank results for repeated queries.</p>
+  <p>Kafka partitions for the job topic: if one worker processes 4 documents/s (GPU-bound) and the target is 2,000 documents/s during backfills, you need 500 consumer instances. That is impractical, so batch inside the worker (64 documents per GPU call → about 100 documents/s per worker) and plan 24–32 partitions with 20 workers. The partition count caps consumer parallelism, so size it for peak plus headroom, since increasing it later reshuffles keys.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code: Four Projects in Java, Python and Go</h2>
+  <p>As in Chapter 8.7, Java targets Spring Boot 4.x and Spring AI 2.0, Python 3.12 and Go 1.25. Omitted boilerplate is marked. Spring AI and SDK APIs are version-sensitive <span class="tag version">Version-sensitive · checked Nov 2026</span>. Pin versions and check the docs for yours.</p>
+
+  <h3>7.1 Source tree</h3>
+<pre class="ascii">
+ai-projects-ii/
+├── proto/                                   # shared contracts (Buf module)
+│   └── acme/ai/v1/ai_service.proto
+├── coding-assistant/                        # P4 (Python)
+│   ├── indexer/  ts_index.py  graph.py  embed.py
+│   ├── orchestrator/  context.py  loop.py  sandbox.py  review.py  edits.py
+│   ├── sandbox-image/Dockerfile.template
+│   └── bench/  tasks.jsonl  run_bench.py
+├── agent-runtime/                           # P5
+│   ├── agent-api/          (Spring Boot: runs, approvals, registry admin)
+│   ├── executor/           (Python)  runtime.py  budget.py  tools.py  mcp_client.py  policy.py
+│   ├── mcp-servers/ticketing/  (Python FastMCP)   cli-wrapper/ (Go)
+│   └── db/V1__runs.sql
+├── order-service/                           # P7 (existing Spring Boot app + AI features)
+│   └── src/main/java/com/acme/orders/
+│       ├── domain/   OrderService.java  ShippingService.java   (existing)
+│       ├── ai/       AiConfig.java  OrderExtractor.java  OrderDraft.java
+│       │             OrderTools.java  OpsAssistant.java  OpsAssistantController.java
+│       │             AiRerankClient.java (gRPC stub wrapper)
+│       └── test/     OrderExtractorTest.java  OpsAssistantIT.java
+├── ai-service/                              # P8 (Python)
+│   ├── app/  main.py  grpc_server.py  batcher.py  models.py  auth.py  jobs.py
+│   ├── Dockerfile
+│   └── tests/
+└── deploy/
+    ├── helm/ai-service/  values.yaml
+    └── k8s/  sandbox-runtimeclass.yaml  networkpolicies.yaml
+</pre>
+
+  <h3>7.2 P4 — Indexing with tree-sitter</h3>
+<pre data-file="coding-assistant/indexer/ts_index.py"><code class="language-python">"""Extract symbol-level chunks from source files with tree-sitter.
+
+Uses py-tree-sitter &gt;= 0.23 with per-language wheels (tree-sitter-java, tree-sitter-python, ...).
+The Query API changed across versions, so this walks the tree directly. Version-sensitive.
+"""
+from __future__ import annotations
+
+import hashlib
+import re
+from dataclasses import dataclass, field
+
+import tree_sitter_go as tsgo
+import tree_sitter_java as tsjava
+import tree_sitter_python as tspython
+from tree_sitter import Language, Node, Parser
+
+LANGS = {
+    ".java": (Language(tsjava.language()), {"class_declaration", "interface_declaration",
+                                            "method_declaration", "constructor_declaration"}),
+    ".py": (Language(tspython.language()), {"class_definition", "function_definition"}),
+    ".go": (Language(tsgo.language()), {"function_declaration", "method_declaration", "type_declaration"}),
+}
+IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+
+
+@dataclass
+class Symbol:
+    path: str
+    kind: str
+    name: str
+    qualified: str
+    start_line: int
+    end_line: int
+    text: str
+    refs: set[str] = field(default_factory=set)
+    is_test: bool = False
+
+    @property
+    def content_hash(self) -&gt; str:
+        return hashlib.sha256(self.text.encode()).hexdigest()
+
+    def search_text(self) -&gt; str:
+        """Identifier-split text so 'getOrderTotal' matches 'order total'."""
+        split = re.sub(r"([a-z])([A-Z])", r"\1 \2", self.text).replace("_", " ")
+        return f"{self.qualified}\n{split}"
+
+
+def _name(node: Node, src: bytes) -&gt; str:
+    n = node.child_by_field_name("name")
+    return src[n.start_byte:n.end_byte].decode() if n else "&lt;anon&gt;"
+
+
+def extract(path: str, src: bytes, max_symbol_lines: int = 200) -&gt; list[Symbol]:
+    ext = path[path.rfind("."):]
+    if ext not in LANGS:
+        return []
+    lang, kinds = LANGS[ext]
+    tree = Parser(lang).parse(src)
+    out: list[Symbol] = []
+    is_test = "/test" in path or path.endswith(("_test.go", "Test.java")) or "/tests/" in path
+
+    def walk(node: Node, scope: list[str]) -&gt; None:
+        if node.type in kinds:
+            name = _name(node, src)
+            text = src[node.start_byte:node.end_byte].decode(errors="replace")
+            lines = text.count("\n") + 1
+            if node.type in {"class_declaration", "class_definition"} and lines &gt; max_symbol_lines:
+                text = skeleton(node, src)             # signatures only; bodies indexed as methods
+            sym = Symbol(path, node.type, name, ".".join(scope + [name]),
+                         node.start_point[0] + 1, node.end_point[0] + 1, text,
+                         set(IDENT.findall(text)) - {name}, is_test)
+            out.append(sym)
+            scope = scope + [name]
+        for child in node.children:
+            walk(child, scope)
+
+    walk(tree.root_node, [])
+    return out
+
+
+def skeleton(node: Node, src: bytes) -&gt; str:
+    """Class header + field declarations + method signatures (no bodies)."""
+    parts = []
+    class_body = node.child_by_field_name("body")
+    members = class_body.children if class_body else []
+    header = src[node.start_byte:class_body.start_byte if class_body else node.end_byte]
+    parts.append(header.decode(errors="replace").strip())
+    for child in members:                        # fields kept whole; methods cut before their body
+        body = child.child_by_field_name("body")
+        end = body.start_byte if body else child.end_byte
+        parts.append(src[child.start_byte:end].decode(errors="replace").strip())
+    return "\n".join(p for p in parts if p)</code></pre>
+  <p>References are approximate: the identifiers used in a body, minus the symbol's own name. Resolving them against the symbol table by name (preferring same package and imported packages) gives a call graph that is good enough for context expansion. Precision matters less than recall here, because the packer and the model filter noise.</p>
+
+  <h3>7.3 P4 — Context assembly and the sandbox</h3>
+<pre data-file="coding-assistant/orchestrator/context.py"><code class="language-python">from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+STACK_FRAME = re.compile(r"at ([\w.$]+)\.(\w+)\(([\w]+\.java):(\d+)\)|File \"([^\"]+)\", line (\d+)")
+
+
+@dataclass
+class Candidate:
+    symbol_id: str
+    text: str
+    tokens: int
+    score: float
+    skeleton: str | None = None
+
+
+def assemble(task: str, index, budget_tokens: int = 40_000) -&gt; str:
+    pinned = index.symbols_for_frames(STACK_FRAME.findall(task))          # exact hits from stack traces
+    seeds = index.hybrid_search(task, k=30)                               # lexical + vector, RRF
+    graph = index.neighbours({s.symbol_id for s in seeds + pinned}, hops=1, include_tests=True)
+    cands: dict[str, Candidate] = {}
+    for weight, group in ((3.0, pinned), (1.0, seeds), (0.5, graph)):
+        for c in group:
+            prev = cands.get(c.symbol_id)
+            score = weight * c.score + (prev.score if prev else 0)       # accumulate evidence
+            cands[c.symbol_id] = Candidate(c.symbol_id, c.text, c.tokens, score, c.skeleton)
+
+    parts, used = [index.repo_map(max_tokens=3_000)], 3_000
+    for c in sorted(cands.values(), key=lambda c: c.score / max(c.tokens, 1), reverse=True):
+        if used + c.tokens &lt;= budget_tokens:
+            parts.append(f"### {c.symbol_id}\n{c.text}")
+            used += c.tokens
+        elif c.skeleton and used + len(c.skeleton) // 4 &lt;= budget_tokens:
+            parts.append(f"### {c.symbol_id} (skeleton)\n{c.skeleton}")
+            used += len(c.skeleton) // 4
+    return "\n\n".join(parts)</code></pre>
+
+<pre data-file="coding-assistant/orchestrator/sandbox.py"><code class="language-python">"""Runs builds/tests for model-generated code in an isolated Kubernetes pod (gVisor RuntimeClass)."""
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass
+
+from kubernetes import client, config
+from kubernetes.stream import stream
+
+config.load_incluster_config()
+core = client.CoreV1Api()
+NS = "sandboxes"
+
+
+@dataclass
+class ExecResult:
+    exit_code: int
+    output: str
+
+
+def create_sandbox(repo_image: str, sha: str) -&gt; str:
+    name = f"sb-{uuid.uuid4().hex[:10]}"
+    pod = client.V1Pod(
+        metadata=client.V1ObjectMeta(name=name, labels={"app": "sandbox"}),   # NetworkPolicy: deny all egress
+        spec=client.V1PodSpec(
+            runtime_class_name="gvisor",                    # syscall-level isolation
+            automount_service_account_token=False,          # no K8s API credentials inside
+            restart_policy="Never",
+            active_deadline_seconds=1200,                   # hard wall-clock cap
+            security_context=client.V1PodSecurityContext(run_as_non_root=True, run_as_user=10001,
+                                                         seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault")),
+            containers=[client.V1Container(
+                name="work", image=repo_image, command=["sleep", "1200"],
+                env=[client.V1EnvVar(name="GIT_SHA", value=sha)],
+                resources=client.V1ResourceRequirements(
+                    requests={"cpu": "2", "memory": "4Gi"}, limits={"cpu": "4", "memory": "6Gi",
+                                                                   "ephemeral-storage": "10Gi"}),
+                security_context=client.V1SecurityContext(allow_privilege_escalation=False,
+                                                          capabilities=client.V1Capabilities(drop=["ALL"])),
+            )],
+        ),
+    )
+    core.create_namespaced_pod(NS, pod)
+    # (omitted) wait for Running; repo is baked into the image at /work, checked out at GIT_SHA
+    return name
+
+
+def run(name: str, cmd: str, timeout_s: int = 600) -&gt; ExecResult:
+    wrapped = f"cd /work &amp;&amp; timeout {timeout_s} sh -c '{cmd}' 2&gt;&amp;1; echo \"__EXIT=$?\""
+    out = stream(core.connect_get_namespaced_pod_exec, name, NS,
+                 command=["sh", "-c", wrapped], stderr=True, stdout=True, stdin=False, tty=False)
+    body, _, code = out.rpartition("__EXIT=")
+    return ExecResult(int(code.strip() or 1), body)
+
+
+def trim_test_output(raw: str, max_chars: int = 6_000) -&gt; str:
+    """Keep failing test names, assertion messages and first frames; drop download/progress noise."""
+    keep = [l for l in raw.splitlines()
+            if any(k in l for k in ("FAIL", "ERROR", "Expected", "expected", "AssertionError",
+                                    "at com.", "Caused by", "--- FAIL", "panic:", "Tests run:"))]
+    text = "\n".join(keep)
+    return text[:max_chars] + ("\n...[truncated]" if len(text) &gt; max_chars else "")
+
+
+def destroy(name: str) -&gt; None:
+    core.delete_namespaced_pod(name, NS, grace_period_seconds=0)</code></pre>
+
+<pre data-file="coding-assistant/orchestrator/loop.py"><code class="language-python">from __future__ import annotations
+
+import anthropic
+
+from . import sandbox
+from .context import assemble
+from .edits import apply_search_replace, EditError   # exact-match search/replace application
+
+client = anthropic.Anthropic()
+MODEL = "claude-opus-5-5"     # strongest model for multi-file code changes; version-sensitive
+
+SYSTEM = """You are a careful senior engineer fixing an issue in this repository.
+Make the smallest change that fixes the issue and keeps existing behaviour.
+Propose edits ONLY via the `edit` tool as exact search/replace blocks.
+Add or update a test that fails before your change and passes after.
+Use `read_file` and `search_code` when the provided context is insufficient."""
+
+TOOLS = [
+    {"name": "read_file", "description": "Read a file (or line range) from the repo at the task's commit.",
+     "input_schema": {"type": "object", "additionalProperties": False, "required": ["path"],
+                      "properties": {"path": {"type": "string"}, "start": {"type": "integer"},
+                                     "end": {"type": "integer"}}}},
+    {"name": "search_code", "description": "Hybrid code search over the repository index.",
+     "input_schema": {"type": "object", "additionalProperties": False, "required": ["query"],
+                      "properties": {"query": {"type": "string"}}}},
+    {"name": "edit", "description": "Replace an exact snippet in a file. Old text must match exactly once.",
+     "strict": True,
+     "input_schema": {"type": "object", "additionalProperties": False, "required": ["path", "old", "new"],
+                      "properties": {"path": {"type": "string"}, "old": {"type": "string"},
+                                     "new": {"type": "string"}}}},
+]
+
+
+def solve(task, index, sb_name: str, test_cmd: str, max_iterations: int = 4, max_steps: int = 40) -&gt; dict:
+    messages = [{"role": "user", "content": f"&lt;context&gt;\n{assemble(task.text, index)}\n&lt;/context&gt;\n"
+                                              f"&lt;issue&gt;\n{task.text}\n&lt;/issue&gt;"}]
+    iterations, steps = 0, 0
+    while steps &lt; max_steps:
+        steps += 1
+        resp = client.messages.create(model=MODEL, max_tokens=16_000, system=SYSTEM, tools=TOOLS,
+                                      output_config={"effort": "high"}, messages=messages)
+        if resp.stop_reason == "refusal":
+            return {"status": "refused"}
+        messages.append({"role": "assistant", "content": resp.content})   # append-only: keeps cache prefix
+        tool_uses = [b for b in resp.content if b.type == "tool_use"]
+        if not tool_uses:                                  # model believes it is done -&gt; verify with tests
+            iterations += 1
+            res = sandbox.run(sb_name, test_cmd)
+            if res.exit_code == 0:
+                return {"status": "passed", "diff": sandbox.run(sb_name, "git diff").output}
+            if iterations &gt;= max_iterations:
+                return {"status": "tests_failing", "log": sandbox.trim_test_output(res.output)}
+            messages.append({"role": "user", "content": "Tests fail:\n" + sandbox.trim_test_output(res.output)})
+            continue
+        results = []
+        for tu in tool_uses:                               # return ALL results in one user message
+            try:
+                out = dispatch(tu.name, tu.input, index, sb_name)
+                results.append({"type": "tool_result", "tool_use_id": tu.id, "content": out})
+            except EditError as e:
+                results.append({"type": "tool_result", "tool_use_id": tu.id, "content": str(e), "is_error": True})
+        messages.append({"role": "user", "content": results})
+    return {"status": "step_budget_exhausted"}
+
+
+def dispatch(name: str, args: dict, index, sb_name: str) -&gt; str:
+    if name == "read_file":
+        return index.read(args["path"], args.get("start"), args.get("end"))
+    if name == "search_code":
+        return index.render(index.hybrid_search(args["query"], k=8))
+    if name == "edit":
+        apply_search_replace(sb_name, args["path"], args["old"], args["new"])   # raises EditError on no/multi match
+        return "ok"
+    raise EditError(f"unknown tool {name}")</code></pre>
+  <p>The loop treats "the model stopped calling tools" as a <em>claim</em> that the work is done and verifies it by running tests. Tool results go back in one user message, which preserves parallel tool use, and history is append-only so the prompt-cache prefix stays valid (§6.1). The self-review step (omitted) sends the final diff, the test report and the issue to a fresh model call with a reviewer rubric: correctness risks, missing tests, unrelated changes. Its findings go into the PR description.</p>
+
+  <h3>7.4 P5 — Durable run state</h3>
+<pre data-file="agent-runtime/db/V1__runs.sql"><code class="language-sql">CREATE TABLE agent_run (
+  id              uuid PRIMARY KEY,
+  tenant_id       text NOT NULL,
+  requested_by    text NOT NULL,                     -- end user; tools act on their behalf
+  goal            text NOT NULL,
+  plan            jsonb,
+  status          text NOT NULL CHECK (status IN ('PLANNING','RUNNING','WAITING_APPROVAL','REPLANNING',
+                                                  'DONE','BUDGET_EXHAUSTED','FAILED','EXPIRED')),
+  max_steps       int NOT NULL DEFAULT 25,
+  max_cost_usd    numeric(10,4) NOT NULL DEFAULT 1.00,
+  deadline        timestamptz NOT NULL,
+  steps_used      int NOT NULL DEFAULT 0,
+  cost_usd        numeric(10,4) NOT NULL DEFAULT 0,
+  version         int NOT NULL DEFAULT 0,             -- optimistic lock: one executor at a time
+  messages        jsonb NOT NULL DEFAULT '[]',        -- append-only model transcript (compacted on demand)
+  result          jsonb,
+  created_at      timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE agent_step (
+  run_id          uuid REFERENCES agent_run(id),
+  step_no         int,
+  kind            text NOT NULL,                      -- model | tool | approval | replan
+  tool_name       text,
+  tool_input      jsonb,
+  tool_output     jsonb,
+  idempotency_key text UNIQUE,                        -- runId:stepNo:toolUseId
+  input_tokens    int,
+  output_tokens   int,
+  cost_usd        numeric(10,6),
+  latency_ms      int,
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (run_id, step_no)
+);
+
+CREATE TABLE approval_request (
+  id              uuid PRIMARY KEY,
+  run_id          uuid REFERENCES agent_run(id),
+  tool_use_id     text NOT NULL,
+  tool_name       text NOT NULL,
+  proposed_input  jsonb NOT NULL,
+  rationale       text,
+  status          text NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING','APPROVED','REJECTED','EXPIRED')),
+  decided_by      text,
+  final_input     jsonb,                              -- approver may edit arguments
+  expires_at      timestamptz NOT NULL
+);</code></pre>
+
+  <h3>7.5 P5 — Executor with budgets, policy, approvals, retries and MCP</h3>
+<pre data-file="agent-runtime/executor/runtime.py"><code class="language-python">"""One executor 'tick': load a run, take steps until it finishes, pauses, or exhausts its budget."""
+from __future__ import annotations
+
+import json
+import time
+import uuid
+from decimal import Decimal
+
+import anthropic
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
+
+from .budget import estimate_next_cost, usage_cost
+from .policy import Decision, PolicyEngine
+from .store import RunStore, StaleRunError
+from .tools import ToolRegistry, TransientToolError
+
+client = anthropic.Anthropic()
+PLANNER_MODEL = "claude-opus-5-5"     # version-sensitive
+EXECUTOR_MODEL = "claude-sonnet-5-5"
+
+
+class Executor:
+    def __init__(self, store: RunStore, registry: ToolRegistry, policy: PolicyEngine):
+        self.store, self.registry, self.policy = store, registry, policy
+
+    def tick(self, run_id: uuid.UUID) -&gt; None:
+        run = self.store.load(run_id)
+        if run.status not in ("RUNNING", "PLANNING", "REPLANNING"):
+            return
+        tools = self.registry.for_principal(run.tenant_id, run.requested_by)   # filtered by permission
+        while True:
+            if run.steps_used &gt;= run.max_steps or time.time() &gt; run.deadline.timestamp():
+                return self.store.finish(run, "BUDGET_EXHAUSTED", self._partial_report(run))
+            model = PLANNER_MODEL if run.status in ("PLANNING", "REPLANNING") else EXECUTOR_MODEL
+            if run.cost_usd + estimate_next_cost(model, run.messages, max_out=4_000) &gt; run.max_cost_usd:
+                return self.store.finish(run, "BUDGET_EXHAUSTED", self._partial_report(run))
+
+            resp = client.messages.create(
+                model=model, max_tokens=4_000, system=self._system(run), tools=tools.schemas(),
+                messages=run.messages, output_config={"effort": "medium"},
+            )
+            cost = usage_cost(model, resp.usage)
+            run.messages.append({"role": "assistant", "content": [b.model_dump() for b in resp.content]})
+            tool_uses = [b for b in resp.content if b.type == "tool_use"]
+
+            if resp.stop_reason == "refusal" or not tool_uses:
+                final = "".join(b.text for b in resp.content if b.type == "text")
+                return self.store.finish(run, "DONE", {"answer": final}, add_cost=cost)
+
+            results = []
+            for tu in tool_uses:
+                spec = tools.get(tu.name)
+                decision = self.policy.evaluate(run, spec, tu.input)
+                if decision == Decision.DENY:
+                    results.append(self._error(tu, "Denied by policy: " + self.policy.reason(run, spec, tu.input)))
+                elif decision == Decision.NEEDS_APPROVAL:
+                    # Persist everything so far, park the run, and stop. A later approval re-enqueues it.
+                    try:
+                        self.store.park_for_approval(run, tu, rationale=self._rationale(resp), add_cost=cost)
+                    except StaleRunError:
+                        pass                                       # another executor advanced the run
+                    return
+                else:
+                    key = f"{run.id}:{run.steps_used}:{tu.id}"
+                    results.append(self._execute(spec, tu, key, run))
+            run.messages.append({"role": "user", "content": results})
+            run.status = "RUNNING"
+            try:
+                self.store.commit_step(run, add_cost=cost, step_increment=1)   # optimistic lock on version
+            except StaleRunError:
+                return                                             # someone else owns this run now
+
+    @retry(retry=retry_if_exception_type(TransientToolError), stop=stop_after_attempt(3),
+           wait=wait_exponential_jitter(initial=0.5, max=8))
+    def _call_tool(self, spec, args: dict, key: str, run):
+        return spec.invoke(args, idempotency_key=key, on_behalf_of=run.requested_by)
+
+    def _execute(self, spec, tu, key: str, run) -&gt; dict:
+        cached = self.store.step_output_for_key(key)               # replay after crash: no double side effect
+        if cached is not None:
+            return {"type": "tool_result", "tool_use_id": tu.id, "content": json.dumps(cached)}
+        try:
+            out = self._call_tool(spec, tu.input, key, run)
+            self.store.record_tool_step(run, tu, out, key)
+            return {"type": "tool_result", "tool_use_id": tu.id, "content": json.dumps(out)[:20_000]}
+        except Exception as e:                                     # permanent error: let the model re-plan
+            return self._error(tu, f"{type(e).__name__}: {e}")
+
+    @staticmethod
+    def _error(tu, msg: str) -&gt; dict:
+        return {"type": "tool_result", "tool_use_id": tu.id, "content": msg, "is_error": True}
+
+    def _system(self, run) -&gt; str:
+        return (f"You are an operations agent acting for {run.requested_by}. Goal and plan follow. "
+                "Prefer read-only tools to verify state before writes. If a write is rejected, propose an "
+                "alternative or stop and explain. Never invent tool results. "
+                f"Budget: {run.max_steps - run.steps_used} steps left.\nPLAN: {json.dumps(run.plan)}")
+
+    def _rationale(self, resp) -&gt; str:
+        return "".join(b.text for b in resp.content if b.type == "text")[:2_000]
+
+    def _partial_report(self, run) -&gt; dict:
+        return {"completed_steps": self.store.summarize_steps(run.id), "reason": "budget"}</code></pre>
+
+<pre data-file="agent-runtime/executor/policy.py"><code class="language-python">from __future__ import annotations
+
+from enum import Enum
+
+import httpx
+
+
+class Decision(str, Enum):
+    ALLOW = "allow"
+    DENY = "deny"
+    NEEDS_APPROVAL = "needs_approval"
+
+
+class PolicyEngine:
+    """Asks OPA. Input: tool risk, tenant, user roles, arguments, run history counts."""
+
+    def __init__(self, opa_url: str):
+        self.http = httpx.Client(base_url=opa_url, timeout=0.2)
+
+    def evaluate(self, run, spec, args: dict) -&gt; Decision:
+        try:
+            r = self.http.post("/v1/data/agent/tools/decision", json={"input": {
+                "tool": spec.name, "risk": spec.risk, "tenant": run.tenant_id, "user": run.requested_by,
+                "args": args, "writes_so_far": run.write_count}})
+            return Decision(r.json()["result"])
+        except Exception:
+            # Fail safe: reads may proceed, anything else needs a human.
+            return Decision.ALLOW if spec.risk == "read" else Decision.NEEDS_APPROVAL
+
+    def reason(self, run, spec, args) -&gt; str:
+        return f"tool {spec.name} (risk={spec.risk}) not permitted for this user or arguments"</code></pre>
+
+<pre data-file="agent-runtime/policy/agent_tools.rego"><code class="language-plaintext">package agent.tools
+
+default decision := "deny"
+
+decision := "allow" if input.risk == "read"
+
+decision := "allow" if {
+    input.risk == "write"
+    input.tool in data.low_risk_writes          # e.g. add_ticket_comment
+    input.writes_so_far &lt; 5
+}
+
+decision := "needs_approval" if {
+    input.risk == "write"
+    not input.tool in data.low_risk_writes
+}
+
+decision := "needs_approval" if input.risk == "irreversible"</code></pre>
+
+<pre data-file="agent-runtime/executor/mcp_client.py"><code class="language-python">"""Adapter that exposes tools from an MCP server (Streamable HTTP) through the ToolRegistry interface."""
+from __future__ import annotations
+
+import asyncio
+
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client   # MCP Python SDK; version-sensitive
+
+
+class McpToolSpec:
+    def __init__(self, server_url: str, token_provider, tool, risk: str):
+        self.server_url, self.token_provider = server_url, token_provider
+        self.name, self.risk = tool.name, risk
+        self.schema = {"name": tool.name, "description": tool.description, "input_schema": tool.inputSchema}
+
+    def invoke(self, args: dict, idempotency_key: str, on_behalf_of: str) -&gt; dict:
+        return asyncio.run(self._invoke(args, idempotency_key, on_behalf_of))
+
+    async def _invoke(self, args, key, user):
+        # Token exchange: a short-lived, audience-restricted token for this server, carrying the user.
+        headers = {"Authorization": f"Bearer {self.token_provider.for_audience(self.server_url, user)}",
+                   "Idempotency-Key": key}
+        async with streamablehttp_client(self.server_url, headers=headers) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool(self.name, args)
+                if result.isError:
+                    raise RuntimeError(str(result.content))
+                return {"content": [c.model_dump() for c in result.content]}
+
+
+async def discover(server_url: str, token_provider, risk_overrides: dict[str, str]) -&gt; list[McpToolSpec]:
+    headers = {"Authorization": f"Bearer {token_provider.for_audience(server_url, 'registry')}"}
+    async with streamablehttp_client(server_url, headers=headers) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            listed = await session.list_tools()
+            # Unknown tools default to the most restrictive risk; descriptions are reviewed on registration.
+            return [McpToolSpec(server_url, token_provider, t, risk_overrides.get(t.name, "irreversible"))
+                    for t in listed.tools]</code></pre>
+
+<pre data-file="agent-runtime/mcp-servers/ticketing/server.py"><code class="language-python">"""A small MCP server exposing the internal ticketing API (FastMCP, Streamable HTTP)."""
+from mcp.server.fastmcp import FastMCP
+
+from .ticketing_api import TicketingApi   # existing internal client (omitted)
+
+mcp = FastMCP("ticketing")
+api = TicketingApi.from_env()
+
+
+@mcp.tool()
+def find_tickets(query: str, status: str = "open", limit: int = 10) -&gt; list[dict]:
+    """Search tickets visible to the calling user. Read-only."""
+    return api.search(query=query, status=status, limit=min(limit, 50))
+
+
+@mcp.tool()
+def add_comment(ticket_id: str, body: str) -&gt; dict:
+    """Add an internal comment to a ticket. Write; idempotent per Idempotency-Key header."""
+    return api.comment(ticket_id, body)
+
+
+if __name__ == "__main__":
+    mcp.run(transport="streamable-http")</code></pre>
+  <p>Key properties of this runtime: (1) every model call and tool result is persisted before the next step, so a crashed worker loses at most one in-flight call; (2) the idempotency key <code>runId:stepNo:toolUseId</code> plus <code>step_output_for_key</code> makes replay after a crash safe; (3) the policy check happens per call, outside the model; (4) approval parks the run with no thread held; (5) MCP tools default to the most restrictive risk class until someone classifies them. The same structure could be built on LangGraph (nodes for plan, act and approve, with a Postgres checkpointer) or on Temporal (activities for tools, signals for approvals). Choose based on what your team already operates.</p>
+
+  <h3>7.6 P5 — Approval API in Spring Boot</h3>
+<pre data-file="agent-runtime/agent-api/src/main/java/com/acme/agent/ApprovalController.java"><code class="language-java">package com.acme.agent;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import java.util.UUID;
+import org.springframework.http.ResponseEntity;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/v1/approvals")
+class ApprovalController {
+  record Decision(boolean approve, JsonNode editedInput, String comment) {}
+
+  private final ApprovalRepository approvals;
+  private final RunRepository runs;
+  private final KafkaTemplate&lt;String, String&gt; kafka;
+
+  ApprovalController(ApprovalRepository a, RunRepository r, KafkaTemplate&lt;String, String&gt; k) {
+    this.approvals = a; this.runs = r; this.kafka = k;
+  }
+
+  @PostMapping("/{id}")
+  @PreAuthorize("hasAuthority('SCOPE_agent.approve')")
+  @Transactional
+  ResponseEntity&lt;Void&gt; decide(@PathVariable UUID id, @RequestBody Decision d, @AuthenticationPrincipal Jwt jwt) {
+    var req = approvals.findPendingForUpdate(id).orElseThrow(NotFoundOrExpired::new);
+    var run = runs.findById(req.runId()).orElseThrow();
+    if (run.requestedBy().equals(jwt.getSubject()) &amp;&amp; req.riskLevel().equals("irreversible")) {
+      throw new FourEyesViolation();                         // requester may not self-approve irreversible actions
+    }
+    req.decide(d.approve(), jwt.getSubject(), d.editedInput(), d.comment());
+    run.resumeAfterApproval(req);                            // appends tool_result or rejection note, status RUNNING
+    // Transactional outbox in production; shown directly for brevity.
+    kafka.send("run.ready", run.id().toString(), run.id().toString());
+    return ResponseEntity.accepted().build();
+  }
+}</code></pre>
+
+  <h3>7.7 P7 — Spring Boot application integrated with an LLM</h3>
+<pre data-file="order-service/pom.xml (excerpt)"><code class="language-xml">&lt;parent&gt;
+  &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+  &lt;artifactId&gt;spring-boot-starter-parent&lt;/artifactId&gt;
+  &lt;version&gt;4.1.0&lt;/version&gt;                         &lt;!-- version-sensitive --&gt;
+&lt;/parent&gt;
+&lt;dependencyManagement&gt;
+  &lt;dependencies&gt;
+    &lt;dependency&gt;
+      &lt;groupId&gt;org.springframework.ai&lt;/groupId&gt;
+      &lt;artifactId&gt;spring-ai-bom&lt;/artifactId&gt;
+      &lt;version&gt;2.0.1&lt;/version&gt;                      &lt;!-- version-sensitive --&gt;
+      &lt;type&gt;pom&lt;/type&gt;&lt;scope&gt;import&lt;/scope&gt;
+    &lt;/dependency&gt;
+  &lt;/dependencies&gt;
+&lt;/dependencyManagement&gt;
+&lt;dependencies&gt;
+  &lt;dependency&gt;&lt;groupId&gt;org.springframework.ai&lt;/groupId&gt;&lt;artifactId&gt;spring-ai-starter-model-anthropic&lt;/artifactId&gt;&lt;/dependency&gt;
+  &lt;dependency&gt;&lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;&lt;artifactId&gt;spring-boot-starter-webflux&lt;/artifactId&gt;&lt;/dependency&gt;
+  &lt;dependency&gt;&lt;groupId&gt;io.github.resilience4j&lt;/groupId&gt;&lt;artifactId&gt;resilience4j-spring-boot3&lt;/artifactId&gt;&lt;/dependency&gt;
+  &lt;dependency&gt;&lt;groupId&gt;io.micrometer&lt;/groupId&gt;&lt;artifactId&gt;micrometer-tracing-bridge-otel&lt;/artifactId&gt;&lt;/dependency&gt;
+  &lt;dependency&gt;&lt;groupId&gt;io.grpc&lt;/groupId&gt;&lt;artifactId&gt;grpc-netty-shaded&lt;/artifactId&gt;&lt;/dependency&gt;
+  &lt;!-- test --&gt;
+  &lt;dependency&gt;&lt;groupId&gt;org.wiremock&lt;/groupId&gt;&lt;artifactId&gt;wiremock-standalone&lt;/artifactId&gt;&lt;scope&gt;test&lt;/scope&gt;&lt;/dependency&gt;
+  &lt;dependency&gt;&lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;&lt;artifactId&gt;spring-boot-testcontainers&lt;/artifactId&gt;&lt;scope&gt;test&lt;/scope&gt;&lt;/dependency&gt;
+&lt;/dependencies&gt;</code></pre>
+  <p>Check artefact names against the Spring AI version you use. The Resilience4j Spring Boot starter's artefact naming for Boot 4 may differ from the <code>-spring-boot3</code> module shown here <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+
+<pre data-file="order-service/src/main/java/com/acme/orders/ai/OrderDraft.java"><code class="language-java">package com.acme.orders.ai;
+
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.*;
+import java.time.LocalDate;
+import java.util.List;
+
+/** Target of structured extraction. Bean Validation runs after the model returns. */
+public record OrderDraft(
+    @NotBlank String customerReference,
+    @NotEmpty List&lt;@Valid Line&gt; lines,
+    LocalDate requestedDeliveryDate,
+    String notes,
+    @DecimalMin("0") @DecimalMax("1") double confidence,
+    List&lt;String&gt; ambiguities) {
+
+  public record Line(
+      @NotBlank String skuOrDescription,
+      @Positive int quantity,
+      String unit,
+      @DecimalMin("0") @DecimalMax("1") double confidence) {}
+}</code></pre>
+
+<pre data-file="order-service/src/main/java/com/acme/orders/ai/OrderExtractor.java"><code class="language-java">package com.acme.orders.ai;
+
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import io.github.resilience4j.timelimiter.annotation.TimeLimiter;
+import io.micrometer.observation.annotation.Observed;
+import jakarta.validation.Validator;
+import java.util.concurrent.CompletableFuture;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.stereotype.Service;
+
+@Service
+public class OrderExtractor {
+
+  private final ChatClient chat;
+  private final Validator validator;
+  private final CatalogService catalog;      // existing bean: SKU lookup and fuzzy match
+  private final ManualReviewQueue manualQueue;
+
+  public OrderExtractor(ChatClient.Builder builder, Validator validator, CatalogService catalog,
+                        ManualReviewQueue manualQueue) {
+    this.chat = builder.defaultSystem("""
+        Extract a purchase order from the email. Use only information in the email.
+        If a value is missing or unclear, leave it null and add a note to ambiguities.
+        Lower confidence for any line you had to guess.""").build();
+    this.validator = validator;
+    this.catalog = catalog;
+    this.manualQueue = manualQueue;
+  }
+
+  @Observed(name = "ai.order.extract")
+  @CircuitBreaker(name = "llm", fallbackMethod = "toManualReview")
+  @TimeLimiter(name = "llm")
+  public CompletableFuture&lt;ExtractionResult&gt; extract(InboundEmail email) {
+    return CompletableFuture.supplyAsync(() -&gt; {
+      OrderDraft draft = chat.prompt()
+          .user(u -&gt; u.text("&lt;email from=\"{from}\" subject=\"{subject}\"&gt;\n{body}\n&lt;/email&gt;")
+              .param("from", email.from()).param("subject", email.subject()).param("body", email.body()))
+          .call()
+          .entity(OrderDraft.class);
+      var violations = validator.validate(draft);
+      if (!violations.isEmpty() || draft.confidence() &lt; 0.7) {
+        return ExtractionResult.needsReview(draft, violations);
+      }
+      return ExtractionResult.ok(catalog.resolveSkus(draft));   // deterministic SKU resolution
+    });
+  }
+
+  CompletableFuture&lt;ExtractionResult&gt; toManualReview(InboundEmail email, Throwable t) {
+    manualQueue.enqueue(email, "llm_unavailable: " + t.getClass().getSimpleName());
+    return CompletableFuture.completedFuture(ExtractionResult.queuedForHuman());
+  }
+}</code></pre>
+
+<pre data-file="order-service/src/main/java/com/acme/orders/ai/OrderTools.java"><code class="language-java">package com.acme.orders.ai;
+
+import com.acme.orders.domain.*;
+import org.springframework.ai.tool.annotation.Tool;
+import org.springframework.ai.tool.annotation.ToolParam;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.stereotype.Component;
+
+/** Read-only tools that delegate to EXISTING domain services. Method security still applies. */
+@Component
+public class OrderTools {
+  private final OrderService orders;
+  private final ShippingService shipping;
+
+  public OrderTools(OrderService orders, ShippingService shipping) {
+    this.orders = orders;
+    this.shipping = shipping;
+  }
+
+  @Tool(description = "Current status of an order: state, promised date, payment status, warehouse.")
+  @PreAuthorize("hasRole('SUPPORT')")
+  public OrderStatusView getOrderStatus(@ToolParam(description = "Order number") String orderNumber) {
+    return OrderStatusView.from(orders.findByNumber(orderNumber));
+  }
+
+  @Tool(description = "Shipment tracking events for an order, newest first, at most 20.")
+  @PreAuthorize("hasRole('SUPPORT')")
+  public java.util.List&lt;TrackingEvent&gt; getTracking(@ToolParam(description = "Order number") String orderNumber) {
+    return shipping.trackingFor(orderNumber).stream().limit(20).toList();
+  }
+
+  @Tool(description = "Known incidents affecting a warehouse or carrier in the given period.")
+  public java.util.List&lt;IncidentView&gt; getIncidents(String warehouseCode, java.time.LocalDate from) {
+    return shipping.incidents(warehouseCode, from);
+  }
+}</code></pre>
+
+<pre data-file="order-service/src/main/java/com/acme/orders/ai/OpsAssistantController.java"><code class="language-java">package com.acme.orders.ai;
+
+import io.github.resilience4j.bulkhead.annotation.Bulkhead;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.http.MediaType;
+import org.springframework.http.codec.ServerSentEvent;
+import org.springframework.security.core.context.ReactiveSecurityContextHolder;
+import org.springframework.web.bind.annotation.*;
+import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Schedulers;
+
+@RestController
+@RequestMapping("/v1/ops-assistant")
+class OpsAssistantController {
+  record Question(String text) {}
+
+  private final ChatClient chat;
+  private final OrderTools tools;
+
+  OpsAssistantController(ChatClient.Builder builder, OrderTools tools) {
+    this.tools = tools;
+    this.chat = builder.defaultSystem("""
+        You help support staff investigate orders. Use tools to look up facts; never guess order data.
+        Answer in at most 5 sentences, then list the facts you used.""").build();
+  }
+
+  @PostMapping(produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+  @Bulkhead(name = "llm-streams", type = Bulkhead.Type.SEMAPHORE)   // cap concurrent AI streams
+  Flux&lt;ServerSentEvent&lt;String&gt;&gt; ask(@RequestBody Question q) {
+    // Tools are invoked off the request thread; bridge the reactive security context so @PreAuthorize works.
+    return ReactiveSecurityContextHolder.getContext().flatMapMany(ctx -&gt;
+        chat.prompt().user(q.text()).tools(tools).stream().content()
+            .contextWrite(c -&gt; c.put(SecurityContextKeys.CTX, ctx))
+            .subscribeOn(Schedulers.boundedElastic()))
+        .map(token -&gt; ServerSentEvent.builder(token).event("token").build())
+        .onErrorResume(e -&gt; Flux.just(ServerSentEvent.builder(
+            "The assistant is unavailable right now. Order data is still available in the console.")
+            .event("error").build()));
+  }
+}</code></pre>
+  <p>Security-context propagation into tool execution depends on the Spring AI version and how tools are scheduled. Verify it with a test that calls the endpoint as a user without the <code>SUPPORT</code> role and asserts that the tool raised <code>AccessDeniedException</code> (returned to the model as a tool error). The <code>SecurityContextKeys</code> helper and a <code>ToolCallback</code> decorator that restores the context are omitted for brevity.</p>
+
+<pre data-file="order-service/src/main/resources/application.yaml (AI excerpt)"><code class="language-yaml">spring:
+  threads.virtual.enabled: true
+  ai:
+    anthropic:
+      base-url: ${LLM_GATEWAY_URL}
+      api-key: ${LLM_GATEWAY_TOKEN}
+      chat:
+        model: claude-sonnet-5-5
+        max-tokens: 2000
+    chat.observations:
+      log-prompt: false          # never log prompts by default (PII)
+      log-completion: false
+resilience4j:
+  timelimiter.instances.llm.timeout-duration: 20s
+  circuitbreaker.instances.llm:
+    sliding-window-size: 50
+    failure-rate-threshold: 50
+    slow-call-duration-threshold: 15s
+    slow-call-rate-threshold: 80
+    wait-duration-in-open-state: 30s
+  bulkhead.instances.llm-streams.max-concurrent-calls: 300
+management:
+  observations.key-values.app: order-service
+  tracing.sampling.probability: 0.1</code></pre>
+
+  <h3>7.8 P7 — Testing a Spring Boot + LLM application</h3>
+<pre data-file="order-service/src/test/java/com/acme/orders/ai/OrderExtractorIT.java"><code class="language-java">package com.acme.orders.ai;
+
+import static com.github.tomakehurst.wiremock.client.WireMock.*;
+import static org.assertj.core.api.Assertions.assertThat;
+
+import com.github.tomakehurst.wiremock.junit5.WireMockTest;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+
+@SpringBootTest
+@WireMockTest(httpPort = 8099)
+class OrderExtractorIT {
+
+  @DynamicPropertySource
+  static void props(DynamicPropertyRegistry r) {
+    r.add("spring.ai.anthropic.base-url", () -&gt; "http://localhost:8099");
+    r.add("spring.ai.anthropic.api-key", () -&gt; "test");
+    r.add("resilience4j.timelimiter.instances.llm.timeout-duration", () -&gt; "2s");
+  }
+
+  @Autowired OrderExtractor extractor;
+  @Autowired ManualReviewQueue manualQueue;
+
+  @Test
+  void lowConfidenceDraftGoesToReview() throws Exception {
+    stubFor(post(urlPathEqualTo("/v1/messages")).willReturn(okJson(
+        Fixtures.messageWithJson("""
+          {"customerReference":"PO-77","lines":[{"skuOrDescription":"blue widgets","quantity":40,
+           "unit":"box","confidence":0.4}],"confidence":0.55,"ambiguities":["unit unclear"]}"""))));
+    var result = extractor.extract(Fixtures.email("Please send 40 of the blue widgets")).get();
+    assertThat(result.status()).isEqualTo(ExtractionResult.Status.NEEDS_REVIEW);
+  }
+
+  @Test
+  void providerTimeoutFallsBackToManualQueue() throws Exception {
+    stubFor(post(urlPathEqualTo("/v1/messages")).willReturn(ok().withFixedDelay(5_000)));
+    var result = extractor.extract(Fixtures.email("anything")).get();
+    assertThat(result.status()).isEqualTo(ExtractionResult.Status.QUEUED_FOR_HUMAN);
+    assertThat(manualQueue.size()).isEqualTo(1);
+  }
+}</code></pre>
+  <p>The testing layers for P7: (1) <strong>unit tests</strong> of everything around the model (validation, SKU resolution, fallbacks) with a stubbed <code>ChatClient</code>; (2) <strong>integration tests</strong> with WireMock replaying recorded provider responses (capture real responses once, store them as fixtures, and refresh them when you change prompts), plus Testcontainers for PostgreSQL so tools hit real queries; (3) <strong>eval tests</strong>, a nightly JUnit suite tagged <code>@Tag("eval")</code> that runs the 300 labelled emails against the real model and asserts field-level accuracy thresholds, publishing a report. Do not run (3) on every PR. It is slow, costs money and is noisy.</p>

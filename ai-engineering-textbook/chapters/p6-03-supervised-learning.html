@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Supervised Learning: Regression, Classification, Trees &amp; Boosting — AI-Era Software Engineering</title>
+<meta name="description" content="Linear and logistic regression, regularisation, k-NN, SVMs, decision trees, random forests, gradient boosting, XGBoost, LightGBM and CatBoost, derived from first principles and implemented from scratch and with libraries.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p6-03-supervised-learning" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 6 · Chapter 3</p>
+  <h1>Supervised Learning: Regression, Classification, Trees &amp; Boosting</h1>
+  <p class="lede">Most ML in production at ordinary companies is supervised learning on tables: predict a number (delivery time, price, demand) or a label (fraud, churn, click) from features. This chapter builds the core algorithms from their mathematics, from linear models through decision trees to gradient-boosted ensembles like XGBoost and LightGBM, which still win most tabular problems. Each algorithm is implemented once from scratch so you know what the library is doing, then used properly through scikit-learn, XGBoost and LightGBM.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Chapter 6.1 (gradients, MLE, norms, cross-entropy) and Chapter 6.2 (pipelines, encoding, splits).</li>
+    <li><strong>You will be able to:</strong> derive and implement linear regression (normal equation and gradient descent), ridge/lasso/elastic net, logistic and softmax regression; explain k-NN and SVM margins; grow a decision tree with Gini/entropy and prune it; explain why random forests and gradient boosting work; derive XGBoost's split gain from its second-order objective; and choose between XGBoost, LightGBM and CatBoost for a given problem.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: Learning a Function from Examples</h2>
+  <p>Supervised learning starts with pairs (x, y): an input description x and the answer y someone or something recorded for it. A delivery with its distance, restaurant, hour and weather (x) and how long it actually took (y). A card transaction (x) and whether it was later charged back (y). The goal is a function f such that f(x) is close to y <em>for new x we have not seen</em>. When y is a number, the task is <strong>regression</strong>; when y is a category, it is <strong>classification</strong>.</p>
+  <p>Three choices define every supervised method, and once you see them you can place any algorithm in the space:</p>
+  <ol>
+    <li><strong>Hypothesis class</strong>: what functions f can the model express? Lines and hyperplanes (linear models), piecewise-constant regions (trees), sums of trees (ensembles), compositions of matrix multiplications and non-linearities (neural networks).</li>
+    <li><strong>Loss</strong>: how is the gap between f(x) and y measured? Squared error, log-loss, hinge loss. As Chapter 6.1 showed, each corresponds to a probabilistic noise assumption.</li>
+    <li><strong>Optimiser</strong>: how are the parameters found? Closed form, gradient descent, greedy recursive partitioning, stage-wise boosting.</li>
+  </ol>
+  <p>Add a fourth, <strong>regularisation</strong> (how complexity is penalised), and you have the whole design space. Linear regression is (hyperplanes, squared error, normal equation). Random forests are (averages of deep trees, impurity, greedy splitting plus bootstrap). XGBoost is (sums of shallow trees, any twice-differentiable loss, stage-wise second-order boosting, explicit penalties on tree size and leaf values).</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>You have written rules engines: chains of <code>if (amount &gt; 1000 &amp;&amp; country != homeCountry) riskScore += 30</code>, maybe in Drools or as a strategy pattern. You have tuned thresholds by hand from dashboards. A decision tree is exactly such a rule set, except that the conditions and thresholds are chosen automatically to minimise error on historical data, and a gradient-boosted model is hundreds of such small rule sets whose scores are added.</dd>
+      <dt>Why that is not enough</dt><dd>Hand-written rules do not scale beyond a few dozen conditions, interact in unpredictable ways, and drift silently as behaviour changes. Learned models search millions of candidate rules, weigh evidence consistently, and can be retrained on a schedule.</dd>
+      <dt>The modern approach</dt><dd>For tabular data, start with a regularised linear/logistic baseline and a gradient-boosted tree model (XGBoost, LightGBM, CatBoost, or scikit-learn's HistGradientBoosting). Neural networks win on images, text and audio, but on typical business tables, boosted trees are usually as good or better with far less tuning <span class="tag opinion">Opinion</span>, a view supported by benchmark studies such as Grinsztajn et al. (NeurIPS 2022).</dd>
+      <dt>Where Python and Go fit</dt><dd>Training is Python. Serving is flexible: XGBoost and LightGBM models are plain tree dumps (JSON/text) and have native JVM bindings (XGBoost4J), Java predictors, and ONNX converters (<code>onnxmltools</code>); Tribuo (Oracle's Java ML library) can train and serve linear models and trees directly in Java. A linear model is just a weight vector you can store in a config file and evaluate with a dot product in any language.</dd>
+      <dt>In production</dt><dd>The trained model becomes a dependency of a Spring service: a versioned file loaded at startup (or hot-swapped from a registry), wrapped in a <code>ScoringService</code> bean, scored per request in microseconds for trees with a few hundred estimators, with features from a feature store and predictions logged for monitoring and retraining.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use supervised learning when you have historical labels that reflect the decision you want to automate, and the future resembles the past. Avoid it when labels are absent or biased by the old process (consider the feedback loop), when the cost of errors requires guarantees rules can give and models cannot, or when a simple deterministic rule already captures the logic.</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="history">
+  <h2>2. History</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Year</th><th>Milestone</th></tr></thead>
+    <tbody>
+      <tr><td>1805–1809</td><td>Least squares (Legendre, Gauss): linear regression.</td></tr>
+      <tr><td>1944–1958</td><td>Berkson's logit model (1944); Cox's analysis of the logistic regression of binary sequences (1958).</td></tr>
+      <tr><td>1951; 1967</td><td>Fix and Hodges introduce nearest-neighbour classification (1951); Cover and Hart analyse its error (1967).</td></tr>
+      <tr><td>1970</td><td>Hoerl and Kennard: ridge regression.</td></tr>
+      <tr><td>1984</td><td>Breiman, Friedman, Olshen, Stone: <em>Classification and Regression Trees</em> (CART), with cost-complexity pruning.</td></tr>
+      <tr><td>1986; 1993</td><td>Quinlan's ID3 (information gain) and C4.5.</td></tr>
+      <tr><td>1995</td><td>Cortes and Vapnik: support-vector networks (soft-margin SVM). Freund and Schapire: AdaBoost (1995–1997).</td></tr>
+      <tr><td>1996</td><td>Tibshirani: the lasso. Breiman: bagging.</td></tr>
+      <tr><td>2001</td><td>Breiman: random forests. Friedman: "Greedy Function Approximation: A Gradient Boosting Machine".</td></tr>
+      <tr><td>2005</td><td>Zou and Hastie: elastic net.</td></tr>
+      <tr><td>2014–2016</td><td>XGBoost dominates Kaggle; Chen and Guestrin's KDD 2016 paper (arXiv:1603.02754).</td></tr>
+      <tr><td>2017</td><td>LightGBM (Ke et al., NeurIPS 2017): histogram-based, leaf-wise growth, GOSS, exclusive feature bundling. CatBoost (Yandex, arXiv:1706.09516): ordered boosting and ordered target statistics.</td></tr>
+      <tr><td>2019–present</td><td>scikit-learn's HistGradientBoosting (stable since 1.0); XGBoost 2.x and 3.x mature GPU training, native categoricals and multi-output trees <span class="tag version">Version-sensitive · checked Nov 2026</span> (XGBoost 3.1.0 released September 2025, with later 3.x releases).</td></tr>
+    </tbody>
+  </table></div>
+  <p>The story is one of increasing <em>model capacity paired with increasingly clever regularisation</em>: linear models are low-capacity and stable; single trees are high-capacity and unstable; ensembles tame that instability through averaging (forests) or careful, shrunken, stage-wise fitting (boosting).</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 The supervised learning framing</h3>
+  <p>Formally, we assume examples (x, y) are drawn independently from an unknown distribution D. We want f minimising the <em>expected</em> loss (the risk) on D, but we only have m samples, so we minimise the <em>empirical</em> risk, the average loss on the training set, plus a regularisation term:</p>
+  \[ \hat f = \arg\min_{f\in\mathcal{F}} \;\frac{1}{m}\sum_{i=1}^{m}\ell\big(f(\mathbf{x}_i), y_i\big) + \lambda\,\Omega(f). \]
+  <p>In words: pick the function from the allowed family that fits the training data well, while not being too complex. The gap between training performance and performance on D is the generalisation gap, which Chapter 6.5 measures with validation and cross-validation and analyses with the bias-variance decomposition.</p>
+
+  <h3>3.2 Linear regression</h3>
+  <p><strong>Intuition.</strong> Predict y as a weighted sum of the features plus a constant. Each weight answers: "holding the other features fixed, how much does the prediction change per unit of this feature?" For houses, perhaps price ≈ 50 + 2.0 × (m²) + 10 × (bedrooms), in thousands. A 100 m² three-bedroom house is predicted at 50 + 200 + 30 = 280.</p>
+  \[ \hat y = w_0 + w_1x_1 + \dots + w_nx_n = \mathbf{w}^\top\mathbf{x}\quad(\text{with } x_0 = 1). \]
+  <p><strong>Loss.</strong> Mean squared error, \( \text{MSE} = \frac{1}{m}\sum_i(\hat y_i - y_i)^2 \), justified in Chapter 6.1 as maximum likelihood under Gaussian noise. Squaring penalises large errors more than small ones and makes the loss a smooth convex bowl.</p>
+  <p><strong>Two solvers.</strong> The <em>normal equation</em> \( \mathbf{w} = (X^\top X)^{-1}X^\top\mathbf{y} \) solves it exactly in one shot (implemented via QR or SVD); <em>gradient descent</em> iterates \( \mathbf{w}\leftarrow\mathbf{w} - \eta\cdot\frac{2}{m}X^\top(X\mathbf{w}-\mathbf{y}) \). Tiny example: points (1, 1), (2, 3), (3, 4). With an intercept, the least-squares line is ŷ = −0.333 + 1.5x (slope = Σ(x − x̄)(y − ȳ) / Σ(x − x̄)² = (−1·(−1.667) + 0 + 1·1.333)/2 = 3/2 = 1.5; intercept = ȳ − 1.5x̄ = 2.667 − 3 = −0.333). Predictions 1.167, 2.667, 4.167; residuals −0.167, 0.333, −0.167, which sum to zero, as they always do with an intercept.</p>
+  <p><strong>Interpreting coefficients</strong> requires care: they are conditional on the other features, change when correlated features are added or removed, and are only comparable in magnitude if features are standardised. Linear regression can also model curves by adding transformed features (x², log x, splines); it is "linear in the parameters", not necessarily in the inputs.</p>
+
+  <h3>3.3 Regularisation: L2 (ridge), L1 (lasso), elastic net</h3>
+  <p><strong>Intuition: a complexity budget.</strong> With many features, especially correlated or noisy ones, least squares will happily assign huge positive and negative weights that cancel on the training data and explode on new data. Regularisation charges the model for weight size, so it only "spends" weight where the data strongly justifies it.</p>
+  <p><strong>Ridge (L2)</strong> adds λ‖w‖₂²: every weight is shrunk toward zero proportionally, correlated features share weight, and nothing becomes exactly zero. Closed form: \( \mathbf{w} = (X^\top X + \lambda I)^{-1}X^\top\mathbf{y} \). Example with one standardised feature where Σx² = 10 and Σxy = 20: OLS gives w = 2.0; ridge with λ = 10 gives 20/(10 + 10) = 1.0. The weight is halved.</p>
+  \[ \min_{\mathbf{w}}\;\|X\mathbf{w}-\mathbf{y}\|_2^2 + \lambda\|\mathbf{w}\|_2^2. \]
+  <p><strong>Lasso (L1)</strong> adds λ‖w‖₁: small weights are pushed to <em>exactly</em> zero, performing feature selection. In the single-feature case the solution is <em>soft-thresholding</em>: compute the OLS weight, subtract a constant from its magnitude, and clip at zero. With the same numbers and the objective ‖Xw − y‖² + λ|w|, w = sign(2) × max(0, 2 − λ/(2 × 10)); with λ = 20, w = 1.0; with λ ≥ 40, w = 0.</p>
+  \[ \min_{\mathbf{w}}\;\|X\mathbf{w}-\mathbf{y}\|_2^2 + \lambda\|\mathbf{w}\|_1. \]
+  <p>Why L1 gives zeros and L2 does not has a clean geometric picture: the solution is where the elliptical contours of the squared error first touch the constraint region. The L1 region is a diamond with corners on the axes, and contours usually first touch at a corner, where some coordinates are zero. The L2 region is a circle with no corners. A gradient picture says the same thing: the L2 penalty's pull, 2λw, fades as w approaches zero; the L1 pull, λ·sign(w), stays constant all the way to zero.</p>
+  <p><strong>Elastic net</strong> mixes both, \( \lambda[\alpha\|\mathbf{w}\|_1 + \tfrac{1-\alpha}{2}\|\mathbf{w}\|_2^2] \) (scikit-learn's <code>l1_ratio</code> = α). It keeps lasso's sparsity but, unlike lasso, selects groups of correlated features together instead of arbitrarily picking one. Remember: penalties assume standardised features, and the intercept is not penalised. In scikit-learn, <code>Ridge(alpha)</code> and <code>Lasso(alpha)</code> use α for λ, while <code>LogisticRegression(C)</code> uses C = 1/λ, so larger C means <em>less</em> regularisation.</p>
+
+  <h3>3.4 Logistic regression</h3>
+  <p><strong>Intuition.</strong> For a yes/no outcome we want a probability. Compute the same linear score z = wᵀx (called the <em>logit</em>, which can be any real number), then squash it into (0, 1) with the sigmoid function σ(z) = 1/(1 + e<sup>−z</sup>). z = 0 maps to 0.5; z = 2 maps to 0.881; z = −2 to 0.119. The logit has a concrete meaning: it is the log-odds, log(p/(1 − p)). A weight of 0.7 on "has used a coupon before" means that feature multiplies the odds of conversion by e<sup>0.7</sup> ≈ 2.0, holding the rest fixed.</p>
+  \[ P(y=1\mid\mathbf{x}) = \sigma(\mathbf{w}^\top\mathbf{x}) = \frac{1}{1+e^{-\mathbf{w}^\top\mathbf{x}}},\qquad \log\frac{p}{1-p} = \mathbf{w}^\top\mathbf{x}. \]
+  <p><strong>Loss.</strong> Log-loss (binary cross-entropy), the Bernoulli negative log-likelihood from Chapter 6.1. Its gradient has the elegant form \( \nabla = \frac{1}{m}X^\top(\hat{\mathbf{p}} - \mathbf{y}) \): the same "error times input" shape as linear regression. There is no closed-form solution, but the loss is convex, so gradient descent, Newton's method or L-BFGS (scikit-learn's default <code>lbfgs</code> solver) reliably finds the global optimum. If the classes are perfectly separable, the unregularised optimum is at infinity (weights grow forever to push probabilities to exactly 0 and 1); regularisation is what keeps the solution finite.</p>
+  <p><strong>Decision boundary.</strong> Predicting class 1 when p ≥ 0.5 is the same as wᵀx ≥ 0: a straight line in 2-D, a hyperplane in general. Logistic regression is a <em>linear classifier</em>; curved boundaries require engineered features (polynomials, interactions, splines) or a different model. The threshold need not be 0.5: Chapter 6.5 shows how to choose it from costs.</p>
+
+  <h3>3.5 Softmax (multinomial) regression</h3>
+  <p>For K classes, compute one score per class, z<sub>k</sub> = w<sub>k</sub>ᵀx, and turn the score vector into probabilities with <strong>softmax</strong>: exponentiate each score (making them positive) and divide by the sum (making them add to 1). Scores [2.0, 1.0, 0.1] become e² : e¹ : e<sup>0.1</sup> = 7.389 : 2.718 : 1.105, normalised to [0.659, 0.242, 0.099]. The largest score wins, but the others keep non-zero probability.</p>
+  \[ P(y=k\mid\mathbf{x}) = \frac{e^{z_k}}{\sum_{j=1}^{K}e^{z_j}},\qquad \mathcal{L} = -\log P(y = y_{\text{true}}\mid\mathbf{x}). \]
+  <p>With cross-entropy loss, the gradient with respect to the scores is simply (p − onehot(y)): for the example above with true class 0, it is [0.659 − 1, 0.242, 0.099] = [−0.341, 0.242, 0.099]. Gradient descent raises the true class's score and lowers the others in proportion to their probability. Logistic regression is the K = 2 special case. Softmax is also the output layer of almost every neural classifier, and, in Chapter 7.3, the core of attention.</p>
+
+  <h3>3.6 k-nearest neighbours</h3>
+  <p><strong>Intuition.</strong> To classify a new point, find the k most similar training points and let them vote (or average their targets for regression). No training phase at all: the "model" is the stored dataset. With k = 3 and neighbours labelled {spam, spam, ham}, predict spam with confidence 2/3.</p>
+  <p>Everything depends on the distance metric, so features must be scaled (Chapter 6.2). Small k gives jagged, high-variance boundaries that chase noise; large k gives smooth, high-bias boundaries. Prediction cost is the catch: brute force compares the query with all m training points, O(md) per query; KD-trees and ball trees help in low dimensions, and approximate nearest-neighbour indexes (HNSW, IVF) are needed at scale. In high dimensions distances concentrate (the nearest and farthest neighbours become nearly equidistant), the "curse of dimensionality", which is why k-NN works best on learned low-dimensional embeddings rather than raw features. k-NN over embeddings is exactly what a vector database does.</p>
+
+  <h3>3.7 Support vector machines, briefly</h3>
+  <p><strong>Intuition.</strong> Among all lines that separate two classes, choose the one with the widest "street" (margin) between them, because a wide margin is robust to small perturbations of new points. The points on the edge of the street are the <em>support vectors</em>; the solution depends only on them. The soft-margin SVM allows some points inside the street or on the wrong side, paying a penalty controlled by C.</p>
+  \[ \min_{\mathbf{w},b}\;\tfrac12\|\mathbf{w}\|^2 + C\sum_i\max\big(0,\;1 - y_i(\mathbf{w}^\top\mathbf{x}_i + b)\big),\quad y_i\in\{-1,+1\}. \]
+  <p>The second term is the <strong>hinge loss</strong>: zero for points correctly classified beyond the margin, growing linearly otherwise. The margin width is 2/‖w‖, so minimising ‖w‖ maximises it. Compare with logistic regression: same linear score, a different loss (hinge versus log-loss), and SVMs output no calibrated probabilities. The <strong>kernel trick</strong> lets SVMs learn non-linear boundaries by replacing dot products with a kernel K(x, x′) (for example the RBF kernel exp(−γ‖x − x′‖²)), equivalent to working in a very high-dimensional feature space without constructing it. Kernel SVMs train in roughly O(m²) to O(m³), so they fell out of favour for large datasets; linear SVMs remain useful for high-dimensional sparse text.</p>
+
+  <h3>3.8 Decision trees</h3>
+  <p><strong>Intuition.</strong> A decision tree is a flowchart of yes/no questions on features ("amount &gt; 450?", "country == home?") ending in leaves that hold a prediction (the majority class or the mean target of the training rows that reached it). It is learned top-down: at each node, try every feature and every threshold, pick the split that makes the two child groups as <em>pure</em> as possible, and recurse until a stopping rule.</p>
+  <p><strong>Impurity measures for classification.</strong> For a node with class proportions p<sub>k</sub>:</p>
+  \[ \text{Gini} = 1 - \sum_k p_k^2,\qquad \text{Entropy} = -\sum_k p_k\log_2 p_k. \]
+  <p>Gini is the probability that two randomly drawn rows from the node have different labels; entropy is the average surprise from Chapter 6.1. A pure node scores 0 on both; a 50/50 binary node has Gini 0.5 and entropy 1 bit. They usually choose the same splits; Gini is slightly cheaper (no logarithm) and is scikit-learn's default.</p>
+  <p><strong>Information gain</strong> is the parent impurity minus the size-weighted average child impurity. Worked example: a node with 10 rows, 5 fraud and 5 legitimate (Gini 0.5). Candidate split "amount &gt; 450" sends 4 rows left (4 fraud, 0 legit; Gini 0) and 6 right (1 fraud, 5 legit; Gini = 1 − (1/6)² − (5/6)² = 1 − 0.0278 − 0.694 = 0.278). Weighted child Gini = 0.4 × 0 + 0.6 × 0.278 = 0.167. Gain = 0.5 − 0.167 = 0.333. A different split, "is_weekend", giving left (3 fraud, 3 legit) and right (2 fraud, 2 legit), has gain 0: it separates nothing. The algorithm picks the amount split.</p>
+  <p>For <strong>regression trees</strong>, impurity is variance (MSE around the node mean), and each leaf predicts its mean.</p>
+  <p><strong>Overfitting and pruning.</strong> Grown without limit, a tree keeps splitting until every leaf is pure, memorising noise: training accuracy 100%, test accuracy mediocre. Controls: <em>pre-pruning</em> (stop early: <code>max_depth</code>, <code>min_samples_leaf</code>, <code>min_impurity_decrease</code>) and <em>post-pruning</em>, notably CART's <strong>cost-complexity pruning</strong>, which grows a full tree then removes subtrees whose accuracy contribution does not justify their size, minimising error + α × (number of leaves) for a validated α (<code>ccp_alpha</code> in scikit-learn).</p>
+  <p><strong>Properties.</strong> Trees handle mixed feature types, need no scaling, capture interactions and non-linearities naturally, and are readable when small. But a single tree is <em>unstable</em>: change a few training rows and the top split can change, altering the whole tree. Its predictions are piecewise constant (step functions), and it cannot extrapolate beyond the target range seen in training. Ensembles keep the strengths and fix the instability.</p>
+
+  <h3>3.9 Bagging and random forests</h3>
+  <p><strong>Intuition: wisdom of a diverse crowd.</strong> If you average many predictors whose errors are not perfectly correlated, the errors partially cancel. Bagging (bootstrap aggregating) creates diversity by training each tree on a <em>bootstrap sample</em>: m rows drawn with replacement from the m training rows. Each tree sees a slightly different dataset, so it overfits differently, and the average is far more stable than any single tree.</p>
+  <p>Trees grown on bootstrap samples of the same data are still quite correlated, mostly because the same strong features dominate the top splits. <strong>Random forests</strong> add <em>feature randomness</em>: at each split, only a random subset of features (often √n for classification) is considered. That decorrelates the trees further, and the averaging becomes more effective. The math of why (variance of an average of correlated variables) is in §6.</p>
+  <p><strong>Out-of-bag (OOB) evaluation.</strong> A bootstrap sample of size m omits about 36.8% of rows (the probability a given row is never drawn is (1 − 1/m)<sup>m</sup> ≈ e<sup>−1</sup>). Each row can therefore be scored by the roughly one-third of trees that did not see it, giving a nearly free validation estimate (<code>oob_score=True</code>).</p>
+  <p>Random forests are robust defaults: few critical hyperparameters (number of trees, which only needs to be "enough"; max_features; min_samples_leaf), hard to badly overfit by adding trees, embarrassingly parallel. They are usually somewhat less accurate than well-tuned boosting, and their models are large (hundreds of deep trees), which matters for memory and latency.</p>
+
+  <h3>3.10 Gradient boosting</h3>
+  <p><strong>Intuition: a team of specialists who fix each other's mistakes.</strong> Start with a constant prediction (the mean). Look at the errors, the <em>residuals</em>. Fit a small tree to predict those residuals. Add a <em>fraction</em> of that tree's predictions to the model. Recompute residuals, fit another small tree, add a fraction, and repeat hundreds of times. Each new tree focuses on what the ensemble still gets wrong.</p>
+  <p>Numeric example with squared error. Targets y = [10, 20, 30]; start at F₀ = mean = 20; residuals [−10, 0, 10]. Suppose tree 1 learns to predict [−10, 0, 10] exactly (in reality it approximates). With learning rate (shrinkage) ν = 0.1, F₁ = 20 + 0.1 × [−10, 0, 10] = [19, 20, 21]; new residuals [−9, 0, 9]. After t perfect steps, the residuals are 0.9<sup>t</sup> times the original: 100 steps reduce them to about 0.003%. Shrinkage makes each step deliberately timid, which counterintuitively improves generalisation because no single tree's noise dominates; the cost is needing more trees.</p>
+  <p><strong>Why "gradient"?</strong> For squared error L = ½(y − F)², the negative gradient with respect to the prediction F is exactly the residual y − F. For any other differentiable loss, we fit each tree to the negative gradient, the <em>pseudo-residuals</em>. Boosting is therefore gradient descent, but in function space: instead of nudging a parameter vector, each step adds a small function (a tree) pointing downhill. For log-loss the pseudo-residual is y − p, the same "error" term as logistic regression.</p>
+  \[ F_m(\mathbf{x}) = F_{m-1}(\mathbf{x}) + \nu\, h_m(\mathbf{x}),\qquad h_m \approx -\frac{\partial\,\ell(y, F)}{\partial F}\Big|_{F=F_{m-1}}. \]
+  <p>Key hyperparameters: number of trees (choose by early stopping on a validation set), learning rate (0.01 to 0.3), tree depth or number of leaves (controls interaction order; shallow trees of depth 3 to 8 are typical), row and column subsampling (stochastic gradient boosting, which adds randomness like a forest), and minimum samples or hessian weight per leaf.</p>
+  <p><strong>Bagging versus boosting.</strong> Bagging averages independent, low-bias, high-variance models to reduce variance. Boosting sums dependent, high-bias (shallow) models sequentially to reduce bias, with shrinkage and subsampling controlling variance. Forests are hard to overfit by adding trees; boosting does overfit with too many trees, hence early stopping.</p>
+
+  <h3>3.11 XGBoost</h3>
+  <p>XGBoost ("eXtreme Gradient Boosting", Chen and Guestrin 2016) made gradient boosting fast, scalable and well-regularised. Its contributions, each explained in §4 and §6:</p>
+  <ul>
+    <li><strong>Regularised objective.</strong> The loss includes an explicit complexity penalty on each tree: γ per leaf (a cost for adding a leaf) and ½λ‖w‖² on leaf values (L2 shrinkage of leaf predictions), plus optional α‖w‖₁.</li>
+    <li><strong>Second-order approximation.</strong> Each boosting step approximates the loss with a second-order Taylor expansion using both the gradient g and the hessian h (curvature) of the loss per example. This yields a closed-form optimal leaf value, −G/(H + λ), and an exact formula for split gain, making split search a matter of summing g and h.</li>
+    <li><strong>Split finding.</strong> Exact greedy enumeration for small data; for large data, an approximate algorithm that proposes candidate thresholds from weighted quantiles (the "weighted quantile sketch", weighted by hessians), and in modern versions the histogram method (<code>tree_method="hist"</code>, the default since XGBoost 2.0).</li>
+    <li><strong>Sparsity-aware splitting.</strong> Missing values and sparse zeros get a learned default direction per split, and the algorithm only iterates over non-missing entries, making it fast on sparse one-hot data.</li>
+    <li><strong>Systems engineering.</strong> Column blocks stored sorted in memory, cache-aware access, out-of-core computation, distributed training, and GPU support.</li>
+  </ul>
+
+  <h3>3.12 LightGBM and CatBoost</h3>
+  <p><strong>LightGBM</strong> (Microsoft, 2017) focuses on speed for large datasets. It bins features into histograms (typically up to 255 bins) and computes split gains on bins; it grows trees <em>leaf-wise</em> (always splitting the leaf with the largest gain, rather than level by level), which reaches lower loss with the same number of leaves but can overfit small data unless <code>num_leaves</code> and <code>min_data_in_leaf</code> are constrained. It adds GOSS (keep examples with large gradients, sample those with small ones) and Exclusive Feature Bundling (merge sparse features that are rarely non-zero together). Native categorical handling finds good category partitions by sorting categories by gradient statistics.</p>
+  <p><strong>CatBoost</strong> (Yandex, 2017) focuses on categorical data and robustness. Its <em>ordered target statistics</em> encode categories using only rows that precede the current row in a random permutation, avoiding target leakage; <em>ordered boosting</em> applies the same idea to residuals to reduce prediction shift; and it uses <em>oblivious (symmetric) trees</em>, where every node at the same depth uses the same split, making trees very regular, fast to evaluate and less prone to overfitting. Default parameters are strong, so it often needs less tuning.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Aspect</th><th>XGBoost</th><th>LightGBM</th><th>CatBoost</th><th>sklearn HistGradientBoosting</th></tr></thead>
+    <tbody>
+      <tr><td>Tree growth</td><td>Depth-wise by default (<code>grow_policy="lossguide"</code> available)</td><td>Leaf-wise</td><td>Symmetric (oblivious) by default</td><td>Leaf-wise (max_leaf_nodes)</td></tr>
+      <tr><td>Split finding</td><td>Histogram (default), exact, approx</td><td>Histogram + GOSS, EFB</td><td>Histogram on quantised features</td><td>Histogram (255 bins)</td></tr>
+      <tr><td>Categoricals</td><td>Native (<code>enable_categorical=True</code>)</td><td>Native partition search</td><td>Ordered target statistics, combinations</td><td>Native (<code>categorical_features</code>)</td></tr>
+      <tr><td>Missing values</td><td>Learned default direction</td><td>Learned default direction</td><td>Treated as min or max (configurable)</td><td>Learned default direction</td></tr>
+      <tr><td>Strength</td><td>Mature, ubiquitous, strong GPU and distributed support</td><td>Fastest on large data, low memory</td><td>Best defaults, categorical-heavy data</td><td>No extra dependency, integrates with pipelines</td></tr>
+      <tr><td>JVM serving</td><td>XGBoost4J, ONNX</td><td>LightGBM4j / ONNX</td><td>CatBoost Java applier, ONNX (limited)</td><td>ONNX via skl2onnx</td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout note"><p class="callout-title">Versions</p><p>Details above are <span class="tag version">Version-sensitive · checked Nov 2026</span>; consult each library's current documentation for defaults.</p></div>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working</h2>
+  <h3>4.1 How a CART tree is grown</h3>
+  <ol>
+    <li>Start with all training rows at the root.</li>
+    <li>For each feature, sort the rows' values (or bin them). Sweep through candidate thresholds between consecutive distinct values; for each, maintain running class counts (or sums and sums of squares for regression) on the left and right, so each candidate's impurity is computed in O(1) after the sort. Total per node: O(n · m log m) for n features and m rows, or O(n · bins) with histograms.</li>
+    <li>Choose the (feature, threshold) with the largest impurity decrease. If no split improves impurity by at least <code>min_impurity_decrease</code>, or limits such as <code>max_depth</code>/<code>min_samples_split</code> are hit, make a leaf.</li>
+    <li>Partition rows into left and right children and recurse on each.</li>
+    <li>Optionally post-prune with cost-complexity pruning, choosing α by cross-validation.</li>
+  </ol>
+  <p>Prediction walks from root to leaf: O(depth), a handful of comparisons. That is why tree ensembles serve in microseconds even on a JVM: 500 trees of depth 6 are 3,000 comparisons and 500 additions.</p>
+  <h3>4.2 How a random forest trains and predicts</h3>
+  <ol>
+    <li>For b = 1 … B (in parallel): draw a bootstrap sample; grow a deep tree where each split considers only <code>max_features</code> randomly chosen features; record which rows were out-of-bag.</li>
+    <li>Predict by averaging the trees' outputs (regression) or averaging their class probability estimates (classification, in scikit-learn).</li>
+    <li>OOB score: for each row, aggregate only trees for which it was out-of-bag.</li>
+  </ol>
+  <h3>4.3 How gradient boosting trains</h3>
+  <ol>
+    <li>Initialise F₀ to the constant minimising the loss (mean for squared error; log-odds of the base rate for log-loss).</li>
+    <li>For t = 1 … T: compute per-example gradients g<sub>i</sub> (and hessians h<sub>i</sub> for second-order methods) of the loss at the current predictions; optionally subsample rows and columns; fit a regression tree to these statistics; set leaf values (for XGBoost, −G/(H + λ)); add ν times the tree to the ensemble; evaluate on the validation set; stop if the validation metric has not improved for <code>early_stopping_rounds</code>.</li>
+    <li>The model is the base score plus the sum of all trees' leaf values for the input, passed through a link function (sigmoid for binary log-loss, softmax for multiclass).</li>
+  </ol>
+  <h3>4.4 Inside XGBoost's histogram split search</h3>
+  <p>Before training, each feature is quantised into at most <code>max_bin</code> bins (default 256) using quantiles. At a node, a single pass over its rows accumulates, per feature and per bin, the sums G<sub>bin</sub> and H<sub>bin</sub>. Scanning bins left to right with prefix sums gives G<sub>L</sub>, H<sub>L</sub> for every candidate threshold, and G<sub>R</sub> = G − G<sub>L</sub>. Missing values are accumulated separately and tried on both sides. A key trick, the <em>histogram subtraction</em>: after splitting, build the histogram only for the smaller child and obtain the larger child's histogram as parent minus smaller, halving the work. On GPU, histograms are built with parallel atomic adds across thousands of threads.</p>
+  <h3>4.5 How prediction is serialised and served</h3>
+  <p>An XGBoost model saved as JSON (<code>model.save_model("m.json")</code>; the old binary format was removed in 3.1) contains the base score and, per tree, arrays of split feature indices, thresholds, default directions for missing values, child indices and leaf values. Any language can evaluate it with a loop. XGBoost4J loads the same file on the JVM; ONNX converters turn it into a <code>TreeEnsembleClassifier</code> operator for ONNX Runtime. Feature order is positional: the serving code must assemble features in exactly the training column order, which is the most common integration bug.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: How the Algorithms Relate</h2>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  SL["Supervised learning"] --> LIN["Linear models: score = w dot x"]
+  SL --> INST["Instance-based: k-NN"]
+  SL --> TREE["Decision trees: recursive partitioning"]
+  LIN --> LR["Linear regression + squared loss"]
+  LIN --> LOG["Logistic / softmax + log-loss"]
+  LIN --> SVM["Linear SVM + hinge loss"]
+  LR --> REG["Ridge / Lasso / Elastic net"]
+  TREE --> BAG["Bagging: average independent deep trees"]
+  BAG --> RF["Random forest: + feature subsampling"]
+  TREE --> BOOST["Boosting: add shallow trees sequentially"]
+  BOOST --> GBM["Gradient boosting: fit negative gradients"]
+  GBM --> XGB["XGBoost: 2nd order + regularised trees"]
+  GBM --> LGBM["LightGBM: histograms, leaf-wise, GOSS"]
+  GBM --> CAT["CatBoost: ordered boosting, oblivious trees"]
+</pre>
+  <figcaption>Figure 6.3.1 — Family tree of the supervised algorithms in this chapter.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> linear models differ only in their loss (squared, log, hinge) and penalty; they share the same hypothesis class. Tree ensembles split into two strategies for fixing a single tree's weaknesses: bagging attacks variance by averaging, boosting attacks bias by sequential correction. The three boosting libraries share the gradient-boosting core and differ in engineering and regularisation choices.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  Y["Targets y"] --> G["Compute g = dLoss/dF, h = d2Loss/dF2"]
+  F["Current ensemble F(x)"] --> G
+  G --> T["Fit tree to (g, h): best split by gain"]
+  T --> W["Leaf value w = -G / (H + lambda)"]
+  W --> U["F(x) += eta * tree(x)"]
+  U --> V{"Validation metric improved?"}
+  V -- "yes" --> F
+  V -- "no for k rounds" --> S["Stop; keep best iteration"]
+</pre>
+  <figcaption>Figure 6.3.2 — The boosting loop as a feedback controller with early stopping.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> information flows from the current ensemble's errors (gradients and hessians) into the structure and leaf values of the next tree, which is then added with shrinkage η. The validation check is the governor: it measures generalisation every round and stops the loop when additional trees start fitting noise. Like a deployment pipeline with automated rollback, you keep the best version seen, not the last.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  R["Root: amount above 450?"] -- yes --> A["new_device?"]
+  R -- no --> B["merchant_risk above 0.3?"]
+  A -- yes --> L1["leaf: +1.2"]
+  A -- "no / missing" --> L2["leaf: +0.4"]
+  B -- yes --> L3["leaf: +0.1"]
+  B -- "no / missing" --> L4["leaf: -0.6"]
+</pre>
+  <figcaption>Figure 6.3.3 — One depth-2 tree from a boosted fraud model; leaf values are log-odds contributions, and missing values follow learned default branches.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> a boosted tree does not output a class; each leaf holds a small additive contribution to the log-odds. A transaction of 600 on a known device gets +0.4 from this tree; the final score is base log-odds plus the sum over all trees, passed through the sigmoid. "Missing" edges show the sparsity-aware default direction. Compare with a hand-written rules engine: same shape, but every threshold and weight was optimised against data.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math</h2>
+  <h3>6.1 Logistic regression gradient and Hessian</h3>
+  <p><strong>In words:</strong> the gradient is "prediction error times input", and the curvature is largest where the model is most uncertain (p near 0.5).</p>
+  <p>With p<sub>i</sub> = σ(wᵀx<sub>i</sub>) and the average log-loss, using σ′ = σ(1 − σ) (derived in Chapter 6.1, Exercise 5):</p>
+  \[ \nabla_{\mathbf{w}}\mathcal{L} = \frac1m X^\top(\mathbf{p}-\mathbf{y}),\qquad \nabla^2_{\mathbf{w}}\mathcal{L} = \frac1m X^\top S X,\quad S = \operatorname{diag}\big(p_i(1-p_i)\big). \]
+  <p>Since S has non-negative entries, the Hessian is positive semi-definite: the loss is convex. Newton's method, w ← w − H⁻¹∇L, converges in a handful of iterations (this is "iteratively reweighted least squares"). Adding an L2 term λ‖w‖² adds 2λI to the Hessian, making it strictly positive definite and the optimum unique and finite even for separable data.</p>
+  <h3>6.2 Softmax cross-entropy gradient</h3>
+  <p>With p<sub>k</sub> = e<sup>z<sub>k</sub></sup>/Σ<sub>j</sub>e<sup>z<sub>j</sub></sup> and L = −log p<sub>c</sub> for true class c: L = −z<sub>c</sub> + log Σ<sub>j</sub> e<sup>z<sub>j</sub></sup>. Differentiating, ∂L/∂z<sub>k</sub> = −[k = c] + e<sup>z<sub>k</sub></sup>/Σe<sup>z<sub>j</sub></sup> = p<sub>k</sub> − [k = c]. In vector form:</p>
+  \[ \frac{\partial\mathcal{L}}{\partial\mathbf{z}} = \mathbf{p} - \mathbf{e}_c,\qquad \frac{\partial\mathcal{L}}{\partial W} = (\mathbf{p}-\mathbf{e}_c)\,\mathbf{x}^\top. \]
+  <h3>6.3 Ridge closed form and its shrinkage in the SVD basis</h3>
+  <p>Setting the gradient of ‖Xw − y‖² + λ‖w‖² to zero: 2Xᵀ(Xw − y) + 2λw = 0, so (XᵀX + λI)w = Xᵀy. Using the SVD X = UΣVᵀ, the fitted values are</p>
+  \[ X\mathbf{w}_{\text{ridge}} = \sum_j \mathbf{u}_j\,\frac{\sigma_j^2}{\sigma_j^2+\lambda}\,\mathbf{u}_j^\top\mathbf{y}. \]
+  <p><strong>In words:</strong> ridge projects y onto each principal direction of the data and shrinks that component by σ<sub>j</sub>²/(σ<sub>j</sub>² + λ). Directions with large singular values (well-supported by data) are barely shrunk; directions with tiny singular values (where OLS would be wildly unstable) are shrunk almost to zero. Numeric: σ² = 100, λ = 1 gives factor 0.99; σ² = 0.5 gives 0.33.</p>
+  <h3>6.4 Impurity and information gain, formally</h3>
+  <p>For a split of node S into S<sub>L</sub>, S<sub>R</sub> with impurity I:</p>
+  \[ \Delta I = I(S) - \frac{|S_L|}{|S|}I(S_L) - \frac{|S_R|}{|S|}I(S_R). \]
+  <p>Entropy-based gain equals the mutual information between the split indicator and the label within the node. Redoing §3.8's example with entropy: parent 1 bit; left (4/0) entropy 0; right (1/5) entropy −(1/6)log₂(1/6) − (5/6)log₂(5/6) = 0.431 + 0.219 = 0.650; gain = 1 − 0.6 × 0.650 = 0.610 bits.</p>
+  <h3>6.5 Why averaging correlated trees helps (and its limit)</h3>
+  <p>If B identically distributed predictors each have variance σ² and pairwise correlation ρ, the variance of their average is</p>
+  \[ \operatorname{Var}\Big(\frac1B\sum_b T_b\Big) = \rho\,\sigma^2 + \frac{1-\rho}{B}\,\sigma^2. \]
+  <p><strong>In words:</strong> adding trees drives the second term to zero, but the first term, ρσ², is a floor that more trees cannot remove. Only decorrelation (lower ρ) lowers the floor, which is exactly what random feature subsets do. Numeric: σ² = 1, ρ = 0.5, B = 100: variance 0.5 + 0.005 = 0.505. Halve ρ to 0.25 and it is 0.2575. Going from 100 to 1,000 trees at ρ = 0.5 only saves 0.0045.</p>
+  <h3>6.6 The out-of-bag fraction</h3>
+  <p>The probability that a specific row is not drawn in m draws with replacement is (1 − 1/m)<sup>m</sup>. Since ln(1 − 1/m) ≈ −1/m for large m, this tends to e<sup>−1</sup> ≈ 0.368. For m = 10: 0.9<sup>10</sup> ≈ 0.349; for m = 1,000: about 0.3677.</p>
+  <h3>6.7 Gradient boosting as functional gradient descent</h3>
+  <p>Think of the predictions on the training set, F = (F(x₁), …, F(x<sub>m</sub>)), as a vector of m "parameters". The steepest-descent step on the total loss is −∇<sub>F</sub>L = (−∂ℓ/∂F(x<sub>i</sub>))<sub>i</sub>. We cannot add an arbitrary vector (it would not generalise to new x), so we add the tree h from our hypothesis class that best approximates this direction in the least-squares sense, then take a step of size ν. For common losses:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Loss</th><th>ℓ(y, F)</th><th>Negative gradient (pseudo-residual)</th><th>Hessian h</th></tr></thead>
+    <tbody>
+      <tr><td>Squared error</td><td>½(y − F)²</td><td>y − F</td><td>1</td></tr>
+      <tr><td>Absolute error</td><td>|y − F|</td><td>sign(y − F)</td><td>0 (not usable directly in 2nd-order methods)</td></tr>
+      <tr><td>Log-loss (F = log-odds, p = σ(F))</td><td>−y log p − (1 − y) log(1 − p)</td><td>y − p</td><td>p(1 − p)</td></tr>
+      <tr><td>Poisson (F = log rate)</td><td>e<sup>F</sup> − yF</td><td>y − e<sup>F</sup></td><td>e<sup>F</sup></td></tr>
+    </tbody>
+  </table></div>
+  <h3>6.8 XGBoost's objective, leaf weights and split gain</h3>
+  <p><strong>In words:</strong> approximate the loss around the current predictions by a parabola per example; within a leaf, all examples get the same added value w, so the leaf's loss is a sum of parabolas in w, whose minimum is at −(sum of slopes)/(sum of curvatures + λ). The quality of a tree structure is how far it can push down the total of those parabola minima, minus γ per leaf.</p>
+  <p>At round t, the objective for the new tree f<sub>t</sub> with T leaves and leaf values w is</p>
+  \[ \mathcal{L}^{(t)} = \sum_i \ell\big(y_i,\hat y_i^{(t-1)} + f_t(\mathbf{x}_i)\big) + \gamma T + \tfrac12\lambda\sum_{j=1}^T w_j^2. \]
+  <p>Second-order Taylor expansion with g<sub>i</sub> = ∂ℓ/∂ŷ and h<sub>i</sub> = ∂²ℓ/∂ŷ² at ŷ<sup>(t−1)</sup>, dropping constants:</p>
+  \[ \mathcal{L}^{(t)} \approx \sum_i\Big[g_i f_t(\mathbf{x}_i) + \tfrac12 h_i f_t(\mathbf{x}_i)^2\Big] + \gamma T + \tfrac12\lambda\sum_j w_j^2 = \sum_{j=1}^{T}\Big[G_j w_j + \tfrac12(H_j+\lambda)w_j^2\Big] + \gamma T, \]
+  <p>where G<sub>j</sub>, H<sub>j</sub> sum g and h over the examples in leaf j. Each bracket is a parabola in w<sub>j</sub>, minimised at</p>
+  \[ w_j^* = -\frac{G_j}{H_j+\lambda},\qquad \mathcal{L}^* = -\frac12\sum_{j=1}^{T}\frac{G_j^2}{H_j+\lambda} + \gamma T. \]
+  <p>Splitting one leaf into left and right changes the objective by</p>
+  \[ \text{Gain} = \frac12\left[\frac{G_L^2}{H_L+\lambda} + \frac{G_R^2}{H_R+\lambda} - \frac{(G_L+G_R)^2}{H_L+H_R+\lambda}\right] - \gamma. \]
+  <p>A split is worth making only if Gain &gt; 0, so γ acts as a minimum gain threshold (pre-pruning built into the objective). <code>min_child_weight</code> requires H in each child to exceed a threshold; for log-loss, H = Σp(1 − p), so this prevents leaves made of a few confidently predicted examples.</p>
+  <p><strong>Numeric example</strong> (squared error, so g = ŷ − y and h = 1). Targets [1, 2, 8, 9], current prediction 5 for all, so g = [4, 3, −3, −4]. λ = 1, γ = 0. Split {1, 2} | {8, 9}: G<sub>L</sub> = 7, H<sub>L</sub> = 2, G<sub>R</sub> = −7, H<sub>R</sub> = 2. Gain = ½[49/3 + 49/3 − 0/5] ≈ 16.33. Leaf values: −7/3 ≈ −2.33 and +2.33. Plain residual-mean fitting would give ∓3.5; λ shrinks leaves with little hessian mass toward zero, which is how XGBoost regularises small leaves. Alternative split {1} | {2, 8, 9}: G<sub>L</sub> = 4, H<sub>L</sub> = 1, G<sub>R</sub> = −4, H<sub>R</sub> = 3; gain = ½[16/2 + 16/4 − 0] = 6.0. The first split wins.</p>
+  <h3>6.9 Complexity summary</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Model</th><th>Training</th><th>Prediction per row</th><th>Model size</th></tr></thead>
+    <tbody>
+      <tr><td>Linear / logistic (L-BFGS)</td><td>O(k · m · n) for k iterations</td><td>O(n)</td><td>n weights</td></tr>
+      <tr><td>Normal equation</td><td>O(mn² + n³)</td><td>O(n)</td><td>n weights</td></tr>
+      <tr><td>k-NN (brute)</td><td>O(1) (store data)</td><td>O(mn)</td><td>The whole dataset</td></tr>
+      <tr><td>Kernel SVM</td><td>~O(m²)–O(m³)</td><td>O(#SV · n)</td><td>Support vectors</td></tr>
+      <tr><td>Decision tree</td><td>O(n · m log m)</td><td>O(depth)</td><td>O(leaves)</td></tr>
+      <tr><td>Random forest (B trees)</td><td>O(B · max_features · m log m · depth-ish)</td><td>O(B · depth)</td><td>B deep trees (often large)</td></tr>
+      <tr><td>Histogram GBDT (T trees)</td><td>O(T · (m · n + bins · n · leaves))</td><td>O(T · depth)</td><td>T shallow trees</td></tr>
+    </tbody>
+  </table></div>
+</section>

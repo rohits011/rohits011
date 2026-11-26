@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API Security, Injection, XSS, CSRF, SSRF &amp; Secure Coding — AI-Era Software Engineering</title>
+<meta name="description" content="The OWASP API Security Top 10 2023, rate limiting, input validation and mass assignment, SQL/JPQL/NoSQL injection, XSS with CSP and Trusted Types, CSRF, SSRF and cloud metadata, deserialization, path traversal, SAST/DAST and a secure code review checklist — with Spring, Python and Go fixes.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p11-03-appsec-vulnerabilities" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 11 · Chapter 3</p>
+  <h1>API Security, Injection, XSS, CSRF, SSRF &amp; Secure Coding</h1>
+  <p class="lede">This is the chapter about the bugs you write. Each vulnerability class is presented the same way: the root cause in one sentence, the minimal vulnerable pattern, the secure implementation in Spring (and Python/Go where it differs), and the test or tool that catches regressions. By the end you will have a secure code review checklist you can apply to every pull request — including the ones an AI assistant wrote.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Chapters 11.1 (OWASP Top 10, threat modeling) and 11.2 (tokens, sessions); Spring MVC, Spring Data JPA, Jackson.</li>
+    <li><strong>You will be able to:</strong> recognise and fix every OWASP API Security Top 10 2023 risk; implement rate limiting and strict input binding; eliminate SQL/JPQL/NoSQL injection; apply contextual output encoding, CSP and Trusted Types; decide when CSRF protection is needed; defend against SSRF including cloud metadata; avoid deserialization and path-traversal bugs; integrate SAST/DAST; run a structured secure code review.</li>
+  </ul>
+</header>
+
+<div class="callout warn"><p class="callout-title">Authorization and safety</p><p>Example payloads in this chapter are the classic, harmless textbook illustrations (such as <code>' OR '1'='1</code> or <code>&lt;script&gt;alert(1)&lt;/script&gt;</code>) used to show <em>why</em> a pattern is vulnerable. Practise only against intentionally vulnerable applications that you run locally (OWASP Juice Shop, WebGoat, or your own test app bound to 127.0.0.1). Scanning or probing systems you do not own or lack written permission to test is unlawful in most jurisdictions.</p></div>
+
+<section id="introduction">
+  <h2>1. Introduction: Untrusted Data Meets an Interpreter or a Decision</h2>
+  <p>Almost every vulnerability in this chapter reduces to one of two shapes. Either <strong>untrusted data reaches an interpreter</strong> (SQL engine, browser, shell, deserializer, file system, URL fetcher) in a position where it is treated as code or as a target, or <strong>a security decision is made on the wrong basis</strong> (the object's owner is not checked, the client supplies a field that should be server-controlled, a request's origin is assumed). Once you see vulnerabilities this way, the defences become systematic: keep data and code in separate channels (parameter binding, contextual encoding, typed APIs), make decisions on server-held facts, and constrain what any single request can consume.</p>
+  <p>APIs make the second shape dominant. A server-rendered page used to hide object IDs and fields behind forms; a JSON API exposes them directly, and clients — mobile apps, SPAs, partners, scripts, and now AI agents — can call any endpoint with any payload. That is why OWASP maintains a separate API Security Top 10, and why its top entries are about authorization rather than injection.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>Spring Data JPA derived queries and <code>@Query</code> with named parameters bind values safely; Thymeleaf's <code>th:text</code> HTML-escapes; <code>CsrfFilter</code> rejects state-changing browser requests without a token; Bean Validation (<code>@Valid</code>, <code>@Size</code>, <code>@Pattern</code>) rejects malformed input; Jackson maps JSON to your DTOs.</dd>
+      <dt>Why that is not enough</dt><dd>Each safe default has an escape hatch you will eventually use: native queries with string concatenation for a dynamic <code>ORDER BY</code>; <code>th:utext</code> for "rich text"; CSRF disabled globally because "we are an API" while a cookie session still exists; binding JSON straight onto JPA entities (mass assignment); <code>RestTemplate</code> fetching a user-supplied URL (SSRF); <code>ObjectInputStream</code> in an old integration. Bean Validation checks shape, not authorization.</dd>
+      <dt>The modern approach</dt><dd>Treat every API as public; authorize every object and every property; bind requests to dedicated DTOs; limit every resource (rate, size, page, time); encode output by context and add CSP with nonces; use SameSite cookies plus CSRF tokens for cookie-authenticated endpoints; route outbound fetches of user-influenced URLs through an allow-list and egress controls; never deserialize untrusted native formats; and automate detection with SAST, SCA, DAST and security unit tests.</dd>
+      <dt>Where Python and Go fit</dt><dd>Python's DB-API placeholders and SQLAlchemy bind parameters are safe; f-strings into <code>execute()</code> are not. Jinja2 autoescapes only if enabled (Flask enables it for HTML templates). Pydantic models give strict request schemas (use <code>extra="forbid"</code>). Go's <code>database/sql</code> placeholders and <code>html/template</code> (contextual auto-escaping) are safe; <code>text/template</code> for HTML is not. Both ecosystems have pickle/gob-style serializers you must not expose.</dd>
+      <dt>In production</dt><dd>An API gateway enforces authentication, quotas and schema; services enforce object- and property-level authorization; a WAF provides virtual patching but is never the primary control; SAST runs on every PR; DAST runs nightly against staging; the API inventory is generated from code (OpenAPI) so nothing is forgotten.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use the full checklist on every endpoint that accepts input or returns data — that is all of them. Avoid relying on client-side validation, obscurity (unguessable URLs), or a WAF as substitutes for server-side controls.</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="history">
+  <h2>2. History</h2>
+  <ul>
+    <li><strong>1998</strong> — SQL injection is described publicly in Phrack magazine (issue 54) by Jeff Forristal ("rain.forest.puppy").</li>
+    <li><strong>2000</strong> — Microsoft security engineers coin the term "cross-site scripting".</li>
+    <li><strong>2001</strong> — Cross-site request forgery is described (initially as "session riding" in some literature); it remained under-appreciated for years.</li>
+    <li><strong>2005</strong> — The Samy worm spreads through MySpace via stored XSS, adding over a million "friends" in about a day — the first famous XSS worm.</li>
+    <li><strong>2012</strong> — GitHub is affected by a Rails mass-assignment bug that let a user attach an SSH key to another account (CVE-2012-2055); Rails moves to "strong parameters".</li>
+    <li><strong>2012–2016</strong> — W3C Content Security Policy Level 1 (2012) and Level 2 (2016) give sites a declarative way to restrict script sources; Level 3 introduces <code>strict-dynamic</code>.</li>
+    <li><strong>2015</strong> — Frohoff and Lawrence's "Marshalling Pickles" talk shows practical Java deserialization gadget chains (Apache Commons Collections); a wave of CVEs follows across Java middleware. Java adds serialization filtering (JEP 290, Java 9, backported to 8u121).</li>
+    <li><strong>2016–2020</strong> — The <code>SameSite</code> cookie attribute ships in browsers (2016); Chrome makes <code>Lax</code> the default for cookies without the attribute (rolled out in 2020).</li>
+    <li><strong>2019</strong> — OWASP publishes the first API Security Top 10. Capital One's breach via SSRF and an over-privileged role leads AWS to launch IMDSv2 (November 2019).</li>
+    <li><strong>2020</strong> — Trusted Types ships in Chromium (version 83), enforcing safe sinks for DOM XSS.</li>
+    <li><strong>2021</strong> — OWASP Top 10 2021 adds SSRF as its own category; Java 17 adds context-specific deserialization filters (JEP 415).</li>
+    <li><strong>2023</strong> — OWASP API Security Top 10 2023 adds Unrestricted Access to Sensitive Business Flows, SSRF and Unsafe Consumption of APIs; MOVEit's SQL injection is exploited at scale.</li>
+    <li><strong>2025</strong> — OWASP Top 10:2025 folds SSRF into Broken Access Control; AI-generated code becomes a significant source of new code to review.</li>
+  </ul>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 The OWASP API Security Top 10 (2023)</h3>
+  <p><span class="tag version">Version-sensitive · checked Nov 2026</span> The 2023 edition is the current API list. <span class="tag fact">Verified</span></p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>ID</th><th>Risk</th><th>Root cause</th><th>Primary Spring control</th></tr></thead>
+    <tbody>
+      <tr><td>API1</td><td>Broken Object Level Authorization (BOLA)</td><td>Object ID from the request is used without checking the caller may access that object</td><td>Owner/tenant-scoped queries; <code>@PreAuthorize</code> with a permission bean; RLS</td></tr>
+      <tr><td>API2</td><td>Broken Authentication</td><td>Weak token validation, credential stuffing, missing rate limits on auth endpoints</td><td>OAuth2 resource server with full validation; rate-limited login; MFA (Chapter 11.2)</td></tr>
+      <tr><td>API3</td><td>Broken Object Property Level Authorization (BOPLA)</td><td>Reading or writing properties the caller should not see or change (excessive data exposure + mass assignment)</td><td>Separate request/response DTOs; <code>@JsonView</code> or field-level authorization</td></tr>
+      <tr><td>API4</td><td>Unrestricted Resource Consumption</td><td>No limits on rate, payload size, page size, query complexity, or costly downstream calls (SMS, email, LLM tokens)</td><td>Rate limiting (Bucket4j/gateway), max sizes, timeouts, pagination caps, quotas</td></tr>
+      <tr><td>API5</td><td>Broken Function Level Authorization (BFLA)</td><td>Normal users can call administrative or privileged functions</td><td>Deny-by-default URL rules; method security; separate admin APIs</td></tr>
+      <tr><td>API6</td><td>Unrestricted Access to Sensitive Business Flows</td><td>Automatable abuse of legitimate flows (bulk ticket purchase, referral fraud, scraping)</td><td>Per-account/device limits, bot detection, business-level velocity checks</td></tr>
+      <tr><td>API7</td><td>Server-Side Request Forgery (SSRF)</td><td>Server fetches a URL influenced by the client without validation</td><td>Allow-lists, URL parsing + IP checks, egress firewall, IMDSv2</td></tr>
+      <tr><td>API8</td><td>Security Misconfiguration</td><td>Permissive CORS, verbose errors, missing TLS, debug endpoints</td><td>Hardened profiles, actuator lockdown, CORS allow-list</td></tr>
+      <tr><td>API9</td><td>Improper Inventory Management</td><td>Unknown, old or undocumented API versions and hosts remain reachable</td><td>OpenAPI generated from code, gateway as registry, retire old versions</td></tr>
+      <tr><td>API10</td><td>Unsafe Consumption of APIs</td><td>Trusting third-party API responses more than user input</td><td>Validate and bound third-party data; TLS verification; timeouts; no blind redirects</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>3.2 BOLA, BOPLA and BFLA — three levels of authorization</h3>
+  <p>Think of authorization at three granularities. <strong>Function level</strong>: may this caller invoke <code>DELETE /users/{id}</code> at all? <strong>Object level</strong>: may this caller act on user 42? <strong>Property level</strong>: may this caller read <code>user.ssn</code> or write <code>user.role</code>? Frameworks help with the first; the second and third are business logic in your service and DTO design. BOLA is the API list's #1 because every endpoint that takes an ID is a candidate, and automated scanners rarely detect it — they do not know who should own what.</p>
+
+  <h3>3.3 Mass assignment</h3>
+  <p>Mass assignment happens when a framework binds all request fields onto an object that has fields the client must not control. In Spring, the classic form is accepting a JPA entity as <code>@RequestBody</code>: a client adds <code>"role":"ADMIN"</code> or <code>"accountBalance":1000000</code> and Jackson happily sets it, then <code>save()</code> persists it. The fix is structural: request DTOs (Java records) containing only client-settable fields, explicit mapping to the entity, and <code>FAIL_ON_UNKNOWN_PROPERTIES</code> so unexpected fields are rejected rather than silently ignored. For form binding with <code>@ModelAttribute</code>, use <code>WebDataBinder.setAllowedFields</code> (Spring Framework 6.1 also added <code>setDeclarativeBinding</code> to bind only via constructor).</p>
+
+  <h3>3.4 Rate limiting algorithms</h3>
+  <ul>
+    <li><strong>Fixed window</strong> — count requests per key per calendar window (e.g. per minute). Simple; allows bursts of up to 2× the limit at window boundaries.</li>
+    <li><strong>Sliding window log</strong> — store timestamps of recent requests; exact but memory-heavy.</li>
+    <li><strong>Sliding window counter</strong> — weighted combination of the current and previous fixed windows; good approximation with O(1) memory.</li>
+    <li><strong>Token bucket</strong> — a bucket of capacity <em>B</em> refills at rate <em>r</em>; each request takes a token. Allows bursts up to <em>B</em> while enforcing long-run rate <em>r</em>. Used by Bucket4j, Envoy, AWS API Gateway, Spring Cloud Gateway's Redis rate limiter.</li>
+    <li><strong>Leaky bucket</strong> — queue drained at a constant rate; smooths output.</li>
+    <li><strong>Concurrency limits</strong> — cap in-flight requests (bulkheads), which protect against slow, expensive calls better than rate limits do.</li>
+  </ul>
+  <p>Choose the <em>key</em> carefully: per IP (weak behind NAT and trivially rotated by attackers), per API key/client ID, per authenticated user, per tenant, and per sensitive resource (e.g. per phone number for OTP sends). Layers: gateway global limits, service per-user limits, and business-flow limits (API6).</p>
+
+  <h3>3.5 Input validation principles</h3>
+  <p>Validation answers "is this input well-formed and within expected bounds?" It reduces attack surface but does not replace output encoding or parameter binding, because valid input can still be dangerous in another context (an Irish surname with an apostrophe is valid and still breaks concatenated SQL). Rules: validate on the server; prefer allow-lists (enumerations, regex for formats, ranges) over deny-lists; canonicalise before validating (Unicode normalisation, URL decoding once); validate types, lengths, ranges and cross-field rules; reject rather than "sanitise and continue" where possible; and enforce limits on collections and nesting depth to prevent resource exhaustion.</p>
+
+  <h3>3.6 Injection — the general model</h3>
+  <p>Injection occurs when a program builds a string in some language (SQL, JPQL, HQL, LDAP filter, OS shell, XPath, SpEL, OGNL, template syntax, MongoDB query JSON, log format) by concatenating untrusted data, and the interpreter parses the whole string. The universal fix is to use an API that keeps code and data in separate channels: prepared statements, typed query builders, argument arrays for processes, escaping functions specific to the target grammar only as a last resort.</p>
+  <ul>
+    <li><strong>SQL injection</strong> — e.g. <code>"... WHERE email = '" + email + "'"</code>. With input <code>' OR '1'='1</code> the WHERE clause becomes always true.</li>
+    <li><strong>JPQL/HQL injection</strong> — the same bug one layer up; JPA is not magic if you concatenate into <code>createQuery</code>.</li>
+    <li><strong>NoSQL injection</strong> — in MongoDB, passing a parsed JSON object where a string is expected: <code>{"username": {"$ne": null}}</code> matches any user. Spring Data MongoDB's derived queries and <code>Criteria</code> API are safe; string-built <code>@Query</code> JSON or <code>BasicQuery</code> with concatenation is not.</li>
+    <li><strong>OS command injection</strong> — passing user data to <code>sh -c</code>. Use <code>ProcessBuilder</code> with an argument list and no shell, plus allow-listed values.</li>
+    <li><strong>Expression language injection</strong> — evaluating user input as SpEL (<code>parser.parseExpression(userInput)</code>) is remote code execution. Use <code>SimpleEvaluationContext</code> if you must evaluate anything, and never on untrusted input.</li>
+    <li><strong>Log injection</strong> — CR/LF in logged values forges log lines (Chapter 11.1).</li>
+  </ul>
+
+  <h3>3.7 Cross-site scripting (XSS)</h3>
+  <p>XSS is injection into a web page: attacker-controlled data is rendered so that the browser executes it as script in your origin, with access to the DOM, cookies not marked HttpOnly, and the ability to make authenticated requests as the user.</p>
+  <ul>
+    <li><strong>Stored XSS</strong> — payload saved (comment, profile, invoice note) and served to other users.</li>
+    <li><strong>Reflected XSS</strong> — payload in the request (query parameter) echoed into the response.</li>
+    <li><strong>DOM-based XSS</strong> — client-side JavaScript reads attacker-influenced data (<code>location.hash</code>, <code>postMessage</code>, API responses) and writes it to a dangerous sink (<code>innerHTML</code>, <code>document.write</code>, <code>eval</code>, <code>setTimeout(string)</code>, <code>location = "javascript:..."</code>). The server may never see the payload.</li>
+  </ul>
+  <p><strong>Contextual output encoding</strong> is the core defence: the correct encoding depends on where data lands. HTML element content needs <code>&amp;lt;</code>, <code>&amp;gt;</code>, <code>&amp;amp;</code>, quotes encoded; an HTML attribute value needs quoting plus attribute encoding; a JavaScript string needs JS escaping (<code>\x3c</code> style); a URL parameter needs percent-encoding and a scheme allow-list (no <code>javascript:</code>); CSS values need CSS escaping. Template engines do HTML-context escaping automatically (Thymeleaf <code>th:text</code>, React JSX text, Go <code>html/template</code> with full contextual escaping, Jinja2 with autoescape); XSS usually enters through escape hatches: <code>th:utext</code>, <code>dangerouslySetInnerHTML</code>, <code>v-html</code>, <code>|safe</code>, <code>template.HTML(userInput)</code>.</p>
+  <p>When you genuinely need user-supplied HTML (rich-text editor), sanitise with a maintained allow-list sanitizer (OWASP Java HTML Sanitizer server-side, DOMPurify client-side) — never with your own regex.</p>
+
+  <h3>3.8 Content Security Policy (CSP)</h3>
+  <p>CSP is a response header that tells the browser which sources of script, style, frames and connections are permitted. A strict policy turns many XSS bugs from "full compromise" into "blocked and reported". The modern recommendation (from Google's research on CSP effectiveness) is a <strong>nonce-based strict CSP</strong>:</p>
+  <pre><code class="language-plaintext">Content-Security-Policy: script-src 'nonce-R4nd0m...' 'strict-dynamic'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; report-to csp-endpoint</code></pre>
+  <p>Every legitimate <code>&lt;script&gt;</code> carries the per-response random nonce; injected scripts do not know it. <code>'strict-dynamic'</code> lets trusted scripts load further scripts. Avoid <code>'unsafe-inline'</code> and <code>'unsafe-eval'</code>; host allow-lists (<code>script-src https://cdn.example.com</code>) are often bypassable via JSONP endpoints or script gadgets on allowed hosts. Roll out with <code>Content-Security-Policy-Report-Only</code> first.</p>
+
+  <h3>3.9 Trusted Types</h3>
+  <p>Trusted Types attacks DOM XSS at the sink. With the header <code>Content-Security-Policy: require-trusted-types-for 'script'</code>, the browser refuses to accept plain strings at dangerous sinks such as <code>innerHTML</code>; code must pass a <code>TrustedHTML</code> object created by a named policy (e.g. one that runs DOMPurify). The set of places that can create trusted values becomes small and reviewable. Support: Chromium-based browsers since 2020; <span class="tag version">Version-sensitive · checked Nov 2026</span> other engines have been adding support — check current compatibility tables, and treat Trusted Types as defense in depth.</p>
+
+  <h3>3.10 Cross-site request forgery (CSRF)</h3>
+  <p>CSRF abuses <em>ambient credentials</em>: the browser automatically attaches cookies (and HTTP Basic or client-certificate credentials) to requests for your site, even when the request is initiated by another site. A malicious page can auto-submit a form to <code>https://bank.example/transfer</code>; if the bank authenticates by cookie alone, the transfer happens as the victim. Defences:</p>
+  <ul>
+    <li><strong>Synchronizer / double-submit tokens</strong> — the server requires a secret token in a header or form field that a cross-site page cannot read. Spring Security's <code>CsrfFilter</code> implements this (with BREACH-resistant masking since 6.0).</li>
+    <li><strong>SameSite cookies</strong> — <code>Lax</code> stops cookies on cross-site subresource requests and cross-site POSTs (but sends them on top-level GET navigations); <code>Strict</code> stops them on all cross-site requests. Note "site" means registrable domain: <code>evil.example.com</code> is same-site with <code>app.example.com</code>, so a compromised sibling subdomain bypasses SameSite.</li>
+    <li><strong>Fetch metadata</strong> — browsers send <code>Sec-Fetch-Site</code>; a server can reject <code>cross-site</code> state-changing requests.</li>
+    <li><strong>Never change state on GET.</strong></li>
+  </ul>
+  <p><strong>When do stateless APIs need CSRF protection?</strong> If and only if the browser attaches credentials automatically. An API authenticated solely by an <code>Authorization: Bearer</code> header that JavaScript sets explicitly is not CSRF-able, because a cross-site page cannot make the browser add that header. The moment you move tokens into cookies (a BFF, or "JWT in a cookie"), CSRF protection is required again. CORS is not a CSRF defence by itself: simple requests (form-encoded POSTs) are sent cross-origin without preflight; CORS only controls whether the attacker can <em>read</em> the response.</p>
+
+  <h3>3.11 Server-side request forgery (SSRF)</h3>
+  <p>SSRF occurs when the server makes a network request to a destination influenced by the attacker — webhooks, URL previews, PDF/image renderers fetching remote assets, "import from URL", XML external entities, redirects followed by HTTP clients. The server usually sits inside the trust boundary, so it can reach things the attacker cannot: internal admin services, databases with HTTP interfaces, Kubernetes APIs, and especially <strong>cloud instance metadata services</strong> (<code>169.254.169.254</code> on AWS, Azure, GCP), which hand out temporary credentials for the instance's role. Variants include <em>blind SSRF</em> (attacker sees no response but can scan or trigger side effects) and bypasses via redirects, alternative IP encodings, IPv6, and DNS rebinding (a hostname that resolves to a public IP at validation time and a private IP at fetch time).</p>
+  <p><strong>IMDSv2</strong> on AWS requires a session token obtained via an HTTP <code>PUT</code> with a TTL header before metadata can be read, and the token response has an IP hop limit (default 1 for EC2; set to 2 where containers need it, or block container access entirely). Most SSRF primitives can only issue GETs with no custom headers, so IMDSv2 blocks them. Azure and GCP require a <code>Metadata: true</code> / <code>Metadata-Flavor: Google</code> header for the same reason.</p>
+
+  <h3>3.12 Insecure deserialization</h3>
+  <p>Native object serialization formats (Java <code>ObjectInputStream</code>, Python <code>pickle</code>, .NET <code>BinaryFormatter</code>, PHP <code>unserialize</code>, Ruby <code>Marshal</code>, YAML loaders that construct arbitrary types) let the byte stream choose which classes to instantiate. Combined with "gadget" classes on the classpath whose deserialization hooks (<code>readObject</code>, <code>hashCode</code>, <code>toString</code>) have side effects, an attacker can chain calls to execute code. Jackson is safe by default but becomes vulnerable when polymorphic typing is enabled for broad base types (<code>activateDefaultTyping</code>, <code>@JsonTypeInfo(use = Id.CLASS)</code> on <code>Object</code> fields). SnakeYAML before 2.0 constructed arbitrary types by default (CVE-2022-1471). Defences: use data-only formats (JSON into concrete DTOs, Protobuf); never deserialize untrusted native formats; if unavoidable, use <code>ObjectInputFilter</code> allow-lists (JEP 290/415); for Jackson polymorphism use logical type names with <code>Id.NAME</code> and a closed set of subtypes, or a <code>PolymorphicTypeValidator</code>.</p>
+
+  <h3>3.13 Path traversal</h3>
+  <p>Path traversal occurs when user input is used to build a file path, and sequences like <code>../</code> (or encoded variants, absolute paths, or symlinks) escape the intended directory. A download endpoint <code>/files?name=../../etc/passwd</code> or a ZIP extraction that writes entries named <code>../../app/config.yml</code> ("Zip Slip") are classic forms. Defence: do not use user input as paths at all — map IDs to stored paths server-side; if you must, resolve and normalise the path, then verify it starts with the canonical base directory (<code>Path.normalize()</code> + <code>startsWith</code>, or <code>toRealPath()</code> to resolve symlinks), and allow-list file names.</p>
+
+  <h3>3.14 Testing approaches: SAST, DAST, IAST, SCA, fuzzing</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Approach</th><th>What it examines</th><th>Good at</th><th>Weak at</th><th>Examples</th></tr></thead>
+    <tbody>
+      <tr><td>SAST</td><td>Source/bytecode, data flow from sources to sinks</td><td>Injection, unsafe APIs, hard-coded secrets</td><td>Authorization logic, config, false positives</td><td>Semgrep, CodeQL, SpotBugs + Find Security Bugs, SonarQube</td></tr>
+      <tr><td>DAST</td><td>Running app via HTTP</td><td>Misconfig, headers, reflected XSS, some injection</td><td>Coverage of authenticated/complex flows; BOLA</td><td>OWASP ZAP, Burp Suite, Nuclei templates</td></tr>
+      <tr><td>IAST / RASP</td><td>Instrumented runtime during tests</td><td>Low false positives for injection paths actually exercised</td><td>Agent overhead, language support, cost</td><td>Commercial agents</td></tr>
+      <tr><td>SCA</td><td>Dependencies vs advisories</td><td>Known CVEs</td><td>Zero-days, malicious packages</td><td>Dependabot, OSV-Scanner, Snyk, Trivy</td></tr>
+      <tr><td>Fuzzing</td><td>Random/structured inputs to parsers</td><td>Crashes, parser bugs, DoS</td><td>Logic bugs</td><td>Jazzer (JVM), Go native fuzzing, Atheris (Python)</td></tr>
+      <tr><td>Security unit/integration tests</td><td>Your invariants</td><td>BOLA, BFLA, mass assignment regressions</td><td>Only what you think of</td><td>spring-security-test, pytest, Go httptest</td></tr>
+    </tbody>
+  </table></div>
+</section>

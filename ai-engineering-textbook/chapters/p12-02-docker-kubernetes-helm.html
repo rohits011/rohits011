@@ -1,0 +1,1219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker, Kubernetes &amp; Helm — AI-Era Software Engineering</title>
+<meta name="description" content="Container images and BuildKit, Kubernetes architecture and the reconciliation loop, workloads, networking, probes, resources, autoscaling and operators, and packaging with Helm and Kustomize — anchored in Spring Boot experience.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p12-02-docker-kubernetes-helm" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 12 · Chapter 2</p>
+  <h1>Docker, Kubernetes &amp; Helm</h1>
+  <p class="lede">A container image replaces your fat JAR as the unit of delivery; Kubernetes replaces your hand-run servers with a control loop that continuously drives the cluster toward the state you declare; Helm and Kustomize package that declaration for many environments. This chapter explains all three from the inside, with production-grade artifacts for the Lumen platform's Spring Boot, Python and Go services.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Chapter 12.1 (processes, cgroups, namespaces, TCP, DNS, load balancing); basic Docker CLI use.</li>
+    <li><strong>You will be able to:</strong> build small, cache-efficient, secure images for JVM, Go and Python services; explain what every Kubernetes control-plane component does when you run <code>kubectl apply</code>; write Deployments with correct probes, resources, autoscaling and disruption budgets; route traffic with Services and Gateway API; and package it all as a Helm chart.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: From Fat JARs to Declarative Clusters</h2>
+  <p>Spring Boot solved one deployment problem brilliantly: <code>java -jar app.jar</code> runs anywhere a JVM exists. But "anywhere a JVM exists" turned out to be the hard part. Which JDK version? Which OS packages for fonts or native libraries? Which CA certificates? Which system user, which ports, which memory settings? And once you have twenty services in three languages, how do you restart a crashed process, replace an unhealthy host, roll out version 2 without downtime, or scale to traffic?</p>
+  <p><strong>Containers</strong> answer the first set of questions by shipping the whole userland — JRE, libraries, certificates, your app — as an immutable, content-addressed image that runs identically on a laptop and in production. <strong>Kubernetes</strong> answers the second set by letting you <em>declare</em> the desired state ("three replicas of orders-service v1.8.2, each with 1 CPU and 1.5 GiB, reachable as <code>orders</code>, never fewer than two available") and running controllers that continuously reconcile reality toward that declaration. <strong>Helm</strong> and <strong>Kustomize</strong> answer the third: how to express that declaration once and vary it per environment.</p>
+  <p>In Chapter 1 the Lumen platform ran on VMs under systemd. In this chapter we containerise <code>orders-service</code> (Spring Boot), <code>assist-service</code> (FastAPI) and <code>edge-gateway</code> (Go), and deploy them to Kubernetes with probes, resource budgets, autoscaling, disruption budgets and Gateway API routing. Chapter 3 will build these artifacts in CI and deploy them with Argo CD; Chapter 4 provides the EKS cluster.</p>
+
+<div class="bridge">
+  <h4>Bridging from Java &amp; Spring Boot</h4>
+  <dl>
+    <dt>What you already know</dt><dd>Fat JARs built by <code>spring-boot-maven-plugin</code>; <code>application-{profile}.yaml</code> with <code>spring.profiles.active</code>; <code>/actuator/health</code> for load-balancer checks; external config through environment variables and <code>@ConfigurationProperties</code>; perhaps a Jenkins job that <code>scp</code>s a JAR and restarts a systemd unit.</dd>
+    <dt>Why that is not enough</dt><dd>A fat JAR still depends on the host's JRE and OS; it does not restart itself, scale itself, or roll back. Spring profiles bake environment knowledge into the artifact. A single health endpoint conflates "restart me" with "do not send me traffic", which in Kubernetes causes cascading restarts.</dd>
+    <dt>The modern approach</dt><dd>The <strong>container image</strong> is the artifact (fat JAR → layered image). Configuration is injected at deploy time from <strong>ConfigMaps and Secrets</strong> (profiles → environment-specific values outside the image). Health becomes three <strong>probes</strong> — startup, liveness, readiness — mapped to Spring Boot's <code>/actuator/health/liveness</code> and <code>/readiness</code> groups. Deployment becomes a <strong>declarative manifest</strong> reconciled by controllers.</dd>
+    <dt>Where Python and Go fit</dt><dd>Go compiles to a static binary that fits in a 2–10 MB distroless image and starts in milliseconds — ideal for gateways and operators (Kubernetes itself is written in Go, and controllers are usually written with <code>controller-runtime</code>). Python images are dominated by dependency size (PyTorch wheels can exceed a gigabyte); careful layering and slim bases matter most there.</dd>
+    <dt>In production</dt><dd>Most incidents on Kubernetes are not Kubernetes bugs: they are probes that restart healthy-but-slow JVMs, memory limits below JVM footprint, missing PodDisruptionBudgets during node upgrades, and rollouts without readiness gating. Every one is covered here.</dd>
+    <dt>Use it when / avoid it when</dt><dd>Use Kubernetes when you run many services, need self-healing and standardised operations, or need portability across clouds. Avoid it for a handful of services a small team could run on a managed PaaS (App Runner, Cloud Run, ECS Fargate, Heroku-style platforms) — Kubernetes' operational cost is real.</dd>
+  </dl>
+</div>
+
+  <h3>1.1 Mapping your mental model</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Spring Boot / VM world</th><th>Container / Kubernetes world</th></tr></thead>
+    <tbody>
+      <tr><td>Fat JAR in Nexus/Artifactory</td><td>OCI image in a registry (ECR, GHCR, Harbor), referenced by digest</td></tr>
+      <tr><td><code>application-prod.yaml</code> inside the JAR</td><td>ConfigMap/Secret mounted as env vars or files; Spring reads them via <code>spring.config.import</code></td></tr>
+      <tr><td><code>/actuator/health</code> for the LB</td><td>startupProbe, livenessProbe, readinessProbe</td></tr>
+      <tr><td>systemd <code>Restart=on-failure</code></td><td>kubelet restart policy + ReplicaSet controller</td></tr>
+      <tr><td><code>MemoryMax=</code>, <code>CPUQuota=</code></td><td><code>resources.limits</code>; <code>requests</code> drive scheduling</td></tr>
+      <tr><td>Load balancer target group</td><td>Service + EndpointSlices; Gateway/HTTPRoute</td></tr>
+      <tr><td>Jenkins job "deploy to prod"</td><td><code>kubectl apply</code> / Helm / Argo CD sync of a desired state in Git</td></tr>
+      <tr><td>Spring Cloud Config / Eureka</td><td>ConfigMaps + Kubernetes DNS-based service discovery</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="history">
+  <h2>2. History: From chroot to Gateway API</h2>
+  <p>Process isolation is older than most engineers: <code>chroot</code> appeared in Unix V7 in 1979; FreeBSD jails in 2000; Solaris Zones in 2004; Linux namespaces and cgroups from 2002–2008 (Chapter 1). <strong>Docker</strong>, released by dotCloud in March 2013, did not invent isolation; it invented the developer experience — the Dockerfile, layered images, a registry protocol, and <code>docker run</code>. In June 2015 Docker and others founded the <strong>Open Container Initiative (OCI)</strong>, which standardised the image format, the runtime specification (<code>runc</code> is the reference implementation) and later the distribution (registry) API. BuildKit, a new build engine, became Docker's default builder in Docker Engine 23.0 (2023).</p>
+  <p>Inside Google, <strong>Borg</strong> had run nearly all workloads on shared clusters since the mid-2000s; the 2015 EuroSys paper "Large-scale cluster management at Google with Borg" described it publicly. Google engineers (Joe Beda, Brendan Burns, Craig McLuckie and others) announced <strong>Kubernetes</strong> in June 2014 as an open-source system inspired by Borg and its successor Omega; version 1.0 shipped in July 2015 together with the formation of the Cloud Native Computing Foundation (CNCF), to which Google donated it. Key milestones since: CRDs (2017) and the operator pattern; the Container Runtime Interface (CRI) and the removal of the built-in Docker shim in v1.24 (May 2022), after which nodes run containerd or CRI-O directly; Gateway API v1.0 (October 2023) as the successor to Ingress; native <strong>sidecar containers</strong> GA in v1.33 (April 2025); <strong>Dynamic Resource Allocation</strong> (DRA, for GPUs and other devices) GA in v1.34 (August 2025); <strong>in-place Pod resize</strong> GA in v1.35 (December 2025); and v1.37 "Garhwal" in August 2026, with HPA scale-to-zero moving to beta <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+  <p>In November 2025 Kubernetes SIG Network and the Security Response Committee announced the retirement of the community <strong>ingress-nginx</strong> controller — for years the de facto default Ingress implementation — with best-effort maintenance ending in March 2026 and a recommendation to migrate to Gateway API or another controller <span class="tag fact">Verified</span>. That event made Gateway API the default choice for new clusters.</p>
+  <p><strong>Helm</strong> began at Deis in 2015 and joined the CNCF; Helm 3 (November 2019) removed the cluster-side Tiller component that had been a security liability; <strong>Helm 4</strong> was released on 12 November 2025, Helm's tenth anniversary, with a redesigned plugin system (including WebAssembly plugins), server-side apply support and a restructured SDK <span class="tag version">Version-sensitive · checked Nov 2026</span>. <strong>Kustomize</strong> was built into <code>kubectl</code> (<code>kubectl apply -k</code>) in v1.14 (2019).</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 Images, layers and the OCI format</h3>
+  <p>An OCI image is three kinds of content-addressed blobs: <strong>layers</strong> (tarballs of filesystem changes), a <strong>config</strong> (JSON with environment, entrypoint, user, working directory, and the ordered list of layer digests), and a <strong>manifest</strong> that points to the config and layers by SHA-256 digest. A multi-architecture image adds an <strong>index</strong> that points to one manifest per platform (<code>linux/amd64</code>, <code>linux/arm64</code>). Because everything is addressed by hash, two images that share a base layer store and transfer it once, and an image reference by digest (<code>orders@sha256:3f1…</code>) is immutable, while a tag (<code>orders:1.8.2</code>, or worse, <code>:latest</code>) is a mutable pointer.</p>
+  <p>At runtime, the container runtime stacks the read-only layers with an <strong>overlay filesystem</strong> (overlayfs) and adds a thin writable layer on top. Writes copy the file up into that layer (copy-on-write); deletions create "whiteout" entries. That is why deleting a file in a later Dockerfile step never reduces image size — the bytes remain in the earlier layer.</p>
+
+  <h3>3.2 Dockerfile instructions and layer caching</h3>
+  <p>Each <code>RUN</code>, <code>COPY</code> and <code>ADD</code> creates a layer; the builder reuses a cached layer if the instruction and its inputs (for <code>COPY</code>, the checksums of copied files) are unchanged <em>and</em> every previous layer was a cache hit. Order instructions from least to most frequently changing: base image, OS packages, dependency manifests (<code>pom.xml</code>, <code>go.mod</code>, <code>pyproject.toml</code>/<code>uv.lock</code>), dependency download, then source code. Copying the whole source tree before resolving dependencies invalidates the dependency layer on every commit and turns a 20-second build into a 5-minute one.</p>
+  <p><code>ENTRYPOINT</code> and <code>CMD</code> have a <em>shell form</em> (<code>CMD java -jar app.jar</code>, run via <code>/bin/sh -c</code>) and an <em>exec form</em> (<code>CMD ["java","-jar","app.jar"]</code>, run directly as PID 1). Use exec form so signals reach your process (Chapter 1, §3.2).</p>
+
+  <h3>3.3 BuildKit and multi-stage builds</h3>
+  <p><strong>BuildKit</strong> builds a dependency graph of stages and executes independent stages in parallel, skips stages not needed for the target, and supports features the legacy builder never had: <strong>cache mounts</strong> (<code>RUN --mount=type=cache,target=/root/.m2</code> persists the Maven repository across builds without putting it in a layer), <strong>secret mounts</strong> (<code>--mount=type=secret,id=npmrc</code> exposes a credential to one step without leaking it into image history), SSH forwarding, external cache export/import (<code>--cache-to</code>/<code>--cache-from</code> to a registry or GitHub Actions cache), multi-platform builds via <code>docker buildx</code>, and SBOM and provenance attestations.</p>
+  <p>A <strong>multi-stage</strong> Dockerfile uses a full SDK image (JDK + Maven, Go toolchain, Python build tools) in a <em>build</em> stage and copies only the output into a minimal <em>runtime</em> stage. For Java that means a JRE instead of a JDK; for Go, a static binary on a distroless or <code>scratch</code> base; for Python, a pre-built virtual environment on a slim base. Smaller runtime images pull faster (faster scale-out), have fewer CVEs, and give attackers fewer tools.</p>
+
+  <h3>3.4 Layered Spring Boot jars, Buildpacks and Jib</h3>
+  <p>A fat JAR is one 80 MB file; change one class and the whole 80 MB layer changes. Spring Boot's <strong>layered jar</strong> support (since 2.3) writes a <code>layers.idx</code> into the JAR that groups content into <code>dependencies</code>, <code>spring-boot-loader</code>, <code>snapshot-dependencies</code> and <code>application</code>. The <code>tools</code> jar mode (Spring Boot 3.3+, replacing the older <code>layertools</code> mode) extracts those groups into directories that you copy as separate image layers, so a typical code change ships only the few-hundred-KB <code>application</code> layer.</p>
+  <p>Two alternatives avoid writing a Dockerfile at all. <strong>Cloud Native Buildpacks</strong> (Paketo for Java) are what <code>./mvnw spring-boot:build-image</code> uses: they detect a Java app, pick a JRE, apply memory calculator logic, layer the app, and produce a reproducible OCI image. <strong>Jib</strong> (Google) is a Maven/Gradle plugin that builds layered images directly from the build's class output — no Docker daemon required — and pushes them to a registry. Both trade flexibility for consistency; platform teams like them because every service gets the same base image and patching policy.</p>
+
+  <h3>3.5 JVM container awareness and startup</h3>
+  <p>Since JDK 10 (and 8u191) the JVM reads cgroup limits (<code>-XX:+UseContainerSupport</code>, on by default), so <code>MaxRAMPercentage</code> (default 25%!) applies to the container limit rather than host RAM, and <code>availableProcessors()</code> reflects the CPU limit. Two consequences: the default heap is often too <em>small</em> (25% of a 2 GiB limit is 512 MiB), so set <code>-XX:MaxRAMPercentage=70</code> to 75; and in a container with fewer than 2 CPUs and less than 1792 MB, the JVM ergonomically selects SerialGC — usually fine for small services but surprising if you expected G1.</p>
+  <p>Startup time matters more on Kubernetes because it gates rollouts and autoscaling. Options, in increasing effort: Class Data Sharing archives (Spring Boot 3.3+ can produce a CDS-friendly layout; JDK 24's AOT cache, JEP 483, extends this), Spring AOT processing, CRaC checkpoint/restore (Spring Framework 6.1+ support), and GraalVM native images (milliseconds to start, lower memory, but longer builds and reflection constraints) <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+
+  <h3>3.6 Kubernetes architecture</h3>
+  <p>A cluster has a <strong>control plane</strong> and <strong>worker nodes</strong>.</p>
+  <ul>
+    <li><strong>kube-apiserver</strong> — the only component that talks to etcd. A RESTful, versioned API for all objects; performs authentication, authorisation (RBAC), admission (mutating and validating webhooks, ValidatingAdmissionPolicy with CEL), schema validation, and serves <em>watches</em> — long-lived streams of change events that every other component consumes.</li>
+    <li><strong>etcd</strong> — a strongly consistent key-value store using Raft consensus; holds all cluster state. Typically 3 or 5 members; losing quorum makes the API read-only or unavailable (running workloads keep running).</li>
+    <li><strong>kube-scheduler</strong> — watches for Pods with no <code>nodeName</code>, filters nodes that cannot fit the Pod (resources, taints, affinity, topology spread), scores the rest, and <em>binds</em> the Pod to the best node by writing to the API.</li>
+    <li><strong>kube-controller-manager</strong> — runs dozens of controllers (Deployment, ReplicaSet, StatefulSet, Job, Node, EndpointSlice, ServiceAccount, garbage collector…), each a reconciliation loop.</li>
+    <li><strong>cloud-controller-manager</strong> — cloud-specific controllers (on EKS: node lifecycle; load balancers are usually handled by the AWS Load Balancer Controller add-on).</li>
+    <li><strong>kubelet</strong> (every node) — watches Pods bound to its node, asks the container runtime (containerd via CRI) to create them, mounts volumes, runs probes, reports status, and enforces resource limits via cgroups.</li>
+    <li><strong>kube-proxy</strong> (every node, optional with eBPF CNIs) — programs iptables, IPVS or nftables rules so Service virtual IPs reach backend Pods.</li>
+    <li><strong>CNI plugin</strong> — gives each Pod an IP and connectivity (AWS VPC CNI, Cilium, Calico).</li>
+    <li><strong>CoreDNS</strong> — cluster DNS: <code>orders.lumen.svc.cluster.local</code> → Service IP.</li>
+  </ul>
+
+  <h3>3.7 The reconciliation loop</h3>
+  <p>Every Kubernetes controller follows one pattern: <em>observe</em> the desired state (spec) and the actual state (status, child objects), <em>diff</em> them, <em>act</em> to reduce the difference, and repeat. Controllers are <strong>level-triggered</strong>, not edge-triggered: they do not react to "a pod was deleted" as an event to be processed once; they react to "the current number of pods is 2 and the desired number is 3", which is robust to missed events, restarts and concurrent changes. Informers maintain a local cache fed by watches; work queues de-duplicate and rate-limit reconcile requests. Spring developers can think of it as a <code>@Scheduled</code> job that is also woken by change notifications, is idempotent, and never assumes what happened before.</p>
+
+  <h3>3.8 Pods</h3>
+  <p>A <strong>Pod</strong> is the unit of scheduling: one or more containers that share a network namespace (one IP, shared <code>localhost</code>), can share volumes, and are scheduled together on one node. Init containers run to completion, in order, before app containers start. <strong>Sidecar containers</strong> (GA in v1.33) are init containers with <code>restartPolicy: Always</code>: they start before the main containers, keep running alongside them, and are terminated after them — fixing long-standing problems with log shippers and service-mesh proxies in Jobs and during shutdown. Pods are cattle: they are never "moved"; a replacement Pod with a new name and IP is created.</p>
+
+  <h3>3.9 Workload controllers</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Controller</th><th>Purpose</th><th>Lumen example</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Deployment</strong> → ReplicaSet → Pods</td><td>Stateless replicas with rolling updates and rollback</td><td>orders-service, assist-service, edge-gateway</td></tr>
+      <tr><td><strong>StatefulSet</strong></td><td>Stable identities (<code>pg-0</code>, <code>pg-1</code>), ordered rollout, a PersistentVolumeClaim per replica</td><td>A self-hosted vector DB or Redis (if not managed)</td></tr>
+      <tr><td><strong>DaemonSet</strong></td><td>One Pod per (matching) node</td><td>Log shipper, OpenTelemetry node agent, CNI</td></tr>
+      <tr><td><strong>Job</strong></td><td>Run to completion with retries and parallelism</td><td>Re-embedding the document corpus</td></tr>
+      <tr><td><strong>CronJob</strong></td><td>Jobs on a schedule</td><td>Nightly order reconciliation report</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>3.10 Services and service discovery</h3>
+  <p>Pod IPs change; a <strong>Service</strong> gives a stable virtual IP (ClusterIP) and DNS name to a set of Pods selected by labels. The EndpointSlice controller keeps the list of <em>ready</em> Pod IPs behind each Service. Types: <code>ClusterIP</code> (internal only), <code>NodePort</code> (a port on every node), <code>LoadBalancer</code> (provisions a cloud load balancer — on EKS an NLB via the AWS Load Balancer Controller), <code>ExternalName</code> (a DNS CNAME), and <em>headless</em> (<code>clusterIP: None</code>: DNS returns Pod IPs directly, used by StatefulSets and client-side balancing for gRPC).</p>
+
+  <h3>3.11 kube-proxy: iptables, IPVS, nftables and eBPF</h3>
+  <p>A ClusterIP exists on no interface; it is implemented by rules on every node. In <strong>iptables</strong> mode, kube-proxy writes a chain per Service that DNATs the destination to a randomly chosen endpoint (with probability rules); rule evaluation is linear, so clusters with tens of thousands of Services pay in update latency and CPU. <strong>IPVS</strong> mode uses the kernel's L4 load balancer with hash tables and real algorithms (round-robin, least-connection). <strong>nftables</strong> mode, GA in v1.33, uses the modern netfilter API with maps and is the forward path for kube-proxy <span class="tag version">Version-sensitive · checked Nov 2026</span>. <strong>eBPF</strong> data planes such as Cilium replace kube-proxy entirely, resolving Service IPs at the socket level (<code>connect()</code> is rewritten to the backend address) or at the TC/XDP hooks, avoiding conntrack and DNAT for much of the traffic.</p>
+
+  <h3>3.12 Ingress vs Gateway API</h3>
+  <p><strong>Ingress</strong> (stable since v1.19) is a single resource that maps hosts and paths to Services, with everything else — TLS options, timeouts, rewrites, canary weights — pushed into controller-specific annotations. That made Ingress manifests non-portable and mixed infrastructure and application concerns in one object. <strong>Gateway API</strong> splits roles: a <code>GatewayClass</code> (installed by the infrastructure provider, e.g., AWS Load Balancer Controller, Envoy Gateway, Cilium, Istio), a <code>Gateway</code> (owned by the platform team: listeners, ports, TLS certificates, which namespaces may attach), and <code>HTTPRoute</code>/<code>GRPCRoute</code>/<code>TLSRoute</code> objects (owned by application teams: matches, filters, weighted backends, timeouts). Header matching, traffic splitting and cross-namespace delegation are part of the spec, not annotations.</p>
+
+  <h3>3.13 ConfigMaps and Secrets</h3>
+  <p>A <strong>ConfigMap</strong> holds non-sensitive configuration; a <strong>Secret</strong> holds sensitive values, base64-encoded (not encrypted!) in the API, optionally encrypted at rest in etcd with a KMS provider, and access-controlled via RBAC. Both can be exposed as environment variables (read once at container start) or mounted as files (updated in place by the kubelet after a delay, except with <code>subPath</code>). Spring Boot consumes them naturally: environment variables map via relaxed binding (<code>SPRING_DATASOURCE_URL</code>), and mounted directories can be imported with <code>spring.config.import=optional:configtree:/etc/config/</code>. In production, secrets usually originate in a secret manager (AWS Secrets Manager, Vault) and are synced by External Secrets Operator or mounted by the Secrets Store CSI driver.</p>
+  <div class="callout java"><p class="callout-title">Profiles vs ConfigMaps</p><p>Keep Spring profiles for <em>behavioural</em> variation that the code knows about (e.g., a <code>kubernetes</code> profile enabling probe groups). Put <em>environment values</em> — URLs, pool sizes, feature toggles — in ConfigMaps per environment. One image, promoted unchanged from dev to prod, with environment supplied from outside: the third factor of the Twelve-Factor App.</p></div>
+
+  <h3>3.14 Probes: startup, liveness, readiness</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Probe</th><th>Question</th><th>On failure</th><th>Spring Boot endpoint</th></tr></thead>
+    <tbody>
+      <tr><td><strong>startupProbe</strong></td><td>Has the app finished starting?</td><td>Kills the container after <code>failureThreshold × periodSeconds</code>; other probes are disabled until it succeeds</td><td><code>/actuator/health/liveness</code></td></tr>
+      <tr><td><strong>livenessProbe</strong></td><td>Is the process irrecoverably broken (deadlock, corrupted state)?</td><td>Container restarted</td><td><code>/actuator/health/liveness</code> (<code>LivenessState</code>)</td></tr>
+      <tr><td><strong>readinessProbe</strong></td><td>Should this Pod receive traffic now?</td><td>Removed from Service endpoints; not restarted</td><td><code>/actuator/health/readiness</code> (<code>ReadinessState</code> + chosen indicators)</td></tr>
+    </tbody>
+  </table></div>
+  <p>Spring Boot enables the probe health groups automatically when it detects Kubernetes (or with <code>management.endpoint.health.probes.enabled=true</code>). By default the liveness group contains only <code>livenessState</code> — deliberately <em>not</em> the database — because if PostgreSQL is down, restarting every replica of every service only makes recovery harder. Readiness may include dependencies you truly cannot serve without, via <code>management.endpoint.health.group.readiness.include=readinessState,db</code>, but be careful: if all replicas become unready at once, the Service has no endpoints and clients get connection errors instead of graceful degradation.</p>
+
+  <h3>3.15 Resources, requests, limits and QoS</h3>
+  <p><strong>Requests</strong> are what the scheduler reserves on a node and what <code>cpu.weight</code> is derived from; <strong>limits</strong> are the cgroup ceilings (<code>cpu.max</code>, <code>memory.max</code>). From them Kubernetes derives a <strong>QoS class</strong>: <em>Guaranteed</em> (every container has requests = limits for CPU and memory), <em>Burstable</em> (some requests set), and <em>BestEffort</em> (nothing set). Under node memory pressure the kubelet evicts BestEffort first, then Burstable Pods exceeding their requests; Guaranteed Pods are last. A common, defensible policy: memory request = limit (memory is not compressible; overcommit causes OOM kills), CPU request set from measured usage, CPU limit either absent or generous (Chapter 1 §6.4). <strong>LimitRange</strong> sets namespace defaults and <strong>ResourceQuota</strong> caps namespace totals.</p>
+
+  <h3>3.16 Autoscaling: HPA, VPA, KEDA and node autoscaling</h3>
+  <ul>
+    <li><strong>HorizontalPodAutoscaler</strong> (<code>autoscaling/v2</code>) changes replica count based on resource metrics (CPU/memory utilisation relative to <em>requests</em>), custom metrics (via a metrics adapter, e.g., requests per second from Prometheus) or external metrics, with configurable scale-up/scale-down behaviour and stabilisation windows.</li>
+    <li><strong>VerticalPodAutoscaler</strong> recommends or applies requests/limits based on observed usage; with in-place resize (GA in v1.35) it can increasingly adjust resources without recreating Pods. Do not let VPA and HPA act on the same metric (CPU) for the same workload.</li>
+    <li><strong>KEDA</strong> (CNCF) scales on event sources — SQS queue depth, Kafka lag, Prometheus queries, cron — and can scale Deployments to and from zero; it creates and drives an HPA under the hood.</li>
+    <li><strong>Node autoscaling</strong>: Cluster Autoscaler adds nodes to node groups when Pods are unschedulable; <strong>Karpenter</strong> provisions right-sized instances directly and consolidates underused nodes (it underpins EKS Auto Mode — Chapter 4).</li>
+  </ul>
+
+  <h3>3.17 Rolling updates and PodDisruptionBudgets</h3>
+  <p>A Deployment's default strategy, <code>RollingUpdate</code>, creates a new ReplicaSet and shifts Pods over, bounded by <code>maxSurge</code> (extra Pods allowed above desired) and <code>maxUnavailable</code> (Pods allowed below desired). A new Pod counts as available only after it is ready for <code>minReadySeconds</code>; a rollout that does not progress within <code>progressDeadlineSeconds</code> is marked failed (it is <em>not</em> automatically rolled back — that is the job of your CD tooling or Argo Rollouts, Chapter 3).</p>
+  <p>A <strong>PodDisruptionBudget</strong> limits <em>voluntary</em> disruptions — node drains during upgrades, Karpenter consolidation, cluster autoscaler scale-down — via the Eviction API: "at least 2 orders-service Pods must remain available" or "at most 1 may be unavailable". It does not protect against involuntary disruptions (node crash, OOM kill). Without PDBs, a routine node-group upgrade can evict all replicas of a service at once.</p>
+
+  <h3>3.18 Custom resources and operators</h3>
+  <p>A <strong>CustomResourceDefinition</strong> extends the API with your own types (<code>kind: VectorIndex</code>); an <strong>operator</strong> is a controller that reconciles those types, encoding operational knowledge as code. Examples you will use: cert-manager (<code>Certificate</code>), External Secrets (<code>ExternalSecret</code>), Argo CD (<code>Application</code>), Karpenter (<code>NodePool</code>), CloudNativePG (<code>Cluster</code>), Prometheus Operator (<code>ServiceMonitor</code>, <code>PrometheusRule</code>). Operators are usually written in Go with Kubebuilder/controller-runtime; Java teams can use the Java Operator SDK or Fabric8 client.</p>
+
+  <h3>3.19 Helm and Kustomize</h3>
+  <p><strong>Helm</strong> is a package manager: a <em>chart</em> is a directory of Go-templated manifests plus <code>values.yaml</code> defaults and <code>Chart.yaml</code> metadata; <code>helm install</code>/<code>upgrade</code> renders templates with merged values and applies them as a <em>release</em> whose history Helm stores (as Secrets in the release namespace), enabling <code>helm rollback</code>. Charts can depend on other charts, be versioned and published to OCI registries, and run <em>hooks</em> (pre-install, pre-upgrade, post-upgrade, test) for migrations or checks. <strong>Kustomize</strong> takes the opposite approach: no templates; plain YAML <em>bases</em> plus <em>overlays</em> that patch them (strategic merge or JSON patch), set images, add labels and generate ConfigMaps with content hashes. Helm suits distributing reusable software with many options; Kustomize suits your own services where you want readable, valid YAML at every step. Many teams combine them (Kustomize post-processing a Helm chart) or let Argo CD render either.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working: What Happens After <code>kubectl apply</code></h2>
+  <h3>4.1 From manifest to running container</h3>
+  <ol>
+    <li><strong>Client side.</strong> <code>kubectl apply -f deployment.yaml</code> reads your kubeconfig, authenticates (on EKS via an exec plugin that obtains a token from AWS IAM), and sends a request to the API server. With server-side apply (<code>--server-side</code>, also used by Helm 4 and Argo CD), the server computes the merge and records <em>field ownership</em> per manager, which prevents tools from silently overwriting each other's fields.</li>
+    <li><strong>API server pipeline.</strong> Authentication → authorisation (RBAC: can this identity <code>patch deployments</code> in namespace <code>lumen</code>?) → mutating admission (defaults, injected sidecars, image digest pinning by policy engines) → schema validation → validating admission (Kyverno/Gatekeeper policies, ValidatingAdmissionPolicy: "images must come from our ECR", "no privileged containers") → persistence to etcd with a new <code>resourceVersion</code> → watch events fan out.</li>
+    <li><strong>Deployment controller</strong> sees the Deployment's new pod template hash, creates (or scales) a ReplicaSet for it, and scales the old one down according to the rolling-update parameters.</li>
+    <li><strong>ReplicaSet controller</strong> sees desired replicas 3, actual 0, and creates three Pod objects with no <code>nodeName</code>.</li>
+    <li><strong>Scheduler</strong> watches unscheduled Pods. For each, it <em>filters</em> (enough allocatable CPU/memory for the requests? taints tolerated? node affinity? topology spread satisfiable? volumes attachable in that zone?) and <em>scores</em> (spreading, image locality, balanced utilisation), then writes a Binding.</li>
+    <li><strong>kubelet</strong> on the chosen node sees a Pod bound to it. It creates the Pod sandbox via CRI (containerd starts a "pause" container that holds the network namespace), calls the <strong>CNI plugin</strong> to attach an interface and IP, pulls images (respecting <code>imagePullPolicy</code>), mounts volumes, ConfigMaps and Secrets, runs init containers in order, starts sidecars and then app containers via <code>runc</code> (namespaces, cgroups, seccomp, capabilities — Chapter 1 §7.10, automated).</li>
+    <li><strong>Probes.</strong> The kubelet runs the startup probe until success, then liveness and readiness probes periodically. On readiness success, it updates the Pod's <code>Ready</code> condition.</li>
+    <li><strong>EndpointSlice controller</strong> adds the ready Pod's IP to the Service's EndpointSlice; <strong>kube-proxy</strong> (or Cilium) on every node updates its rules; the AWS Load Balancer Controller registers the Pod IP in the target group (with IP target mode). Only now does traffic arrive.</li>
+  </ol>
+
+  <h3>4.2 The packet path to a Pod</h3>
+  <p>A request from <code>edge-gateway</code> to <code>http://orders.lumen.svc.cluster.local:80</code>: the gateway's resolver asks CoreDNS (the nameserver in its <code>resolv.conf</code>) and gets the ClusterIP, say <code>172.20.14.7</code>. The gateway calls <code>connect()</code> to <code>172.20.14.7:80</code>. In iptables mode the packet leaves the gateway Pod's network namespace through its veth pair, hits the node's <code>PREROUTING</code>/<code>OUTPUT</code> chains, matches <code>KUBE-SERVICES</code> → <code>KUBE-SVC-…</code> → randomly one <code>KUBE-SEP-…</code> chain, and is DNATed to a Pod IP and target port, e.g., <code>10.0.37.21:8080</code>; conntrack records the translation. If the target Pod is on another node, the node routes the packet: with AWS VPC CNI, Pod IPs are real VPC addresses, so the packet travels on the VPC fabric with no overlay; with overlay CNIs it is encapsulated (VXLAN/Geneve). On the destination node it is delivered through the target Pod's veth to its network namespace and Tomcat's listening socket. The reply is reverse-NATed via conntrack so the gateway sees a response from the ClusterIP.</p>
+
+  <h3>4.3 A rolling update, step by step</h3>
+  <p>With <code>replicas: 4</code>, <code>maxSurge: 1</code>, <code>maxUnavailable: 0</code>: the controller creates one new Pod (5 total). When it becomes ready and stays ready for <code>minReadySeconds</code>, the controller scales the old ReplicaSet to 3 — which deletes one old Pod. Deletion sets a <code>deletionTimestamp</code>; the EndpointSlice controller removes the Pod from endpoints <em>and</em>, concurrently, the kubelet runs the <code>preStop</code> hook and sends SIGTERM. Because endpoint removal propagates asynchronously to every node's kube-proxy and to external load balancers, the Pod may receive new connections for a short time after SIGTERM — the reason for a <code>preStop</code> sleep (Chapter 1 §4.6). After <code>terminationGracePeriodSeconds</code> the kubelet sends SIGKILL. The cycle repeats until all four Pods run the new version.</p>
+
+  <h3>4.4 How HPA decides</h3>
+  <p>Every 15 seconds (the default sync period) the HPA controller fetches metrics (from metrics-server for CPU/memory, or the custom/external metrics APIs), computes a desired replica count per metric, takes the maximum, applies the <code>behavior</code> policies (e.g., scale up by at most 100% or 4 Pods per 60 s; scale down by at most 10% per minute after a 300 s stabilisation window), clamps to <code>[minReplicas, maxReplicas]</code>, and updates the Deployment's <code>scale</code> subresource. Pods that are not yet ready or are missing metrics are treated conservatively to avoid thrashing during startup — another reason JVM startup time matters.</p>
+
+  <h3>4.5 How Helm performs an upgrade</h3>
+  <p><code>helm upgrade --install orders ./orders -f values-prod.yaml</code>: Helm loads the chart and its dependencies, merges values (chart defaults ← parent chart ← <code>-f</code> files in order ← <code>--set</code>), renders templates with the Go template engine and Sprig functions, validates against the cluster API (optionally a JSON schema in <code>values.schema.json</code>), runs <code>pre-upgrade</code> hooks and waits for them, then computes a three-way merge between the previous release's manifest, the live objects and the new manifest (or uses server-side apply in Helm 4), applies changes, optionally waits for resources to become ready (<code>--wait</code>; Helm 4 uses kstatus-based readiness checking), runs <code>post-upgrade</code> hooks, and stores the new release revision. <code>helm rollback orders 41</code> re-applies revision 41's stored manifest.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture Diagrams</h2>
+  <h3>5.1 Control plane and nodes</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph CP["Control plane (managed by EKS)"]
+    API["kube-apiserver"]
+    ETCD[("etcd (Raft, 3 members)")]
+    SCH["kube-scheduler"]
+    CM["kube-controller-manager"]
+    API --- ETCD
+    SCH -->|"watch + bind"| API
+    CM -->|"watch + reconcile"| API
+  end
+  subgraph N1["Worker node"]
+    KL["kubelet"] --> CRI["containerd (CRI)"]
+    CRI --> P1["Pod: orders-service"]
+    CRI --> P2["Pod: edge-gateway"]
+    KP["kube-proxy / Cilium"]
+    CNI["CNI plugin (VPC CNI)"]
+  end
+  DEV["kubectl / Argo CD"] -->|"HTTPS + RBAC"| API
+  KL -->|"watch pods for this node, report status"| API
+  KP -->|"watch Services, EndpointSlices"| API
+</pre>
+<figcaption>Figure 12.7 — Kubernetes components. Everything talks to the API server; only the API server talks to etcd.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> there are no direct calls between the scheduler, controllers and kubelets — all coordination happens through objects in the API server, which each component watches. This hub-and-spoke design is why Kubernetes is extensible (your operator is just another watcher) and why API server and etcd health are critical: if the API is down, running Pods keep running, but nothing can be scheduled, scaled or healed. On EKS the control plane is managed by AWS across three Availability Zones; you operate the nodes (or delegate them with Auto Mode/Fargate).</p>
+
+  <h3>5.2 Pod creation sequence</h3>
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant U as kubectl
+  participant A as API server
+  participant D as Deployment ctrl
+  participant R as ReplicaSet ctrl
+  participant S as Scheduler
+  participant K as kubelet
+  participant E as EndpointSlice ctrl
+  U->>A: apply Deployment (replicas=3)
+  A-->>D: watch event: Deployment changed
+  D->>A: create ReplicaSet (hash=7d9f)
+  A-->>R: watch event: ReplicaSet
+  R->>A: create 3 Pods (no nodeName)
+  A-->>S: watch event: unscheduled Pods
+  S->>A: bind Pod to node-a
+  A-->>K: watch event: Pod bound to node-a
+  K->>K: sandbox, CNI, pull image, start containers
+  K->>A: status Running, then Ready=true
+  A-->>E: watch event: Pod Ready
+  E->>A: add Pod IP to EndpointSlice
+</pre>
+<figcaption>Figure 12.8 — Each arrow from the API server is a watch notification, not a command.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> read the solid arrows as writes to the API and the dashed arrows as watch notifications. No component orders another to act; each reacts to state. That is why the same flow handles a node failure: the node controller marks the node's Pods for deletion, the ReplicaSet controller sees too few Pods and creates replacements, and the scheduler places them elsewhere — no special "failover" code exists.</p>
+
+  <h3>5.3 Packet path through a Service and Gateway</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  C["Client"] --> NLB["AWS NLB (L4, Service type LoadBalancer or Gateway)"]
+  NLB -->|"IP target mode"| GWP["edge-gateway Pod 10.0.12.5"]
+  GWP -->|"DNS: orders.lumen.svc"| DNS["CoreDNS"]
+  GWP -->|"connect 172.20.14.7:80"| KPX["Node rules: kube-proxy DNAT or Cilium socket LB"]
+  KPX -->|"10.0.37.21:8080"| OP1["orders Pod on node B"]
+  KPX -.->|"or 10.0.41.9:8080"| OP2["orders Pod on node C"]
+  OP1 --> RDS[("RDS PostgreSQL")]
+</pre>
+<figcaption>Figure 12.9 — The Lumen request path inside EKS. The ClusterIP is a rule, not a machine.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> the NLB sends traffic straight to gateway Pod IPs (IP target mode) rather than to NodePorts, avoiding an extra hop and preserving client IPs. The gateway resolves the <code>orders</code> Service name to a ClusterIP; that address is translated on the gateway's own node to a concrete Pod IP, possibly on another node. Because each new TCP connection is balanced independently, the gateway's keep-alive pool to <code>orders</code> should hold enough connections to spread load across replicas — or the gateway should resolve a headless Service and balance per request itself.</p>
+
+  <h3>5.4 Gateway API role model</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  GC["GatewayClass: aws-alb or envoy (infra provider)"] --> GW["Gateway: lumen-public, listener HTTPS 443, cert (platform team, ns infra)"]
+  GW --> R1["HTTPRoute: /api/orders to orders:80 (team orders, ns lumen)"]
+  GW --> R2["HTTPRoute: /api/assist to assist:80, timeout 120s (team ai, ns lumen)"]
+  GW --> R3["HTTPRoute: canary 90/10 orders-v1 / orders-v2"]
+  R1 --> S1["Service orders"]
+  R2 --> S2["Service assist"]
+</pre>
+<figcaption>Figure 12.10 — Gateway API separates infrastructure, platform and application ownership.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> the platform team owns the Gateway (ports, TLS certificates, which namespaces may attach routes), and application teams own their HTTPRoutes in their own namespaces. Features that required controller-specific annotations on Ingress — timeouts, weighted canaries, header matching — are typed fields. The same HTTPRoute works on any conformant implementation, so migrating from one controller to another (as ingress-nginx users had to in 2026) does not require rewriting application routing.</p>
+
+  <h3>5.5 Reconciliation as a state machine</h3>
+<figure class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> Observe
+  Observe --> Diff: read spec and status from informer cache
+  Diff --> Idle: actual equals desired
+  Diff --> Act: drift detected
+  Act --> UpdateStatus: create, update or delete child objects
+  UpdateStatus --> Observe: requeue or wait for next watch event
+  Idle --> Observe: watch event or periodic resync
+  Act --> Backoff: API error or conflict
+  Backoff --> Observe: exponential retry
+</pre>
+<figcaption>Figure 12.11 — The controller loop shared by every built-in controller, operator, Argo CD and Karpenter.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> note that there is no "event handled" terminal state. A controller always returns to Observe, so missed events, crashes and conflicting writers are tolerated: the next pass sees current reality. Conflicts (another writer updated the object first, detected by <code>resourceVersion</code>) lead to back-off and retry rather than corruption — optimistic concurrency, exactly like JPA's <code>@Version</code>.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math of Scheduling, Scaling and Rollouts</h2>
+  <h3>6.1 HPA replica calculation</h3>
+  <p>Intuition: if Pods run at twice the target utilisation, you need twice as many. Formally, for each metric:</p>
+  \[ \text{desired} = \left\lceil \text{current} \times \frac{\text{currentMetricValue}}{\text{targetMetricValue}} \right\rceil \]
+  <p>with a default tolerance of 10% (no change if the ratio is within 0.9–1.1). Example: 4 replicas at average 85% CPU (of requests) with a 60% target → \(\lceil 4 \times 85/60 \rceil = \lceil 5.67 \rceil = 6\). Note the denominator is the <em>request</em>: if you set a CPU request of 100m on a service that needs 500m, utilisation reads 500% and HPA scales to the maximum. Requests must be realistic for HPA to work.</p>
+
+  <h3>6.2 Bin-packing and allocatable capacity</h3>
+  <p>A node's <em>allocatable</em> = capacity − kube-reserved − system-reserved − eviction threshold. An m7i.xlarge (4 vCPU, 16 GiB) on EKS might offer roughly 3.9 vCPU and ~14.5 GiB allocatable, and the VPC CNI also caps Pods per node by ENI/IP limits <span class="tag illus">Illustrative</span>. If <code>orders-service</code> requests 500m/1.5Gi, memory binds first: \(\lfloor 14.5 / 1.5 \rfloor = 9\) Pods, using \(9 \times 0.5 = 4.5\) vCPU — more than allocatable, so CPU binds at 7 Pods. Mixing memory-heavy (assist-service with an embedding model) and CPU-heavy (gateway) workloads improves packing.</p>
+
+  <h3>6.3 Rolling update capacity</h3>
+  <p>During a rollout with \(N\) desired replicas, available capacity is at least \(N - \text{maxUnavailable}\) and total Pods at most \(N + \text{maxSurge}\). Percentages round: <code>maxSurge</code> rounds up, <code>maxUnavailable</code> rounds down. With \(N = 10\), <code>maxSurge: 25%</code> → 3, <code>maxUnavailable: 25%</code> → 2: between 8 and 13 Pods, each "wave" replacing up to 5. Rollout duration is roughly</p>
+  \[ T \approx \left\lceil \frac{N}{\text{maxSurge} + \text{maxUnavailable}} \right\rceil \times (t_{\text{start}} + t_{\text{ready}} + \text{minReadySeconds}) \]
+  <p>For a Spring Boot service with 25 s to readiness, 10 s <code>minReadySeconds</code> and 2 Pods per wave across 20 replicas: \(10 \times 35 = 350\) s. Cutting JVM startup to 5 s with CDS/AOT reduces this to 150 s — faster deploys and faster rollbacks.</p>
+
+  <h3>6.4 PodDisruptionBudget arithmetic</h3>
+  <p>With \(N\) healthy replicas and <code>minAvailable: m</code>, the Eviction API allows \(N - m\) concurrent voluntary evictions. If \(N = m\) (e.g., 2 replicas, <code>minAvailable: 2</code>), zero evictions are allowed and node drains hang forever — a classic upgrade blocker. Prefer <code>maxUnavailable: 1</code>, which stays valid as replicas scale.</p>
+
+  <h3>6.5 Image size and scale-out time</h3>
+  <p>Pull time ≈ compressed size / effective throughput + decompression. A 450 MB JDK-based image at an effective 100 MB/s takes ~5 s to pull before the JVM even starts; a 180 MB JRE layered image takes ~2 s, and only changed layers are pulled on updates (often under 1 MB). For an autoscaling event that adds 20 Pods on 5 fresh nodes, image size directly adds to time-to-capacity <span class="tag illus">Illustrative</span>.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code: Production Artifacts for Lumen</h2>
+
+  <h3>7.1 Multi-stage Dockerfiles</h3>
+<div class="code-tabs">
+<pre data-lang="Java" data-file="orders-service/Dockerfile"><code class="language-dockerfile"># syntax=docker/dockerfile:1.7
+# ---------- build stage: JDK + Maven, with a persistent BuildKit cache ----------
+FROM eclipse-temurin:21-jdk-noble AS build
+WORKDIR /workspace
+COPY .mvn/ .mvn/
+COPY mvnw pom.xml ./
+RUN --mount=type=cache,target=/root/.m2 ./mvnw -B -q dependency:go-offline
+COPY src/ src/
+RUN --mount=type=cache,target=/root/.m2 ./mvnw -B -q -DskipTests package \
+ &amp;&amp; cp target/*.jar app.jar \
+ &amp;&amp; java -Djarmode=tools -jar app.jar extract --layers --launcher --destination extracted
+
+# ---------- runtime stage: JRE only, non-root, one layer per Spring Boot layer ----------
+FROM eclipse-temurin:21-jre-noble
+RUN groupadd --system --gid 10001 app &amp;&amp; useradd --system --uid 10001 --gid app app
+WORKDIR /app
+# Least to most frequently changing: dependencies change rarely, application on every commit
+COPY --from=build /workspace/extracted/dependencies/ ./
+COPY --from=build /workspace/extracted/spring-boot-loader/ ./
+COPY --from=build /workspace/extracted/snapshot-dependencies/ ./
+COPY --from=build /workspace/extracted/application/ ./
+USER 10001:10001
+EXPOSE 8080
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError"
+# Exec form: the JVM is PID 1 and receives SIGTERM
+ENTRYPOINT ["java", "org.springframework.boot.loader.launch.JarLauncher"]</code></pre>
+<pre data-lang="Python" data-file="assist-service/Dockerfile"><code class="language-dockerfile"># syntax=docker/dockerfile:1.7
+FROM python:3.12-slim AS build
+COPY --from=ghcr.io/astral-sh/uv:0.5.11 /uv /usr/local/bin/uv
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT=/opt/venv
+WORKDIR /src
+# Dependencies first (cached unless the lockfile changes)
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev --no-install-project
+COPY app/ app/
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev
+
+FROM python:3.12-slim
+RUN groupadd --system --gid 10001 app &amp;&amp; useradd --system --uid 10001 --gid app app
+COPY --from=build /opt/venv /opt/venv
+COPY --from=build /src/app /app/app
+WORKDIR /app
+ENV PATH="/opt/venv/bin:$PATH" PYTHONUNBUFFERED=1
+USER 10001:10001
+EXPOSE 8000
+# Explicit worker count: Python does not read cgroup CPU limits
+ENTRYPOINT ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", \
+            "--workers", "2", "--timeout-keep-alive", "75", "--timeout-graceful-shutdown", "20"]</code></pre>
+<pre data-lang="Go" data-file="edge-gateway/Dockerfile"><code class="language-dockerfile"># syntax=docker/dockerfile:1.7
+FROM --platform=$BUILDPLATFORM golang:1.25 AS build
+ARG TARGETOS TARGETARCH
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w" -o /out/edge-gateway ./cmd/edge-gateway
+
+# Distroless static: no shell, no package manager, runs as nonroot (uid 65532)
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/edge-gateway /edge-gateway
+EXPOSE 8443
+ENTRYPOINT ["/edge-gateway"]</code></pre>
+</div>
+  <p>Build and inspect: <code>docker buildx build --platform linux/amd64,linux/arm64 -t 123456789012.dkr.ecr.eu-west-1.amazonaws.com/orders:1.8.2 --push .</code>, then <code>docker history</code> or <code>dive</code> to verify that the application layer is small. The Go image cross-compiles natively on the build host (<code>$BUILDPLATFORM</code>) for both architectures instead of emulating — much faster than QEMU. Pin base images by digest in production and let Renovate/Dependabot update them. <span class="tag version">Version-sensitive · checked Nov 2026</span> image tags shown are examples; use the current patch releases.</p>
+
+  <h3>7.2 Dockerfile-free alternatives for Spring Boot</h3>
+<pre data-file="build-image.sh"><code class="language-bash"># Cloud Native Buildpacks (Paketo) via the Spring Boot plugin: no Dockerfile, no layering work
+./mvnw -B spring-boot:build-image \
+  -Dspring-boot.build-image.imageName=ghcr.io/lumen/orders:1.8.2
+
+# Jib: daemonless, pushes layered image straight to the registry
+./mvnw -B compile com.google.cloud.tools:jib-maven-plugin:3.4.4:build \
+  -Djib.from.image=eclipse-temurin:21-jre-noble \
+  -Djib.to.image=ghcr.io/lumen/orders:1.8.2 \
+  -Djib.container.user=10001</code></pre>
+
+  <h3>7.3 Spring Boot configuration for Kubernetes</h3>
+<pre data-file="src/main/resources/application.yaml"><code class="language-yaml">spring:
+  application:
+    name: orders-service
+  config:
+    # Files from a mounted ConfigMap/Secret directory become properties (key = file name)
+    import: "optional:configtree:/etc/orders/config/"
+server:
+  shutdown: graceful
+  tomcat:
+    keep-alive-timeout: 75s
+management:
+  server:
+    port: 8081                   # separate port: probes and metrics not exposed via Gateway
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        readiness:
+          include: readinessState,db   # only dependencies we truly cannot serve without
+  health:
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true</code></pre>
+
+  <h3>7.4 Kubernetes manifests for orders-service</h3>
+<pre data-file="k8s/orders-deployment.yaml"><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders
+  namespace: lumen
+  labels: {app.kubernetes.io/name: orders, app.kubernetes.io/part-of: lumen}
+spec:
+  replicas: 3                       # HPA owns this after creation; omit when using GitOps + HPA
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 300
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 25%, maxUnavailable: 0}
+  selector:
+    matchLabels: {app.kubernetes.io/name: orders}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: orders, app.kubernetes.io/part-of: lumen}
+    spec:
+      serviceAccountName: orders     # bound to an IAM role via EKS Pod Identity (Chapter 4)
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {app.kubernetes.io/name: orders}
+      containers:
+        - name: orders
+          image: 123456789012.dkr.ecr.eu-west-1.amazonaws.com/orders@sha256:REPLACE_WITH_DIGEST
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: management, containerPort: 8081}
+          env:
+            - name: SPRING_DATASOURCE_URL
+              valueFrom: {configMapKeyRef: {name: orders-config, key: datasource-url}}
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom: {secretKeyRef: {name: orders-db, key: password}}
+            - name: JAVA_TOOL_OPTIONS
+              value: "-XX:MaxRAMPercentage=70 -XX:+ExitOnOutOfMemoryError"
+          volumeMounts:
+            - {name: config, mountPath: /etc/orders/config, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+          resources:
+            requests: {cpu: 500m, memory: 1536Mi}
+            limits: {memory: 1536Mi}          # memory limit = request; no CPU limit (measured choice)
+          startupProbe:
+            httpGet: {path: /actuator/health/liveness, port: management}
+            periodSeconds: 5
+            failureThreshold: 24              # up to 120 s to start
+          livenessProbe:
+            httpGet: {path: /actuator/health/liveness, port: management}
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: {path: /actuator/health/readiness, port: management}
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          lifecycle:
+            preStop:
+              exec: {command: ["sh", "-c", "sleep 10"]}   # let endpoints/LBs drop us first
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+      volumes:
+        - name: config
+          configMap: {name: orders-config}
+        - name: tmp
+          emptyDir: {sizeLimit: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orders
+  namespace: lumen
+spec:
+  selector: {app.kubernetes.io/name: orders}
+  ports:
+    - {name: http, port: 80, targetPort: http}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orders-config
+  namespace: lumen
+data:
+  datasource-url: jdbc:postgresql://orders-db.cluster-abc.eu-west-1.rds.amazonaws.com:5432/orders
+  lumen.orders.max-items-per-order: "50"     # becomes a property via configtree
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: orders
+  namespace: lumen
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: orders}
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 60}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies: [{type: Percent, value: 100, periodSeconds: 60}]
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies: [{type: Percent, value: 10, periodSeconds: 60}]
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: orders
+  namespace: lumen
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: orders}</code></pre>
+  <p>Points worth noticing: probes hit a separate management port so they are never exposed publicly; the startup probe tolerates slow JVM starts without weakening liveness; the readiness group is explicit; the memory limit equals the request (Guaranteed for memory, Burstable overall because there is no CPU limit); a writable <code>/tmp</code> is provided because the root filesystem is read-only (Tomcat needs a temp directory); the image is pinned by digest; and HPA scales on CPU relative to a realistic request. <code>REPLACE_WITH_DIGEST</code> is filled in by CI (Chapter 3).</p>
+
+  <h3>7.5 Gateway API routing</h3>
+<pre data-file="k8s/gateway.yaml"><code class="language-yaml">apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: lumen-public
+  namespace: infra
+spec:
+  gatewayClassName: envoy          # or the AWS Load Balancer Controller / Cilium class in your cluster
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: "api.lumen.example.com"
+      tls:
+        mode: Terminate
+        certificateRefs: [{name: api-lumen-tls}]   # issued by cert-manager
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector: {matchLabels: {lumen.example.com/expose: "true"}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: orders
+  namespace: lumen
+spec:
+  parentRefs: [{name: lumen-public, namespace: infra}]
+  hostnames: ["api.lumen.example.com"]
+  rules:
+    - matches: [{path: {type: PathPrefix, value: /api/orders}}]
+      timeouts: {request: 10s}
+      backendRefs:
+        - {name: orders, port: 80, weight: 90}
+        - {name: orders-canary, port: 80, weight: 10}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: assist
+  namespace: lumen
+spec:
+  parentRefs: [{name: lumen-public, namespace: infra}]
+  hostnames: ["api.lumen.example.com"]
+  rules:
+    - matches: [{path: {type: PathPrefix, value: /api/assist}}]
+      timeouts: {request: 120s}        # streaming LLM responses
+      backendRefs: [{name: assist, port: 80}]</code></pre>
+  <p>In Lumen the Go <code>edge-gateway</code> handles authentication and rate limiting; a Gateway API implementation (Envoy Gateway here) could take over some of those roles. Many teams run both: a Gateway for TLS, routing and coarse policies, and an application gateway for domain-specific logic <span class="tag opinion">Opinion</span>.</p>
+
+  <h3>7.6 Event-driven scaling with KEDA for assist-service</h3>
+<pre data-file="k8s/assist-scaledobject.yaml"><code class="language-yaml">apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: assist-embedder
+  namespace: lumen
+spec:
+  scaleTargetRef: {name: assist-embedder}      # Deployment consuming an SQS queue of re-embedding jobs
+  minReplicaCount: 0                           # scale to zero when the queue is empty
+  maxReplicaCount: 20
+  cooldownPeriod: 300
+  triggers:
+    - type: aws-sqs-queue
+      authenticationRef: {name: keda-aws-pod-identity}
+      metadata:
+        queueURL: https://sqs.eu-west-1.amazonaws.com/123456789012/lumen-embed-jobs
+        queueLength: "50"                      # target messages per replica
+        awsRegion: eu-west-1</code></pre>
+
+  <h3>7.7 A Helm chart for Lumen services</h3>
+  <p>All three Lumen services share one internal chart, <code>lumen-service</code>, with per-service values. Directory layout:</p>
+<pre class="ascii">lumen-service/
+  Chart.yaml
+  values.yaml
+  values.schema.json        (optional: validates values)
+  templates/
+    _helpers.tpl
+    deployment.yaml
+    service.yaml
+    hpa.yaml
+    pdb.yaml
+    httproute.yaml
+    NOTES.txt</pre>
+<div class="code-tabs">
+<pre data-lang="Chart.yaml" data-file="lumen-service/Chart.yaml"><code class="language-yaml">apiVersion: v2
+name: lumen-service
+description: Standard deployment unit for Lumen platform services
+type: application
+version: 2.3.0          # chart version (SemVer)
+appVersion: "1.8.2"     # default app version; CI overrides image.digest</code></pre>
+<pre data-lang="values.yaml" data-file="lumen-service/values.yaml"><code class="language-yaml">nameOverride: ""
+image:
+  repository: 123456789012.dkr.ecr.eu-west-1.amazonaws.com/orders
+  digest: ""            # required: sha256:...
+replicaCount: 3
+containerPort: 8080
+managementPort: 8081
+env: {}
+envFromSecrets: {}      # NAME: {secret: x, key: y}
+resources:
+  requests: {cpu: 500m, memory: 1536Mi}
+  limits: {memory: 1536Mi}
+probes:
+  liveness: /actuator/health/liveness
+  readiness: /actuator/health/readiness
+  startupFailureThreshold: 24
+preStopSleepSeconds: 10
+terminationGracePeriodSeconds: 45
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 30
+  targetCPUUtilization: 60
+pdb:
+  maxUnavailable: 1
+route:
+  enabled: true
+  gateway: {name: lumen-public, namespace: infra}
+  hostname: api.lumen.example.com
+  pathPrefix: /api/orders
+  timeout: 10s</code></pre>
+<pre data-lang="_helpers.tpl" data-file="lumen-service/templates/_helpers.tpl"><code class="language-plaintext">{{- define "lumen.name" -}}
+{{- default .Release.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "lumen.labels" -}}
+app.kubernetes.io/name: {{ include "lumen.name" . }}
+app.kubernetes.io/part-of: lumen
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+{{- end -}}
+
+{{- define "lumen.selector" -}}
+app.kubernetes.io/name: {{ include "lumen.name" . }}
+{{- end -}}</code></pre>
+<pre data-lang="deployment.yaml" data-file="lumen-service/templates/deployment.yaml"><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "lumen.name" . }}
+  labels: {{- include "lumen.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  minReadySeconds: 10
+  strategy:
+    rollingUpdate: {maxSurge: 25%, maxUnavailable: 0}
+  selector:
+    matchLabels: {{- include "lumen.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "lumen.labels" . | nindent 8 }}
+      annotations:
+        # roll Pods when the referenced config changes
+        checksum/env: {{ toJson .Values.env | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "lumen.name" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: app
+          image: "{{ .Values.image.repository }}@{{ required "image.digest is required" .Values.image.digest }}"
+          ports:
+            - {name: http, containerPort: {{ .Values.containerPort }}}
+            - {name: management, containerPort: {{ .Values.managementPort }}}
+          env:
+            {{- range $k, $v := .Values.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            {{- range $k, $v := .Values.envFromSecrets }}
+            - name: {{ $k }}
+              valueFrom: {secretKeyRef: {name: {{ $v.secret }}, key: {{ $v.key }}}}
+            {{- end }}
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          startupProbe:
+            httpGet: {path: {{ .Values.probes.liveness }}, port: management}
+            periodSeconds: 5
+            failureThreshold: {{ .Values.probes.startupFailureThreshold }}
+          livenessProbe:
+            httpGet: {path: {{ .Values.probes.liveness }}, port: management}
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: {path: {{ .Values.probes.readiness }}, port: management}
+            periodSeconds: 5
+            failureThreshold: 2
+          lifecycle:
+            preStop:
+              sleep: {seconds: {{ .Values.preStopSleepSeconds }}}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}</code></pre>
+<pre data-lang="hpa+pdb" data-file="lumen-service/templates/hpa.yaml"><code class="language-yaml">{{- if .Values.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "lumen.name" . }}
+  labels: {{- include "lumen.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: {{ include "lumen.name" . }}}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: {{ .Values.autoscaling.targetCPUUtilization }}}
+{{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "lumen.name" . }}
+spec:
+  maxUnavailable: {{ .Values.pdb.maxUnavailable }}
+  selector:
+    matchLabels: {{- include "lumen.selector" . | nindent 6 }}</code></pre>
+</div>
+  <p>The template uses the native <code>preStop.sleep</code> action (beta and enabled by default since v1.30, so it works on distroless images without a shell) <span class="tag version">Version-sensitive · checked Nov 2026</span>. <code>required</code> fails rendering if CI forgot the digest. The <code>checksum/env</code> annotation forces a rollout when environment values change — a standard Helm idiom because Pods otherwise do not restart when only config changes.</p>
+<pre data-file="helm-session.sh"><code class="language-bash"># Render locally and diff before touching the cluster
+helm lint ./lumen-service -f values/orders-prod.yaml
+helm template orders ./lumen-service -f values/orders-prod.yaml --set image.digest=sha256:3f1c... | kubectl diff -f -
+
+# Install or upgrade atomically: roll back automatically if resources are not ready in time
+helm upgrade --install orders ./lumen-service -n lumen \
+  -f values/orders-prod.yaml --set image.digest=sha256:3f1c... \
+  --rollback-on-failure --wait --timeout 10m       # Helm 3 used --atomic; Helm 4 renamed it
+
+helm history orders -n lumen
+helm rollback orders 41 -n lumen
+
+# Publish the chart to an OCI registry
+helm package ./lumen-service
+helm push lumen-service-2.3.0.tgz oci://123456789012.dkr.ecr.eu-west-1.amazonaws.com/charts</code></pre>
+  <p><span class="tag version">Version-sensitive · checked Nov 2026</span> Helm 4 renamed several flags (for example <code>--atomic</code> became <code>--rollback-on-failure</code>, and <code>--force</code> became <code>--force-replace</code>); check <code>helm upgrade --help</code> for your version.</p>
+
+  <h3>7.8 The same service with Kustomize</h3>
+<pre data-file="kustomize-layout.txt"><code class="language-plaintext">k8s/
+  base/
+    kustomization.yaml      # resources: deployment.yaml, service.yaml, hpa.yaml, pdb.yaml
+    deployment.yaml
+    ...
+  overlays/
+    staging/kustomization.yaml
+    prod/kustomization.yaml
+    prod/resources-patch.yaml</code></pre>
+<pre data-file="k8s/overlays/prod/kustomization.yaml"><code class="language-yaml">apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: lumen
+resources:
+  - ../../base
+images:
+  - name: orders
+    newName: 123456789012.dkr.ecr.eu-west-1.amazonaws.com/orders
+    digest: sha256:3f1c0000000000000000000000000000000000000000000000000000000000aa
+configMapGenerator:
+  - name: orders-config
+    literals:
+      - datasource-url=jdbc:postgresql://orders-db.cluster-abc.eu-west-1.rds.amazonaws.com:5432/orders
+patches:
+  - path: resources-patch.yaml
+    target: {kind: Deployment, name: orders}</code></pre>
+  <p>The <code>configMapGenerator</code> appends a content hash to the ConfigMap name and rewrites references, so changing configuration automatically rolls the Deployment — the Kustomize equivalent of Helm's checksum annotation. Render with <code>kubectl kustomize k8s/overlays/prod</code>; apply with <code>kubectl apply -k</code> or, better, let Argo CD do it (Chapter 3).</p>
+
+  <h3>7.9 A minimal operator reconcile loop in Go</h3>
+<pre data-file="internal/controller/vectorindex_controller.go"><code class="language-go">// Partial example (controller-runtime v0.19+): reconcile a VectorIndex custom resource
+// into a Job that (re)builds the index. Scaffolding generated by Kubebuilder is omitted.
+package controller
+
+import (
+	"context"
+	"fmt"
+
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	lumenv1 "example.com/lumen/api/v1"
+)
+
+type VectorIndexReconciler struct {
+	client.Client
+}
+
+func (r *VectorIndexReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	var idx lumenv1.VectorIndex
+	if err := r.Get(ctx, req.NamespacedName, &amp;idx); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err) // deleted: owned Jobs are garbage-collected
+	}
+
+	// Desired state: one build Job per spec generation.
+	jobName := fmt.Sprintf("%s-build-%d", idx.Name, idx.Generation)
+	var job batchv1.Job
+	err := r.Get(ctx, client.ObjectKey{Namespace: idx.Namespace, Name: jobName}, &amp;job)
+	if apierrors.IsNotFound(err) {
+		job = batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: idx.Namespace},
+			Spec: batchv1.JobSpec{
+				Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyOnFailure,
+					Containers: []corev1.Container{{
+						Name:  "build",
+						Image: idx.Spec.BuilderImage,
+						Args:  []string{"--source", idx.Spec.SourceURI, "--model", idx.Spec.EmbeddingModel},
+					}},
+				}},
+			},
+		}
+		if err := ctrl.SetControllerReference(&amp;idx, &amp;job, r.Scheme()); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, r.Create(ctx, &amp;job) // the Job's own watch event will requeue us
+	} else if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Observed state -&gt; status (level-triggered: computed from current reality every time).
+	idx.Status.Ready = job.Status.Succeeded &gt; 0
+	idx.Status.ObservedGeneration = idx.Generation
+	return ctrl.Result{}, r.Status().Update(ctx, &amp;idx)
+}
+
+func (r *VectorIndexReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&amp;lumenv1.VectorIndex{}).
+		Owns(&amp;batchv1.Job{}). // reconcile the parent when an owned Job changes
+		Complete(r)
+}</code></pre>
+  <p>The function never asks "what changed?"; it computes the desired child from the spec, compares with what exists, and writes status from observed reality. Owner references give cascading deletion for free.</p>
+
+  <h3>7.10 Troubleshooting session: a Pod that will not become ready</h3>
+<pre data-file="k8s-debug-session.txt"><code class="language-bash">$ kubectl -n lumen get pods -l app.kubernetes.io/name=orders -o wide
+NAME                      READY   STATUS             RESTARTS      AGE   IP           NODE
+orders-7d9f6c5b8-2xkqp    0/1     Running            3 (40s ago)   4m    10.0.37.21   ip-10-0-37-4
+orders-7d9f6c5b8-9ztlm    0/1     CrashLoopBackOff   5 (12s ago)   4m    10.0.41.9    ip-10-0-41-7
+
+$ kubectl -n lumen describe pod orders-7d9f6c5b8-2xkqp | sed -n '/Last State/,/Events/p'
+    Last State:     Terminated
+      Reason:       Error
+      Exit Code:    143
+  Warning  Unhealthy  Startup probe failed: Get "http://10.0.37.21:8081/actuator/health/liveness": connection refused
+  Normal   Killing    Container app failed startup probe, will be restarted
+
+# Diagnosis 1: startup takes longer than 5 s x failureThreshold. How long does it really take?
+$ kubectl -n lumen logs orders-7d9f6c5b8-2xkqp --previous | grep "Started OrdersApplication"
+Started OrdersApplication in 38.412 seconds (process running for 41.03)
+
+$ kubectl -n lumen describe pod orders-7d9f6c5b8-9ztlm | grep -A3 "Last State"
+    Last State:     Terminated
+      Reason:       OOMKilled
+      Exit Code:    137
+
+# Diagnosis 2: memory. Compare the JVM's view with the limit
+$ kubectl -n lumen exec orders-7d9f6c5b8-2xkqp -- java -XX:+PrintFlagsFinal -version 2&gt;/dev/null | grep -E "MaxHeapSize|UseSerialGC|UseG1GC"
+
+# Is CPU throttled during startup? (cAdvisor metrics via Prometheus, or the cgroup file)
+$ kubectl -n lumen exec orders-7d9f6c5b8-2xkqp -- cat /sys/fs/cgroup/cpu.stat
+
+# Network: does the Service have endpoints? Only READY pods appear.
+$ kubectl -n lumen get endpointslices -l kubernetes.io/service-name=orders
+$ kubectl -n lumen get events --sort-by=.lastTimestamp | tail -20
+
+# Debug a distroless pod with an ephemeral container that shares its process namespace
+$ kubectl -n lumen debug -it orders-7d9f6c5b8-2xkqp --image=nicolaka/netshoot --target=app -- bash
+netshoot$ ss -lnt ; dig orders.lumen.svc.cluster.local ; curl -s localhost:8081/actuator/health</code></pre>
+  <p><span class="tag illus">Illustrative</span> output. Typical fixes: raise the startup probe budget, cut startup time (lazy initialisation of non-critical beans, CDS), increase memory limit or reduce <code>MaxRAMPercentage</code>, and check the readiness group does not include a dependency that is down.</p>
+</section>
+
+<section id="applications">
+  <h2>8. Applications: How Teams Run Kubernetes</h2>
+  <h3>8.1 Golden paths and internal charts</h3>
+  <p>Platform teams rarely let every service write raw manifests. They publish a <em>golden path</em>: a base image per language, a shared Helm chart (like <code>lumen-service</code>) or a higher-level abstraction (a CRD such as <code>kind: Microservice</code>, or a Backstage software template) that bakes in probes, security contexts, PDBs, topology spread and observability annotations. Service teams set a dozen values instead of 200 lines of YAML; platform teams can roll out a security fix to every service by bumping the chart.</p>
+  <h3>8.2 Multi-tenancy by namespace</h3>
+  <p>Teams are separated by namespaces with RBAC, ResourceQuotas, LimitRanges, NetworkPolicies (default-deny plus explicit allows) and Pod Security Admission at the <code>restricted</code> level. Cluster-wide concerns — ingress/gateway, cert-manager, external-secrets, monitoring, Karpenter — live in platform namespaces managed by the platform team.</p>
+  <h3>8.3 Policy as code</h3>
+  <p>Admission policies (Kyverno, OPA Gatekeeper, or built-in ValidatingAdmissionPolicy with CEL) enforce organisational rules at the API: images only from approved registries and pinned by digest, non-root, resource requests present, no <code>hostPath</code>, required labels for cost allocation. Shift-left versions of the same policies run in CI (<code>kyverno apply</code>, <code>conftest</code>) so engineers see violations before merge.</p>
+  <h3>8.4 AI and GPU workloads</h3>
+  <p>Inference services like <code>assist-service</code> are increasingly scheduled onto GPU nodes. DRA (GA in v1.34) lets Pods request devices with structured parameters rather than opaque extended resources like <code>nvidia.com/gpu: 1</code>; Karpenter provisions GPU instances on demand; KEDA scales on queue depth or token throughput; and model weights are cached on node-local storage or pre-pulled images to cut cold-start times. Batch embedding jobs use Jobs with indexed completions.</p>
+  <h3>8.5 Local development</h3>
+  <p>Developers run kind, k3d or Docker Desktop's Kubernetes locally, with Tilt or Skaffold rebuilding images and syncing files on change, and Testcontainers for integration tests (Spring Boot's <code>@ServiceConnection</code> wires containers into the application context). The same Helm chart or Kustomize base is used locally as in production to catch configuration drift early.</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 Google Borg: the ancestor</h3>
+  <p><span class="tag fact">Verified</span> The Borg paper (Verma et al., EuroSys 2015) describes a cluster manager running hundreds of thousands of jobs across many clusters, with declarative job specifications, a central replicated store, a scheduler with feasibility checking and scoring, and priority/quota mechanisms. Kubernetes' Pods, labels, Services and the separation of scheduler from state store are directly informed by Borg's lessons, which the paper lists explicitly (for example, that "jobs" as the only grouping mechanism was too restrictive, which led to labels). Source: <a href="https://research.google/pubs/large-scale-cluster-management-at-google-with-borg/">Large-scale cluster management at Google with Borg</a>.</p>
+  <h3>9.2 OpenAI: scaling Kubernetes to 7,500 nodes</h3>
+  <p><span class="tag fact">Verified</span> In January 2021 OpenAI described running Kubernetes clusters of up to 7,500 nodes for large ML training workloads. They reported issues and solutions around networking throughput (moving away from an overlay network), splitting Kubernetes events into a separate etcd cluster, API server memory, and monitoring at scale, and noted that many of their workloads use an entire node per Pod. The lesson for ordinary teams: the control plane (API server, etcd, watches) is the scaling bottleneck long before workers are. Source: <a href="https://openai.com/index/scaling-kubernetes-to-7500-nodes/">OpenAI, "Scaling Kubernetes to 7,500 nodes"</a>.</p>
+  <h3>9.3 The ingress-nginx retirement</h3>
+  <p><span class="tag fact">Verified</span> In November 2025 Kubernetes SIG Network and the Security Response Committee announced that the community ingress-nginx controller would be retired, with best-effort maintenance ending in March 2026 and no further releases or security fixes afterward; they cited a lack of maintainers and recommended migrating to Gateway API or another controller. A January 2026 statement from the Steering and Security Response Committees reiterated the risk of running it after retirement. The lesson: a "default" open-source component can be the least-funded piece of your stack — track the health of critical dependencies, and prefer standard APIs (Gateway API) that let you swap implementations. Sources: <a href="https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/">Kubernetes blog, "Ingress NGINX Retirement: What You Need to Know"</a>; <a href="https://kubernetes.io/blog/2026/01/29/ingress-nginx-statement/">Kubernetes blog, Steering and SRC statement (2026)</a>.</p>
+  <h3>9.4 Kubernetes failure stories</h3>
+  <p><span class="tag fact">Verified</span> The community-curated "Kubernetes Failure Stories" list collects public postmortems from many organisations — DNS failures, OOM kills, CPU throttling, etcd and API server overload, admission webhook outages. Reading a handful is the fastest way to learn which defaults bite in practice. Source: <a href="https://k8s.af/">k8s.af — Kubernetes Failure Stories</a>.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Strengths, Limits and Operational Cost</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Technology</th><th>Strengths</th><th>Limitations</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>Docker images (OCI)</td><td>Reproducible, immutable, portable artifacts; layer sharing</td><td>Image sprawl, base-image CVEs, supply-chain risk</td><td>Registry, scanning, base-image patching cadence</td></tr>
+      <tr><td>Kubernetes</td><td>Self-healing, declarative, huge ecosystem, portable</td><td>Complexity, many moving parts, steep learning curve, YAML surface</td><td>Upgrades every ~4 months (each minor supported ~14 months upstream), add-ons, platform team</td></tr>
+      <tr><td>HPA</td><td>Simple, built-in</td><td>Reactive; depends on realistic requests; slow for JVM start</td><td>Tuning behaviour and metrics adapters</td></tr>
+      <tr><td>KEDA</td><td>Event-driven, scale to zero</td><td>Another controller; cold starts at zero</td><td>Low–medium</td></tr>
+      <tr><td>Helm</td><td>Packaging, versioning, dependencies, rollback history</td><td>Templated YAML is hard to read and test; values sprawl</td><td>Chart maintenance and versioning</td></tr>
+      <tr><td>Kustomize</td><td>Plain YAML, built into kubectl, easy review</td><td>No packaging/versioning, limited logic</td><td>Low</td></tr>
+      <tr><td>Operators</td><td>Encode operations as code</td><td>Operator bugs operate at scale; upgrades of CRDs are delicate</td><td>Need to vet and upgrade each operator</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+  <h3>11.1 Decision table</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Question</th><th>Option A</th><th>Option B</th><th>Guidance</th></tr></thead>
+    <tbody>
+      <tr><td>Kubernetes or managed containers (ECS, App Runner, Cloud Run)?</td><td>Kubernetes</td><td>Managed PaaS</td><td>Fewer than ~10 services and no platform team → PaaS. Many services, multi-cloud, custom controllers, GPU scheduling → Kubernetes <span class="tag opinion">Opinion</span></td></tr>
+      <tr><td>Dockerfile, Buildpacks or Jib?</td><td>Dockerfile (full control)</td><td>Buildpacks/Jib (standardised)</td><td>Polyglot platform with custom needs → Dockerfiles with a shared template; JVM-only org wanting uniformity → Buildpacks or Jib</td></tr>
+      <tr><td>JVM vs GraalVM native image</td><td>JVM + CDS/AOT cache</td><td>Native image</td><td>Long-running services with steady load → JVM (peak throughput, tooling). Scale-to-zero, CLI, Lambda → native</td></tr>
+      <tr><td>Helm vs Kustomize</td><td>Helm</td><td>Kustomize</td><td>Third-party software and shared internal charts → Helm. Your own services' env overlays → Kustomize, or Helm for the base and Kustomize for last-mile patches</td></tr>
+      <tr><td>Ingress vs Gateway API</td><td>Ingress</td><td>Gateway API</td><td>New clusters → Gateway API. Existing Ingress on a maintained controller → migrate deliberately; on ingress-nginx → migrate now</td></tr>
+      <tr><td>Service mesh or not</td><td>Mesh (Istio ambient, Linkerd, Cilium)</td><td>Libraries + Gateway</td><td>Need mTLS everywhere, per-request L7 policy and uniform telemetry across many languages → mesh; otherwise start without</td></tr>
+    </tbody>
+  </table></div>
+  <h3>11.2 Choosing a workload type</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A["New workload"] --> B{"Runs to completion?"}
+  B -->|yes| C{"On a schedule?"}
+  C -->|yes| CJ["CronJob"]
+  C -->|no| J["Job (indexed for parallel shards)"]
+  B -->|no| D{"Needs one instance per node?"}
+  D -->|yes| DS["DaemonSet"]
+  D -->|no| E{"Needs stable identity or per-replica storage?"}
+  E -->|yes| SS["StatefulSet (or a managed service/operator)"]
+  E -->|no| DEP["Deployment + HPA/KEDA + PDB"]
+</pre>
+<figcaption>Figure 12.12 — Picking the controller for a workload.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> the overwhelming majority of backend services end at "Deployment". Reach for StatefulSets only when identity or per-replica storage is truly required — and even then, consider a managed database or a mature operator (CloudNativePG, Strimzi) before writing your own stateful logic.</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Production Failures</h2>
+  <ol>
+    <li><strong>Liveness probe checks the database.</strong> The DB has a blip; every replica of every service fails liveness and restarts; the restart storm (JVM warm-up, connection storms) prolongs the outage.</li>
+    <li><strong>No startup probe for slow JVMs.</strong> A liveness probe with a short <code>initialDelaySeconds</code> kills the JVM before it finishes starting, producing CrashLoopBackOff only under CPU-constrained conditions (e.g., during node scale-up).</li>
+    <li><strong>Memory limit below JVM footprint</strong> or <code>-Xmx</code> hard-coded to the limit → OOMKilled.</li>
+    <li><strong>No PDB, or a PDB that allows zero disruptions.</strong> The first causes outages during node upgrades; the second blocks upgrades indefinitely.</li>
+    <li><strong>Using <code>:latest</code> tags</strong> with <code>imagePullPolicy: IfNotPresent</code> — different nodes run different code. Pin digests.</li>
+    <li><strong>Deployment <code>replicas</code> set in Git while an HPA manages it.</strong> Every sync resets replicas to the Git value, fighting the autoscaler. Omit <code>replicas</code> when an HPA owns it.</li>
+    <li><strong>Secrets in ConfigMaps or baked into images</strong>, or assuming base64 is encryption.</li>
+    <li><strong>CPU requests far below real usage</strong>, making nodes overcommitted and HPA percentages meaningless.</li>
+    <li><strong>Ignoring the termination race</strong>: no preStop delay and app keep-alive shorter than the LB idle timeout → 502s on every deploy.</li>
+    <li><strong>Copying the whole repo before dependency resolution</strong> in Dockerfiles, destroying cache efficiency; or building as root and running as root.</li>
+    <li><strong>Helm values sprawl</strong>: every manifest field exposed as a value, until the chart is a worse version of raw YAML. Expose what varies; hard-code standards.</li>
+    <li><strong>Treating the cluster as a pet</strong>: manual <code>kubectl edit</code> in production. The next GitOps sync silently reverts it, or worse, it is never captured and lost on cluster rebuild.</li>
+  </ol>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Performance</h3>
+  <p>Measure startup (time to ready), steady-state CPU per request, memory working set and throttling for each service, and set requests from the 90th–95th percentile of usage. Keep images small and layered; pre-pull large images (AI models) with DaemonSets or bake them into node AMIs. Spread replicas across zones but be aware of cross-AZ data transfer cost (Chapter 4); topology-aware routing can keep Service traffic in-zone.</p>
+  <h3>13.2 Security</h3>
+  <ul>
+    <li>Pod Security Admission <code>restricted</code>: non-root, no privilege escalation, dropped capabilities, seccomp <code>RuntimeDefault</code>, read-only root filesystem.</li>
+    <li>Default-deny NetworkPolicies; allow only required flows (gateway → orders, orders → RDS).</li>
+    <li>Workload identity (EKS Pod Identity or IRSA) instead of node IAM roles or static keys.</li>
+    <li>Image scanning (Trivy, Grype, ECR scanning), signed images (Sigstore cosign) and admission verification; SBOMs from BuildKit.</li>
+    <li>RBAC least privilege; no cluster-admin for CI; audit logs enabled; etcd encryption with KMS.</li>
+  </ul>
+  <h3>13.3 Scalability</h3>
+  <p>Control-plane load scales with objects and watchers: large numbers of ConfigMaps, Secrets and CRDs, chatty controllers and <code>kubectl get --watch</code> loops from tools all cost API server memory. Use label selectors and field selectors, set <code>revisionHistoryLimit</code>, clean up completed Jobs (<code>ttlSecondsAfterFinished</code>), and prefer fewer, larger clusters per environment with namespaces over hundreds of tiny clusters — unless isolation requirements dictate otherwise.</p>
+  <h3>13.4 Monitoring</h3>
+  <p>kube-state-metrics (object state: desired vs available replicas, restarts, OOMKilled reasons), cAdvisor via the kubelet (container CPU, memory, throttling), node-exporter (node resources), control-plane metrics (API latency, etcd), and events exported to your log store. Alert on: Deployment unavailable replicas, CrashLoopBackOff, OOMKilled, Pods pending longer than N minutes, HPA at max replicas, PDB with zero allowed disruptions for a long time, certificate expiry. Chapter 5 builds these dashboards.</p>
+  <h3>13.5 Reliability and maintainability</h3>
+  <p>Upgrade the cluster at least every few minor versions (EKS standard support covers each minor for about 14 months, extended support for a further 12 at extra cost) <span class="tag version">Version-sensitive · checked Nov 2026</span>; test upgrades in staging with the same add-ons; run <code>kubectl deprecations</code>-style checks (Pluto, kubent) in CI to catch removed APIs. Keep everything in Git and apply through GitOps so the cluster can be rebuilt from scratch — the ultimate disaster-recovery test.</p>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundation</p>
+    <p>A colleague's Dockerfile for a Spring Boot service is <code>FROM eclipse-temurin:21-jdk</code>, <code>COPY . .</code>, <code>RUN ./mvnw package</code>, <code>CMD java -jar target/app.jar</code>. List four problems and rewrite the key lines.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>(1) Full JDK and Maven repository in the runtime image — large, more CVEs; use multi-stage with a JRE runtime. (2) <code>COPY . .</code> before dependency resolution destroys caching; copy <code>pom.xml</code> first and use a cache mount for <code>~/.m2</code>. (3) Fat JAR as one layer; use <code>-Djarmode=tools extract --layers</code> and copy each layer. (4) Shell-form <code>CMD</code> means <code>/bin/sh</code> is PID 1 and SIGTERM may not reach the JVM; use exec form. Also: runs as root (add a user), no memory settings (<code>MaxRAMPercentage</code>), tests skipped/unskipped deliberately. See §7.1 for the rewritten file.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Write probe configuration for a Spring Boot service that takes between 20 and 70 seconds to start depending on node load, must be restarted if it deadlocks, and should stop receiving traffic if its PostgreSQL connection pool is exhausted — but must not be restarted for that reason.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-yaml">startupProbe:
+  httpGet: {path: /actuator/health/liveness, port: management}
+  periodSeconds: 5
+  failureThreshold: 20        # 100 s budget, covers 70 s worst case
+livenessProbe:
+  httpGet: {path: /actuator/health/liveness, port: management}
+  periodSeconds: 10
+  failureThreshold: 3
+readinessProbe:
+  httpGet: {path: /actuator/health/readiness, port: management}
+  periodSeconds: 5
+  failureThreshold: 2
+# application.yaml: management.endpoint.health.group.readiness.include=readinessState,db</code></pre>
+      <p>Liveness contains only <code>livenessState</code> (a deadlocked Tomcat will fail to answer and be restarted). Readiness includes <code>db</code>, so pool exhaustion removes the Pod from endpoints without restarting it. Consider whether all replicas could go unready simultaneously; if so, prefer a custom indicator with hysteresis.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>An HPA targets 70% CPU. The Deployment has 5 replicas, each requesting 250m, and Pods are actually using 600m each. What does the HPA do, and what is wrong?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Utilisation = 600/250 = 240%. Desired = ceil(5 × 240/70) = ceil(17.1) = 18 replicas (clamped to <code>maxReplicas</code>). The request is unrealistic: the service needs ~600m per Pod at this load, so requests should be raised to ~600–700m. Then utilisation reads ~90%, and HPA computes ceil(5 × 90/70) = 7 — a proportionate response. Unrealistic requests also overcommit nodes and cause CPU contention.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>During an EKS managed node group upgrade, <code>orders-service</code> (3 replicas, all on one node due to no spread constraints, no PDB) had a 90-second outage. Explain the mechanism and design the fix with manifests.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>The upgrade drains nodes via the Eviction API. Without a PDB, all three Pods on the drained node were evicted at once; replacements had to be scheduled, pull the image and pass startup/readiness (~60–90 s for a JVM). Fix: (1) <code>topologySpreadConstraints</code> on zone and hostname so replicas land on different nodes; (2) a PDB with <code>maxUnavailable: 1</code> so drains evict one at a time and wait for replacements to be ready; (3) <code>minReadySeconds</code> and fast startup; (4) <code>maxUnavailable: 0</code> in the rolling update strategy; (5) optionally a higher minimum replica count. See §7.4 for the manifests.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>Design a Helm chart change so that any change to a mounted ConfigMap rolls the Deployment, and explain why Kubernetes does not do this on its own. Then give the Kustomize equivalent.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>The Pod template does not change when a referenced ConfigMap's data changes, so the Deployment controller sees no new template hash and does nothing (mounted files eventually update in place, but env vars never do, and many apps read config only at startup). Helm: add <code>checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}</code> to <code>spec.template.metadata.annotations</code>. Kustomize: generate the ConfigMap with <code>configMapGenerator</code>, which suffixes a content hash to its name and updates references, changing the Pod template.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Walk me through what happens when you run kubectl apply on a Deployment.</summary><div><p>Authentication, RBAC authorisation, mutating admission, validation, validating admission, write to etcd. The Deployment controller creates/updates a ReplicaSet; the ReplicaSet controller creates Pods; the scheduler filters and scores nodes and binds Pods; the kubelet creates the sandbox via CRI, sets up networking via CNI, pulls images, starts containers and runs probes; when ready, the EndpointSlice controller adds the Pod IP and kube-proxy/the CNI updates rules. Each step is a controller reacting to watched state.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is the difference between liveness and readiness, and why should liveness not check dependencies?</summary><div><p>Liveness failure restarts the container; readiness failure removes it from Service endpoints. Dependencies failing is not fixed by restarting your process; including them in liveness turns a dependency blip into a fleet-wide restart storm.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain QoS classes and how they affect eviction and OOM.</summary><div><p>Guaranteed (requests = limits for CPU and memory on all containers), Burstable (some requests), BestEffort (none). Under node memory pressure, the kubelet evicts BestEffort first, then Burstable exceeding requests. The kubelet also sets <code>oom_score_adj</code> so the kernel OOM killer prefers BestEffort and spares Guaranteed.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Why did Kubernetes introduce Gateway API when Ingress already existed?</summary><div><p>Ingress was too limited and relied on non-portable annotations; it mixed infrastructure and application concerns in one object. Gateway API offers role-oriented resources (GatewayClass, Gateway, Routes), typed features (header matching, weights, timeouts), multiple protocols and cross-namespace attachment rules, and conformance tests across implementations.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How would you make a JVM service scale fast enough for spiky traffic on Kubernetes?</summary><div><p>Reduce time-to-ready (CDS/AOT cache, lazy init, smaller images, layer caching), keep headroom with a lower HPA target, scale on a leading metric (RPS or queue depth via KEDA) rather than CPU, aggressive scale-up behaviour, pre-provisioned node capacity (Karpenter with over-provisioning placeholders), and consider native images for extreme cases.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Write a kubectl command to list Pods that were OOMKilled in the last restart across all namespaces.</summary><div><pre><code class="language-bash">kubectl get pods -A -o json | jq -r '.items[] | select(any(.status.containerStatuses[]?; .lastState.terminated.reason == "OOMKilled")) | "\(.metadata.namespace)/\(.metadata.name)"'</code></pre></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> After a deploy, 1% of requests return 502 for about 20 seconds. What do you check?</summary><div><p>Termination sequence: is there a preStop delay so endpoints/LB deregistration propagate before shutdown? Is <code>server.shutdown=graceful</code> on, and is the grace period long enough? Is the app's keep-alive timeout longer than the LB's idle timeout? Is <code>maxUnavailable</code> 0 and readiness correct so new Pods receive traffic only when ready? Check LB target health timelines against Pod events.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> A node drain hangs forever during a cluster upgrade. Why might that be?</summary><div><p>A PDB allows zero disruptions (e.g., <code>minAvailable</code> equals replicas, or replicas are unhealthy so the budget is already consumed), or a Pod has no controller and drain refuses to delete it, or local storage blocks eviction. Check <code>kubectl get pdb -A</code> for <code>ALLOWED DISRUPTIONS 0</code>.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Helm vs Kustomize — when would you use each?</summary><div><p>Helm for distributable packages with options, dependencies, versioned releases and rollback (third-party software, internal shared charts). Kustomize for patching plain YAML per environment with minimal abstraction. They compose: render Helm, then patch with Kustomize, often via Argo CD.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> Describe how you would migrate a team from VM deployments to Kubernetes.</summary><div><p>Start with one low-risk service; containerise with a standard Dockerfile; define probes, resources and PDB from measured VM data; run in parallel behind a weighted DNS or LB split; build dashboards and runbooks; train the team; then migrate the rest via a golden-path chart. Communicate the operational responsibilities that change (no SSH, immutable deploys, GitOps).</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>An image is content-addressed layers + config + manifest; order Dockerfile steps by change frequency and use multi-stage builds.</li>
+    <li>Layered Spring Boot jars (or Buildpacks/Jib) make code-only changes ship as tiny layers.</li>
+    <li>Kubernetes is a set of level-triggered controllers coordinating only through the API server.</li>
+    <li>Startup, liveness and readiness probes answer different questions; liveness must not check dependencies.</li>
+    <li>Requests drive scheduling and HPA; limits drive cgroups; memory limit = request is a safe default; CPU limits need measurement.</li>
+    <li>PDBs, topology spread and readiness-gated rollouts prevent upgrade and deploy outages.</li>
+    <li>Gateway API is the successor to Ingress; ingress-nginx was retired in March 2026.</li>
+    <li>Helm packages and versions; Kustomize patches plain YAML; both feed GitOps.</li>
+  </ul>
+  <div class="quiz" data-answer="b">
+    <p class="q">Which component decides on which node a new Pod runs?</p>
+    <ol>
+      <li data-k="a">kubelet</li>
+      <li data-k="b">kube-scheduler</li>
+      <li data-k="c">kube-controller-manager</li>
+      <li data-k="d">etcd</li>
+    </ol>
+    <div class="explain">The scheduler filters and scores nodes and writes a binding. The kubelet only runs Pods already bound to its node.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">What happens when a readiness probe fails?</p>
+    <ol>
+      <li data-k="a">The container is restarted</li>
+      <li data-k="b">The Pod is rescheduled to another node</li>
+      <li data-k="c">The Pod is removed from Service endpoints but keeps running</li>
+      <li data-k="d">The Deployment rollout is automatically rolled back</li>
+    </ol>
+    <div class="explain">Readiness only gates traffic. Liveness restarts; rollbacks are not automatic in plain Deployments.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">An HPA targets 50% CPU. 4 replicas each use 300m with a 200m request. How many replicas will it want?</p>
+    <ol>
+      <li data-k="a">12</li>
+      <li data-k="b">6</li>
+      <li data-k="c">8</li>
+      <li data-k="d">4</li>
+    </ol>
+    <div class="explain">Utilisation = 150%. ceil(4 × 150/50) = 12.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">Which Dockerfile change most improves rebuild time for a Spring Boot service after a one-line code change?</p>
+    <ol>
+      <li data-k="a">Switching from Ubuntu to Alpine base</li>
+      <li data-k="b">Adding HEALTHCHECK</li>
+      <li data-k="c">Using shell-form ENTRYPOINT</li>
+      <li data-k="d">Copying pom.xml and resolving dependencies before copying src, with a Maven cache mount</li>
+    </ol>
+    <div class="explain">Ordering by change frequency keeps the dependency layer cached; cache mounts persist the repository across builds.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">A PDB with minAvailable: 3 protects a Deployment with 3 replicas. What happens during a node drain?</p>
+    <ol>
+      <li data-k="a">Pods are evicted one at a time</li>
+      <li data-k="b">No evictions are allowed, so the drain blocks</li>
+      <li data-k="c">The PDB is ignored for drains</li>
+      <li data-k="d">All Pods are evicted at once</li>
+    </ol>
+    <div class="explain">Allowed disruptions = 3 − 3 = 0. Use maxUnavailable: 1 instead.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">In Gateway API, which resource is typically owned by application teams?</p>
+    <ol>
+      <li data-k="a">GatewayClass</li>
+      <li data-k="b">Gateway</li>
+      <li data-k="c">HTTPRoute</li>
+      <li data-k="d">EndpointSlice</li>
+    </ol>
+    <div class="explain">GatewayClass belongs to the infrastructure provider, Gateway to the platform team, Routes to application teams.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Docs</span> <a href="https://kubernetes.io/docs/concepts/">Kubernetes documentation — Concepts</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/">Configure Liveness, Readiness and Startup Probes</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.spring.io/spring-boot/reference/packaging/container-images/index.html">Spring Boot reference: Container Images (efficient images, Dockerfiles, Buildpacks)</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.spring.io/spring-boot/reference/actuator/endpoints.html#actuator.endpoints.kubernetes-probes">Spring Boot Actuator: Kubernetes probes</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.docker.com/build/buildkit/">Docker BuildKit documentation</a></li>
+    <li><span class="ref-kind">Spec</span> <a href="https://github.com/opencontainers/image-spec">OCI Image Format Specification</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://gateway-api.sigs.k8s.io/">Gateway API documentation</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://helm.sh/docs/">Helm documentation</a> and <a href="https://helm.sh/blog/helm-4-released">"Helm 4 Released"</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://kubectl.docs.kubernetes.io/references/kustomize/">Kustomize reference</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://research.google/pubs/large-scale-cluster-management-at-google-with-borg/">Verma et al., "Large-scale cluster management at Google with Borg", EuroSys 2015</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://queue.acm.org/detail.cfm?id=2898444">Burns, Grant, Oppenheimer, Brewer, Wilkes, "Borg, Omega, and Kubernetes", ACM Queue, 2016</a></li>
+    <li><span class="ref-kind">Book</span> Brendan Burns, <em>Designing Distributed Systems</em>, O'Reilly (1st ed. 2018; a 2nd edition followed) — container patterns (sidecar, ambassador, adapter).</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://book.kubebuilder.io/">The Kubebuilder Book</a> — writing controllers and operators.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://keda.sh/docs/">KEDA documentation</a></li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,1033 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Analytical SQL, Warehouses, Lakes &amp; the Lakehouse — AI-Era Software Engineering</title>
+<meta name="description" content="Analytical SQL (window functions, grouping sets, approximate aggregates), OLTP vs OLAP, Parquet and columnar storage internals, Snowflake/BigQuery/Redshift architecture, Kimball dimensional modeling and SCDs, data lakes, and Iceberg/Delta/Hudi lakehouse tables, with DuckDB examples.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p9-02-analytical-sql-storage" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 9 · Chapter 2</p>
+  <h1>Analytical SQL, Warehouses, Lakes &amp; the Lakehouse</h1>
+  <p class="lede">You know how to make Postgres fast for a thousand small transactions per second. This chapter is about the opposite workload: a handful of queries that each scan billions of rows. It explains why analytical engines store data by column, how Parquet files and lakehouse table formats such as Iceberg give you ACID tables on object storage, how cloud warehouses separate storage from compute, and how to model data so that analysts can query it correctly.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Solid SQL (joins, GROUP BY, indexes) and Postgres or MySQL operational experience; Chapter 9.1 is helpful but not required.</li>
+    <li><strong>You will be able to:</strong> write window-function, grouping-set and approximate queries; read a columnar query plan; explain Parquet's layout, encodings and predicate pushdown; compare Snowflake, BigQuery and Redshift architectures; design a star schema with SCD Type 2 dimensions; explain how Iceberg, Delta Lake and Hudi implement snapshots, time travel and ACID commits on S3; and use DuckDB as a local analytical engine.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: Two Workloads, Two Kinds of Database</h2>
+  <p>Your order service writes one row per order and reads orders by primary key. Postgres excels at this: a B-tree index finds a row in a few page reads, row-oriented heap pages keep all of an order's columns together, and MVCC lets thousands of short transactions run concurrently. This is <strong>OLTP</strong>, online transaction processing.</p>
+  <p>Now finance asks: <em>revenue by merchant category by week for the last three years, compared with the same week the previous year, excluding refunds.</em> That query touches hundreds of millions of rows but only five of the orders table's forty columns. On a row store it reads every byte of every row, including the 35 irrelevant columns, and it competes for buffer cache and I/O with checkout traffic. This is <strong>OLAP</strong>, online analytical processing, and it needs a different storage layout (columnar), a different execution model (vectorized, parallel scans), different modelling (denormalized star schemas instead of 3NF), and usually a different system: a cloud warehouse such as Snowflake, BigQuery or Redshift, or a <strong>lakehouse</strong> built from open files (Parquet) and open table formats (Apache Iceberg, Delta Lake, Apache Hudi) on object storage, queried by engines such as Spark, Trino or DuckDB.</p>
+  <p>This chapter goes from the SQL you write, down through the query plan, into the bytes on disk, and back up to the table formats and modelling patterns that make analytical data trustworthy.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>JPA entities mapped to normalized Postgres tables, Flyway migrations that evolve the schema, B-tree indexes chosen from <code>EXPLAIN ANALYZE</code>, read replicas for reporting queries, and the pain of a long-running report query holding back vacuum or saturating I/O on the primary.</dd>
+      <dt>Why that is not enough</dt><dd>Row storage and B-trees optimize for point lookups and small ranges. Analytical queries scan, aggregate and join huge fractions of the data; indexes do not help, normalization multiplies joins, and a single-node database cannot scale scans horizontally. Running analytics on OLTP replicas works until it does not, usually around the time data reaches hundreds of GB.</dd>
+      <dt>The modern approach</dt><dd>Replicate operational data (CDC, Chapter 9.3) into columnar storage: a managed warehouse, or Parquet files under an Iceberg/Delta table on S3/GCS/ADLS. Model it into fact and dimension tables. Query it with engines that prune files by statistics, read only needed columns, and process data in vectorized batches across many machines.</dd>
+      <dt>Where Python and Go fit</dt><dd>Python is the lingua franca for working with these formats (PyArrow, PyIceberg, DuckDB, Polars). Go appears in ingestion tooling and has Parquet and Arrow libraries. Java/Scala is the home of Spark, Trino, Flink and the reference Iceberg implementation, so JVM skills transfer directly to the engines.</dd>
+      <dt>In production</dt><dd>Warehouses are governed with role-based access, cost controls (warehouse auto-suspend, slot reservations), and table maintenance (clustering, compaction, snapshot expiry). Lakehouse tables need the same care your Postgres gets from vacuum and index maintenance, just under different names.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use columnar OLAP for scans and aggregations over large history. Avoid it as the backing store for request-path point lookups or high-rate single-row updates; that is still Postgres, a key-value store, or an online feature store.</dd>
+    </dl>
+  </div>
+  <div class="callout insight"><p class="callout-title">The core asymmetry</p><p>OLTP optimizes for <em>latency of many small operations</em>; OLAP optimizes for <em>throughput of few large scans</em>. Almost every design decision in this chapter (columns, compression, immutable files, batch commits, denormalized models) follows from that.</p></div>
+</section>
+
+<section id="history">
+  <h2>2. History: From Codd to Open Table Formats</h2>
+  <h3>2.1 Relational and the first warehouses (1970–1996)</h3>
+  <p>Edgar Codd's 1970 paper defined the relational model. By the late 1980s companies were copying operational data into separate "decision support" databases so that reports would not slow down transactions. Bill Inmon's <em>Building the Data Warehouse</em> (1992) argued for an enterprise-wide, normalized warehouse feeding departmental marts. Ralph Kimball's <em>The Data Warehouse Toolkit</em> (1996) argued for <strong>dimensional modelling</strong>: business-process-oriented star schemas that analysts can query directly. Both schools still shape how teams organize warehouses. The SQL:1999 standard added <code>GROUPING SETS</code>, <code>ROLLUP</code> and <code>CUBE</code>; SQL:2003 standardized window functions.</p>
+  <h3>2.2 Columnar engines and MPP (2000s)</h3>
+  <p>Research systems such as MonetDB and the C-Store paper (Stonebraker et al., VLDB 2005) showed that storing columns separately, compressing them aggressively, and executing queries over compressed columns was dramatically faster for analytics. C-Store was commercialized as Vertica. MPP (massively parallel processing) appliances such as Teradata, Netezza and Greenplum spread scans across many nodes with shared-nothing architecture.</p>
+  <h3>2.3 Hadoop, Hive and the data lake (2006–2013)</h3>
+  <p>Hadoop (2006) made it cheap to store everything in HDFS and process it with MapReduce. Hive (developed at Facebook, open-sourced 2008) put SQL on top, along with the <strong>Hive Metastore</strong>, which mapped table names to directories and is the ancestor of today's catalogs. The term "data lake" was coined by James Dixon around 2010. Google's Dremel paper (VLDB 2010) described nested columnar storage and tree-structured query execution; it inspired <strong>Apache Parquet</strong>, created by Twitter and Cloudera in 2013. Hortonworks and Facebook introduced <strong>ORC</strong> in Hive the same year. Lakes delivered cheap storage but became "swamps": directories of files with no transactions, no schema enforcement and no reliable way to update or delete a row.</p>
+  <h3>2.4 Cloud warehouses separate storage and compute (2010–2016)</h3>
+  <p>Google announced BigQuery in 2010, exposing Dremel as a service. Amazon Redshift was announced in late 2012 (based on technology licensed from ParAccel) and became generally available in early 2013. Snowflake, founded in 2012 and generally available in 2015, was built from scratch for the cloud with storage on S3 and independent virtual warehouses for compute; its design was published at SIGMOD 2016. Separation of storage and compute is the defining architectural shift of this era: you pay for storage continuously and for compute only while queries run.</p>
+  <h3>2.5 Table formats and the lakehouse (2017–2026)</h3>
+  <p>Three projects independently attacked the lake's lack of transactions. <strong>Apache Hudi</strong> was built at Uber (introduced publicly in 2017) for incremental upserts on HDFS. <strong>Apache Iceberg</strong> was created at Netflix to fix Hive table correctness and performance problems, entered the Apache incubator in 2018, and graduated in 2020. <strong>Delta Lake</strong> was open-sourced by Databricks in 2019. The 2021 CIDR paper "Lakehouse" by Armbrust and colleagues named the architecture: warehouse-grade management (ACID, schema, time travel, governance) over open files in object storage. Since then the formats have converged on features: Iceberg's v3 specification (2025) adds deletion vectors, row lineage and a variant type for semi-structured data, and Delta Lake's 4.x line adds a variant type and catalog-coordinated commits <span class="tag version">Version-sensitive · checked Nov 2026</span>. Warehouses responded by reading and writing Iceberg natively, and DuckDB (2019) brought a fast embedded columnar engine to laptops; its 1.4 LTS release (September 2025) added Iceberg writes and <code>MERGE</code>.</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals: Analytical SQL, Storage and Modelling Concepts</h2>
+
+  <h3>3.1 OLTP versus OLAP, precisely</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Dimension</th><th>OLTP (Postgres for your services)</th><th>OLAP (warehouse / lakehouse)</th></tr></thead>
+    <tbody>
+      <tr><td>Typical query</td><td>Point lookup or small range by key</td><td>Scan + filter + aggregate + join over millions to billions of rows</td></tr>
+      <tr><td>Write pattern</td><td>Many small concurrent transactions</td><td>Bulk loads, micro-batches, periodic MERGE</td></tr>
+      <tr><td>Storage layout</td><td>Row-oriented pages (heap + B-tree indexes)</td><td>Column-oriented, compressed, immutable files or micro-partitions</td></tr>
+      <tr><td>Schema style</td><td>Normalized (3NF) to avoid update anomalies</td><td>Denormalized star schemas for simple, fast joins</td></tr>
+      <tr><td>Concurrency</td><td>Thousands of short transactions</td><td>Tens to hundreds of heavy queries</td></tr>
+      <tr><td>Latency target</td><td>Milliseconds</td><td>Seconds to minutes (sub-second for BI with caching)</td></tr>
+      <tr><td>Data volume</td><td>GB to low TB, current state</td><td>TB to PB, full history</td></tr>
+      <tr><td>Scaling</td><td>Vertical, read replicas, sharding</td><td>Horizontal: add compute nodes, scale storage independently</td></tr>
+    </tbody>
+  </table></div>
+  <p>Hybrid systems (HTAP) such as TiDB, SingleStore or AlloyDB's columnar engine try to serve both; they are useful but do not remove the need to model analytical data well.</p>
+
+  <h3>3.2 Window functions</h3>
+  <p>A window function computes a value for each row using a set of related rows (its <em>window</em>) without collapsing them as <code>GROUP BY</code> does. The anatomy is <code>func(...) OVER (PARTITION BY ... ORDER BY ... frame)</code>:</p>
+  <ul>
+    <li><strong>PARTITION BY</strong> splits rows into independent groups (per zone, per customer).</li>
+    <li><strong>ORDER BY</strong> orders rows within a partition, which ranking and offset functions need.</li>
+    <li><strong>Frame</strong> selects which ordered rows feed an aggregate: <code>ROWS BETWEEN 6 PRECEDING AND CURRENT ROW</code> (a physical 7-row window) or <code>RANGE BETWEEN INTERVAL 7 DAYS PRECEDING AND CURRENT ROW</code> (a logical window by value). The default frame when <code>ORDER BY</code> is present is <code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code>, which produces running totals and surprises people when ties exist.</li>
+  </ul>
+  <p>Families: <strong>ranking</strong> (<code>ROW_NUMBER</code>, <code>RANK</code>, <code>DENSE_RANK</code>, <code>NTILE</code>, <code>PERCENT_RANK</code>), <strong>offset</strong> (<code>LAG</code>, <code>LEAD</code>, <code>FIRST_VALUE</code>, <code>LAST_VALUE</code>, <code>NTH_VALUE</code>), and <strong>aggregate</strong> (<code>SUM</code>, <code>AVG</code>, <code>COUNT</code> over a frame). The <code>QUALIFY</code> clause (Snowflake, BigQuery, DuckDB, Databricks) filters on window results the way <code>HAVING</code> filters on aggregates, which removes a layer of subquery for "top N per group" and deduplication.</p>
+  <p>Canonical uses: deduplicate CDC rows by keeping the latest version per key (<code>ROW_NUMBER() OVER (PARTITION BY id ORDER BY updated_at DESC) = 1</code>); sessionization (start a new session when <code>LAG(ts)</code> is more than 30 minutes earlier, then running-sum the session starts); period-over-period comparisons with <code>LAG</code>; moving averages; cumulative distributions.</p>
+
+  <h3>3.3 Common table expressions and recursion</h3>
+  <p>CTEs (<code>WITH name AS (...)</code>) name intermediate results, making long analytical queries readable as a pipeline of steps, which is how dbt models are usually written. Most modern engines inline CTEs and optimize across them (Postgres stopped treating CTEs as optimization fences by default in version 12). <code>WITH RECURSIVE</code> walks hierarchies (org charts, category trees, bill of materials) and graph-like structures; it is rarer in analytics but invaluable when needed.</p>
+
+  <h3>3.4 GROUPING SETS, ROLLUP and CUBE</h3>
+  <p>Reports often need totals at several levels: by borough and payment type, by borough alone, and a grand total. Writing three queries and a <code>UNION ALL</code> scans the data three times. <code>GROUPING SETS ((borough, payment_type), (borough), ())</code> computes all three in one pass. <code>ROLLUP(a, b, c)</code> is shorthand for the hierarchical sets <code>(a,b,c), (a,b), (a), ()</code>; <code>CUBE(a, b)</code> produces all 2<sup>n</sup> combinations. In the output, columns aggregated away are <code>NULL</code>; the <code>GROUPING(col)</code> function returns 1 when <code>col</code> is a rolled-up placeholder rather than a real null, which you need to label subtotal rows correctly.</p>
+
+  <h3>3.5 Approximate aggregates</h3>
+  <p>Exact <code>COUNT(DISTINCT user_id)</code> over billions of rows requires remembering every distinct value (memory proportional to cardinality) and a shuffle across nodes. <strong>HyperLogLog</strong> (HLL) estimates distinct counts in a few kilobytes with roughly 1–2% error, and HLL sketches are <em>mergeable</em>: you can store a daily sketch per merchant and combine them into weekly or monthly uniques without rescanning raw data. Similarly <strong>t-digest</strong> and <strong>KLL</strong> sketches estimate quantiles (p50, p99 latency or order value) with bounded error, and <strong>Count-Min Sketch</strong> estimates frequencies for heavy hitters. SQL surfaces these as <code>APPROX_COUNT_DISTINCT</code>, <code>APPROX_QUANTILES</code> / <code>APPROX_PERCENTILE</code>, <code>approx_top_k</code> and sketch-typed columns (BigQuery's <code>HLL_COUNT.*</code>, Snowflake's <code>HLL_*</code>, Apache DataSketches in Druid/Spark). Use them for dashboards and exploration; use exact counts for billing and finance.</p>
+
+  <h3>3.6 Columnar storage, compression and encodings</h3>
+  <p>A columnar layout stores each column's values contiguously. Three benefits follow. <strong>I/O reduction</strong>: a query touching 5 of 40 columns reads roughly an eighth of the bytes. <strong>Compression</strong>: values of one column share a type and often a small set of distinct values, so lightweight encodings work well: <em>dictionary encoding</em> (replace strings with small integer codes), <em>run-length encoding</em> (store <code>(value, run length)</code> for sorted or repetitive data), <em>bit-packing</em> (store small integers in the minimum bits), <em>delta encoding</em> (store differences between successive timestamps or ids), and <em>byte-stream split</em> for floats. A general-purpose codec (Snappy, ZSTD, LZ4, GZIP) is applied on top. <strong>Vectorized execution</strong>: operators process a batch of a few thousand values of one column at a time in tight loops (as in Chapter 9.1), and some operators work directly on encoded data (comparing dictionary codes instead of strings).</p>
+
+  <h3>3.7 Parquet and ORC</h3>
+  <p><strong>Parquet</strong> files are divided into <em>row groups</em> (horizontal slices, commonly 128 MB–1 GB of uncompressed data), each containing one <em>column chunk</em> per column, each chunk split into <em>pages</em> (around 1 MB) that are the unit of encoding and compression. The file ends with a <em>footer</em> holding the schema and, for every column chunk, statistics (min, max, null count), offsets, encodings and codec. Optional <em>page indexes</em> add per-page min/max, and optional <em>bloom filters</em> help with equality predicates on high-cardinality columns. Parquet supports nested data (structs, lists, maps) via Dremel-style repetition and definition levels. <strong>ORC</strong> has an equivalent structure (stripes, streams, a footer with statistics, lightweight indexes every 10,000 rows) and remains common in Hive-heavy environments; Parquet has become the default almost everywhere else.</p>
+
+  <h3>3.8 Predicate pushdown, projection pushdown and partition pruning</h3>
+  <p>These three optimizations are why lakehouse queries can be fast despite object storage latency:</p>
+  <ul>
+    <li><strong>Projection pushdown</strong>: read only the column chunks the query references.</li>
+    <li><strong>Predicate pushdown</strong>: evaluate filters against row-group and page statistics before reading data. If a row group's <code>pickup_date</code> max is before the filter's lower bound, skip the whole row group. Effectiveness depends on data being <em>clustered</em> on the filter column; random order makes every row group's min/max span the whole range, and nothing is skipped.</li>
+    <li><strong>Partition pruning</strong>: when data is laid out by a partition key (Hive-style directories <code>dt=2024-01-15/</code>, or Iceberg hidden partitions), whole files are skipped based on the partition values recorded in metadata.</li>
+  </ul>
+
+  <h3>3.9 Cloud data warehouses</h3>
+  <p><strong>Snowflake</strong> has three layers: a cloud-services layer (metadata, optimizer, transactions, access control), virtual warehouses (independent compute clusters of a chosen size that can be started, suspended and scaled), and storage (tables stored as immutable, compressed columnar <em>micro-partitions</em> of roughly 50–500 MB uncompressed in object storage, with min/max metadata for pruning). Because compute is decoupled, a BI team and an ETL job can use separate warehouses on the same data with no contention. Time travel and zero-copy cloning fall out of immutable micro-partitions plus metadata versioning.</p>
+  <p><strong>BigQuery</strong> is serverless: storage in Google's Colossus file system in the Capacitor columnar format, compute in a shared pool of execution units called <em>slots</em> scheduled by Dremel, and an in-memory distributed <em>shuffle</em> tier between stages, all connected by Google's Jupiter network. You pay per byte scanned (on-demand) or for reserved slot capacity. Partitioning (by date or integer range) and clustering (sorting within partitions by up to four columns) are the main levers for both performance and cost.</p>
+  <p><strong>Amazon Redshift</strong> started as a shared-nothing MPP cluster (a leader node plus compute nodes, data distributed by a distribution key, sorted by sort keys). Its RA3 node types and Redshift Serverless separate compute from <em>Redshift Managed Storage</em> backed by S3 with local SSD caching, and Spectrum queries external tables in S3. Distribution style (<code>KEY</code>, <code>EVEN</code>, <code>ALL</code>, <code>AUTO</code>) matters because joins on a shared distribution key avoid network redistribution.</p>
+  <p>Other important engines: <strong>Databricks SQL</strong> (Delta Lake with the Photon vectorized engine), <strong>Trino</strong>/Starburst and Amazon Athena (federated SQL over lake tables), <strong>ClickHouse</strong> (very fast columnar database, popular for event analytics and observability), <strong>Apache Druid</strong> and <strong>Apache Pinot</strong> (real-time OLAP for user-facing dashboards with sub-second latency).</p>
+
+  <h3>3.10 Dimensional modelling: facts, dimensions and grain</h3>
+  <p>Kimball's method designs analytical tables around <strong>business processes</strong> (taking an order, completing a trip). Each process gets a <strong>fact table</strong> whose rows are measurement events at a declared <strong>grain</strong> ("one row per completed trip", "one row per order line"). Facts hold foreign keys to dimensions plus numeric <em>measures</em> (fare, tip, distance). Measures are <em>additive</em> (sum across all dimensions: revenue), <em>semi-additive</em> (sum across some dimensions but not time: account balance), or <em>non-additive</em> (ratios: tip percentage, which must be recomputed from additive parts). <strong>Dimension tables</strong> describe the who/what/where/when: <code>dim_zone</code>, <code>dim_date</code>, <code>dim_vendor</code>, <code>dim_payment_type</code>. They are wide, denormalized, and full of descriptive attributes that analysts filter and group by.</p>
+  <p>A <strong>star schema</strong> is one fact table joined to its dimensions by surrogate keys. A <strong>snowflake schema</strong> normalizes dimensions into sub-dimensions (zone → borough), saving a little storage at the cost of more joins; in columnar engines, storage savings are negligible, so stars are preferred. <strong>Conformed dimensions</strong> (one <code>dim_customer</code> shared by orders, returns and support facts) let analysts compare across processes, the "bus architecture". Fact table types: <em>transaction</em> (one row per event), <em>periodic snapshot</em> (one row per entity per period: daily account balances), and <em>accumulating snapshot</em> (one row per workflow instance updated as it passes milestones: order placed, shipped, delivered). A <em>factless fact</em> records events with no measures (student attended class). <em>Degenerate dimensions</em> such as an order number live directly in the fact table. <em>Junk dimensions</em> group low-cardinality flags.</p>
+  <p><strong>Surrogate keys</strong> (warehouse-generated integers or hashes) rather than natural keys decouple the warehouse from source-system key changes and are required for history tracking.</p>
+
+  <h3>3.11 Slowly changing dimensions (SCD)</h3>
+  <p>Dimension attributes change: a merchant changes category, a customer moves city. How you record that change determines whether historical reports are reproducible.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Type</th><th>Behaviour</th><th>History?</th><th>Use when</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td>Retain original; never update</td><td>Original only</td><td>Immutable attributes (date of first order)</td></tr>
+      <tr><td>1</td><td>Overwrite in place</td><td>No</td><td>Corrections; attributes where history does not matter</td></tr>
+      <tr><td>2</td><td>Insert a new row with a new surrogate key; close the old row with <code>valid_to</code> and <code>is_current = false</code></td><td>Full</td><td>Reporting must reflect the attribute as it was at event time (sales by the merchant's category at the time of sale)</td></tr>
+      <tr><td>3</td><td>Add a "previous value" column</td><td>One prior value</td><td>Comparing before/after a known reorganization</td></tr>
+      <tr><td>4</td><td>Current table plus separate history table</td><td>Full, separated</td><td>Rapidly changing attributes</td></tr>
+      <tr><td>6 (1+2+3)</td><td>Type 2 rows plus a current-value column overwritten on all rows</td><td>Full + current</td><td>Report by both historical and current attribute</td></tr>
+    </tbody>
+  </table></div>
+  <p>Type 2 is the workhorse; dbt snapshots (Chapter 9.4) automate it. Fact rows must join to the dimension version valid at the event time, either by storing the surrogate key at load time or by a range join on <code>valid_from &lt;= event_ts &lt; valid_to</code>.</p>
+
+  <h3>3.12 Data vault, briefly</h3>
+  <p><strong>Data Vault 2.0</strong> (Dan Linstedt) models the integration layer as <em>hubs</em> (unique business keys), <em>links</em> (relationships between hubs) and <em>satellites</em> (descriptive attributes with load timestamps and record sources, append-only). It is insert-only, highly auditable and resilient to source changes, which suits large enterprises integrating dozens of systems under regulation. It is not meant for direct analyst querying: star-schema marts are built on top. Many teams in practice use a lighter layering (staging → intermediate → marts) instead.</p>
+
+  <h3>3.13 Data lakes</h3>
+  <p>A data lake stores raw and processed data as files in object storage (S3, GCS, ADLS) in open formats, organized by zones: <em>raw/bronze</em> (as ingested, immutable), <em>cleaned/silver</em> (deduplicated, typed, conformed), <em>curated/gold</em> (business-level aggregates and marts), the "medallion" naming popularized by Databricks. Lakes are cheap, open to every engine, and hold any data type including images and logs for ML. Their classic failures: no atomic multi-file commits (readers see half-written data), no safe concurrent writes, expensive directory listing on object stores, no row-level updates or deletes (a GDPR erasure means rewriting partitions by hand), and schemas that drift silently.</p>
+
+  <h3>3.14 The lakehouse and open table formats</h3>
+  <p>A <strong>table format</strong> is a metadata layer that defines which files constitute a table at a point in time. Iceberg, Delta Lake and Hudi all provide:</p>
+  <ul>
+    <li><strong>Snapshots</strong>: each commit produces a new immutable table version listing its data files.</li>
+    <li><strong>ACID commits on object storage</strong>: writers write new files, then atomically publish a new snapshot via a single atomic operation (a catalog compare-and-swap, or a put-if-absent of the next log file). Readers always see a complete snapshot.</li>
+    <li><strong>Optimistic concurrency control</strong>: concurrent writers detect conflicts at commit time and retry.</li>
+    <li><strong>Time travel</strong>: query <code>AS OF</code> a snapshot id or timestamp; roll back a bad write.</li>
+    <li><strong>Schema evolution</strong>: add, drop, rename and reorder columns safely (Iceberg tracks columns by id, so a rename never misreads old files).</li>
+    <li><strong>Partition evolution and hidden partitioning</strong> (Iceberg): partitions are derived by transforms such as <code>day(ts)</code> or <code>bucket(16, id)</code>; queries filter on <code>ts</code> and pruning happens automatically; the partition spec can change without rewriting old data.</li>
+    <li><strong>Row-level changes</strong>: <code>MERGE</code>, <code>UPDATE</code>, <code>DELETE</code> via copy-on-write (rewrite affected files) or merge-on-read (write delete files or deletion vectors and reconcile at read time).</li>
+    <li><strong>File-level statistics in metadata</strong>: so engines prune files without listing directories or opening footers.</li>
+  </ul>
+  <p>A <strong>catalog</strong> (Hive Metastore, AWS Glue, Iceberg REST catalogs such as Apache Polaris, Unity Catalog, Nessie) maps table names to the current metadata pointer and is where the atomic commit happens for Iceberg.</p>
+
+  <h3>3.15 DuckDB</h3>
+  <p>DuckDB is an in-process columnar SQL engine (like SQLite for analytics): no server, a single library linked into Python, Java (JDBC), Go, Node or the CLI. It uses vectorized execution with morsel-driven parallelism, reads Parquet, CSV, JSON, Iceberg and Delta directly from local disk or object storage, spills to disk for larger-than-memory operations, and integrates zero-copy with pandas, Polars and Arrow. It is ideal for local development against production-shaped data, CI tests of SQL models, embedded analytics inside services, and medium-scale ETL on a single machine.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working: Bytes on Disk, Plans in Memory, Commits on S3</h2>
+
+  <h3>4.1 Anatomy of a Parquet file</h3>
+<pre class="ascii">
+yellow_tripdata_2024-01.parquet
++-----------------------------------------------------------+
+| "PAR1" magic (4 bytes)                                    |
+| Row group 0  (~1M rows)                                   |
+|   Column chunk: tpep_pickup_datetime                      |
+|     [dictionary page?] [data page 1] [data page 2] ...    |
+|   Column chunk: PULocationID   (dict + RLE/bit-packed)    |
+|   Column chunk: fare_amount    (plain or byte-stream-split)|
+|   ...                                                     |
+| Row group 1 ...                                           |
+| Row group N ...                                           |
+| [column indexes / offset indexes]  (optional page stats)  |
+| [bloom filters]                    (optional)             |
+| Footer (Thrift FileMetaData):                             |
+|   schema, num_rows, key/value metadata (e.g. Arrow schema)|
+|   per row group, per column chunk:                        |
+|     offsets, sizes, codec, encodings,                     |
+|     statistics {min, max, null_count, distinct_count?}    |
+| footer length (4 bytes) | "PAR1" magic                    |
++-----------------------------------------------------------+
+</pre>
+  <p>A reader seeks to the end, reads the footer length and footer, and from then on knows exactly which byte ranges to fetch. On object storage that translates into a handful of HTTP range GETs: one for the footer, then one per needed column chunk in each surviving row group. This is why Parquet works well over S3 even though each request has tens of milliseconds of latency: engines issue many range requests in parallel and skip most of the file.</p>
+
+  <h3>4.2 Encoding a column, step by step</h3>
+  <p>Take <code>PULocationID</code> (about 260 distinct zone ids) for one million trips. The writer (1) builds a dictionary of distinct values, written once as a dictionary page; (2) replaces each value with its dictionary index, which fits in 9 bits; (3) encodes the index stream with the RLE/bit-packing hybrid: runs of repeated indexes become (value, count) pairs, other stretches are bit-packed 9 bits per value; (4) compresses each page with the chosen codec (ZSTD or Snappy). An int32 column that would take 4 MB raw might occupy a few hundred KB <span class="tag illus">Illustrative</span>. If the data is sorted by zone, RLE collapses it to a few hundred runs. If the dictionary grows too large (high-cardinality strings), the writer falls back to plain encoding for later pages.</p>
+
+  <h3>4.3 How a columnar engine executes a query</h3>
+  <p>Consider: <code>SELECT pu_borough, SUM(total_amount) FROM trips JOIN dim_zone USING (zone_key) WHERE pickup_date BETWEEN '2024-01-01' AND '2024-01-07' GROUP BY 1</code>. A distributed columnar engine (Snowflake, BigQuery, Spark SQL, Trino) proceeds roughly like this:</p>
+  <ol>
+    <li><strong>Parse and bind</strong> names against the catalog; resolve types.</li>
+    <li><strong>Logical optimization</strong>: push the date predicate down to the scan, prune unused columns (only <code>zone_key</code>, <code>pickup_date</code>, <code>total_amount</code> from trips), and decide join order using statistics.</li>
+    <li><strong>Metadata pruning</strong>: consult file/micro-partition min/max statistics for <code>pickup_date</code>; skip files outside the range. For a well-clustered table, 1 week out of 3 years leaves under 1% of files.</li>
+    <li><strong>Physical planning</strong>: the dimension is small, so choose a <em>broadcast hash join</em> (ship <code>dim_zone</code> to every worker) rather than a <em>shuffle (partitioned) hash join</em>.</li>
+    <li><strong>Distributed execution</strong>: each worker scans its assigned files, decodes only the needed column chunks into vectors of a few thousand values, applies the filter as a selection vector, probes the broadcast hash table, and computes a <em>partial aggregate</em> per borough.</li>
+    <li><strong>Exchange</strong>: partial aggregates are shuffled by borough (tiny: a handful of rows per worker) to final aggregators.</li>
+    <li><strong>Final aggregation</strong> and return.</li>
+  </ol>
+  <p>Reading a plan in a columnar engine means looking for: bytes scanned versus table size (pruning efficiency), the join strategy (broadcast vs shuffle), exchange/shuffle volume, and skew (one worker processing far more than others). Section 7.3 shows DuckDB's <code>EXPLAIN ANALYZE</code>.</p>
+
+  <h3>4.4 Iceberg's metadata tree</h3>
+  <p>An Iceberg table is a tree of immutable files:</p>
+  <ul>
+    <li><strong>Catalog entry</strong>: table name → location of the current <em>metadata file</em>. This pointer is the only mutable thing.</li>
+    <li><strong>Metadata file</strong> (<code>vN.metadata.json</code>): schemas (with column ids), partition specs, sort orders, properties, the list of snapshots, and the current snapshot id.</li>
+    <li><strong>Snapshot</strong>: points to one <em>manifest list</em> and records the operation (append, overwrite, delete) and summary statistics.</li>
+    <li><strong>Manifest list</strong> (Avro): one entry per manifest file, with partition-value ranges for each manifest so whole manifests can be skipped.</li>
+    <li><strong>Manifest files</strong> (Avro): one entry per data or delete file with its path, partition values, record count, and per-column lower/upper bounds, null counts and sizes.</li>
+    <li><strong>Data files</strong> (Parquet, ORC or Avro) and <strong>delete files</strong> (position deletes, equality deletes, or in v3, deletion vectors stored as Roaring bitmaps in Puffin files).</li>
+  </ul>
+  <p><strong>Read path</strong>: catalog → metadata file → current snapshot → manifest list (prune manifests by partition range) → manifests (prune data files by column bounds) → read surviving data files, applying delete files. No directory listing is ever needed.</p>
+  <p><strong>Write path (commit)</strong>: the writer writes new data files, writes new manifests describing them, writes a new manifest list that references new plus unchanged manifests, writes a new metadata file with the new snapshot, then asks the catalog to atomically swap the pointer from the metadata file it started from to the new one. If another writer committed first, the swap fails; the writer re-reads the latest metadata, checks whether its change conflicts (for an append, usually not; for an overwrite of the same files, yes), and retries by rewriting only the metadata, not the data.</p>
+
+  <h3>4.5 Delta Lake's transaction log</h3>
+  <p>A Delta table directory contains Parquet data files and a <code>_delta_log/</code> folder of ordered JSON commit files (<code>00000000000000000000.json</code>, <code>...001.json</code>). Each commit lists <em>actions</em>: <code>add</code> (a file with its statistics), <code>remove</code> (a file logically deleted), <code>metaData</code> (schema, partitioning), <code>protocol</code> (reader/writer feature versions), and <code>commitInfo</code>. The table state at version N is the replay of commits 0..N. Every 10 commits by default a <em>checkpoint</em> Parquet file summarizes the state so readers do not replay thousands of JSON files. Atomicity comes from creating the next numbered log file with put-if-absent semantics; on stores that historically lacked it (S3 before conditional writes), Delta used a coordination service such as DynamoDB. Newer Delta versions add catalog-managed/coordinated commits so that a catalog, not the file system, arbitrates commits <span class="tag version">Version-sensitive · checked Nov 2026</span>. Deletion vectors mark deleted rows in existing files without rewriting them.</p>
+
+  <h3>4.6 Hudi's timeline, copy-on-write and merge-on-read</h3>
+  <p>Hudi organizes a table around a <em>timeline</em> of instants (commits, delta commits, compactions, cleans) in a <code>.hoodie</code> directory, and around <em>file groups</em> identified by a record-key index, so an upsert can find which file group holds a key. <strong>Copy-on-Write (CoW)</strong> tables rewrite the affected Parquet base file on each update: reads are fast, writes are expensive. <strong>Merge-on-Read (MoR)</strong> tables append updates to row-based (Avro) log files next to the base file, and readers merge them on the fly until an asynchronous <em>compaction</em> folds logs into a new base file: writes are cheap, reads pay a merge cost. Hudi's strength is high-frequency upserts and incremental queries ("give me all records changed since instant T"), which is why it originated from Uber's need to apply database changelogs to the lake within minutes.</p>
+
+  <h3>4.7 Snowflake and BigQuery internals in brief</h3>
+  <p>Snowflake automatically partitions table data into micro-partitions in load order and stores per-column min/max, distinct counts and null counts in the metadata service. Pruning uses that metadata; if a large table's natural load order does not match common filters, a <em>clustering key</em> causes a background service to re-sort micro-partitions. Updates and deletes write new micro-partitions and retire old ones in metadata (copy-on-write), which is why time travel and cloning are cheap. BigQuery's Dremel engine compiles a query into stages of a tree; leaf stages read Capacitor columnar files from Colossus, intermediate results go through the distributed in-memory shuffle, and the scheduler assigns slots dynamically, so a query can use thousands of slots for seconds.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture Diagrams</h2>
+  <h3>5.1 From OLTP to analytics</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph OLTP["Operational tier"]
+    SVC["Spring Boot services"] --> PG[("Postgres primary")]
+    SVC --> K[["Kafka domain events"]]
+  end
+  PG -->|"WAL via Debezium CDC"| K2[["Kafka CDC topics"]]
+  K2 --> ING["Stream or batch ingestion (Spark, Flink, Connect sink)"]
+  K --> ING
+  ING --> BRONZE[("Bronze: raw Iceberg tables on S3")]
+  BRONZE --> SILVER[("Silver: deduplicated, typed")]
+  SILVER --> GOLD[("Gold: star-schema marts")]
+  CAT["Catalog (REST, Glue, Unity, Polaris)"] -.-> BRONZE
+  CAT -.-> SILVER
+  CAT -.-> GOLD
+  GOLD --> WH["Warehouse or SQL engine (Snowflake, BigQuery, Trino, Spark SQL)"]
+  GOLD --> DUCK["DuckDB and notebooks"]
+  WH --> BI["BI dashboards"]
+</pre>
+<figcaption>Figure 9.6 — Operational data flows through CDC into layered lakehouse tables governed by a catalog and queried by several engines.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> services keep writing to Postgres exactly as before; CDC reads the write-ahead log so the analytical copy adds no query load on the primary. Data lands in bronze tables untouched, so you can always replay. Silver applies deduplication (the window-function pattern in Section 7.2) and typing; gold holds dimensional models. The dashed lines matter: every table is registered in a catalog, which is what lets Spark, Trino, Snowflake and DuckDB all read the same Iceberg tables consistently. This "one copy, many engines" property is the main argument for the lakehouse over copying data into each tool.</p>
+
+  <h3>5.2 Iceberg metadata tree and pruning</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  C["Catalog: db.trips points to v42.metadata.json"] --> M["v42.metadata.json: schemas, partition specs, snapshots"]
+  M --> S2["Snapshot 9001 (current)"]
+  M --> S1["Snapshot 9000 (time travel)"]
+  S2 --> ML2["Manifest list snap-9001.avro"]
+  S1 --> ML1["Manifest list snap-9000.avro"]
+  ML2 --> MA["Manifest A: day 2024-01-01 to 01-15"]
+  ML2 --> MB["Manifest B: day 2024-01-16 to 01-31"]
+  ML1 --> MA
+  MA --> D1["data-001.parquet (fare 2.5 to 180)"]
+  MA --> D2["data-002.parquet"]
+  MB --> D3["data-003.parquet"]
+  MB --> DV["deletion vector for data-003"]
+</pre>
+<figcaption>Figure 9.7 — Iceberg's tree of immutable metadata. Snapshots share unchanged manifests; pruning happens at every level.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> two snapshots share manifest A because nothing in the first half of January changed; snapshot 9001 added manifest B. A query for January 20 reads the manifest list, skips manifest A from its partition range, reads manifest B, and prunes data files by column bounds before opening a single Parquet file. Time travel is just "start from snapshot 9000 instead of 9001". Because files are never modified in place, old snapshots remain readable until they are expired, after which orphaned files can be deleted.</p>
+
+  <h3>5.3 Optimistic commit protocol</h3>
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant W1 as Writer A (Spark job)
+  participant W2 as Writer B (streaming job)
+  participant S3 as Object storage
+  participant CAT as Catalog
+  W1->>CAT: load table (current = v41)
+  W2->>CAT: load table (current = v41)
+  W1->>S3: write data files and manifests
+  W2->>S3: write data files and manifests
+  W2->>CAT: commit: swap v41 to v42-B
+  CAT-->>W2: ok (current = v42-B)
+  W1->>CAT: commit: swap v41 to v42-A
+  CAT-->>W1: conflict, current is v42-B
+  W1->>CAT: reload v42-B and validate no conflicting changes
+  W1->>S3: write new manifest list and metadata v43
+  W1->>CAT: commit: swap v42-B to v43
+  CAT-->>W1: ok
+</pre>
+<figcaption>Figure 9.8 — Two concurrent writers commit to an Iceberg table with compare-and-swap at the catalog.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> both writers do the expensive work (writing data files) in parallel without locks. Only the final pointer swap is serialized. Writer A loses the race, re-reads the new state, and checks whether Writer B's changes conflict with its own (two appends never conflict; two overwrites of the same partition do, and then A's operation fails). On retry, A rewrites only small metadata files. This is the same optimistic concurrency you use with JPA <code>@Version</code> columns, applied to an entire table.</p>
+
+  <h3>5.4 A star schema for taxi trips</h3>
+<figure class="diagram">
+<pre class="mermaid">
+erDiagram
+  FACT_TRIP }o--|| DIM_DATE : "pickup_date_key"
+  FACT_TRIP }o--|| DIM_ZONE : "pickup_zone_key"
+  FACT_TRIP }o--|| DIM_ZONE : "dropoff_zone_key"
+  FACT_TRIP }o--|| DIM_VENDOR : "vendor_key"
+  FACT_TRIP }o--|| DIM_PAYMENT_TYPE : "payment_type_key"
+  FACT_TRIP {
+    bigint trip_id
+    int pickup_date_key
+    int pickup_zone_key
+    int dropoff_zone_key
+    int vendor_key
+    int payment_type_key
+    timestamp pickup_ts
+    decimal fare_amount
+    decimal tip_amount
+    decimal total_amount
+    double trip_distance
+    int duration_s
+  }
+  DIM_ZONE {
+    int zone_key
+    int location_id
+    string zone_name
+    string borough
+    string service_zone
+    date valid_from
+    date valid_to
+    boolean is_current
+  }
+  DIM_DATE {
+    int date_key
+    date full_date
+    string day_name
+    boolean is_weekend
+    boolean is_holiday
+  }
+</pre>
+<figcaption>Figure 9.9 — Star schema at the grain of one completed trip; the zone dimension is SCD Type 2 and plays two roles.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> the fact table is narrow and long (one row per trip, foreign keys plus additive measures). Dimensions are short and wide. <code>DIM_ZONE</code> is a <em>role-playing dimension</em>: it joins twice, as pickup and dropoff zone. Its <code>valid_from</code>/<code>valid_to</code>/<code>is_current</code> columns make it SCD Type 2, so if the TLC ever redraws a zone, historical trips keep their original zone attributes. Tip percentage is deliberately absent: it is non-additive, so it is computed at query time as <code>SUM(tip)/SUM(fare)</code>.</p>
+</section>
+
+<section id="math">
+  <h2>6. Mathematical Foundations: Scan Cost, Compression and Sketches</h2>
+  <h3>6.1 Bytes scanned is the cost function</h3>
+  <p>For analytical engines, a good first-order cost model is bytes read. For a table with \( N \) rows, column widths \( w_c \) after compression, a query touching column set \( Q \), and a fraction \( f \) of files surviving pruning:</p>
+  \[ \text{bytes}_{\text{columnar}} \approx f \cdot N \sum_{c \in Q} w_c \qquad \text{versus} \qquad \text{bytes}_{\text{row}} \approx N \sum_{c} w_c^{\text{raw}} \]
+  <p><span class="tag illus">Illustrative</span> 3 billion trips, 20 columns averaging 6 bytes raw: a row store reads about 360 GB. A columnar query touching 3 columns that compress to 2 bytes each, with 1 week of 3 years surviving pruning (\( f \approx 0.0064 \)): \( 0.0064 \times 3\times10^9 \times 6 \approx 115\ \text{MB} \). That is a 3,000x difference, which is why the same query takes hours on a row store and seconds in a warehouse, and why BigQuery's on-demand pricing (per byte scanned) rewards pruning directly.</p>
+
+  <h3>6.2 Dictionary encoding size</h3>
+  <p>With cardinality \( d \), each value costs \( \lceil \log_2 d \rceil \) bits plus the dictionary itself:</p>
+  \[ \text{size} \approx N \lceil \log_2 d \rceil / 8 \;+\; d \cdot \bar{\ell} \]
+  <p>where \( \bar{\ell} \) is the mean byte length of distinct values. For \( d = 263 \) zones and \( N = 10^6 \): \( 10^6 \times 9/8 \approx 1.1\ \text{MB} \) versus several MB for raw strings. For a column of UUIDs (\( d \approx N \)), the dictionary is as large as the data and gives no benefit, which is why writers fall back to plain encoding.</p>
+
+  <h3>6.3 Pruning effectiveness and clustering</h3>
+  <p>If a filter selects a fraction \( s \) of the value range and data is perfectly sorted on that column across \( F \) files, about \( sF + 1 \) files survive. If data is randomly ordered, each file's min/max spans nearly the full range and almost all \( F \) files survive. Clustering (sorting or Z-ordering on common filter columns) moves you from the second regime to the first. Z-ordering or Hilbert curves interleave several columns so that pruning works reasonably on each, at the cost of being optimal on none.</p>
+
+  <h3>6.4 HyperLogLog error</h3>
+  <p>Intuition: hash every value; in a uniformly random hash, seeing a hash with \( k \) leading zeros suggests you have seen about \( 2^k \) distinct values. One estimate is noisy, so HLL splits values into \( m \) buckets by the first bits of the hash, tracks the maximum leading-zero count per bucket, and combines buckets with a harmonic mean. The relative standard error is:</p>
+  \[ \sigma \approx \frac{1.04}{\sqrt{m}} \]
+  <p>With \( m = 2^{14} = 16{,}384 \) registers of 6 bits each (about 12 KB), the error is about 0.8%, regardless of whether the true count is a thousand or a billion. Merging two sketches is an elementwise <code>max</code> of registers, which is why sketches can be pre-aggregated per day and rolled up.</p>
+
+  <h3>6.5 Window function complexity</h3>
+  <p>A window with <code>PARTITION BY p ORDER BY o</code> requires sorting (or hashing then sorting) rows by \( (p, o) \): \( O(n \log n) \), plus a shuffle by \( p \) in a distributed engine. Ranking and running aggregates are then \( O(n) \) in one pass. Sliding-frame aggregates are \( O(n) \) with incremental (add/remove) algorithms for invertible aggregates such as <code>SUM</code>; for <code>MIN</code>/<code>MAX</code> or medians, engines use segment trees giving \( O(n \log w) \). A window <em>without</em> <code>PARTITION BY</code> forces all rows onto one worker: a classic scalability bug.</p>
+
+  <h3>6.6 Small files: the metadata tax</h3>
+  <p>Each data file costs per-file overhead: a footer read, an HTTP request, a manifest entry, and task scheduling. With per-request latency \( L \) and parallelism \( P \), opening \( F \) files costs about \( F \cdot L / P \) before any useful bytes. <span class="tag illus">Illustrative</span> A streaming job committing every minute into 50 partitions produces 72,000 files per day; at \( L = 30 \) ms and \( P = 64 \), just opening them takes about 34 seconds per full-day query. Compaction to ~512 MB files reduces that by orders of magnitude, which is why table maintenance is not optional.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code: Analytical SQL, Parquet Internals, Iceberg and SCD Type 2</h2>
+  <p>Examples run locally with DuckDB 1.4+, PyArrow 17+, PySpark 4.0 with the Iceberg Spark runtime, and PyIceberg 0.9+ <span class="tag version">Version-sensitive · checked Nov 2026</span>. Data is the public NYC TLC yellow-taxi Parquet for January 2024 plus the zone lookup CSV.</p>
+
+  <h3>7.1 Set up a local analytical database with DuckDB</h3>
+<pre data-file="setup.sql (run with: duckdb tlc.duckdb &lt; setup.sql)"><code class="language-sql">INSTALL httpfs; LOAD httpfs;
+
+CREATE OR REPLACE TABLE raw_trips AS
+SELECT * FROM read_parquet('https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet');
+
+CREATE OR REPLACE TABLE dim_zone AS
+SELECT row_number() OVER (ORDER BY LocationID) AS zone_key,
+       LocationID AS location_id, Borough AS borough, Zone AS zone_name,
+       service_zone, DATE '1900-01-01' AS valid_from, DATE '9999-12-31' AS valid_to,
+       TRUE AS is_current
+FROM read_csv_auto('https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv');
+
+-- A cleaned fact table at the grain of one trip.
+CREATE OR REPLACE TABLE fact_trip AS
+SELECT row_number() OVER ()                       AS trip_id,
+       t.tpep_pickup_datetime                     AS pickup_ts,
+       CAST(t.tpep_pickup_datetime AS DATE)       AS pickup_date,
+       pz.zone_key                                AS pickup_zone_key,
+       dz.zone_key                                AS dropoff_zone_key,
+       t.payment_type, t.passenger_count, t.trip_distance,
+       t.fare_amount, t.tip_amount, t.total_amount,
+       date_diff('second', t.tpep_pickup_datetime, t.tpep_dropoff_datetime) AS duration_s
+FROM raw_trips t
+LEFT JOIN dim_zone pz ON pz.location_id = t.PULocationID AND pz.is_current
+LEFT JOIN dim_zone dz ON dz.location_id = t.DOLocationID AND dz.is_current
+WHERE t.fare_amount &gt; 0 AND t.trip_distance &gt; 0
+  AND t.tpep_pickup_datetime &gt;= TIMESTAMP '2024-01-01'
+  AND t.tpep_pickup_datetime &lt;  TIMESTAMP '2024-02-01';</code></pre>
+
+  <h3>7.2 Window functions: ranking, period-over-period, moving averages, dedup, sessions</h3>
+<pre data-file="windows.sql"><code class="language-sql">-- (a) Top 3 pickup zones by revenue within each borough, with share of borough revenue.
+WITH zone_rev AS (
+    SELECT z.borough, z.zone_name, SUM(f.total_amount) AS revenue
+    FROM fact_trip f JOIN dim_zone z ON z.zone_key = f.pickup_zone_key
+    GROUP BY ALL
+)
+SELECT borough, zone_name, revenue,
+       DENSE_RANK() OVER (PARTITION BY borough ORDER BY revenue DESC) AS rnk,
+       revenue / SUM(revenue) OVER (PARTITION BY borough)             AS share_of_borough
+FROM zone_rev
+QUALIFY rnk &lt;= 3
+ORDER BY borough, rnk;
+
+-- (b) Daily trips with day-over-day change, same-weekday-last-week change,
+--     and a 7-day trailing moving average (ROWS frame: exactly 7 rows).
+WITH daily AS (
+    SELECT pickup_date, COUNT(*) AS trips FROM fact_trip GROUP BY 1
+)
+SELECT pickup_date, trips,
+       trips - LAG(trips) OVER w                                 AS dod_change,
+       trips::DOUBLE / LAG(trips, 7) OVER w - 1                  AS wow_pct,
+       AVG(trips) OVER (w ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS trips_ma7
+FROM daily
+WINDOW w AS (ORDER BY pickup_date)
+ORDER BY pickup_date;
+
+-- (c) Running total vs. the default RANGE frame trap: with ties on pickup_date,
+--     RANGE includes all peers, ROWS does not.
+SELECT pickup_date, total_amount,
+       SUM(total_amount) OVER (ORDER BY pickup_date)                                   AS range_running,
+       SUM(total_amount) OVER (ORDER BY pickup_date, trip_id ROWS UNBOUNDED PRECEDING) AS rows_running
+FROM fact_trip
+LIMIT 20;
+
+-- (d) Deduplicate a CDC-style table: keep the latest version of each key.
+CREATE OR REPLACE TABLE orders_cdc AS
+SELECT * FROM (VALUES
+    (1, 'CREATED', TIMESTAMP '2024-01-01 10:00:00', 'c'),
+    (1, 'PAID',    TIMESTAMP '2024-01-01 10:05:00', 'u'),
+    (2, 'CREATED', TIMESTAMP '2024-01-01 11:00:00', 'c'),
+    (1, 'PAID',    TIMESTAMP '2024-01-01 10:05:00', 'u')      -- duplicate delivery
+) t(order_id, status, updated_at, op);
+
+SELECT * FROM orders_cdc
+QUALIFY ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY updated_at DESC) = 1;
+
+-- (e) Sessionization: a new "shift" for a vendor when the gap between
+--     consecutive pickups in a zone exceeds 30 minutes.
+WITH ordered AS (
+    SELECT pickup_zone_key, pickup_ts,
+           CASE WHEN pickup_ts - LAG(pickup_ts) OVER (PARTITION BY pickup_zone_key ORDER BY pickup_ts)
+                     &gt; INTERVAL 30 MINUTE
+                  OR LAG(pickup_ts) OVER (PARTITION BY pickup_zone_key ORDER BY pickup_ts) IS NULL
+                THEN 1 ELSE 0 END AS is_new_session
+    FROM fact_trip
+)
+SELECT pickup_zone_key,
+       SUM(is_new_session) OVER (PARTITION BY pickup_zone_key ORDER BY pickup_ts) AS session_id,
+       pickup_ts
+FROM ordered
+LIMIT 50;</code></pre>
+
+  <h3>7.3 GROUPING SETS, approximate aggregates and reading a plan</h3>
+<pre data-file="rollups.sql"><code class="language-sql">-- Revenue by (borough, payment_type), by borough, and grand total, in one scan.
+SELECT CASE WHEN GROUPING(z.borough) = 1 THEN 'ALL BOROUGHS' ELSE z.borough END AS borough,
+       CASE WHEN GROUPING(f.payment_type) = 1 THEN 'ALL' ELSE CAST(f.payment_type AS VARCHAR) END AS payment_type,
+       COUNT(*)            AS trips,
+       SUM(f.total_amount) AS revenue
+FROM fact_trip f JOIN dim_zone z ON z.zone_key = f.pickup_zone_key
+GROUP BY GROUPING SETS ((z.borough, f.payment_type), (z.borough), ())
+ORDER BY GROUPING(z.borough), borough, GROUPING(f.payment_type), payment_type;
+
+-- Exact vs approximate distinct counts and quantiles.
+SELECT COUNT(DISTINCT pickup_zone_key || '-' || dropoff_zone_key) AS exact_od_pairs,
+       approx_count_distinct(pickup_zone_key || '-' || dropoff_zone_key) AS approx_od_pairs,
+       quantile_cont(total_amount, 0.99)   AS exact_p99,
+       approx_quantile(total_amount, 0.99) AS approx_p99
+FROM fact_trip;
+
+-- Inspect the physical plan with runtime statistics.
+EXPLAIN ANALYZE
+SELECT z.borough, SUM(f.total_amount)
+FROM fact_trip f JOIN dim_zone z ON z.zone_key = f.pickup_zone_key
+WHERE f.pickup_date BETWEEN DATE '2024-01-08' AND DATE '2024-01-14'
+GROUP BY 1;</code></pre>
+  <p>In the <code>EXPLAIN ANALYZE</code> output, look for the filter pushed into the scan (it appears as a filter inside the scan operator), the <code>HASH_JOIN</code> with the small <code>dim_zone</code> on the build side, a <code>HASH_GROUP_BY</code>, and per-operator row counts and timings. When querying Parquet directly, the scan operator also reports how many row groups and files were read, which is the pruning signal.</p>
+
+  <h3>7.4 Write and inspect Parquet with PyArrow</h3>
+<pre data-file="parquet_inspect.py"><code class="language-python">"""Write the same data sorted and unsorted, then compare size and row-group statistics."""
+import duckdb
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
+
+con = duckdb.connect("tlc.duckdb", read_only=True)
+table = con.sql("SELECT * FROM fact_trip").arrow()       # Arrow table, zero-copy
+
+def write(tbl, path: str) -&gt; None:
+    pq.write_table(
+        tbl, path,
+        row_group_size=500_000,            # rows per row group
+        compression="zstd", compression_level=3,
+        use_dictionary=["payment_type", "pickup_zone_key", "dropoff_zone_key"],
+        write_statistics=True,
+        write_page_index=True,             # per-page min/max for finer pruning
+    )
+
+write(table, "trips_unsorted.parquet")
+write(table.sort_by([("pickup_ts", "ascending")]), "trips_sorted.parquet")
+
+for path in ("trips_unsorted.parquet", "trips_sorted.parquet"):
+    md = pq.ParquetFile(path).metadata
+    col = md.schema.to_arrow_schema().get_field_index("pickup_ts")
+    print(f"\n{path}: {md.num_rows:,} rows, {md.num_row_groups} row groups")
+    for rg in range(md.num_row_groups):
+        stats = md.row_group(rg).column(col).statistics
+        print(f"  rg{rg}: pickup_ts min={stats.min} max={stats.max}")
+
+# Predicate pushdown: count row groups that survive a one-day filter.
+import datetime as dt
+lo, hi = dt.datetime(2024, 1, 15), dt.datetime(2024, 1, 16)
+for path in ("trips_unsorted.parquet", "trips_sorted.parquet"):
+    md = pq.ParquetFile(path).metadata
+    col = md.schema.to_arrow_schema().get_field_index("pickup_ts")
+    survivors = sum(
+        1 for rg in range(md.num_row_groups)
+        if not (md.row_group(rg).column(col).statistics.max &lt; lo
+                or md.row_group(rg).column(col).statistics.min &gt;= hi)
+    )
+    print(f"{path}: {survivors}/{md.num_row_groups} row groups must be read")
+
+t = pq.read_table("trips_sorted.parquet", columns=["pickup_ts", "total_amount"],
+                  filters=[("pickup_ts", "&gt;=", lo), ("pickup_ts", "&lt;", hi)])
+print(t.num_rows, pc.sum(t["total_amount"]))</code></pre>
+  <p>Run it and the lesson of Section 6.3 becomes concrete: the unsorted file's row groups all span the whole month, so a one-day filter must read every one; the sorted file's row groups are disjoint, so one or two survive. Sort order is a physical design decision, just as index choice is in Postgres.</p>
+
+  <h3>7.5 Iceberg with Spark SQL: create, MERGE, time travel, schema and partition evolution</h3>
+<pre data-file="iceberg_demo.py"><code class="language-python">"""Local Iceberg lakehouse with a file-based (Hadoop) catalog. For production use a REST catalog."""
+from pyspark.sql import SparkSession
+
+spark = (
+    SparkSession.builder.appName("iceberg-demo")
+    # Match the runtime to your Spark/Scala version; check the Iceberg releases page.
+    .config("spark.jars.packages", "org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.0")
+    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+    .config("spark.sql.catalog.lake", "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.lake.type", "hadoop")
+    .config("spark.sql.catalog.lake.warehouse", "file:///tmp/lakehouse")
+    .getOrCreate()
+)
+
+spark.sql("""
+CREATE TABLE IF NOT EXISTS lake.tlc.trips (
+    trip_id BIGINT, pickup_ts TIMESTAMP, pu_location_id INT, do_location_id INT,
+    payment_type INT, fare_amount DECIMAL(10,2), tip_amount DECIMAL(10,2),
+    total_amount DECIMAL(10,2))
+USING iceberg
+PARTITIONED BY (day(pickup_ts))                      -- hidden partitioning
+TBLPROPERTIES ('format-version'='2', 'write.target-file-size-bytes'='536870912')
+""")
+
+src = (spark.read.parquet("yellow_tripdata_2024-01.parquet")   # downloaded locally
+       .selectExpr("monotonically_increasing_id() AS trip_id",
+                   "tpep_pickup_datetime AS pickup_ts",
+                   "CAST(PULocationID AS INT) AS pu_location_id",
+                   "CAST(DOLocationID AS INT) AS do_location_id",
+                   "CAST(payment_type AS INT) AS payment_type",
+                   "CAST(fare_amount AS DECIMAL(10,2)) AS fare_amount",
+                   "CAST(tip_amount AS DECIMAL(10,2)) AS tip_amount",
+                   "CAST(total_amount AS DECIMAL(10,2)) AS total_amount"))
+src.writeTo("lake.tlc.trips").append()               # snapshot 1
+
+# Idempotent upsert: corrections arrive for some trips (e.g., fare adjustments).
+src.limit(1000).selectExpr("trip_id", "pickup_ts", "pu_location_id", "do_location_id",
+                           "payment_type", "fare_amount + 1 AS fare_amount",
+                           "tip_amount", "total_amount + 1 AS total_amount") \
+   .createOrReplaceTempView("corrections")
+spark.sql("""
+MERGE INTO lake.tlc.trips t
+USING corrections c
+ON t.trip_id = c.trip_id
+WHEN MATCHED THEN UPDATE SET t.fare_amount = c.fare_amount, t.total_amount = c.total_amount
+WHEN NOT MATCHED THEN INSERT *
+""")                                                 # snapshot 2
+
+# Inspect metadata tables: snapshots, files, manifests.
+spark.sql("SELECT snapshot_id, committed_at, operation, summary['added-data-files'] "
+          "FROM lake.tlc.trips.snapshots").show(truncate=False)
+spark.sql("SELECT file_path, record_count, file_size_in_bytes "
+          "FROM lake.tlc.trips.files LIMIT 5").show(truncate=False)
+
+# Time travel: compare revenue before and after the corrections.
+first = spark.sql("SELECT min(snapshot_id) AS s FROM lake.tlc.trips.snapshots").first()["s"]
+spark.sql(f"SELECT SUM(total_amount) FROM lake.tlc.trips VERSION AS OF {first}").show()
+spark.sql("SELECT SUM(total_amount) FROM lake.tlc.trips").show()
+
+# Schema evolution: add and rename columns without rewriting data (columns tracked by id).
+spark.sql("ALTER TABLE lake.tlc.trips ADD COLUMN congestion_surcharge DECIMAL(10,2)")
+spark.sql("ALTER TABLE lake.tlc.trips RENAME COLUMN pu_location_id TO pickup_location_id")
+
+# Partition evolution: new data partitioned by hour; old files keep the day spec.
+spark.sql("ALTER TABLE lake.tlc.trips REPLACE PARTITION FIELD day(pickup_ts) WITH hour(pickup_ts)")
+
+# Maintenance: compact small files, expire old snapshots, remove orphans.
+spark.sql("CALL lake.system.rewrite_data_files(table =&gt; 'tlc.trips')")
+spark.sql("CALL lake.system.expire_snapshots(table =&gt; 'tlc.trips', retain_last =&gt; 5)")
+spark.sql("CALL lake.system.remove_orphan_files(table =&gt; 'tlc.trips')")</code></pre>
+  <p>Every operation above is a new snapshot except the maintenance calls' metadata cleanup. Look in <code>/tmp/lakehouse/tlc/trips/metadata/</code> after each step to see new <code>vN.metadata.json</code>, manifest list and manifest files appear: the tree from Figure 9.7, on your disk.</p>
+
+  <h3>7.6 Reading the same table from Python without Spark (PyIceberg + DuckDB)</h3>
+<pre data-file="pyiceberg_read.py"><code class="language-python">from pyiceberg.catalog import load_catalog
+from pyiceberg.expressions import And, GreaterThanOrEqual, LessThan
+
+# For a REST catalog: load_catalog("prod", uri="https://catalog.example.com", warehouse="s3://lake/")
+catalog = load_catalog("local", type="sql", uri="sqlite:////tmp/pyiceberg.db",
+                       warehouse="file:///tmp/pyiceberg-warehouse")
+table = catalog.load_table("tlc.trips")
+
+scan = table.scan(
+    row_filter=And(GreaterThanOrEqual("pickup_ts", "2024-01-15T00:00:00"),
+                   LessThan("pickup_ts", "2024-01-16T00:00:00")),
+    selected_fields=("pickup_ts", "total_amount"),
+)
+print(len(list(scan.plan_files())), "data files after pruning")   # metadata-only pruning
+arrow_tbl = scan.to_arrow()
+
+import duckdb
+print(duckdb.sql("SELECT date_trunc('hour', pickup_ts) h, SUM(total_amount) "
+                 "FROM arrow_tbl GROUP BY 1 ORDER BY 1").fetchall()[:5])</code></pre>
+  <p>Note: the PyIceberg example uses its own SQL catalog; to read the table created by Spark above, point both at the same catalog (in practice, a shared REST catalog). DuckDB's <code>iceberg</code> extension can also attach REST catalogs and read (and, from 1.4, write) Iceberg tables directly.</p>
+
+  <h3>7.7 SCD Type 2 with MERGE</h3>
+<pre data-file="scd2_merge.sql (Spark SQL on Iceberg/Delta; same shape in Snowflake/BigQuery)"><code class="language-sql">-- dim_merchant: merchant_sk, merchant_id, name, category, city,
+--               valid_from, valid_to, is_current, row_hash
+-- stg_merchant: latest snapshot of the source system (one row per merchant_id)
+
+MERGE INTO dim_merchant AS d
+USING (
+    -- Rows whose attributes changed appear twice: once to close the old version
+    -- (join_key = merchant_id) and once to insert the new one (join_key = NULL).
+    SELECT s.merchant_id AS join_key, s.* FROM stg_merchant s
+    UNION ALL
+    SELECT NULL AS join_key, s.*
+    FROM stg_merchant s
+    JOIN dim_merchant d ON d.merchant_id = s.merchant_id AND d.is_current
+    WHERE d.row_hash &lt;&gt; s.row_hash
+) AS src
+ON d.merchant_id = src.join_key AND d.is_current
+WHEN MATCHED AND d.row_hash &lt;&gt; src.row_hash THEN
+    UPDATE SET d.valid_to = current_timestamp(), d.is_current = false
+WHEN NOT MATCHED THEN
+    INSERT (merchant_sk, merchant_id, name, category, city,
+            valid_from, valid_to, is_current, row_hash)
+    VALUES (xxhash64(src.merchant_id, current_timestamp()), src.merchant_id, src.name,
+            src.category, src.city, current_timestamp(), TIMESTAMP '9999-12-31 00:00:00',
+            true, src.row_hash);
+
+-- Point-in-time join: attach the merchant category valid at order time.
+SELECT o.order_id, o.order_ts, d.category
+FROM fact_order o
+JOIN dim_merchant d
+  ON d.merchant_id = o.merchant_id
+ AND o.order_ts &gt;= d.valid_from AND o.order_ts &lt; d.valid_to;</code></pre>
+  <p>The <code>UNION ALL</code> trick ("merge with a null join key") lets a single atomic <code>MERGE</code> both close the old row and insert the new one, so readers never see a merchant with zero or two current rows. <code>row_hash</code> (for example <code>sha2(concat_ws('|', name, category, city), 256)</code> computed in staging) makes change detection a single comparison.</p>
+
+  <h3>7.8 From Java: DuckDB over JDBC</h3>
+<div class="code-tabs">
+<pre data-lang="Java"><code class="language-java">// Maven: org.duckdb:duckdb_jdbc:1.4.1  (version-sensitive)
+import java.sql.*;
+
+public class ZoneRevenue {
+    public static void main(String[] args) throws SQLException {
+        try (Connection conn = DriverManager.getConnection("jdbc:duckdb:");   // in-memory
+             Statement st = conn.createStatement()) {
+            st.execute("INSTALL httpfs; LOAD httpfs;");
+            String sql = """
+                SELECT PULocationID, COUNT(*) AS trips, SUM(total_amount) AS revenue,
+                       DENSE_RANK() OVER (ORDER BY SUM(total_amount) DESC) AS rnk
+                FROM read_parquet('https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet')
+                WHERE fare_amount &gt; 0
+                GROUP BY PULocationID
+                QUALIFY rnk &lt;= ?
+                """;
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setInt(1, 5);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        System.out.printf("zone=%d trips=%d revenue=%.2f%n",
+                            rs.getInt(1), rs.getLong(2), rs.getDouble(3));
+                    }
+                }
+            }
+        }
+    }
+}</code></pre>
+<pre data-lang="Python"><code class="language-python">import duckdb
+
+print(duckdb.sql("""
+    SELECT PULocationID, COUNT(*) trips, SUM(total_amount) revenue,
+           DENSE_RANK() OVER (ORDER BY SUM(total_amount) DESC) rnk
+    FROM read_parquet('https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet')
+    WHERE fare_amount &gt; 0
+    GROUP BY PULocationID
+    QUALIFY rnk &lt;= 5
+""").fetchall())</code></pre>
+<pre data-lang="Go"><code class="language-go">// go get github.com/marcboeker/go-duckdb   (cgo; version-sensitive)
+package main
+
+import (
+	"database/sql"
+	"fmt"
+	"log"
+
+	_ "github.com/marcboeker/go-duckdb"
+)
+
+func main() {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("INSTALL httpfs; LOAD httpfs;"); err != nil {
+		log.Fatal(err)
+	}
+	rows, err := db.Query(`
+		SELECT PULocationID, COUNT(*) AS trips, SUM(total_amount) AS revenue
+		FROM read_parquet('https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet')
+		WHERE fare_amount &gt; 0
+		GROUP BY PULocationID ORDER BY revenue DESC LIMIT 5`)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var zone int32
+		var trips int64
+		var revenue float64
+		if err := rows.Scan(&amp;zone, &amp;trips, &amp;revenue); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("zone=%d trips=%d revenue=%.2f\n", zone, trips, revenue)
+	}
+}</code></pre>
+</div>
+  <p>Embedding DuckDB in a Spring Boot service is a legitimate pattern for read-only analytical endpoints over Parquet exports (for example, a merchant-facing "your monthly stats" page), isolating analytical load from Postgres. Keep the connection per-thread or use a pool of duplicated connections, and remember DuckDB allows one writing process per database file.</p>
+</section>
+
+<section id="applications">
+  <h2>8. Real-World Applications</h2>
+  <h3>8.1 Enterprise BI on a cloud warehouse</h3>
+  <p>The most common setup: Fivetran/Airbyte or CDC loads source data into Snowflake or BigQuery, dbt builds staging and dimensional marts, and BI tools (Looker, Tableau, Power BI, Superset) query the marts. Separate compute for loading, transformation and BI prevents a dashboard storm from slowing the nightly build.</p>
+  <h3>8.2 Open lakehouse for multi-engine access</h3>
+  <p>Companies with large data volumes, ML workloads, or a desire to avoid vendor lock-in store tables as Iceberg or Delta on object storage. Spark or Flink write; Trino, Snowflake, BigQuery, Databricks SQL and DuckDB read. ML training jobs read the same tables as BI, with time travel providing reproducible training snapshots (Chapter 10.1).</p>
+  <h3>8.3 Real-time user-facing analytics</h3>
+  <p>"Your store's sales today" pages and observability backends need sub-second queries under high concurrency. That is the domain of ClickHouse, Druid and Pinot, which ingest from Kafka and pre-aggregate or index aggressively. Warehouses are rarely the right backend for a page that thousands of merchants load at once.</p>
+  <h3>8.4 Regulatory and audit reporting</h3>
+  <p>SCD Type 2 dimensions, time travel, and immutable snapshots answer "what did we report on March 31, and why?" Auditors care that a historical report can be reproduced exactly; table formats make that a query rather than an archaeology project.</p>
+  <h3>8.5 Local development and CI with DuckDB</h3>
+  <p>Teams run their dbt models or SQL transformations against DuckDB with sampled Parquet fixtures in CI, catching SQL errors and test failures in seconds without warehouse cost. Analysts query production-sized Parquet extracts on laptops.</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 Netflix and the origin of Iceberg</h3>
+  <p><span class="tag fact">Verified</span> Iceberg was created at Netflix to address correctness and performance problems with Hive tables at very large scale: Hive tracked partitions in a metastore but files by directory listing, which made atomic changes impossible and listings slow on S3. Iceberg replaced directory listing with tracked file metadata and atomic snapshot commits. The project's own documentation and the Apache incubation record describe this origin. Source: <a href="https://iceberg.apache.org/spec/">Apache Iceberg table specification</a>.</p>
+  <h3>9.2 Uber and Apache Hudi</h3>
+  <p><span class="tag fact">Verified</span> Uber introduced Hudi in 2017 as an incremental processing framework that applies mutations to data in HDFS within minutes and chains incremental processing, splitting storage into a columnar base format and row-based logs. A 2023 follow-up describes Uber's transactional data lake running incremental ETL on Hudi, using incremental reads and upserts instead of recomputing whole partitions, with snapshot reads for backfills. Sources: <a href="https://www.uber.com/blog/hoodie/">Hudi: Uber Engineering's Incremental Processing Framework on Apache Hadoop</a> and <a href="https://www.uber.com/blog/ubers-lakehouse-architecture/">Setting Uber's Transactional Data Lake in Motion with Incremental ETL Using Apache Hudi</a>.</p>
+  <h3>9.3 Snowflake's architecture paper</h3>
+  <p><span class="tag fact">Verified</span> Dageville et al. described Snowflake's multi-cluster, shared-data architecture at SIGMOD 2016: storage in S3, independent elastic virtual warehouses, and a cloud services layer for metadata and transactions, with micro-partition pruning instead of indexes. It is the clearest primary source on why separating storage from compute changed warehouse economics. Source: <a href="https://dl.acm.org/doi/10.1145/2882903.2903741">The Snowflake Elastic Data Warehouse (SIGMOD 2016)</a>.</p>
+  <h3>9.4 Google Dremel</h3>
+  <p><span class="tag fact">Verified</span> The Dremel paper (VLDB 2010) introduced the nested columnar representation with repetition and definition levels that Parquet adopted, and multi-level serving trees for interactive queries over trillions of rows; a 2020 retrospective ("Dremel: A Decade of Interactive SQL Analysis at Web Scale") describes how BigQuery evolved toward disaggregated storage, compute and in-memory shuffle. Sources: <a href="https://research.google/pubs/dremel-interactive-analysis-of-web-scale-datasets-2/">Dremel: Interactive Analysis of Web-Scale Datasets</a> and <a href="https://research.google/pubs/dremel-a-decade-of-interactive-sql-analysis-at-web-scale/">Dremel: A Decade of Interactive SQL Analysis at Web Scale</a>.</p>
+  <h3>9.5 Shopify's dbt-on-BigQuery modelling workflow</h3>
+  <p><span class="tag fact">Verified</span> Shopify's data team described building a production-grade SQL modelling workflow with dbt on BigQuery, with conventions for model layering, testing and CI, an example of dimensional and modular modelling discipline applied at scale. Source: <a href="https://shopify.engineering/build-production-grade-workflow-sql-modelling">Build Production Grade Workflow with SQL Modelling</a>.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages, Limitations and Costs</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Option</th><th>Advantages</th><th>Limitations</th><th>Cost model</th></tr></thead>
+    <tbody>
+      <tr><td>Analytics on Postgres replica</td><td>No new system; fresh data; familiar</td><td>Row storage; single node; long queries interfere with replication; poor at TB scale</td><td>Replica instance cost</td></tr>
+      <tr><td>Snowflake</td><td>Separate warehouses per workload; near-zero tuning; time travel; sharing</td><td>Proprietary storage (Iceberg tables mitigate); credit cost surprises with poorly suspended warehouses</td><td>Per-second compute credits + storage</td></tr>
+      <tr><td>BigQuery</td><td>Serverless; massive burst parallelism; no clusters</td><td>On-demand per-TB-scanned cost punishes unpartitioned <code>SELECT *</code>; slot contention on reservations</td><td>Per byte scanned or slot reservations + storage</td></tr>
+      <tr><td>Redshift</td><td>Tight AWS integration; RA3/Serverless separation; Spectrum for S3</td><td>More tuning (dist/sort keys, WLM) than peers; concurrency scaling costs</td><td>Node-hours or RPU-hours + managed storage</td></tr>
+      <tr><td>Lakehouse (Iceberg/Delta/Hudi + engines)</td><td>Open formats; one copy for BI and ML; no lock-in; cheapest storage</td><td>You own compaction, snapshot expiry, catalog ops, engine tuning</td><td>Object storage + engine compute + ops time</td></tr>
+      <tr><td>DuckDB</td><td>Zero infra; extremely fast single-node; great for dev and CI</td><td>Single machine; single writer per file; not a shared multi-user service by itself</td><td>Free (your hardware)</td></tr>
+      <tr><td>ClickHouse / Druid / Pinot</td><td>Sub-second, high-concurrency analytics on fresh data</td><td>Weaker joins and updates; specialized modelling</td><td>Cluster cost or managed service</td></tr>
+    </tbody>
+  </table></div>
+  <h3>10.1 Table formats compared</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Feature</th><th>Apache Iceberg</th><th>Delta Lake</th><th>Apache Hudi</th></tr></thead>
+    <tbody>
+      <tr><td>Metadata structure</td><td>Metadata JSON → manifest list → manifests</td><td>Ordered JSON log + Parquet checkpoints</td><td>Timeline of instants + file groups + index</td></tr>
+      <tr><td>Commit atomicity</td><td>Catalog compare-and-swap</td><td>Put-if-absent log file, or catalog-coordinated commits</td><td>Timeline instant with locking provider</td></tr>
+      <tr><td>Partitioning</td><td>Hidden partitioning with transforms; partition evolution</td><td>Explicit columns; liquid clustering (Databricks/OSS)</td><td>Explicit partition paths</td></tr>
+      <tr><td>Row-level changes</td><td>CoW or MoR (position/equality deletes, v3 deletion vectors)</td><td>CoW or deletion vectors</td><td>CoW or MoR with log files and compaction</td></tr>
+      <tr><td>Sweet spot</td><td>Multi-engine open lakehouse</td><td>Spark/Databricks-centric lakehouse</td><td>High-frequency upserts and incremental pulls</td></tr>
+      <tr><td>Interop</td><td>Broadest engine support; REST catalog spec</td><td>UniForm exposes Iceberg metadata</td><td>XTable (incubating) translates metadata</td></tr>
+    </tbody>
+  </table></div>
+  <p><span class="tag version">Version-sensitive · checked Nov 2026</span> Feature parity changes with every release; verify against current docs before choosing on a single feature.</p>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs and Decisions</h2>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A["Analytical data under 100 GB and one team?"] -->|"yes"| B["Postgres replica or DuckDB over Parquet"]
+  A -->|"no"| C{"Need open formats, ML on same data, or multi-engine?"}
+  C -->|"yes"| D{"Heavy upserts or CDC at minute latency?"}
+  D -->|"yes"| E["Iceberg MoR or Hudi, with compaction"]
+  D -->|"no"| F["Iceberg or Delta with Spark, Trino or warehouse engines"]
+  C -->|"no"| G{"Want zero infrastructure tuning?"}
+  G -->|"yes"| H["Snowflake or BigQuery"]
+  G -->|"no, deep AWS integration"| I["Redshift Serverless or RA3"]
+  F --> J{"User-facing sub-second dashboards?"}
+  H --> J
+  J -->|"yes"| K["Add ClickHouse, Pinot or Druid serving layer"]
+  J -->|"no"| L["BI directly on marts"]
+</pre>
+<figcaption>Figure 9.10 — A decision flow for analytical storage.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> the first branch is scale, because the cheapest system is the one you already run. The second is openness: if ML pipelines, multiple engines or long-term cost control matter, a table format over object storage is the default, with the upsert profile choosing between formats. If you value operational simplicity above all, a managed warehouse wins. Real-time user-facing analytics is a separate serving concern regardless of which analytical store you choose. <span class="tag opinion">Opinion</span> Many organizations end up with a hybrid: Iceberg as the system of record and a warehouse that reads and writes those Iceberg tables.</p>
+  <h3>11.1 Star schema versus one big table (OBT)</h3>
+  <p>Columnar engines make wide denormalized tables cheap to scan, so some teams skip stars and publish one big table per use case. OBT is simpler for BI tools and fast to query, but duplicates dimension attributes (updating a merchant category means rewriting history), and different OBTs drift apart. A common compromise: model stars as the source of truth and generate OBTs from them as presentation views or tables.</p>
+  <h3>11.2 Copy-on-write versus merge-on-read</h3>
+  <p>CoW makes writes expensive and reads cheap: choose it for tables read far more often than updated (most marts). MoR makes writes cheap and reads more expensive until compaction: choose it for CDC targets updated every few minutes. The compaction schedule is the knob that trades freshness cost for read cost.</p>
+  <h3>11.3 Partitioning granularity</h3>
+  <p>Partition by the most common filter (usually event date), at a granularity that yields files of hundreds of MB. Over-partitioning (by hour and customer) creates millions of tiny files. Under-partitioning forces large scans. With Iceberg, rely on hidden partitioning plus sort order within files rather than encoding every filter into directory structure.</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Production Failures</h2>
+  <ul>
+    <li><strong>Running analytics on the OLTP primary.</strong> A month-end report scans the orders table, evicts the buffer cache and causes checkout latency spikes. Use replicas at minimum, CDC to analytics properly.</li>
+    <li><strong>Window without PARTITION BY on huge data.</strong> <code>ROW_NUMBER() OVER (ORDER BY ts)</code> over billions of rows pushes everything to one worker.</li>
+    <li><strong>The default RANGE frame.</strong> Running totals that jump in steps because ties on the ordering column are included together.</li>
+    <li><strong>Averaging non-additive measures.</strong> Storing tip percentage in the fact table and summing or averaging it across groups.</li>
+    <li><strong>Unpartitioned <code>SELECT *</code> in BigQuery.</strong> A single exploratory query scanning tens of TB on on-demand pricing. Require partition filters (<code>require_partition_filter</code>) and set per-user quotas.</li>
+    <li><strong>Small files.</strong> Streaming writes every few seconds into many partitions without compaction; query planning time dominates.</li>
+    <li><strong>Never expiring snapshots.</strong> Storage grows without bound because every overwritten file is retained for time travel; GDPR deletes are not physically complete until old snapshots expire.</li>
+    <li><strong>SCD Type 1 where Type 2 was needed.</strong> Last year's revenue by category changes every time a merchant is recategorized; finance loses trust.</li>
+    <li><strong>Joining facts to current dimension rows.</strong> Using <code>is_current</code> instead of the event-time validity range, rewriting history in every report.</li>
+    <li><strong>Treating approximate counts as exact.</strong> Billing customers from <code>APPROX_COUNT_DISTINCT</code>.</li>
+    <li><strong>Leaving warehouses running.</strong> A Snowflake warehouse with auto-suspend disabled over a weekend.</li>
+    <li><strong>Multiple catalogs for one table.</strong> Two engines committing to the same Iceberg table through different catalogs corrupts its history; use exactly one catalog of record.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Performance</h3>
+  <p>Cluster or sort large tables on dominant filter columns; target file sizes of 256 MB–1 GB; keep statistics fresh; prefer broadcast joins for small dimensions; materialize expensive aggregates (incremental models or materialized views); use result caches for repeated BI queries. Monitor bytes scanned per query and the pruning ratio.</p>
+  <h3>13.2 Cost control</h3>
+  <p>Warehouses: auto-suspend in minutes, size warehouses per workload, resource monitors or budgets, query tagging for chargeback. BigQuery: partition filters required, reservations for predictable workloads, per-project quotas. Lakehouse: lifecycle policies on object storage, snapshot expiry, compaction to reduce request costs.</p>
+  <h3>13.3 Security and governance</h3>
+  <p>Centralize permissions in the catalog (Unity Catalog, Polaris, Lake Formation) or warehouse RBAC; use column masking and row-access policies for PII; encrypt at rest with managed keys; never grant direct bucket access that bypasses catalog policies. Deletion for privacy requests must include expiring snapshots that still reference deleted rows. Chapter 9.4 covers governance in depth.</p>
+  <h3>13.4 Reliability and maintenance</h3>
+  <p>Schedule table maintenance like you schedule vacuum: compaction, manifest rewriting, snapshot expiry, orphan file removal. Back up catalog state. Test restores via time travel. Alert on commit conflicts and failed maintenance jobs.</p>
+  <h3>13.5 Monitoring</h3>
+  <p>Track per-table freshness (last commit time), row-count deltas, file counts and average file size, query latency percentiles by workload, queueing time in warehouses, and spend per team. These are the Micrometer-dashboard equivalents for the analytical tier.</p>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>Using <code>fact_trip</code> in DuckDB, compute for each day the number of trips, the 7-day moving average, and the percentage change versus the same weekday one week earlier. Which days of January 2024 show the largest week-over-week drop, and what plausible non-data explanation exists?</p>
+    <details class="solution"><summary>Solution</summary><div>
+    <p>Use query 7.2(b) and order by <code>wow_pct</code> ascending. Expect drops around holidays (New Year's Day; Martin Luther King Jr. Day on January 15, 2024) and around severe weather. Before concluding, check that the pipeline loaded all hours for those days (a data issue would show as missing hours).</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Write one query that returns revenue by (borough, day-of-week), subtotals per borough, subtotals per day-of-week across boroughs, and a grand total, with readable labels for subtotal rows. Then explain why <code>CUBE</code> would be equivalent here.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-sql">SELECT CASE WHEN GROUPING(z.borough)=1 THEN 'ALL' ELSE z.borough END AS borough,
+       CASE WHEN GROUPING(dayname(f.pickup_date))=1 THEN 'ALL' ELSE dayname(f.pickup_date) END AS dow,
+       SUM(f.total_amount) AS revenue
+FROM fact_trip f JOIN dim_zone z ON z.zone_key = f.pickup_zone_key
+GROUP BY CUBE (z.borough, dayname(f.pickup_date))
+ORDER BY 1, 2;</code></pre>
+    <p><code>CUBE(a, b)</code> expands to <code>GROUPING SETS ((a,b), (a), (b), ())</code>, exactly the four levels requested. <code>ROLLUP(a, b)</code> would omit the <code>(b)</code> level. <code>GROUPING()</code> distinguishes subtotal placeholders from genuine null boroughs (the TLC lookup has "Unknown" and null-like zones).</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>Write the trips Parquet file twice, once sorted by <code>pickup_ts</code> and once by <code>pickup_zone_key</code>. For the queries "one day of trips" and "all trips from zone 132 (JFK)", count surviving row groups for each layout. What layout would you choose if both queries are equally common?</p>
+    <details class="solution"><summary>Solution</summary><div>
+    <p>Each layout prunes well for its own sort column and poorly for the other. Options: partition by day and sort within each file by zone (day pruning via partitions, zone pruning via in-file sort; good for both); Z-order on both columns; or keep two copies if both are latency-critical. With Iceberg: <code>PARTITIONED BY (day(pickup_ts))</code> plus <code>WRITE ORDERED BY pu_location_id</code>.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>Design the SCD Type 2 <code>dim_merchant</code> pipeline for a source Postgres table updated in place. Specify the change-detection method, the MERGE, how fact rows get the right surrogate key, and how a late-arriving fact (an order from 3 days ago arriving today) is handled.</p>
+    <details class="solution"><summary>Solution</summary><div>
+    <p>Change detection: CDC from Postgres gives every update with its commit timestamp; alternatively, daily snapshot comparison with a row hash. Use the source commit time, not load time, as <code>valid_from</code>, so history reflects reality. MERGE: Section 7.7. Fact keys: look up the dimension version where <code>valid_from &lt;= order_ts &lt; valid_to</code> during fact loading, which handles late-arriving facts naturally because the range join uses the order's own timestamp. If a fact arrives before its dimension row exists (an early-arriving fact), insert an "inferred member" placeholder row and update it in place (Type 1 for that row) when the real attributes arrive.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>A streaming job appends to an Iceberg table every 30 seconds into hourly partitions. After a month, queries over one day take 40 seconds, mostly in planning. Diagnose using metadata tables and propose a maintenance plan.</p>
+    <details class="solution"><summary>Solution</summary><div>
+    <p>Query <code>table.files</code> for file count and average size per partition (expect thousands of tiny files per day), <code>table.manifests</code> for manifest count, and <code>table.snapshots</code> (tens of thousands of snapshots). Plan: run <code>rewrite_data_files</code> hourly on the previous hour's partition (binpack to ~512 MB, optionally sort), <code>rewrite_manifests</code> daily, <code>expire_snapshots</code> keeping 2–7 days for time travel, <code>remove_orphan_files</code> weekly. Increase the streaming commit interval if freshness allows (2–5 minutes). Verify by measuring planning time and files scanned before and after.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why is columnar storage faster for analytics, and when is it slower?</summary><div><p>It reads only referenced columns, compresses far better because each column is homogeneous, enables vectorized SIMD execution, and supports statistics-based pruning. It is slower for point lookups and single-row updates: reconstructing a row touches every column file, and updating a value means rewriting compressed, immutable files.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is the difference between RANK, DENSE_RANK and ROW_NUMBER?</summary><div><p>For values 100, 90, 90, 80: ROW_NUMBER gives 1,2,3,4 (arbitrary among ties unless ordered further); RANK gives 1,2,2,4 (gaps after ties); DENSE_RANK gives 1,2,2,3 (no gaps). Use ROW_NUMBER for deduplication, DENSE_RANK for "top N distinct values".</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How do Iceberg tables achieve ACID transactions on S3, which has no multi-object transactions?</summary><div><p>Data and metadata files are immutable and written first. The only mutable state is the catalog pointer to the current metadata file, updated by an atomic compare-and-swap. Readers resolve a snapshot and see a consistent set of files; writers commit optimistically and retry metadata on conflict. Isolation is snapshot isolation by default, with serializable available for some operations.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Explain separation of storage and compute and why it matters.</summary><div><p>Storage lives in durable object storage; compute clusters are stateless (with caches) and can be created, resized and shut down independently. Benefits: pay for compute only when used, isolate workloads with separate clusters on the same data, scale storage without moving data, and restart compute without data loss. Costs: remote reads (mitigated by caching and pruning) and a metadata service that becomes critical.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Deduplicate a CDC table keeping the latest row per key, but drop keys whose latest operation is a delete.</summary><div>
+<pre><code class="language-sql">SELECT * EXCLUDE (rn)
+FROM (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY lsn DESC) AS rn
+  FROM orders_cdc
+)
+WHERE rn = 1 AND op &lt;&gt; 'd';</code></pre>
+  <p>Order by the log sequence number (or commit LSN plus event position), not a wall-clock timestamp, since multiple changes can share a timestamp.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Finance says last quarter's revenue by region changed since they last ran the report. What could cause it?</summary><div><p>Late-arriving facts loaded after the first run; SCD Type 1 overwrites moving merchants between regions; a backfill or bug fix reprocessing old partitions; currency rates restated; deduplication logic changed. Fixes: SCD2 for region; snapshot or time-travel the reported dataset and record the snapshot id with the report; document restatement policy.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Kimball versus Inmon versus Data Vault?</summary><div><p>Kimball: bottom-up, business-process star schemas with conformed dimensions, optimized for querying. Inmon: top-down normalized enterprise warehouse feeding marts, optimized for integration. Data Vault: hubs/links/satellites, insert-only, optimized for auditability and absorbing source change, with marts on top. Modern practice often uses a light layered approach with Kimball-style marts.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> A BigQuery bill doubled this month. How do you investigate and prevent recurrence?</summary><div><p>Query <code>INFORMATION_SCHEMA.JOBS</code> for bytes billed by user, project and query hash; find the top offenders (often a dashboard refreshing a <code>SELECT *</code> on an unpartitioned table, or a scheduled query without partition filters). Fix with partitioning and clustering, <code>require_partition_filter</code>, materialized aggregates for dashboards, per-user quotas, and possibly moving predictable workloads to reserved slots.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> When would you use merge-on-read rather than copy-on-write?</summary><div><p>When updates are frequent and small relative to file size (CDC applied every few minutes): MoR writes compact delete markers or log files instead of rewriting large files, then compaction amortizes the rewrite. Reads pay a merge cost until compaction, so it suits write-heavy tables with tolerant readers.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>OLAP workloads scan and aggregate; columnar storage, compression, vectorization and pruning make them fast.</li>
+    <li>Window functions, CTEs, GROUPING SETS and approximate aggregates are the core analytical SQL toolkit; know frames and QUALIFY.</li>
+    <li>Parquet = row groups of column chunks of pages, with footer statistics enabling pushdown; sort order determines pruning effectiveness.</li>
+    <li>Snowflake, BigQuery and Redshift all separate storage from compute in different ways; cost follows compute time or bytes scanned.</li>
+    <li>Dimensional models: declare the grain, keep measures additive, use conformed dimensions and SCD Type 2 where history matters.</li>
+    <li>Iceberg, Delta and Hudi add snapshots, atomic commits, time travel and schema evolution to files on object storage; they need maintenance.</li>
+    <li>DuckDB brings the same columnar engine ideas to a single process: ideal for dev, CI and medium data.</li>
+  </ul>
+  <div class="quiz" data-answer="b">
+    <p class="q">A Parquet file's row groups each span the full date range of the data. What does that imply for a one-day filter?</p>
+    <ol>
+      <li data-k="a">Bloom filters will compensate</li>
+      <li data-k="b">Min/max statistics cannot prune any row group, so all must be read</li>
+      <li data-k="c">Dictionary encoding makes the filter free</li>
+      <li data-k="d">Projection pushdown will skip the irrelevant rows</li>
+    </ol>
+    <div class="explain">Statistics pruning only skips a row group if the filter range lies outside its min/max. Unsorted data gives every row group a wide range. Bloom filters help equality predicates, not ranges; projection pushdown skips columns, not rows.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">In Iceberg, what is the single mutable piece of state changed by a commit?</p>
+    <ol>
+      <li data-k="a">The newest manifest file</li>
+      <li data-k="b">The data files of the affected partition</li>
+      <li data-k="c">The catalog's pointer to the current metadata file</li>
+      <li data-k="d">A lock file in the table directory</li>
+    </ol>
+    <div class="explain">Everything else is written as new immutable files; the commit is an atomic swap of the catalog pointer from the old metadata file to the new one.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">Sales must be reported by the customer's region at the time of sale, even after customers move. Which SCD type?</p>
+    <ol>
+      <li data-k="a">Type 2</li>
+      <li data-k="b">Type 1</li>
+      <li data-k="c">Type 0</li>
+      <li data-k="d">Type 3</li>
+    </ol>
+    <div class="explain">Type 2 keeps a new row per version with validity ranges, so facts join to the version valid at event time. Type 1 overwrites history; Type 3 keeps only one previous value.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">Which query pattern forces all rows onto a single worker in a distributed engine?</p>
+    <ol>
+      <li data-k="a"><code>SUM(x) OVER (PARTITION BY customer_id)</code></li>
+      <li data-k="b"><code>GROUP BY GROUPING SETS ((a), (b))</code></li>
+      <li data-k="c"><code>APPROX_COUNT_DISTINCT(user_id)</code></li>
+      <li data-k="d"><code>ROW_NUMBER() OVER (ORDER BY event_ts)</code> with no PARTITION BY</li>
+    </ol>
+    <div class="explain">A global ordering without partitions requires a single sorted sequence. Partitioned windows, grouping sets and mergeable sketches all parallelize.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">Approximately how large an HLL sketch gives about 0.8% relative error?</p>
+    <ol>
+      <li data-k="a">Proportional to the number of distinct values</li>
+      <li data-k="b">About 16K registers, roughly 12 KB, independent of cardinality</li>
+      <li data-k="c">1 bit per input row</li>
+      <li data-k="d">It cannot be bounded</li>
+    </ol>
+    <div class="explain">Relative error ≈ 1.04/√m; m = 2<sup>14</sup> gives ≈ 0.81%, with 6-bit registers totalling about 12 KB, regardless of how many distinct values exist.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Which property best distinguishes merge-on-read from copy-on-write tables?</p>
+    <ol>
+      <li data-k="a">MoR tables cannot be time-travelled</li>
+      <li data-k="b">CoW tables only support appends</li>
+      <li data-k="c">MoR records changes separately and reconciles at read time until compaction; CoW rewrites affected files at write time</li>
+      <li data-k="d">MoR stores data row-wise only</li>
+    </ol>
+    <div class="explain">The trade is where the merge cost is paid: on write (CoW) or on read plus compaction (MoR).</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Ralph Kimball, Margy Ross, <em>The Data Warehouse Toolkit</em>, 3rd ed., Wiley, 2013.</li>
+    <li><span class="ref-kind">Book</span> Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, O'Reilly, 2017 — ch. 3 (column-oriented storage).</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://parquet.apache.org/docs/file-format/">Apache Parquet file format documentation</a>.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://iceberg.apache.org/spec/">Apache Iceberg table specification</a>.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://github.com/delta-io/delta/blob/master/PROTOCOL.md">Delta Lake transaction protocol</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://hudi.apache.org/docs/overview">Apache Hudi documentation</a>.</li>
+    <li><span class="ref-kind">Paper</span> <a href="https://www.cidrdb.org/cidr2021/papers/cidr2021_paper17.pdf">Armbrust et al., Lakehouse: A New Generation of Open Platforms (CIDR 2021)</a>.</li>
+    <li><span class="ref-kind">Paper</span> <a href="https://dl.acm.org/doi/10.1145/2882903.2903741">Dageville et al., The Snowflake Elastic Data Warehouse (SIGMOD 2016)</a>.</li>
+    <li><span class="ref-kind">Paper</span> <a href="https://research.google/pubs/dremel-interactive-analysis-of-web-scale-datasets-2/">Melnik et al., Dremel (VLDB 2010)</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://duckdb.org/docs/">DuckDB documentation</a> and <a href="https://duckdb.org/2025/09/16/announcing-duckdb-140">DuckDB 1.4 LTS announcement</a>.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://opensource.googleblog.com/2025/08/whats-new-in-iceberg-v3.html">Google Open Source: What's new in Apache Iceberg v3</a>.</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

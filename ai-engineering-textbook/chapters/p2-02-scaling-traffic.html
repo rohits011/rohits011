@@ -1,0 +1,1244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scaling &amp; Traffic: Load Balancers, Proxies, Gateways, Rate Limits — AI-Era Software Engineering</title>
+<meta name="description" content="Horizontal and vertical scaling, stateless services and Spring Session, L4/L7 load balancing algorithms and health checks, reverse proxies, API gateways and BFFs, and rate limiting algorithms from token bucket to distributed Redis + Lua limiters.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p2-02-scaling-traffic" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 2 · Chapter 2</p>
+  <h1>Scaling &amp; Traffic: Load Balancers, Proxies, Gateways, Rate Limits</h1>
+  <p class="lede">Chapter 1 gave you the numbers; this chapter gives you the machinery that lets a fleet of Spring Boot instances absorb them. We go from "add more pods" to the precise mechanics of how traffic is spread, protected and shaped: why statelessness is the prerequisite for everything, how L4 and L7 balancers really choose a backend, why power-of-two-choices beats round-robin on heterogeneous fleets, what belongs in a gateway and what does not, and how to build a rate limiter that is correct across fifty gateway nodes.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> <a href="p2-01-system-design-foundations.html">Chapter 1</a> (Little's Law, percentiles, availability maths). Experience deploying Spring Boot behind a cloud load balancer or Kubernetes Service/Ingress.</li>
+    <li><strong>You will be able to:</strong> choose between vertical and horizontal scaling with a cost argument; make services stateless and externalise sessions; select an L4 or L7 balancer and an algorithm for a given workload; configure health checks and graceful draining that drop zero requests on deploy; decide what belongs in an API gateway versus a BFF versus the service; and implement, compare and operate token bucket, leaky bucket, fixed window, sliding log and sliding window counter limiters, locally and on Redis.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: Getting Traffic to the Right Place, Safely</h2>
+  <p>Every system that outgrows one machine faces the same three questions. <em>Where</em> does each request go? <em>What</em> happens to it on the way (authentication, routing, transformation, observation)? And <em>how much</em> of it do we accept before saying no? Load balancers answer the first, reverse proxies and API gateways the second, and rate limiters and load shedders the third. Together they form the traffic layer: the part of the architecture that sits between the internet and your Spring Boot code.</p>
+  <p>The traffic layer exists because horizontal scaling only works if requests can be spread across interchangeable instances, failing instances can be removed without users noticing, new versions can be rolled out without dropping connections, and abusive or excessive traffic can be stopped before it consumes the capacity that legitimate users need. Get any of these wrong and adding instances does not add capacity: sticky sessions pin load to a few hot instances, a naive algorithm sends requests to a server stuck in a GC pause, a deploy drops a few thousand in-flight requests, or a single misbehaving client consumes the database.</p>
+  <p>This chapter covers, in order: the scaling decision itself; statelessness and session externalisation; load balancing at layer 4 and layer 7 with every major algorithm and the health-checking and draining machinery around them; reverse proxies (NGINX, Envoy, HAProxy); API gateways (Spring Cloud Gateway, Kong, Envoy-based gateways, AWS API Gateway) and the Backend-for-Frontend pattern; and finally rate limiting in depth, from the five classic algorithms to distributed implementations with Redis and Lua, Bucket4j and Resilience4j in Spring, and <code>golang.org/x/time/rate</code> in Go.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>You have deployed services behind an AWS ALB or a Kubernetes Ingress, maybe called other services through Spring Cloud LoadBalancer or a <code>@LoadBalanced RestTemplate</code>/<code>WebClient</code>, perhaps used <code>spring-session-data-redis</code> to share HTTP sessions, written a <code>OncePerRequestFilter</code> for auth, and configured a Resilience4j <code>@RateLimiter</code> on an outbound call.</dd>
+      <dt>Why that is not enough</dt><dd>Those are mostly defaults chosen by someone else. At scale you must reason about which layer balances (DNS, L4, L7, client-side), which algorithm suits a fleet with uneven instance sizes and long-tailed latencies, how health checks interact with deploys and autoscaling, why per-instance rate limiters are wrong by a factor of the instance count, and why a gateway full of business logic becomes a distributed monolith.</dd>
+      <dt>The modern approach</dt><dd>Stateless services with state in purpose-built stores; a cloud L4/L7 balancer or Envoy-family proxy at the edge; an API gateway for cross-cutting edge concerns only (TLS, authN, coarse authZ, routing, quotas, observability); latency-aware algorithms (least-request with power of two choices) for heterogeneous backends; active plus passive health checking; graceful shutdown coordinated with readiness; and rate limiting at multiple tiers with a token bucket at the core and a shared store for global limits.</dd>
+      <dt>Where Python and Go fit</dt><dd>Go dominates the proxy and gateway ecosystem's control planes and many data planes (Traefik, Caddy, much of the Kubernetes Gateway API tooling) and ships a high-quality token bucket in <code>golang.org/x/time/rate</code>. Python services sit behind the same proxies; Python is a convenient choice for limiter simulations and for small Redis-backed limiters in FastAPI middleware.</dd>
+      <dt>In production</dt><dd>Typical stack: DNS → CDN/WAF → cloud L4 or L7 balancer → API gateway (Spring Cloud Gateway, Kong, Envoy Gateway, or a managed gateway) → Kubernetes Service or service mesh → Spring Boot pods with graceful shutdown. Rate limits are enforced at the edge (per IP, per API key), at the gateway (per tenant/plan), and in services (per expensive operation, e.g. LLM calls).</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use a gateway when you have many services or external API consumers needing consistent auth, quotas and routing. Avoid putting business logic, data aggregation for a single UI, or per-request database lookups in a shared gateway. Use distributed rate limiting when limits are contractual (API plans) or protect a shared scarce resource; prefer local limiters when approximate limits suffice, since they add no network hop.</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="history">
+  <h2>2. History: From DNS Round-Robin to Programmable Proxies</h2>
+  <h3>2.1 DNS and hardware appliances (1990s–2000s)</h3>
+  <p>The first web-scale load balancing was DNS round-robin: return several A records and let clients pick. It is crude (no health awareness, at the mercy of resolver caching) but still used today for coarse global distribution. In the late 1990s dedicated appliances from vendors such as F5 (BIG-IP) and Cisco took over, doing layer-4 balancing in specialised hardware and, increasingly, layer-7 features such as SSL termination and cookie persistence.</p>
+  <h3>2.2 Software proxies (2000s)</h3>
+  <p>HAProxy (Willy Tarreau, first released in 2001) and NGINX (Igor Sysoev, first public release 2004) showed that event-driven software on commodity servers could match appliances for most workloads. NGINX's asynchronous architecture was a direct response to the "C10K problem" (handling ten thousand concurrent connections), articulated by Dan Kegel around 1999. Both remain foundational.</p>
+  <h3>2.3 Cloud load balancers and API gateways (2009–2016)</h3>
+  <p>AWS launched Elastic Load Balancing in 2009, followed by the Application Load Balancer (L7) in 2016 and the Network Load Balancer (L4) in 2017. Netflix open-sourced Zuul, a JVM edge gateway, in 2013; many Spring engineers met gateways through Spring Cloud Netflix Zuul. Kong (2015) built a plugin-based gateway on NGINX/OpenResty, and AWS API Gateway launched in 2015. Google published Maglev (NSDI 2016), its software L4 balancer using consistent hashing across commodity machines.</p>
+  <h3>2.4 Envoy, service mesh and Spring Cloud Gateway (2016–present)</h3>
+  <p>Lyft open-sourced Envoy in September 2016: a C++ L4/L7 proxy designed around dynamic configuration APIs (xDS), rich observability, and advanced load balancing. Envoy became the data plane for Istio and many gateways (Envoy Gateway, Contour, Emissary, Gloo). Spring Cloud Gateway arrived in 2017–2018 as the reactive (Netty/WebFlux) successor to Zuul 1, and later gained a servlet-based "Server MVC" variant. The Kubernetes Gateway API reached v1.0 (GA for its core resources) in October 2023, standardising how gateways are configured across implementations.</p>
+  <h3>2.5 Rate limiting algorithms</h3>
+  <p>Token and leaky buckets come from network traffic shaping and policing in the 1980s–1990s (ATM networks standardised a leaky-bucket-equivalent, the Generic Cell Rate Algorithm). The web adopted them for API quotas. In 2017 Stripe and Cloudflare published widely read posts on production rate limiting, and in 2021 GitHub described moving its API limiter to sharded, replicated Redis with Lua scripts; §9 covers all three. Michael Mitzenmacher's 1996 thesis on the "power of two choices" provided the theory behind P2C balancing, now standard in Envoy, Finagle, gRPC and many others.</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 Vertical versus horizontal scaling</h3>
+  <p><strong>Vertical scaling</strong> (scale up) means a bigger machine: more cores, more RAM, faster disks. It requires no code changes, keeps everything in one process and one memory space (no network hops, no distributed state), and is often the right first move. Its limits are hard ceilings (the largest instance type), super-linear cost at the top end, a single failure domain, and diminishing returns from contention: Amdahl's law (§6.1) says the serial fraction of work caps speed-up, and lock contention, memory bandwidth and GC can make a 96-core JVM slower per core than a 16-core one.</p>
+  <p><strong>Horizontal scaling</strong> (scale out) means more machines behind a balancer. It gives near-linear capacity growth <em>if</em> instances are independent, allows incremental cost, provides redundancy, and enables rolling deploys. Its cost is distribution: state must live elsewhere, requests must be routed, and coordination (locks, consistency, distributed transactions) becomes expensive.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Dimension</th><th>Vertical</th><th>Horizontal</th></tr></thead>
+    <tbody>
+      <tr><td>Code changes</td><td>None</td><td>Requires statelessness or partitioning</td></tr>
+      <tr><td>Ceiling</td><td>Largest instance (hundreds of vCPUs, terabytes of RAM)</td><td>Effectively unbounded for stateless tiers</td></tr>
+      <tr><td>Failure domain</td><td>One machine</td><td>Many; tolerates instance loss</td></tr>
+      <tr><td>Cost curve</td><td>Super-linear near the top</td><td>Roughly linear plus coordination overhead</td></tr>
+      <tr><td>Best for</td><td>Databases (primary), in-memory workloads, early-stage products</td><td>Stateless services, caches, partitioned stores</td></tr>
+    </tbody>
+  </table></div>
+  <p>In practice you do both: scale stateless services horizontally and scale stateful primaries vertically until partitioning (Chapter 5) is unavoidable. Many companies run surprisingly large businesses on one very large Postgres or MySQL primary plus replicas.</p>
+
+  <h3>3.2 Stateless services and session externalisation</h3>
+  <p>A service is <strong>stateless</strong> if any instance can handle any request, because nothing a request needs is stored only in a particular instance's memory or local disk. State still exists; it lives in a database, cache, object store, or the request itself (a token). Statelessness is what makes instances interchangeable, which in turn enables any balancing algorithm, autoscaling, rolling deploys and instant failover.</p>
+  <p>The classic violation is the HTTP session. A servlet container's in-memory <code>HttpSession</code> ties a user to one instance. The traditional fix, <strong>sticky sessions</strong> (session affinity via a cookie or source-IP hash at the balancer), keeps users on one instance but causes uneven load, loses sessions when an instance dies or is deployed, and fights autoscaling (new instances receive no existing users). Three better options:</p>
+  <ul>
+    <li><strong>Externalised sessions.</strong> Store session data in Redis (or a database) so any instance can load it. Spring Session replaces the container's <code>HttpSession</code> implementation transparently: <code>spring-session-data-redis</code> plus a couple of properties, and your existing <code>session.getAttribute</code> code works unchanged. Cost: one Redis round trip per request that touches the session (Spring Session saves lazily and only writes changed attributes by default).</li>
+    <li><strong>Client-held state (tokens).</strong> Put identity and claims in a signed token (JWT or opaque token validated against an introspection endpoint/cache). The service validates and needs no server-side session at all. Cost: revocation is harder for self-contained JWTs (short expiry plus refresh tokens, or a revocation list), and tokens must stay small.</li>
+    <li><strong>Move conversational state into the domain.</strong> Shopping carts, wizards and drafts become first-class persisted entities, not session attributes. This is usually the right choice for anything users would be upset to lose.</li>
+  </ul>
+  <p>Other hidden state to hunt for when making a service stateless: local file uploads (use object storage), in-memory caches that must be consistent across instances (use a distributed cache or accept per-instance staleness), in-process scheduled jobs that must run once (use ShedLock or a dedicated scheduler), WebSocket connections (need a pub/sub fan-out layer so any instance can deliver to a user connected elsewhere), and in-memory rate-limit counters (§3.10).</p>
+
+  <h3>3.3 Load balancing at layer 4 and layer 7</h3>
+  <p>A <strong>layer-4 (transport) load balancer</strong> makes decisions per TCP connection (or UDP flow) using addresses and ports only. It does not parse HTTP. It either rewrites packet addresses (NAT), encapsulates packets to the backend, or uses direct server return (DSR) where responses bypass the balancer. L4 balancers are extremely fast (millions of packets per second per node), protocol-agnostic (work for databases, gRPC, MQTT, anything over TCP), and preserve end-to-end TLS if desired. Their limitation is granularity: all requests on a long-lived connection (an HTTP/2 or gRPC connection carrying thousands of requests) go to the same backend, which can badly unbalance load.</p>
+  <p>A <strong>layer-7 (application) load balancer</strong> terminates the client connection, parses the application protocol (HTTP/1.1, HTTP/2, HTTP/3, gRPC), and makes a decision <em>per request</em>. It can route by host, path, header or cookie; retry idempotent requests; terminate TLS; compress; add headers (<code>X-Forwarded-For</code>, trace context); and observe status codes and latency for health decisions. The cost is CPU (TLS and parsing), an extra hop with its own connection pools, and the need to hold certificates at the balancer.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Aspect</th><th>L4</th><th>L7</th></tr></thead>
+    <tbody>
+      <tr><td>Decision unit</td><td>Connection / flow</td><td>Request</td></tr>
+      <tr><td>Sees</td><td>IPs, ports, TCP flags</td><td>Full HTTP: host, path, headers, body</td></tr>
+      <tr><td>TLS</td><td>Pass-through (or terminate in some products)</td><td>Terminates (and optionally re-encrypts)</td></tr>
+      <tr><td>Routing</td><td>By port/IP</td><td>By host, path, header, weight (canary)</td></tr>
+      <tr><td>HTTP/2 and gRPC balancing</td><td>Poor (one connection pins to one backend)</td><td>Good (per-stream balancing)</td></tr>
+      <tr><td>Throughput / latency overhead</td><td>Very high / microseconds</td><td>High / sub-millisecond to low milliseconds</td></tr>
+      <tr><td>Examples</td><td>AWS NLB, GCP passthrough NLB, Maglev, IPVS, HAProxy in TCP mode</td><td>AWS ALB, GCP external Application LB, Envoy, NGINX, HAProxy HTTP mode</td></tr>
+    </tbody>
+  </table></div>
+  <p>Balancing can also happen in the <strong>client</strong>: the caller resolves a list of instances (from Kubernetes endpoints, Consul or Eureka) and picks one itself. Spring Cloud LoadBalancer, gRPC's built-in balancers and service-mesh sidecars all do this. Client-side balancing removes a hop and a central bottleneck but requires every client to implement the algorithm and health logic, which is why meshes move it into a sidecar.</p>
+
+  <h3>3.4 Load-balancing algorithms</h3>
+  <p>The algorithm decides which healthy backend receives the next connection or request. The right one depends on how uniform your backends and requests are.</p>
+  <ul>
+    <li><strong>Round-robin.</strong> Cycle through backends in order. Perfectly fair in request <em>count</em>, blind to request <em>cost</em> and backend speed. Good when backends are identical and requests are uniform and short.</li>
+    <li><strong>Weighted round-robin.</strong> Backends receive traffic in proportion to static weights (e.g. an 8-core node weight 2, a 4-core node weight 1). Also used for canaries (weight 5% to the new version). Smooth weighted round-robin (as in NGINX) interleaves rather than sending bursts to the heavy node.</li>
+    <li><strong>Random.</strong> Pick uniformly at random. Stateless and trivially distributed across many balancer nodes, but the maximum load on any backend is noticeably higher than the average due to variance.</li>
+    <li><strong>Least connections / least outstanding requests.</strong> Send to the backend with the fewest active connections (L4) or in-flight requests (L7). Adapts automatically to slow backends (they accumulate in-flight requests and receive fewer new ones), which is what you want when request cost varies or a node is degraded. Requires the balancer to track counts; across many independent balancer nodes, each only knows its own counts.</li>
+    <li><strong>Power of two choices (P2C).</strong> Pick two backends at random and send to the one with fewer outstanding requests (or lower latency-weighted load). Nearly as good as full least-connections, but O(1), robust to stale information, and it avoids the <em>herding</em> problem where many balancers simultaneously see the same "least loaded" backend and all pile onto it. Envoy's <code>LEAST_REQUEST</code> policy uses P2C by default when backends have equal weights.</li>
+    <li><strong>Least response time / peak EWMA.</strong> Choose by an exponentially weighted moving average of observed latency multiplied by in-flight count (Finagle and Linkerd popularised peak-EWMA). Reacts quickly to backends that become slow.</li>
+    <li><strong>Hashing (source IP, header, consistent hashing, ring hash, Maglev).</strong> Map a request attribute to a backend deterministically, so the same key always reaches the same backend. Used for cache locality (route all requests for <code>tenant=42</code> to the instance with that tenant warm in its local cache) and for affinity. Consistent hashing (Chapter 3) ensures that adding or removing a backend remaps only about \(1/n\) of keys. Maglev hashing trades a little consistency for near-perfect balance and fast lookup tables.</li>
+  </ul>
+  <p>The interactive widget in §5 lets you compare these on a fleet with heterogeneous server speeds.</p>
+
+  <h3>3.5 Health checks: active, passive, and what "healthy" means</h3>
+  <p><strong>Active health checks</strong> probe each backend periodically (HTTP <code>GET /actuator/health/readiness</code> every few seconds) and remove it after N consecutive failures, re-adding it after M successes. <strong>Passive health checks</strong> (outlier detection) watch real traffic: if a backend returns five consecutive 5xx responses or its error rate exceeds the fleet's by a margin, eject it for a backoff period. Active checks catch dead instances before users hit them; passive checks catch instances that answer health probes but fail real requests. Use both.</p>
+  <p>The hard question is what the health endpoint should check. In Kubernetes and Spring Boot terms:</p>
+  <ul>
+    <li><strong>Liveness</strong> (<code>/actuator/health/liveness</code>): "is this process broken beyond repair?" If it fails, the container is restarted. It must <em>not</em> include dependencies: if the database is down and liveness fails, Kubernetes restarts every pod simultaneously, which fixes nothing and adds a cold-start storm.</li>
+    <li><strong>Readiness</strong> (<code>/actuator/health/readiness</code>): "should this instance receive traffic right now?" Fails during startup (warm-up, cache loading), during shutdown (so the balancer stops routing), and optionally when a <em>critical, instance-local</em> resource is unavailable. Including a shared dependency (the database) in readiness is debatable: if it fails, all instances become unready and the balancer has nowhere to send traffic, turning a partial degradation into a full outage. Many teams exclude shared dependencies and handle their failure in code with fallbacks.</li>
+    <li><strong>Startup</strong> probes protect slow-starting JVMs from being killed by liveness checks before they finish initialising.</li>
+  </ul>
+  <p>Health checks have a <em>fail-open</em> subtlety: if all backends fail health checks, many balancers (Envoy's panic threshold, AWS ALB's behaviour when all targets are unhealthy) route to all of them anyway, on the theory that a broken health check is more likely than a fully dead fleet.</p>
+
+  <h3>3.6 Connection draining and graceful shutdown</h3>
+  <p>When an instance is removed (deploy, scale-in, node drain), requests already in flight must complete and no new requests must be routed to it. <strong>Connection draining</strong> (deregistration delay on AWS, drain timeouts in Envoy) is the balancer's half: stop sending new requests, wait up to a timeout for in-flight ones. The application's half is graceful shutdown: on SIGTERM, stop accepting new connections, finish in-flight requests, then exit.</p>
+  <p>In Kubernetes these two halves race. When a pod is deleted, the kubelet sends SIGTERM <em>and</em>, in parallel, the endpoint controller removes the pod from Service endpoints, which then propagates to kube-proxy, Ingress controllers and external balancers over the next few seconds. If the application stops accepting connections immediately on SIGTERM, requests routed during that propagation window fail. The standard fix is a <code>preStop</code> hook that sleeps a few seconds (long enough for endpoint removal to propagate) before SIGTERM reaches the JVM, combined with Spring Boot graceful shutdown (<code>server.shutdown=graceful</code>, which became the default in Spring Boot 3.4 <span class="tag version">Version-sensitive · checked Nov 2026</span>) and a <code>terminationGracePeriodSeconds</code> longer than preStop plus the shutdown phase timeout. §4.3 walks through the timeline.</p>
+
+  <h3>3.7 Reverse proxies</h3>
+  <p>A <strong>forward proxy</strong> acts on behalf of clients (corporate egress proxies). A <strong>reverse proxy</strong> acts on behalf of servers: clients connect to it believing it is the origin, and it forwards to one or more backends. Load balancing is one reverse-proxy function among many: TLS termination, HTTP/2 and HTTP/3 to clients while speaking HTTP/1.1 to backends, connection pooling and keep-alive to backends (turning thousands of client connections into dozens of upstream ones), buffering slow clients so application threads are not held while a mobile phone trickles a response, compression, static file serving, caching, request size limits, header normalisation, and access logging.</p>
+  <ul>
+    <li><strong>NGINX</strong>: event-driven, very efficient, configured with a declarative file; dynamic reconfiguration requires reload (graceful) or the commercial edition/OpenResty Lua. Ubiquitous as an edge proxy and Kubernetes ingress controller (note that the community <code>ingress-nginx</code> controller project announced its retirement, with maintenance ending in March 2026 <span class="tag version">Version-sensitive · checked Nov 2026</span>; new clusters typically adopt Gateway API implementations).</li>
+    <li><strong>HAProxy</strong>: extremely mature L4/L7 balancer, excellent observability and algorithms, runtime API for dynamic changes.</li>
+    <li><strong>Envoy</strong>: designed for dynamic environments; everything (listeners, routes, clusters, endpoints, secrets) can be updated at runtime via xDS APIs from a control plane; first-class HTTP/2, gRPC, retries, circuit breaking, outlier detection, rich stats and tracing. The data plane of Istio and many gateways.</li>
+  </ul>
+
+  <h3>3.8 API gateways</h3>
+  <p>An <strong>API gateway</strong> is a reverse proxy specialised for APIs, sitting at the boundary between clients and a set of services. It centralises cross-cutting concerns that every service would otherwise reimplement:</p>
+  <ul>
+    <li>Routing by path, host, header and version, including canary and blue/green weights.</li>
+    <li>Authentication (validate JWTs, API keys, mTLS client certificates) and coarse-grained authorisation (scopes, plans).</li>
+    <li>Rate limiting and quotas per API key, tenant, plan or route.</li>
+    <li>Request/response transformation (header injection, protocol translation such as REST to gRPC), CORS.</li>
+    <li>Observability: access logs, metrics per route and consumer, trace context propagation.</li>
+    <li>Resilience at the edge: timeouts, retries for idempotent routes, circuit breaking.</li>
+    <li>Developer-facing concerns for public APIs: API keys, usage plans, developer portals, monetisation.</li>
+  </ul>
+  <p>Options a Spring engineer is likely to meet:</p>
+  <ul>
+    <li><strong>Spring Cloud Gateway</strong>: Java, configured with routes made of predicates and filters in YAML or Java DSL; the reactive variant runs on Netty/WebFlux, and a Server MVC variant runs on servlet stacks (well suited to virtual threads). Natural choice when the team is Java-centric and wants custom filters in Java. Current release train: Spring Cloud 2025.1 "Oakwood" with Gateway 5.0.x for Spring Boot 4 <span class="tag version">Version-sensitive · checked Nov 2026</span>.</li>
+    <li><strong>Kong</strong>: NGINX/OpenResty-based, extensible with plugins (Lua, Go, and others), with an open-source gateway and commercial offerings including a control plane and portal.</li>
+    <li><strong>Envoy-based gateways</strong>: Envoy Gateway (the CNCF project implementing Kubernetes Gateway API on Envoy), Istio's ingress gateway, Contour, Emissary-ingress, Gloo. High performance, dynamic config, consistent with a mesh.</li>
+    <li><strong>Managed cloud gateways</strong>: AWS API Gateway (REST and HTTP APIs, with usage plans and API keys, Lambda and HTTP integrations), Azure API Management, Google Cloud API Gateway/Apigee. Little to operate, per-request pricing, and service limits to check (e.g. AWS API Gateway's integration timeout and payload size limits).</li>
+  </ul>
+  <div class="callout warn"><p class="callout-title">The gateway is not your domain layer</p><p>A gateway that aggregates five services into a bespoke response for one screen, applies business validation, or queries a database per request becomes a shared bottleneck owned by no team, deployed on everyone's critical path. Keep shared gateways thin and generic; put client-specific aggregation in a BFF and business rules in services.</p></div>
+
+  <h3>3.9 Backend for Frontend (BFF)</h3>
+  <p>The <strong>BFF pattern</strong> gives each client experience (web, iOS/Android, partner API, perhaps an AI agent interface) its own thin backend owned by the team that owns that client. The BFF aggregates calls to downstream services, shapes payloads for that client (mobile wants fewer, smaller responses; web wants richer ones), handles client-specific auth flows (a web BFF can keep tokens server-side and give the browser only an HTTP-only session cookie, a pattern now recommended for browser-based OAuth apps), and evolves at the client's pace. It sits <em>behind</em> the shared gateway, which still handles edge concerns. GraphQL servers are often used as BFFs, letting clients choose fields. The risk is duplication across BFFs; shared logic belongs in downstream services, not copy-pasted between BFFs.</p>
+
+  <h3>3.10 Rate limiting: purpose and algorithms</h3>
+  <p><strong>Rate limiting</strong> bounds how many requests a client (identified by IP, API key, user, tenant) may make in a time period. Its purposes are distinct and lead to different designs: <em>protection</em> (prevent any client from overloading the system or a scarce dependency), <em>fairness</em> (one tenant cannot starve others), <em>commercial quotas</em> (plan tiers, billing), <em>abuse prevention</em> (credential stuffing, scraping), and <em>cost control</em> (LLM token spend). Related but different: <strong>load shedding</strong> rejects work based on the server's own state (CPU, queue depth, concurrency) regardless of who sent it; <strong>concurrency limiting</strong> bounds in-flight requests rather than rate; <strong>backpressure</strong> signals upstream to slow down.</p>
+  <p>The five classic algorithms:</p>
+  <ul>
+    <li><strong>Token bucket.</strong> A bucket holds up to \(b\) tokens and refills at rate \(r\) tokens per second. Each request takes one token (or a cost-weighted number); with no tokens, it is rejected (or waits). Allows bursts up to \(b\) after idle periods while enforcing a long-run average of \(r\). State per key: token count and last refill timestamp; refill is computed lazily on each request. The most widely used algorithm (AWS API Gateway throttling, Bucket4j, Go's <code>x/time/rate</code>, Stripe's request limiter, Spring Cloud Gateway's Redis limiter).</li>
+    <li><strong>Leaky bucket.</strong> Requests enter a FIFO queue of capacity \(b\) that drains at constant rate \(r\); when full, new requests are dropped. Output is perfectly smooth, which suits shaping traffic toward a fragile downstream, at the cost of added queueing latency. A "leaky bucket as meter" variant (equivalent to GCRA) tracks a theoretical arrival time instead of a queue and behaves like a token bucket.</li>
+    <li><strong>Fixed window counter.</strong> Count requests per key in aligned windows (e.g. per minute, keyed by <code>floor(now/60)</code>); reject above the limit. Tiny state, one atomic <code>INCR</code> in Redis. Flaw: boundary bursts. A client can send the full limit at 12:00:59 and again at 12:01:00, so up to \(2\times\) the limit in any two-second span.</li>
+    <li><strong>Sliding window log.</strong> Store a timestamp per accepted request (e.g. a Redis sorted set); on each request, drop timestamps older than the window and count the rest. Exact, no boundary problem, but memory is proportional to the limit (a 10,000-per-hour limit stores up to 10,000 timestamps per key).</li>
+    <li><strong>Sliding window counter.</strong> Keep counters for the current and previous fixed windows and estimate the sliding count as \(\text{prev} \times \frac{\text{window} - \text{elapsed}}{\text{window}} + \text{curr}\). Constant memory, smooths the boundary problem, and is accurate to within a small error when traffic within the previous window is roughly uniform. Cloudflare described using this approach (§9).</li>
+  </ul>
+  <p>The second widget in §5 shows token bucket, fixed window and sliding log side by side under bursty traffic.</p>
+
+  <h3>3.11 Distributed rate limiting</h3>
+  <p>A limiter that runs in each of 20 gateway instances with a limit of 100 per second admits up to 2,000 per second for a client whose requests are spread evenly, and an unpredictable amount if load is uneven. There are three ways to get a global limit:</p>
+  <ul>
+    <li><strong>Centralised store.</strong> Keep limiter state in Redis (or Memcached, or a dedicated service such as Envoy's global rate limit service backed by Redis) and update it atomically per request. Accurate, but adds a network round trip (~0.3–1 ms in-zone) and makes the store a critical dependency: decide whether to <em>fail open</em> (allow traffic when Redis is unreachable, prioritising availability) or <em>fail closed</em> (reject, prioritising protection). Most user-facing APIs fail open with a local fallback limiter.</li>
+    <li><strong>Local limits with division.</strong> Give each of \(n\) instances a limit of \(L/n\). No network hop, but inaccurate when load is uneven or \(n\) changes; acceptable for protective limits, not for contractual quotas.</li>
+    <li><strong>Hybrid / batched.</strong> Each instance consumes from a local allowance and periodically syncs with the central store (reserving batches of tokens). Reduces store load at the cost of brief over-admission. Common at very high request rates.</li>
+  </ul>
+  <p>Atomicity matters: a read-modify-write of a token count from two gateway instances concurrently will double-spend tokens. In Redis, run the whole algorithm in a Lua script (or Redis Function), which executes atomically on the server; §7 implements this. In Redis Cluster all keys touched by a script must hash to the same slot, which is natural when the key is the client identifier.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working</h2>
+
+  <h3>4.1 Inside an L4 balancer: NAT, DSR and consistent flow hashing</h3>
+  <p>A software L4 balancer such as Maglev, Katran (Meta's XDP/eBPF balancer) or Linux IPVS processes packets, not requests. For each incoming packet it computes a hash of the 5-tuple (source IP, source port, destination IP, destination port, protocol) and looks the hash up in a table to choose a backend. Every packet of the same TCP connection has the same 5-tuple, so all of them reach the same backend without the balancer storing per-connection state (though most also keep a connection-tracking cache). The packet is then either:</p>
+  <ul>
+    <li><strong>NATed</strong>: the destination address is rewritten to the backend, and replies come back through the balancer, which rewrites the source. Simple, but the balancer carries traffic in both directions.</li>
+    <li><strong>Encapsulated with direct server return</strong>: the packet is wrapped (IP-in-IP or GUE) and sent to the backend, which unwraps it and replies directly to the client using the virtual IP as source. Because responses are typically much larger than requests, DSR lets a small balancer tier front enormous egress.</li>
+  </ul>
+  <p>Many balancer nodes share one virtual IP via ECMP (equal-cost multi-path) routing from upstream routers, so the L4 tier itself scales horizontally. The hard part is what happens when a balancer node or a backend is added or removed: ECMP may send a connection's packets to a different balancer node, which must pick the <em>same</em> backend. This is why these systems use consistent hashing variants (Maglev hashing) so that independent nodes compute identical, stable assignments.</p>
+
+  <h3>4.2 Inside an L7 proxy: the life of a request in Envoy</h3>
+  <ol>
+    <li><strong>Listener</strong> accepts the TCP connection on a worker thread (Envoy runs one event loop per worker thread; a connection stays on its thread for its lifetime, so no locking on the hot path).</li>
+    <li><strong>Network filter chain</strong>: the TLS transport socket performs the handshake (selecting certificates via SNI); the HTTP connection manager network filter decodes HTTP/1.1, HTTP/2 or HTTP/3 into streams.</li>
+    <li><strong>HTTP filter chain</strong> per request: e.g. JWT authentication, external authorisation, local or global rate limit, CORS, fault injection, then the <strong>router</strong> filter.</li>
+    <li><strong>Route matching</strong> selects a cluster (a named group of upstream endpoints) by host, path, headers, and weights.</li>
+    <li><strong>Load balancer</strong> for that cluster picks a healthy host using the configured policy (round robin, least request with P2C, ring hash, Maglev, random), excluding hosts ejected by outlier detection.</li>
+    <li><strong>Connection pool</strong> per upstream host provides an existing connection (HTTP/1.1 pools many connections; HTTP/2 multiplexes streams over few). Circuit-breaker thresholds (max connections, max pending requests, max requests, max retries) bound the pool; exceeding them fails fast with a 503 rather than queueing.</li>
+    <li>The request is forwarded with a per-route <strong>timeout</strong>; on eligible failures the router may <strong>retry</strong> on a different host, subject to a retry budget.</li>
+    <li>The response streams back through the filters in reverse; stats (per-cluster latency histograms, response codes) and access logs are emitted.</li>
+  </ol>
+  <p>Spring Cloud Gateway follows a similar shape on Netty: route predicates select a route, a chain of <code>GatewayFilter</code>s and global filters runs (including <code>RequestRateLimiter</code>, <code>CircuitBreaker</code>, <code>Retry</code>), and the Netty HTTP client forwards using a pooled connection, with Spring Cloud LoadBalancer choosing the instance for <code>lb://service-name</code> URIs.</p>
+
+  <h3>4.3 A zero-downtime pod termination, step by step</h3>
+  <ol>
+    <li>A rollout deletes pod P. The API server marks it terminating.</li>
+    <li>In parallel: (a) the endpoints/EndpointSlice controller removes P from Service endpoints; kube-proxy, ingress controllers and cloud balancer integrations learn of this over the next ~1–10 s; (b) the kubelet runs P's <code>preStop</code> hook.</li>
+    <li>The <code>preStop</code> sleep (e.g. 10 s) keeps the JVM serving normally while the removal propagates. Requests that still arrive are served.</li>
+    <li>After preStop, the kubelet sends SIGTERM. Spring Boot's graceful shutdown begins: the readiness state switches to <code>REFUSING_TRAFFIC</code>, the web server stops accepting new connections, and in-flight requests are given up to <code>spring.lifecycle.timeout-per-shutdown-phase</code> (default 30 s) to complete.</li>
+    <li>Application context closes: Kafka consumers commit and leave the group, Hikari closes connections, executors drain.</li>
+    <li>If anything is still running when <code>terminationGracePeriodSeconds</code> (default 30 s, counted from the start of preStop) expires, the kubelet sends SIGKILL. Hence: grace period &gt; preStop sleep + shutdown timeout + margin.</li>
+  </ol>
+  <p>Long-lived connections need extra care: HTTP/1.1 keep-alive connections are closed by the server after the in-flight response (Tomcat sends <code>Connection: close</code>); HTTP/2 connections receive a GOAWAY frame so clients open new streams elsewhere; WebSockets and gRPC streams must be closed by the application with a reconnect hint.</p>
+
+  <h3>4.4 Token bucket internals: lazy refill</h3>
+  <p>A token bucket never runs a timer per key. It stores two numbers, <code>tokens</code> and <code>lastRefill</code>. On each request at time <code>now</code>:</p>
+<pre class="ascii">
+elapsed   = now - lastRefill
+tokens    = min(capacity, tokens + elapsed * refillRate)
+lastRefill = now
+if tokens &gt;= cost:  tokens -= cost; ALLOW (remaining = tokens)
+else:               DENY  (retryAfter = (cost - tokens) / refillRate)
+</pre>
+  <p>This makes it O(1) in time and memory per key, and it works across processes as long as the read-compute-write is atomic. The <code>retryAfter</code> value is exactly what you return in a <code>Retry-After</code> header. Keys for idle clients can be expired after \(\text{capacity}/\text{rate}\) seconds, since by then the bucket would be full anyway and a missing key is equivalent to a full bucket.</p>
+
+  <h3>4.5 Why Redis Lua scripts are atomic</h3>
+  <p>Redis executes commands on a single main thread (Chapter 3 explains the event loop). A Lua script submitted with <code>EVAL</code>/<code>EVALSHA</code> (or a Redis Function invoked with <code>FCALL</code>) runs to completion on that thread with no other command interleaved, so a read-modify-write inside a script is atomic without locks or <code>WATCH</code>. Two implications: scripts must be short (a slow script blocks every client of that Redis node), and in Redis Cluster all keys a script touches must be declared in <code>KEYS</code> and live in the same hash slot (use hash tags like <code>rl:{client42}:tokens</code> and <code>rl:{client42}:ts</code>).</p>
+  <p>Time is a subtle issue. If each gateway instance passes its own clock into the script, clock skew between instances makes the limiter inaccurate. Using the Redis server's clock (<code>redis.call('TIME')</code>, allowed in scripts since Redis 5 because scripts are replicated by effects) gives one clock for all callers of that key.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: The Traffic Layer</h2>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  C["Clients"] --> DNS["DNS (GeoDNS / latency routing)"]
+  C --> CDN["CDN + WAF (per-IP limits, bot rules)"]
+  CDN --> L4["Cloud L4 / L7 balancer (TLS, multi-AZ)"]
+  L4 --> GW["API gateway cluster (authN, quotas, routing)"]
+  GW --> RL[("Redis: rate-limit state")]
+  GW --> BFFW["Web BFF"]
+  GW --> BFFM["Mobile BFF"]
+  GW --> PUB["Public API services"]
+  BFFW --> SVC["Domain services (Spring Boot)"]
+  BFFM --> SVC
+  PUB --> SVC
+  SVC --> LLMG["LLM proxy: token limits, concurrency caps"]
+  SVC --> DB[("Data stores")]
+</pre>
+  <figcaption>Figure 2.1 — A layered traffic architecture with limits enforced at several tiers.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> each tier rejects a different kind of excess as early and as cheaply as possible. The CDN/WAF drops volumetric abuse and applies per-IP limits before traffic reaches your network. The cloud balancer spreads connections across zones and terminates TLS. The gateway authenticates and enforces per-key and per-tenant quotas with shared state in Redis. BFFs shape responses per client. Inside the services, an LLM proxy enforces the strictest and most expensive limits (tokens per minute, concurrent generations). Rejecting early matters because work done before a rejection is wasted; a request rejected at the CDN costs nothing, while one rejected after three service hops has consumed threads, connections and CPU along the way.</p>
+
+  <figure class="diagram">
+  <div class="widget" data-widget="load-balancer"></div>
+  <figcaption>Figure 2.2 — Interactive: round-robin, weighted, least-connections, random and power-of-two-choices on heterogeneous servers.</figcaption>
+  </figure>
+  <p><strong>What to try:</strong> start with identical servers and round-robin; distribution is even. Now make one server much slower (or give the servers different capacities). Round-robin and random keep sending it an equal share, so its queue and latency grow without bound while others idle. Switch to least-connections: the slow server accumulates in-flight requests and naturally receives fewer new ones. Then try P2C: it achieves almost the same balance while only sampling two servers per decision, which is why it scales to many independent balancer nodes without coordination. Weighted round-robin fixes static capacity differences but cannot react to a server that becomes slow dynamically (a GC pause, a noisy neighbour).</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant K as Kubernetes API
+  participant EP as Endpoint controller
+  participant LB as Ingress / LB
+  participant KL as Kubelet
+  participant P as Spring Boot pod
+  K->>EP: pod terminating
+  K->>KL: pod terminating
+  EP->>LB: remove pod endpoint (propagates over seconds)
+  KL->>P: run preStop (sleep 10s)
+  Note over P: still serving requests that arrive during propagation
+  LB-->>P: last requests routed before removal
+  KL->>P: SIGTERM
+  P->>P: readiness REFUSING_TRAFFIC, stop accepting
+  P->>P: finish in-flight requests (up to 30s)
+  P->>P: close Kafka, Hikari, executors
+  P-->>KL: exit 0
+  Note over KL: SIGKILL only if grace period exceeded
+</pre>
+  <figcaption>Figure 2.3 — The termination race and how preStop plus graceful shutdown resolves it.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> endpoint removal and SIGTERM are triggered concurrently, not sequentially. Without the preStop sleep, the pod would stop accepting connections while some balancers still route to it, producing connection-refused errors on every deploy (often noticed only as a small error spike that "always happens during deploys"). The preStop delay converts the race into an ordering: by the time SIGTERM arrives, traffic has stopped arriving, and graceful shutdown only has to finish what is already in flight.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  R["Incoming request"] --> P1{"Route predicates match? (Path, Host, Header, Weight)"}
+  P1 -- "no" --> N404["404 / next route"]
+  P1 -- "yes" --> F1["Global filters: tracing, logging"]
+  F1 --> F2["Auth filter: validate JWT"]
+  F2 -- "invalid" --> R401["401"]
+  F2 --> F3["RequestRateLimiter (Redis token bucket)"]
+  F3 -- "no tokens" --> R429["429 + X-RateLimit headers"]
+  F3 --> F4["CircuitBreaker + Retry filters"]
+  F4 --> LBX["Spring Cloud LoadBalancer picks instance"]
+  LBX --> NET["Netty client, pooled connection"]
+  NET --> SVC["Upstream service"]
+  SVC --> POST["Post filters: headers, metrics"]
+</pre>
+  <figcaption>Figure 2.4 — The Spring Cloud Gateway request pipeline.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> filters are ordered so that cheap rejections happen first: unmatched routes, then authentication (signature verification is CPU-only), then rate limiting (one Redis round trip), and only then the expensive upstream call. Putting the rate limiter before authentication would let unauthenticated traffic consume the limiter's Redis capacity and make it impossible to key limits by authenticated identity; putting it after the upstream call would be pointless. The circuit breaker sits closest to the upstream so it observes real upstream failures.</p>
+
+  <figure class="diagram">
+  <div class="widget" data-widget="rate-limiter"></div>
+  <figcaption>Figure 2.5 — Interactive: token bucket versus fixed window versus sliding-window log under bursty traffic.</figcaption>
+  </figure>
+  <p><strong>What to try:</strong> send a burst right before and right after a fixed-window boundary and watch the fixed window admit up to twice the limit in a short span, while the sliding log rejects the excess. Then let the system idle and send a burst: the token bucket admits a burst up to its capacity and then settles at the refill rate. That burst allowance is a feature for user-facing APIs (a page load fires ten requests at once) and a liability when protecting a fragile downstream, where you want a smaller bucket or a leaky bucket's smooth output. Change the capacity and refill rate to see how they independently control burst size and sustained throughput.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph Clients
+    W["Browser"]
+    M["Mobile app"]
+    A["AI agent / partner"]
+  end
+  W --> G["Shared gateway (TLS, auth, quotas)"]
+  M --> G
+  A --> G
+  G --> BW["Web BFF (session cookie, rich pages)"]
+  G --> BM["Mobile BFF (compact payloads, offline sync)"]
+  G --> BA["Public / agent API (stable, versioned, metered)"]
+  BW --> D1["Orders"]
+  BW --> D2["Catalog"]
+  BM --> D1
+  BM --> D2
+  BA --> D1
+</pre>
+  <figcaption>Figure 2.6 — Shared gateway with per-experience BFFs.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the gateway is shared and generic; each BFF is owned by the team that owns its client and can change as fast as that client. A web BFF can hold OAuth tokens server-side and give the browser only an HTTP-only cookie; a mobile BFF can collapse five calls into one compact response to save radio time; a public or agent-facing API is versioned and metered conservatively because its consumers cannot be redeployed in lockstep. Domain services stay unaware of client shapes.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math</h2>
+
+  <h3>6.1 Why vertical scaling saturates: Amdahl and the Universal Scalability Law</h3>
+  <p><strong>Intuition:</strong> if part of the work cannot be parallelised (a global lock, a single-threaded component), adding cores only speeds up the rest. If cores must also coordinate (cache-line bouncing, lock handoffs), adding cores can make things slower.</p>
+  <p>Amdahl's law for serial fraction \(\sigma\) and \(N\) processors gives speed-up \(S(N) = \frac{N}{1 + \sigma (N-1)}\), bounded by \(1/\sigma\). With 5% serial work, no number of cores exceeds a 20x speed-up. Neil Gunther's Universal Scalability Law adds a coherency term \(\kappa\):</p>
+  \[ C(N) = \frac{N}{1 + \sigma (N - 1) + \kappa N (N - 1)} \]
+  <p>With \(\kappa &gt; 0\), capacity peaks at \(N^* = \sqrt{(1-\sigma)/\kappa}\) and then declines. Fitting \(\sigma\) and \(\kappa\) to load-test results at a few instance sizes or replica counts tells you where scaling stops paying. The same law applies to horizontal scaling when instances share a contended resource (a database row, a global lock in Redis).</p>
+
+  <h3>6.2 Balls into bins: why random is unbalanced and P2C is not</h3>
+  <p>Assign \(n\) requests to \(n\) servers. With uniform random choice, the most loaded server receives about \(\frac{\ln n}{\ln \ln n}\) requests with high probability, compared with an average of 1. With power of two choices (pick two at random, choose the less loaded), the maximum drops to about \(\frac{\ln \ln n}{\ln 2} + O(1)\): an <em>exponential</em> improvement. For \(n = 1{,}000\), \(\ln n / \ln\ln n \approx 3.6\) versus \(\ln\ln n/\ln 2 \approx 2.8\) (plus a constant); the gap widens with \(n\), and in the continuous-load setting with long-running requests it is much more dramatic. Choosing among \(d &gt; 2\) only improves the bound by a constant factor (\(\ln\ln n/\ln d\)), which is why two is the sweet spot.</p>
+
+  <h3>6.3 Token bucket bounds</h3>
+  <p>A token bucket with capacity \(b\) and rate \(r\) admits at most</p>
+  \[ A(t) \le b + r\,t \]
+  <p>requests in any interval of length \(t\). This is an <em>arrival curve</em> in network-calculus terms. For \(b = 20\), \(r = 10\)/s: at most 20 in an instant, 30 in one second, 610 in a minute. Contrast a fixed window of limit \(L\) per window \(T\): in the worst case it admits \(2L\) within any interval just over \(\epsilon\) straddling a boundary, so the burst bound is \(2L\), not \(L\).</p>
+  <p>Retry-After for a denied request of cost \(k\) with \(x\) tokens left: \(t_{wait} = (k - x)/r\).</p>
+
+  <h3>6.4 Sliding window counter error</h3>
+  <p>With previous-window count \(p\), current-window count \(c\), window length \(T\) and elapsed time \(e\) in the current window, the estimate is</p>
+  \[ \hat{n} = p\cdot\frac{T - e}{T} + c \]
+  <p>The estimate is exact if the previous window's requests were uniformly distributed in time. If they were all at the start of the previous window, the true count in the sliding window is lower than the estimate (the limiter is stricter than needed); if all at the end, higher (it under-counts and over-admits). The worst-case over-admission is bounded by \(p\) times the fraction of the window, and in practice (with many independent clients) the error is small.</p>
+
+  <h3>6.5 Local limits in a fleet</h3>
+  <p>Suppose a global limit \(L\) and \(n\) gateway instances each enforcing \(L/n\) locally, with a client's requests landing on instance \(i\) with probability \(q_i\). The client is throttled at instance \(i\) once its rate there exceeds \(L/n\), i.e. when total rate \(\lambda\) exceeds \(\frac{L}{n q_i}\). With perfectly even routing \(q_i = 1/n\) the effective limit is exactly \(L\). With hashing or sticky connections (e.g. one HTTP/2 connection pinned to one instance, \(q_i = 1\)), the effective limit collapses to \(L/n\): the client is throttled at a fraction of its entitlement. Conversely, if \(n\) grows via autoscaling but per-instance limits are not recomputed, the effective limit grows to \(nL/n_0\). This is the quantitative argument for a shared store when limits are contractual.</p>
+
+  <h3>6.6 Sizing the gateway and the limiter store</h3>
+  <p><span class="tag illus">Illustrative</span> Peak 60,000 requests per second at the gateway. If one gateway instance (4 vCPU) sustains 6,000 RPS at 60% CPU with JWT validation and one Redis call per request, you need 10 instances at peak, 15 for N+1 across three zones (each zone must carry half the load if one zone is lost: \(60{,}000/2/6{,}000 = 5\) per zone). The limiter store sees 60,000 script executions per second; a short Lua script executes in a few microseconds, so a single Redis primary can handle this, but for headroom and isolation many teams shard limiter keys across several Redis primaries by client ID (as GitHub describes in §9). Little's Law on the gateway's Redis connections: \(60{,}000 \times 0.0005\ \text{s} = 30\) concurrent operations fleet-wide, so a small pool per instance (or a single multiplexed Lettuce connection) suffices.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code: Stateless Services, Gateways, Proxies and Limiters</h2>
+
+  <h3>7.1 Externalising sessions with Spring Session and Redis</h3>
+  <p>Dependencies: <code>spring-boot-starter-web</code>, <code>spring-boot-starter-data-redis</code>, <code>spring-session-data-redis</code>. No code changes are needed in controllers that use <code>HttpSession</code>.</p>
+<pre data-file="application.yml"><code class="language-yaml">spring:
+  data:
+    redis:
+      host: redis.internal
+      port: 6379
+      ssl:
+        enabled: true
+  session:
+    timeout: 30m
+    redis:
+      namespace: shop:session        # key prefix, lets several apps share a Redis
+      flush-mode: on-save            # write at end of request (default), not on every setAttribute
+      save-mode: on-set-attribute    # only changed attributes are written back
+
+server:
+  servlet:
+    session:
+      cookie:
+        http-only: true
+        secure: true
+        same-site: lax</code></pre>
+<pre data-file="CartController.java"><code class="language-java">package com.example.shop;
+
+import jakarta.servlet.http.HttpSession;
+import org.springframework.web.bind.annotation.*;
+
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/cart")
+class CartController {
+
+    // Works unchanged on any instance: Spring Session swaps HttpSession for a Redis-backed one.
+    @PostMapping("/items")
+    List&lt;CartItem&gt; add(@RequestBody CartItem item, HttpSession session) {
+        @SuppressWarnings("unchecked")
+        List&lt;CartItem&gt; cart = (List&lt;CartItem&gt;) session.getAttribute("cart");
+        if (cart == null) cart = new ArrayList&lt;&gt;();
+        cart.add(item);
+        session.setAttribute("cart", cart); // re-set so Spring Session detects the change
+        return cart;
+    }
+
+    record CartItem(String sku, int qty) implements Serializable {}
+}</code></pre>
+  <div class="callout java"><p class="callout-title">Spring angle: serialisation is part of your API</p><p>Session attributes are serialised into Redis (JDK serialisation by default). A rolling deploy that changes a session class's shape can break deserialisation on old or new instances. Prefer a JSON serialiser (configure a <code>RedisSerializer&lt;Object&gt;</code> bean named <code>springSessionDefaultRedisSerializer</code>), keep session contents small, and, as noted in §3.2, persist anything valuable (like a cart) as a domain entity rather than a session attribute.</p></div>
+
+  <h3>7.2 Spring Cloud Gateway: routes, keyed rate limiting, circuit breaker</h3>
+  <p>For Spring Cloud Gateway 4.3+ / 5.0 (reactive server), route properties live under <code>spring.cloud.gateway.server.webflux</code>; older versions used <code>spring.cloud.gateway</code> directly <span class="tag version">Version-sensitive · checked Nov 2026</span>. Dependencies: <code>spring-cloud-starter-gateway-server-webflux</code>, <code>spring-boot-starter-data-redis-reactive</code>, <code>spring-cloud-starter-circuitbreaker-reactor-resilience4j</code>.</p>
+<pre data-file="application.yml"><code class="language-yaml">spring:
+  data:
+    redis:
+      host: redis-ratelimit.internal
+  cloud:
+    gateway:
+      server:
+        webflux:
+          default-filters:
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@apiKeyResolver}"
+                redis-rate-limiter.replenishRate: 50     # tokens per second
+                redis-rate-limiter.burstCapacity: 100    # bucket size
+                redis-rate-limiter.requestedTokens: 1
+          routes:
+            - id: orders
+              uri: lb://orders-service
+              predicates:
+                - Path=/api/orders/**
+              filters:
+                - name: CircuitBreaker
+                  args:
+                    name: orders
+                    fallbackUri: forward:/fallback/orders
+                - name: Retry
+                  args:
+                    retries: 2
+                    methods: GET
+                    statuses: BAD_GATEWAY, SERVICE_UNAVAILABLE
+                    backoff:
+                      firstBackoff: 50ms
+                      maxBackoff: 500ms
+                      factor: 2
+            - id: search-canary
+              uri: lb://search-service-v2
+              predicates:
+                - Path=/api/search/**
+                - Weight=search, 5          # 5% canary
+            - id: search-stable
+              uri: lb://search-service
+              predicates:
+                - Path=/api/search/**
+                - Weight=search, 95</code></pre>
+<pre data-file="RateLimitKeys.java"><code class="language-java">package com.example.gateway;
+
+import org.springframework.cloud.gateway.filter.ratelimit.KeyResolver;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import reactor.core.publisher.Mono;
+
+import java.util.Objects;
+
+@Configuration
+class RateLimitKeys {
+
+    /** Limit per API key; fall back to client IP for anonymous traffic. */
+    @Bean
+    KeyResolver apiKeyResolver() {
+        return exchange -&gt; {
+            String apiKey = exchange.getRequest().getHeaders().getFirst("X-Api-Key");
+            if (apiKey != null &amp;&amp; !apiKey.isBlank()) {
+                return Mono.just("key:" + apiKey);
+            }
+            // Behind a trusted proxy, configure forwarded-header handling so this is the real client IP
+            var addr = exchange.getRequest().getRemoteAddress();
+            return Mono.just("ip:" + (addr == null ? "unknown"
+                    : Objects.requireNonNull(addr.getAddress()).getHostAddress()));
+        };
+    }
+}</code></pre>
+  <p>The built-in <code>RedisRateLimiter</code> runs a token-bucket Lua script in Redis and adds <code>X-RateLimit-Remaining</code>, <code>X-RateLimit-Replenish-Rate</code> and <code>X-RateLimit-Burst-Capacity</code> headers. By default it allows requests if Redis is unavailable (fail open). An empty key from the resolver causes a 403 by default (<code>deny-empty-key</code>), a safe default for authenticated APIs.</p>
+
+  <h3>7.3 A Redis + Lua token bucket you own (Spring MVC)</h3>
+  <p>When you are not using a gateway (or need per-operation limits deep inside a service, such as LLM calls priced in tokens), implement the limiter directly. The script uses the Redis server clock and stores fractional tokens.</p>
+<pre data-file="src/main/resources/scripts/token_bucket.lua"><code class="language-plaintext">-- KEYS[1] = bucket key, e.g. rl:{tenant-42}
+-- ARGV[1] = refill rate (tokens per second), ARGV[2] = capacity, ARGV[3] = cost
+local key      = KEYS[1]
+local rate     = tonumber(ARGV[1])
+local capacity = tonumber(ARGV[2])
+local cost     = tonumber(ARGV[3])
+
+local t   = redis.call('TIME')                       -- server clock: one clock for all callers
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+
+local state  = redis.call('HMGET', key, 'tokens', 'ts')
+local tokens = tonumber(state[1])
+local ts     = tonumber(state[2])
+if tokens == nil then
+  tokens = capacity
+  ts = now
+end
+
+local elapsed = math.max(0, now - ts)
+tokens = math.min(capacity, tokens + (elapsed * rate / 1000))
+
+local allowed  = 0
+local retry_ms = 0
+if tokens &gt;= cost then
+  tokens  = tokens - cost
+  allowed = 1
+else
+  retry_ms = math.ceil((cost - tokens) * 1000 / rate)
+end
+
+redis.call('HSET', key, 'tokens', tostring(tokens), 'ts', now)
+-- an idle bucket refills completely after capacity/rate seconds; expire it then
+redis.call('PEXPIRE', key, math.ceil(capacity * 1000 / rate) + 1000)
+return { allowed, math.floor(tokens), retry_ms }</code></pre>
+<pre data-file="TokenBucketFilter.java"><code class="language-java">package com.example.api.ratelimit;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.dao.DataAccessException;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.redis.core.script.RedisScript;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+import java.util.List;
+
+@Component
+public class TokenBucketFilter extends OncePerRequestFilter {
+
+    private static final Logger log = LoggerFactory.getLogger(TokenBucketFilter.class);
+
+    private final StringRedisTemplate redis;
+    private final RedisScript&lt;List&gt; script;
+    private final MeterRegistry meters;
+    private final double ratePerSecond = 20;
+    private final int capacity = 40;
+
+    public TokenBucketFilter(StringRedisTemplate redis, MeterRegistry meters) {
+        this.redis = redis;
+        this.meters = meters;
+        var s = new DefaultRedisScript&lt;List&gt;();
+        s.setLocation(new ClassPathResource("scripts/token_bucket.lua"));
+        s.setResultType(List.class);
+        this.script = s;   // Spring Data Redis uses EVALSHA and falls back to EVAL
+    }
+
+    @Override
+    protected boolean shouldNotFilter(HttpServletRequest request) {
+        return request.getRequestURI().startsWith("/actuator");
+    }
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest req, HttpServletResponse res, FilterChain chain)
+            throws ServletException, IOException {
+        String key = "rl:{" + clientId(req) + "}";   // hash tag keeps Cluster slot stable
+        try {
+            @SuppressWarnings("unchecked")
+            List&lt;Long&gt; r = redis.execute(script, List.of(key),
+                    String.valueOf(ratePerSecond), String.valueOf(capacity), "1");
+            boolean allowed = r.get(0) == 1L;
+            res.setHeader("RateLimit-Limit", String.valueOf(capacity));
+            res.setHeader("RateLimit-Remaining", String.valueOf(r.get(1)));
+            if (!allowed) {
+                long retrySeconds = Math.max(1, (r.get(2) + 999) / 1000);
+                res.setHeader("Retry-After", String.valueOf(retrySeconds));
+                res.setStatus(429);
+                res.setContentType("application/problem+json");
+                res.getWriter().write("{\"title\":\"Too Many Requests\",\"status\":429}");
+                meters.counter("ratelimit.rejected", "tier", "api").increment();
+                return;
+            }
+        } catch (DataAccessException e) {
+            // Fail open: availability over protection. Pair with a coarse local limiter in production.
+            meters.counter("ratelimit.store.errors").increment();
+            log.warn("rate limiter store unavailable, allowing request: {}", e.getMessage());
+        }
+        chain.doFilter(req, res);
+    }
+
+    private String clientId(HttpServletRequest req) {
+        String apiKey = req.getHeader("X-Api-Key");
+        if (apiKey != null &amp;&amp; !apiKey.isBlank()) return "key:" + apiKey;
+        return "ip:" + req.getRemoteAddr(); // set server.forward-headers-strategy=native behind a proxy
+    }
+}</code></pre>
+  <div class="callout tip"><p class="callout-title">Tip: hash API keys before using them as Redis keys</p><p>Redis keys appear in <code>MONITOR</code>, slow logs, key-space scans and backups. Use a keyed hash (HMAC) or the API key's public identifier, never the raw secret.</p></div>
+
+  <h3>7.4 In-process limiters: Resilience4j and Bucket4j</h3>
+  <p>For limits that protect <em>this instance</em> or a downstream from <em>this instance</em> (e.g. "no more than 30 calls per second from each pod to the legacy pricing API"), an in-process limiter needs no network hop.</p>
+<pre data-file="application.yml"><code class="language-yaml">resilience4j:
+  ratelimiter:
+    instances:
+      pricingApi:
+        limit-for-period: 30          # permits per refresh period
+        limit-refresh-period: 1s
+        timeout-duration: 50ms        # how long a caller may wait for a permit
+        register-health-indicator: true</code></pre>
+<pre data-file="PricingClient.java"><code class="language-java">package com.example.api.pricing;
+
+import io.github.resilience4j.ratelimiter.annotation.RateLimiter;
+import io.github.resilience4j.ratelimiter.RequestNotPermitted;
+import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestClient;
+
+import java.math.BigDecimal;
+
+@Service
+class PricingClient {
+    private final RestClient http;
+
+    PricingClient(RestClient.Builder builder) {
+        this.http = builder.baseUrl("http://legacy-pricing.internal").build();
+    }
+
+    @RateLimiter(name = "pricingApi", fallbackMethod = "cachedPrice")
+    BigDecimal price(String sku) {
+        return http.get().uri("/prices/{sku}", sku).retrieve().body(BigDecimal.class);
+    }
+
+    BigDecimal cachedPrice(String sku, RequestNotPermitted ex) {
+        return PriceCache.lastKnown(sku); // your own last-known-price store: degrade instead of failing
+    }
+}</code></pre>
+  <p>Resilience4j's limiter is a fixed-window-per-cycle design (permits reset each refresh period). Bucket4j implements a true token bucket with greedy or interval refill, multiple bandwidths per bucket (e.g. 100/minute <em>and</em> 1,000/hour), and pluggable distributed backends (JCache, Hazelcast, Redis via Lettuce/Jedis/Redisson, JDBC). The 8.x line is current <span class="tag version">Version-sensitive · checked Nov 2026</span>; the core local API looks like this:</p>
+<pre data-file="Bucket4jLocal.java"><code class="language-java">import io.github.bucket4j.Bucket;
+import io.github.bucket4j.ConsumptionProbe;
+
+import java.time.Duration;
+
+public class Bucket4jLocal {
+    public static void main(String[] args) {
+        Bucket bucket = Bucket.builder()
+                .addLimit(limit -&gt; limit.capacity(100).refillGreedy(100, Duration.ofMinutes(1)))
+                .addLimit(limit -&gt; limit.capacity(1_000).refillIntervally(1_000, Duration.ofHours(1)))
+                .build();
+
+        ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
+        if (probe.isConsumed()) {
+            System.out.println("allowed, remaining=" + probe.getRemainingTokens());
+        } else {
+            long waitMs = Duration.ofNanos(probe.getNanosToWaitForRefill()).toMillis();
+            System.out.println("rejected, retry after ms=" + waitMs);
+        }
+    }
+}</code></pre>
+
+  <h3>7.5 Python and Go equivalents</h3>
+  <div class="code-tabs">
+<pre data-lang="Python" data-file="sliding_window.py"><code class="language-python">"""Sliding-window-counter limiter on Redis, usable from FastAPI/Flask middleware.
+pip install redis&gt;=5
+"""
+import time
+import redis
+
+SCRIPT = """
+-- KEYS[1] = current window key, KEYS[2] = previous window key
+-- ARGV[1] = limit, ARGV[2] = window ms, ARGV[3] = elapsed ms in current window
+local curr = tonumber(redis.call('GET', KEYS[1]) or '0')
+local prev = tonumber(redis.call('GET', KEYS[2]) or '0')
+local limit = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local elapsed = tonumber(ARGV[3])
+local estimate = prev * ((window - elapsed) / window) + curr
+if estimate &gt;= limit then
+  return {0, math.floor(estimate)}
+end
+redis.call('INCR', KEYS[1])
+redis.call('PEXPIRE', KEYS[1], window * 2)
+return {1, math.floor(estimate) + 1}
+"""
+
+
+class SlidingWindowLimiter:
+    def __init__(self, client: redis.Redis, limit: int, window_s: int):
+        self.r = client
+        self.limit = limit
+        self.window_ms = window_s * 1000
+        self.script = client.register_script(SCRIPT)
+
+    def allow(self, client_id: str) -&gt; tuple[bool, int]:
+        now_ms = int(time.time() * 1000)  # app clock: windows are coarse, skew of ms is harmless
+        window_idx = now_ms // self.window_ms
+        elapsed = now_ms % self.window_ms
+        curr = f"sw:{{{client_id}}}:{window_idx}"
+        prev = f"sw:{{{client_id}}}:{window_idx - 1}"
+        allowed, count = self.script(keys=[curr, prev],
+                                     args=[self.limit, self.window_ms, elapsed])
+        return bool(allowed), int(count)
+
+
+if __name__ == "__main__":
+    lim = SlidingWindowLimiter(redis.Redis(), limit=5, window_s=10)
+    for i in range(8):
+        print(i, lim.allow("demo"))</code></pre>
+<pre data-lang="Go" data-file="limiter.go"><code class="language-go">// Per-client token buckets with golang.org/x/time/rate.
+// go get golang.org/x/time/rate
+package main
+
+import (
+	"net"
+	"net/http"
+	"strconv"
+	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
+)
+
+type entry struct {
+	lim      *rate.Limiter
+	lastSeen time.Time
+}
+
+type PerClient struct {
+	mu      sync.Mutex
+	clients map[string]*entry
+	r       rate.Limit
+	burst   int
+}
+
+func NewPerClient(perSecond float64, burst int) *PerClient {
+	p := &amp;PerClient{clients: map[string]*entry{}, r: rate.Limit(perSecond), burst: burst}
+	go p.janitor()
+	return p
+}
+
+func (p *PerClient) get(id string) *rate.Limiter {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.clients[id]
+	if !ok {
+		e = &amp;entry{lim: rate.NewLimiter(p.r, p.burst)}
+		p.clients[id] = e
+	}
+	e.lastSeen = time.Now()
+	return e.lim
+}
+
+// janitor evicts idle clients so the map does not grow without bound.
+func (p *PerClient) janitor() {
+	for range time.Tick(time.Minute) {
+		p.mu.Lock()
+		for id, e := range p.clients {
+			if time.Since(e.lastSeen) &gt; 3*time.Minute {
+				delete(p.clients, id)
+			}
+		}
+		p.mu.Unlock()
+	}
+}
+
+func (p *PerClient) Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get("X-Api-Key")
+		if id == "" {
+			id, _, _ = net.SplitHostPort(r.RemoteAddr)
+		}
+		res := p.get(id).Reserve()
+		if delay := res.Delay(); delay &gt; 0 {
+			res.Cancel() // give the token back; we are rejecting, not waiting
+			w.Header().Set("Retry-After", strconv.Itoa(int(delay.Seconds())+1))
+			http.Error(w, "too many requests", http.StatusTooManyRequests)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func main() {
+	lim := NewPerClient(10, 20)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/hello", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) })
+	http.ListenAndServe(":8080", lim.Middleware(mux))
+}</code></pre>
+  </div>
+  <p>The Go limiter is local to one process; put it behind a shared store (as in §7.3) when limits must be global. <code>Reserve()</code> plus <code>Cancel()</code> gives you the precise wait time for <code>Retry-After</code>; <code>Allow()</code> is the simpler boolean form, and <code>Wait(ctx)</code> blocks until a token is available, which is the right choice for client-side throttling of outbound calls.</p>
+
+  <h3>7.6 Reverse proxy configuration: NGINX and Envoy</h3>
+  <div class="code-tabs">
+<pre data-lang="NGINX" data-file="nginx.conf"><code class="language-plaintext">http {
+  # 10 MB zone holds ~160k client states; 20 r/s per IP with bursts of 40 served without delay
+  limit_req_zone $binary_remote_addr zone=perip:10m rate=20r/s;
+  limit_req_status 429;
+
+  upstream orders {
+    least_conn;                                  # adapt to slow backends
+    server 10.0.1.11:8080 max_fails=3 fail_timeout=10s;
+    server 10.0.1.12:8080 max_fails=3 fail_timeout=10s;
+    server 10.0.1.13:8080 weight=2;              # bigger instance
+    keepalive 64;                                # pooled upstream connections
+  }
+
+  server {
+    listen 443 ssl;
+    http2 on;
+    ssl_certificate     /etc/nginx/tls/fullchain.pem;
+    ssl_certificate_key /etc/nginx/tls/privkey.pem;
+    client_max_body_size 2m;
+
+    location /api/orders/ {
+      limit_req zone=perip burst=40 nodelay;
+      proxy_http_version 1.1;
+      proxy_set_header Connection "";            # required for upstream keepalive
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_connect_timeout 1s;
+      proxy_read_timeout 5s;
+      proxy_next_upstream error timeout http_502 http_503;   # only safe for idempotent routes
+      proxy_next_upstream_tries 2;
+      proxy_pass http://orders;
+    }
+  }
+}</code></pre>
+<pre data-lang="Envoy" data-file="envoy-cluster.yaml"><code class="language-yaml">clusters:
+  - name: orders
+    connect_timeout: 1s
+    type: STRICT_DNS
+    lb_policy: LEAST_REQUEST          # P2C among equal-weight hosts
+    least_request_lb_config:
+      choice_count: 2
+    load_assignment:
+      cluster_name: orders
+      endpoints:
+        - lb_endpoints:
+            - endpoint: { address: { socket_address: { address: orders.internal, port_value: 8080 } } }
+    health_checks:                    # active checks
+      - timeout: 1s
+        interval: 5s
+        unhealthy_threshold: 3
+        healthy_threshold: 2
+        http_health_check:
+          path: /actuator/health/readiness
+    outlier_detection:                # passive checks on real traffic
+      consecutive_5xx: 5
+      interval: 10s
+      base_ejection_time: 30s
+      max_ejection_percent: 50        # never eject more than half the fleet
+    circuit_breakers:
+      thresholds:
+        - max_connections: 1000
+          max_pending_requests: 200
+          max_requests: 2000
+          max_retries: 50             # retry budget guard against retry storms</code></pre>
+  </div>
+
+  <h3>7.7 Graceful shutdown on Kubernetes</h3>
+<pre data-file="deployment.yaml"><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-service
+spec:
+  replicas: 6
+  strategy:
+    rollingUpdate: { maxSurge: 25%, maxUnavailable: 0 }
+  selector: { matchLabels: { app: orders-service } }
+  template:
+    metadata:
+      labels: { app: orders-service }
+    spec:
+      terminationGracePeriodSeconds: 60        # &gt; preStop (10) + shutdown phase (30) + margin
+      containers:
+        - name: app
+          image: registry.example.com/orders-service:1.42.0
+          ports: [{ containerPort: 8080 }]
+          env:
+            - name: SERVER_SHUTDOWN
+              value: graceful
+            - name: SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE
+              value: 30s
+          lifecycle:
+            preStop:
+              exec: { command: ["sh", "-c", "sleep 10"] }   # let endpoint removal propagate
+          startupProbe:
+            httpGet: { path: /actuator/health/liveness, port: 8080 }
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            httpGet: { path: /actuator/health/readiness, port: 8080 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /actuator/health/liveness, port: 8080 }
+            periodSeconds: 10</code></pre>
+  <p>If the image has no shell, recent Kubernetes versions support a native <code>sleep</code> preStop action instead of <code>exec</code> <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+</section>
+
+<section id="applications">
+  <h2>8. Real-World Applications</h2>
+  <ul>
+    <li><strong>Public API platforms</strong> (payments, communications, developer tools) publish per-key rate limits and quotas, return <code>429</code> with <code>Retry-After</code> and rate-limit headers, and enforce limits in a gateway backed by a shared store. Concurrency limits often protect expensive endpoints separately from request-rate limits.</li>
+    <li><strong>Multi-tenant SaaS</strong> uses per-tenant limits for fairness ("noisy neighbour" protection) and plan-based quotas, often with separate buckets for reads, writes and expensive operations such as exports or AI generation.</li>
+    <li><strong>E-commerce flash sales and ticketing</strong> combine rate limits with virtual waiting rooms (admission control at the edge that lets users in at the rate the backend can sustain) so that a 50x spike becomes a queue rather than an outage.</li>
+    <li><strong>Internal platforms</strong> deploy a service mesh (Envoy sidecars or ambient/node proxies) so that every service gets P2C balancing, outlier detection, retries with budgets, mTLS and uniform metrics without library changes, with a shared gateway at the edge.</li>
+    <li><strong>AI features</strong>: an internal "LLM gateway" centralises provider credentials, enforces per-team token budgets (token buckets where cost = tokens, not requests), caps concurrency per model, routes between providers and models, and records usage for chargeback. The same algorithms as this chapter, with cost-weighted consumption.</li>
+    <li><strong>Mobile backends</strong> use BFFs to collapse chatty calls and to version payloads per app release, since old app versions remain in the field for months.</li>
+    <li><strong>Zero-downtime deploys</strong>: readiness gates, preStop delays, connection draining and weighted canary routing at the gateway are standard parts of a progressive-delivery pipeline (Argo Rollouts, Flagger, or cloud-native equivalents).</li>
+  </ul>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+
+  <h3>9.1 Stripe: four kinds of limiters</h3>
+  <p><span class="tag fact">Verified</span> Stripe's 2017 engineering post <a href="https://stripe.com/blog/rate-limiters"><em>Scaling your API with rate limiters</em></a> describes running several distinct limiters in production: a <em>request rate limiter</em> (per user, token-bucket based, with burst allowance), a <em>concurrent requests limiter</em> (caps in-flight requests, valuable for CPU-heavy endpoints), and two <em>load shedders</em> that reserve capacity for critical traffic (e.g. prioritising critical API methods over less important traffic when the fleet is under stress). The post recommends implementing limiters as middleware, returning clear errors (429 for client-attributable limits, 503 for shedding), building dark-launch and kill switches so a misconfigured limiter can be disabled quickly, and it includes example Redis-backed code. The key design lesson: rate limiting (who is sending too much) and load shedding (the system is overloaded regardless of who) are different controls and you need both.</p>
+
+  <h3>9.2 GitHub: a sharded, replicated Redis limiter</h3>
+  <p><span class="tag fact">Verified</span> In <a href="https://github.blog/engineering/infrastructure/how-we-scaled-github-api-sharded-replicated-rate-limiter-redis/"><em>How we scaled the GitHub API with a sharded, replicated rate limiter in Redis</em></a> (2021), GitHub explains moving its API rate limiter off a Memcached instance shared with other caches onto dedicated Redis with client-side sharding and replicas, and running the limiter logic as a Lua script so that each request's counter update and TTL handling is atomic. The post discusses problems such as inconsistent reset times reported to clients and how server-side scripting fixed them. Lessons for your design: give the limiter its own store (so cache evictions do not reset limits), shard by client key, and do the whole decision server-side in one round trip.</p>
+
+  <h3>9.3 Cloudflare: approximate sliding windows at the edge</h3>
+  <p><span class="tag fact">Verified</span> Cloudflare's 2017 post <a href="https://blog.cloudflare.com/counting-things-a-lot-of-different-things/"><em>How we built rate limiting capable of scaling to millions of domains</em></a> compares fixed windows, exact sliding logs (accurate but memory-heavy) and an approximate sliding window computed from the previous and current window counters, which is the sliding window counter in §3.10 and §6.4. It explains why the approximation was accurate enough in their traffic and how counters are shared across servers in a data centre. The lesson: at very large key cardinality, constant memory per key matters more than perfect accuracy.</p>
+
+  <h3>9.4 Google Maglev: a software L4 balancer</h3>
+  <p><span class="tag fact">Verified</span> The NSDI 2016 paper <a href="https://www.usenix.org/conference/nsdi16/technical-sessions/presentation/eisenbud"><em>Maglev: A Fast and Reliable Software Network Load Balancer</em></a> describes Google's distributed L4 balancer running on commodity Linux servers, using ECMP to spread packets across Maglev machines, kernel-bypass packet processing, and a consistent hashing scheme ("Maglev hashing") designed for even load and minimal disruption when backends change, with connection tracking to keep existing flows stable. It is the reference design behind several cloud L4 balancers and influenced Envoy's Maglev load-balancing policy.</p>
+
+  <h3>9.5 Dropbox: load-aware balancing in Bandaid</h3>
+  <p><span class="tag fact">Verified</span> Dropbox's post <a href="https://dropbox.tech/infrastructure/enhancing-bandaid-load-balancing-at-dropbox-by-leveraging-real-time-backend-server-load-information"><em>Enhancing Bandaid load balancing at Dropbox by leveraging real-time backend server load information</em></a> describes moving its internal proxy (Bandaid) from random choice-of-N based on active request counts to using load information reported by backends, crediting ideas from Netflix's edge load-balancing work. It illustrates the progression in §3.4: round-robin → P2C on local counts → load-aware selection using backend feedback, each step fixing an imbalance visible at scale.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages, Limitations and Operational Cost</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Component</th><th>Advantages</th><th>Limitations</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>Cloud L4 balancer</td><td>Massive throughput, protocol-agnostic, preserves client TLS, static IPs</td><td>No per-request routing; poor balance for long-lived HTTP/2/gRPC connections</td><td>Low; pay per hour and per connection/byte</td></tr>
+      <tr><td>Cloud L7 balancer</td><td>Per-request routing, TLS offload, WAF integration, managed</td><td>Limited extensibility; vendor-specific features and limits</td><td>Low-moderate; per-hour plus capacity units</td></tr>
+      <tr><td>Self-managed Envoy/NGINX/HAProxy</td><td>Full control, advanced algorithms, portable</td><td>You own patching, scaling, config pipelines, certificates</td><td>Moderate-high; needs a platform team</td></tr>
+      <tr><td>Spring Cloud Gateway</td><td>Java filters, Spring ecosystem, easy custom logic</td><td>JVM footprint; temptation to add business logic; throughput lower than C++ proxies for pure proxying</td><td>Moderate; it is another Spring app to run</td></tr>
+      <tr><td>Managed API gateway</td><td>Usage plans, API keys, portals, nothing to run</td><td>Per-request pricing at high volume; timeouts and payload limits; lock-in</td><td>Low ops, potentially high cost</td></tr>
+      <tr><td>Service mesh</td><td>Uniform L7 features for all east-west traffic</td><td>Complexity, resource overhead, debugging indirection</td><td>High; justify with many services</td></tr>
+      <tr><td>Local rate limiter</td><td>No network hop, no dependency</td><td>Inaccurate as global limit; resets on restart</td><td>Negligible</td></tr>
+      <tr><td>Redis-backed rate limiter</td><td>Accurate global limits, shared across fleet</td><td>Extra hop; Redis becomes critical; hot keys for huge clients</td><td>Moderate; dedicated Redis, monitoring, failure policy</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+  <h3>11.1 Choosing a rate-limiting algorithm</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Algorithm</th><th>Memory per key</th><th>Bursts</th><th>Accuracy</th><th>Choose when</th></tr></thead>
+    <tbody>
+      <tr><td>Token bucket</td><td>O(1): two numbers</td><td>Allowed up to capacity</td><td>Exact for its model</td><td>Default for APIs; cost-weighted limits (LLM tokens)</td></tr>
+      <tr><td>Leaky bucket (queue)</td><td>O(queue)</td><td>Smoothed into constant output</td><td>Exact</td><td>Shaping traffic to a fragile downstream; jobs</td></tr>
+      <tr><td>Fixed window</td><td>O(1): one counter</td><td>Up to 2x at boundaries</td><td>Coarse</td><td>Daily/monthly quotas, billing counters</td></tr>
+      <tr><td>Sliding log</td><td>O(limit)</td><td>None beyond limit</td><td>Exact</td><td>Low limits where precision matters (login attempts)</td></tr>
+      <tr><td>Sliding window counter</td><td>O(1): two counters</td><td>Small approximation error</td><td>Approximate</td><td>Huge key cardinality at the edge</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>11.2 Where should this concern live?</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  Q["New cross-cutting requirement"] --> A{"Needed by every API consumer, independent of business data?"}
+  A -- "Yes (TLS, authN, per-key quotas, routing)" --> GW["Shared API gateway"]
+  A -- "No" --> B{"Specific to one client experience?"}
+  B -- "Yes (aggregation, payload shaping, web session)" --> BFF["That client's BFF"]
+  B -- "No" --> C{"Requires domain data or business rules?"}
+  C -- "Yes (entitlements, validation, pricing)" --> SVC["Domain service"]
+  C -- "No (retries, mTLS, metrics for east-west calls)" --> MESH["Mesh / client library"]
+</pre>
+  <figcaption>Figure 2.7 — Placing a concern in the gateway, BFF, service or mesh.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the gateway is for concerns that apply uniformly and need no domain data; the BFF for client-specific composition; services for anything involving business rules; the mesh or a shared library for service-to-service plumbing. Fine-grained authorisation ("can this user edit this document?") needs domain data and therefore belongs in the service, even though coarse checks ("does this token have the <code>documents:write</code> scope?") can be done at the gateway.</p>
+
+  <h3>11.3 Fail open or fail closed?</h3>
+  <p>When the limiter's store is unavailable: <strong>fail open</strong> for user-facing APIs where limits are protective and an outage of the limiter should not become an outage of the product (pair with a coarse local limiter so you are not completely unprotected). <strong>Fail closed</strong> where limits guard money or safety (expensive LLM spend, SMS sending that costs per message and attracts fraud, login attempts). Make the choice explicit per limit and test it.</p>
+
+  <h3>11.4 Sticky sessions versus externalised state</h3>
+  <p>Sticky sessions are acceptable as a performance optimisation (cache locality) when losing affinity is harmless. They are a liability when correctness depends on them. If you find yourself needing stickiness for correctness, externalise the state; if you want it for locality, prefer consistent hashing on a meaningful key (tenant, document) over cookie affinity, because hashing redistributes predictably when the fleet changes.</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Production Failures</h2>
+  <ul>
+    <li><strong>Per-instance limits presented as global limits.</strong> A limit of 100/s per pod becomes 3,000/s after autoscaling to 30 pods (§6.5).</li>
+    <li><strong>Trusting <code>X-Forwarded-For</code> blindly.</strong> Clients can send their own header; keying IP limits on the first value lets attackers rotate fake IPs. Only trust the hops you control (Spring's <code>ForwardedHeaderFilter</code>/<code>server.forward-headers-strategy</code> with trusted proxies configured; NGINX <code>real_ip</code> with <code>set_real_ip_from</code>).</li>
+    <li><strong>Read-modify-write limiters without atomicity.</strong> <code>GET</code> then <code>SET</code> from two instances double-spends tokens. Use Lua, Redis Functions, or atomic <code>INCR</code>.</li>
+    <li><strong>Retries at every layer.</strong> Client, gateway, BFF and service each retry three times: one user action becomes 81 backend calls during an incident. Retry at one layer, with budgets and jittered backoff, and only for idempotent operations.</li>
+    <li><strong>Retrying non-idempotent requests at the proxy.</strong> <code>proxy_next_upstream</code> on a <code>POST /payments</code> can charge twice. Restrict proxy retries to safe methods or require idempotency keys.</li>
+    <li><strong>Dependencies in liveness probes.</strong> Database blip → all pods fail liveness → mass restart → thundering herd on the database as every pod reconnects and warms up.</li>
+    <li><strong>No preStop delay.</strong> A small burst of 502/503 on every deploy that everyone has learned to ignore.</li>
+    <li><strong>L4 balancing of gRPC.</strong> Long-lived HTTP/2 connections pin to a few backends; new pods get no traffic after scale-out. Use L7 balancing, client-side balancing, or connection max-age so clients reconnect.</li>
+    <li><strong>Gateway as dumping ground.</strong> Business logic and data access in a shared gateway; every team's change risks every team's traffic.</li>
+    <li><strong>Unbounded per-key state.</strong> In-memory limiter maps keyed by IP with no eviction become memory leaks under scanning attacks (the Go example's janitor exists for this reason).</li>
+    <li><strong>Missing <code>Retry-After</code>.</strong> Clients retry immediately and amplify load. Always tell them when to come back.</li>
+  </ul>
+  <div class="callout danger"><p class="callout-title">A real-world pattern: the retry storm</p><p><span class="tag illus">Illustrative</span> A downstream slows; gateway timeouts fire; the gateway retries twice; the mobile app also retries twice on 5xx. Effective load on the struggling service rises up to ninefold precisely when it can least handle it. Recovery requires shedding load deliberately. Prevent it with a retry budget (e.g. retries may add at most 10–20% to request volume), circuit breakers, and server-side load shedding that returns fast 503s with <code>Retry-After</code>.</p></div>
+</section>
+
+<section id="production">
+  <h2>13. Production Engineering</h2>
+  <h3>13.1 Performance</h3>
+  <ul>
+    <li>Enable upstream keep-alive and HTTP/2 between proxies and services; TLS handshakes and TCP setup per request waste CPU and add latency.</li>
+    <li>Right-size proxy timeouts from latency budgets (connect timeouts of ~1 s or less in-region; request timeouts per route).</li>
+    <li>Measure the gateway's added latency explicitly (gateway total time minus upstream time) and set an SLO for it.</li>
+  </ul>
+  <h3>13.2 Security</h3>
+  <ul>
+    <li>Terminate TLS with modern configurations (TLS 1.2 minimum, 1.3 preferred) and automate certificate rotation.</li>
+    <li>Validate JWTs at the gateway (signature, <code>iss</code>, <code>aud</code>, <code>exp</code>), but propagate identity to services in a form they can verify again (forwarded token or a signed internal token); do not let services trust unauthenticated headers such as <code>X-User-Id</code> that any internal caller could set.</li>
+    <li>Rate-limit authentication endpoints aggressively (per account and per IP) and protect expensive endpoints with concurrency limits.</li>
+    <li>Set request size limits, header size limits and slow-client timeouts at the proxy to blunt slowloris-style attacks.</li>
+  </ul>
+  <h3>13.3 Scalability and reliability</h3>
+  <ul>
+    <li>Run gateways and balancers across at least three zones with N+1 capacity; they are on every request's critical path, so their SLO must exceed every service's.</li>
+    <li>Keep the gateway's own dependencies minimal: a shared Redis for rate limits (with fail-open), a JWKS cache for keys; avoid synchronous calls to identity providers per request.</li>
+    <li>Use outlier detection with a maximum ejection percentage so a fleet-wide problem does not eject every host.</li>
+  </ul>
+  <h3>13.4 Monitoring</h3>
+  <ul>
+    <li>Per route and per consumer: request rate, error rate, latency histogram, 429 rate. A sudden 429 spike for one consumer is usually a client bug; a broad spike is usually a limit set too low or a store failure.</li>
+    <li>Balancer: healthy host count per cluster, ejections, connection pool saturation (pending requests), retries and retry-budget overflow.</li>
+    <li>Limiter store: command latency, script execution time, memory, evictions (should be zero for a limiter store; use <code>noeviction</code> or a generous <code>maxmemory</code>).</li>
+  </ul>
+  <h3>13.5 Maintainability</h3>
+  <ul>
+    <li>Keep gateway routes and limits as code, reviewed and deployed through CI with automated config validation; a bad route can take down everything.</li>
+    <li>Version limits per plan in configuration rather than code, and expose them to customers via documentation and response headers (the IETF <code>RateLimit</code> header fields draft is a reasonable convention).</li>
+  </ul>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>A token bucket has capacity 50 and refill rate 5 per second. It is full at t = 0. A client sends 80 requests instantly at t = 0, then 1 request every 100 ms. (a) How many of the initial 80 are admitted? (b) From t = 0 onward, what is the steady admission rate? (c) When does the first request after the burst succeed?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>(a) 50 (the capacity); 30 are rejected. (b) 5 per second, the refill rate; the client sends 10 per second, so half are rejected in steady state. (c) After the burst the bucket is empty; one token accrues after 0.2 s, so the request at t = 0.2 s succeeds (the one at 0.1 s fails).</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Your fixed-window limiter allows 600 requests per minute per key. Show the worst-case number of requests a client can get accepted within any 2-second interval, and redesign the limiter so that no 60-second sliding interval exceeds 600 while keeping O(1) memory.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Worst case: 600 at 12:00:59.x and 600 at 12:01:00.x: 1,200 within about one second. A sliding window counter (two counters) reduces this to approximately 600 but not exactly. A naive token bucket with capacity 600 and rate 10/s does not help either: it admits \(b + rt\) in time \(t\), so up to 1,200 in 60 seconds. To cap any 60-second interval at 600 you need \(b + 60r \le 600\), e.g. \(b = 60, r = 9\)/s (60 + 540 = 600). That sacrifices some sustained throughput for a guarantee; alternatively use GCRA (equivalent arithmetic) with the same parameters. If the requirement is only "about 600 per minute, no 2x bursts", the sliding window counter is the pragmatic choice.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>Users report intermittent 502s during every deployment of a Spring Boot service on Kubernetes behind an NGINX-based ingress. Readiness and liveness probes are configured. Explain the most likely cause and the fix, including concrete values.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>The termination race (§4.3): SIGTERM and endpoint removal happen concurrently; the ingress keeps routing to the pod for a few seconds after the JVM stops accepting connections. Fix: add <code>preStop</code> sleep of ~10 s (longer than observed endpoint propagation), keep <code>server.shutdown=graceful</code> with <code>spring.lifecycle.timeout-per-shutdown-phase=30s</code>, set <code>terminationGracePeriodSeconds</code> to ~60, use <code>maxUnavailable: 0</code> in the rollout, and ensure the ingress uses upstream keep-alive with retry on connection errors only for idempotent methods. Verify by running a constant-rate load test during a rollout and checking for zero 5xx.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>Design per-tenant LLM usage limits for an internal AI gateway: each tenant has 200,000 tokens per minute and 20 concurrent generations; requests declare <code>max_tokens</code> but actual usage is only known after completion. Write the algorithm (pseudo-code is fine) and describe the Redis data model.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Two limiters per tenant.</strong> (1) Token bucket in tokens: capacity 200,000, rate 200,000/60 ≈ 3,333 tokens/s. (2) Concurrency semaphore: a counter (or sorted set of request IDs with expiry timestamps, to survive crashes) with limit 20.</p>
+      <p><strong>Algorithm.</strong> On request: estimate cost = prompt tokens (count with a tokenizer) + <code>max_tokens</code>. Atomically (one Lua script): refill bucket, check tokens ≥ estimate and concurrency &lt; 20; if both pass, deduct estimate and add the request ID to the concurrency set with an expiry of now + timeout; else return 429 with Retry-After computed from the bucket. On completion: a second script refunds <code>estimate − actual</code> tokens (capped at capacity) and removes the request ID. A periodic sweep removes expired IDs (crashed workers).</p>
+      <p><strong>Keys:</strong> <code>llm:{tenant}:bucket</code> (hash: tokens, ts) and <code>llm:{tenant}:inflight</code> (sorted set: member = request ID, score = expiry). The shared hash tag keeps both in one Cluster slot for one script. Fail closed if Redis is unreachable (money is at stake), with a small local emergency allowance.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>A gRPC service runs 10 pods behind an AWS NLB. After scaling to 20 pods during a traffic spike, CPU on the new pods stays near zero while the original pods are saturated. Explain why and give three fixes with trade-offs.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>gRPC uses long-lived HTTP/2 connections; an L4 balancer balances <em>connections</em>, and existing clients keep their connections to the original pods. New pods only receive new connections. Fixes: (1) L7 balancing (an Envoy/ALB-style proxy that balances per stream): best balance, extra hop and cost. (2) Client-side balancing (gRPC with DNS or xDS resolver and round_robin or least-request): no extra hop, but every client must be configured and needs endpoint discovery. (3) Server-side <code>max_connection_age</code> (gRPC servers can send GOAWAY after a connection age, e.g. 5 minutes with a grace period), forcing clients to reconnect and rebalance: simple, but rebalancing is gradual and causes periodic reconnection overhead.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions and Answers</h2>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is the difference between L4 and L7 load balancing, and when would you choose each?</summary><div>
+    <p>L4 balances connections using addresses and ports, without parsing the application protocol: very fast, protocol-agnostic, can preserve end-to-end TLS, but balances poorly when connections are long-lived and multiplexed. L7 terminates the connection, parses HTTP/gRPC and balances each request: routing by path/header, retries, TLS offload, observability, at the cost of CPU and an extra hop. Choose L4 for non-HTTP protocols, extreme throughput, or TLS pass-through; L7 for HTTP APIs, gRPC, canaries and anything needing request-level policy. Large systems often use both: L4 in front of a fleet of L7 proxies.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why does power of two choices work so well, and why not always pick the global least-loaded server?</summary><div>
+    <p>Comparing two random choices removes most of the variance of random assignment: the maximum load drops from roughly \(\ln n/\ln\ln n\) to \(\ln\ln n/\ln 2\). Picking the global minimum requires up-to-date global state; with many independent balancers using slightly stale counts, they all pick the same "least loaded" server simultaneously and overload it (herding). Random sampling of two decorrelates choices while still steering away from busy servers, and costs O(1).</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Implement a token bucket rate limiter that is safe across multiple gateway instances.</summary><div>
+    <p>Store per-key state (tokens, last refill timestamp) in Redis; execute refill-check-deduct atomically in a Lua script using the Redis server clock; expire idle keys after capacity/rate seconds; return allowed, remaining and retry-after. The script and Spring filter are in §7.3. Discuss: hash tags for Cluster, fail-open versus fail-closed, hashing API keys, and that the round trip adds ~0.5 ms.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> What belongs in an API gateway, and what doesn't? How does a BFF differ?</summary><div>
+    <p>Gateway: TLS, authentication, coarse authorisation (scopes), routing and versioning, quotas/rate limits, CORS, request size limits, observability, edge resilience. Not: business rules, domain data access, response aggregation for one client. A BFF is a client-specific backend owned by the client team that aggregates and shapes data for that experience; it sits behind the gateway. The gateway is shared and generic; BFFs are many and specific.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How would you make a legacy Spring MVC app that uses HttpSession heavily horizontally scalable without sticky sessions?</summary><div>
+    <p>Introduce Spring Session with Redis: transparent replacement of HttpSession, so code is unchanged. Audit session contents (size, serialisability, class evolution), switch to JSON serialisation, and move durable business state (carts, drafts) into domain tables over time. Also externalise other local state: file uploads to object storage, scheduled jobs with ShedLock, local caches reviewed for consistency. Then remove affinity at the balancer and verify with a test that hops between instances.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> One API customer complains they are being rate-limited at half their contracted rate. Others are fine. What do you check?</summary><div>
+    <p>Check whether limits are enforced locally per gateway instance: if the customer uses few long-lived connections (HTTP/2, keep-alive from a single server), their traffic may land on a subset of instances, each enforcing \(L/n\). Check the limiter key (are several of their API keys mapped to one bucket, or is the key the IP of a shared NAT?). Check cost weighting (some endpoints cost more tokens). Check clock skew if the script uses client clocks. Check for retries on their side counting double. Fix with a shared store or correct key.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> During a dependency outage your services survived, but recovery took 20 minutes after the dependency came back. Why might that be?</summary><div>
+    <p>Likely a thundering herd and retry storm: queued and retried requests, clients with synchronized backoff, cold caches and connection pools all hit the recovered dependency at once and knock it over again. Circuit breakers in half-open state may all probe simultaneously. Mitigations: jittered exponential backoff, retry budgets, gradual ramp-up (slow-start in the balancer for recovered hosts, supported by Envoy and NGINX Plus), admission control/load shedding in the dependency, and warming caches before full traffic.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Compare token bucket and leaky bucket.</summary><div>
+    <p>Both enforce a long-run rate. A token bucket permits bursts up to its capacity after idle periods (admitted traffic can be bursty), and rejects (or delays) when empty. A leaky bucket as a queue emits at a constant rate, smoothing bursts into steady output at the cost of queueing delay, and drops when the queue is full. Use token buckets for API limits where clients legitimately burst; leaky buckets for shaping traffic into a downstream that cannot tolerate bursts. As meters (GCRA), they are mathematically equivalent.</p>
+  </div></details>
+
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is the difference between liveness and readiness, and why should liveness not check the database?</summary><div>
+    <p>Liveness answers "should this container be restarted?"; readiness answers "should it receive traffic?". If liveness depends on the database, a database outage causes every pod to be restarted simultaneously, adding cold starts and reconnection storms while fixing nothing. Liveness should detect only process-local failures (deadlock, unrecoverable state). Readiness may reflect startup and shutdown, and instance-local dependencies.</p>
+  </div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Scale stateless tiers horizontally; scale stateful primaries vertically until partitioning is unavoidable. Amdahl and USL explain why vertical scaling saturates.</li>
+    <li>Statelessness (externalised sessions, tokens, domain-persisted state) is the prerequisite for balancing, autoscaling and zero-downtime deploys.</li>
+    <li>L4 balances connections; L7 balances requests. HTTP/2 and gRPC need L7 or client-side balancing.</li>
+    <li>Least-request with power of two choices adapts to heterogeneous, long-tailed backends without global state or herding.</li>
+    <li>Use active and passive health checks; keep dependencies out of liveness; coordinate preStop, graceful shutdown and grace periods for zero-drop deploys.</li>
+    <li>Keep the shared gateway thin; put client-specific aggregation in BFFs and business rules in services.</li>
+    <li>Token bucket is the default rate-limit algorithm; fixed windows double at boundaries; sliding logs are exact but memory-heavy; sliding window counters are a constant-memory approximation.</li>
+    <li>Global limits need shared, atomic state (Redis + Lua with the server clock) and an explicit fail-open or fail-closed policy.</li>
+  </ul>
+
+  <div class="quiz" data-answer="b">
+    <p class="q">20 gateway pods each enforce a local limit of 50 requests/s for a client. The client's requests are spread evenly. What is the effective limit?</p>
+    <ol>
+      <li data-k="a">50 requests/s</li>
+      <li data-k="b">1,000 requests/s</li>
+      <li data-k="c">2.5 requests/s</li>
+      <li data-k="d">Unbounded</li>
+    </ol>
+    <div class="explain">Each pod admits 50/s independently; with even spreading the client gets 20 × 50 = 1,000/s. Local limits must be divided by the instance count, or use a shared store.</div>
+  </div>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">A token bucket has capacity 100 and rate 10/s. What is the maximum number of requests it can admit in any 10-second interval?</p>
+    <ol>
+      <li data-k="a">100</li>
+      <li data-k="b">110</li>
+      <li data-k="c">200</li>
+      <li data-k="d">1,000</li>
+    </ol>
+    <div class="explain">The arrival bound is b + r·t = 100 + 10 × 10 = 200: a full bucket's burst plus everything refilled during the interval.</div>
+  </div>
+
+  <div class="quiz" data-answer="a">
+    <p class="q">Why does an L4 load balancer often leave newly added gRPC backends idle?</p>
+    <ol>
+      <li data-k="a">gRPC multiplexes many requests over long-lived HTTP/2 connections, and L4 balances connections, not requests</li>
+      <li data-k="b">L4 balancers cannot route TCP traffic</li>
+      <li data-k="c">gRPC requires sticky sessions</li>
+      <li data-k="d">New backends fail health checks for the first hour</li>
+    </ol>
+    <div class="explain">Existing connections stay on existing backends; only new connections reach new pods. L7 balancing, client-side balancing or connection max-age fix it.</div>
+  </div>
+
+  <div class="quiz" data-answer="d">
+    <p class="q">Which Kubernetes/Spring configuration best prevents 502s during rolling deploys?</p>
+    <ol>
+      <li data-k="a">A liveness probe that checks the database</li>
+      <li data-k="b">Setting terminationGracePeriodSeconds to 0 for faster rollouts</li>
+      <li data-k="c">Sticky sessions at the ingress</li>
+      <li data-k="d">A preStop sleep, graceful shutdown, and a grace period longer than both combined</li>
+    </ol>
+    <div class="explain">The preStop delay lets endpoint removal propagate before SIGTERM; graceful shutdown completes in-flight requests; the grace period must cover both or SIGKILL cuts requests off.</div>
+  </div>
+
+  <div class="quiz" data-answer="b">
+    <p class="q">Why is a Redis-backed limiter implemented as a Lua script rather than GET followed by SET from the application?</p>
+    <ol>
+      <li data-k="a">Lua is faster than Java</li>
+      <li data-k="b">The script runs atomically on Redis's main thread, preventing concurrent instances from double-spending tokens</li>
+      <li data-k="c">GET and SET are not available in Redis Cluster</li>
+      <li data-k="d">Scripts persist state to disk while GET/SET do not</li>
+    </ol>
+    <div class="explain">A read-modify-write from two clients can interleave; a script executes with no other command interleaved and needs only one round trip.</div>
+  </div>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">Which concern belongs in a BFF rather than the shared API gateway?</p>
+    <ol>
+      <li data-k="a">TLS termination</li>
+      <li data-k="b">Per-API-key rate limiting</li>
+      <li data-k="c">Aggregating three service calls into one compact response for the mobile home screen</li>
+      <li data-k="d">JWT signature validation</li>
+    </ol>
+    <div class="explain">Client-specific composition and payload shaping belong to that client's BFF; the gateway handles generic edge concerns shared by all consumers.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Blog</span> Paul Tarjan, <a href="https://stripe.com/blog/rate-limiters">"Scaling your API with rate limiters"</a>, Stripe, 2017.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://github.blog/engineering/infrastructure/how-we-scaled-github-api-sharded-replicated-rate-limiter-redis/">"How we scaled the GitHub API with a sharded, replicated rate limiter in Redis"</a>, GitHub, 2021.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://blog.cloudflare.com/counting-things-a-lot-of-different-things/">"How we built rate limiting capable of scaling to millions of domains"</a>, Cloudflare, 2017.</li>
+    <li><span class="ref-kind">Paper</span> Daniel E. Eisenbud et al., <a href="https://www.usenix.org/conference/nsdi16/technical-sessions/presentation/eisenbud">"Maglev: A Fast and Reliable Software Network Load Balancer"</a>, NSDI 2016.</li>
+    <li><span class="ref-kind">Paper</span> Michael Mitzenmacher, "The Power of Two Choices in Randomized Load Balancing", PhD thesis, UC Berkeley, 1996 (journal version in IEEE TPDS, 2001).</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://dropbox.tech/infrastructure/enhancing-bandaid-load-balancing-at-dropbox-by-leveraging-real-time-backend-server-load-information">"Enhancing Bandaid load balancing at Dropbox"</a>, Dropbox Tech.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers">Envoy: supported load balancers</a> and <a href="https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/outlier">outlier detection</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.spring.io/spring-cloud-gateway/reference/">Spring Cloud Gateway reference</a> — route predicates, filters, RequestRateLimiter.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.spring.io/spring-session/reference/">Spring Session reference</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://resilience4j.readme.io/docs/ratelimiter">Resilience4j RateLimiter</a> and <a href="https://bucket4j.com/">Bucket4j documentation</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://pkg.go.dev/golang.org/x/time/rate">Go package golang.org/x/time/rate</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://nginx.org/en/docs/http/ngx_http_limit_req_module.html">NGINX ngx_http_limit_req_module</a> and <a href="https://nginx.org/en/docs/http/ngx_http_upstream_module.html">upstream module</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://gateway-api.sigs.k8s.io/">Kubernetes Gateway API</a>.</li>
+    <li><span class="ref-kind">Book</span> Neil J. Gunther, <em>Guerrilla Capacity Planning</em>, Springer, 2007 — the Universal Scalability Law.</li>
+  </ul>
+  <p>Next: <a href="p2-03-caching-redis.html">Chapter 3 — Caching Strategies &amp; Redis Internals</a>.</p>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

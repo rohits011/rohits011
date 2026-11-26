@@ -1,0 +1,1066 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python Internals, Memory, the GIL &amp; Concurrency — AI-Era Software Engineering</title>
+<meta name="description" content="How CPython really executes your code: bytecode, the eval loop, PyObject, reference counting and the cyclic GC, the GIL and free-threading, and a deep comparison of threading, multiprocessing and asyncio with JVM threads, virtual threads and goroutines.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p4-01-python-internals-concurrency" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 4 · Chapter 1</p>
+  <h1>Python Internals, Memory, the GIL &amp; Concurrency</h1>
+  <p class="lede">You already know how the JVM turns bytecode into machine code, how G1 or ZGC reclaims memory, and how a Tomcat thread pool or a virtual-thread executor serves requests. This chapter builds the same mental model for CPython: what a <code>PyObject</code> really is, why reference counting and a cycle collector coexist, why the Global Interpreter Lock exists and what free-threaded Python changes, and how to choose between threads, processes and <code>asyncio</code> for real AI-serving and data workloads.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Comfortable writing Python; solid JVM knowledge (bytecode, JIT, GC, Java Memory Model, <code>ExecutorService</code>, <code>CompletableFuture</code>, virtual threads); basic Go goroutines.</li>
+    <li><strong>You will be able to:</strong> read CPython bytecode with <code>dis</code>; predict memory behaviour of long-running Python services; explain the GIL handoff precisely; pick threads vs processes vs asyncio vs free-threading for a given workload; write correct structured-concurrency code with <code>TaskGroup</code>, timeouts and cancellation; and avoid the blocking-call and fork-safety bugs that take Python services down in production.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: Why a Java Engineer Must Understand CPython's Engine Room</h2>
+  <p>Most Java engineers meet Python through a script, a notebook or a small FastAPI service bolted onto a Spring Boot estate to wrap a model. It feels like "Java without the ceremony" until the first production incident: a model-serving endpoint that uses eight threads but saturates exactly one core; an <code>async def</code> handler that stalls the whole process because somebody called <code>requests.get</code> inside it; a Celery worker whose resident memory climbs steadily after every <code>fork</code> even though nothing is "leaking". None of these are explained by Python syntax. They are explained by the <em>runtime</em>: CPython's object model, its memory manager and its concurrency rules.</p>
+  <p>The runtime matters more in the AI era than it did a decade ago. Python is the control plane of almost every ML system: data pipelines, feature engineering, training orchestration, evaluation harnesses, LLM agents and retrieval services. The heavy numerical work runs in C, C++, CUDA or Rust underneath NumPy, PyTorch, Polars or tokenizers, but the orchestration, the HTTP layer and the glue run in the interpreter. An engineer who can reason about where the interpreter is the bottleneck and where native code has already released the GIL is the one who can make a Python AI service cheap and fast instead of rewriting it in Go out of frustration.</p>
+  <p>This chapter is deliberately runtime-first. We start with what CPython is (a bytecode interpreter written in C, with no tracing JIT for most of its history), walk through the object model and memory management, then dissect the Global Interpreter Lock, and only then compare the three concurrency models that Python offers: OS threads, processes, and the <code>asyncio</code> event loop. Throughout we compare with the JVM and Go, because the contrasts are where the intuition comes from.</p>
+
+<div class="bridge">
+  <h4>Bridging from Java &amp; Spring Boot</h4>
+  <dl>
+    <dt>What you already know</dt><dd>The JVM loads <code>.class</code> bytecode, interprets it, and HotSpot's C1/C2 JIT compiles hot methods to native code. Objects live on a managed heap reclaimed by a tracing, generational GC (G1, ZGC, Shenandoah). Java threads are OS threads (platform threads) or, since Java 21, virtual threads mounted on carrier threads. The Java Memory Model defines happens-before; <code>synchronized</code>, <code>volatile</code> and <code>java.util.concurrent</code> give you real parallel execution on every core. Spring MVC hands each request to a Tomcat worker thread; WebFlux uses an event loop (Netty).</dd>
+    <dt>Why that is not enough</dt><dd>CPython differs on nearly every axis. It is (by default) an interpreter without a production JIT; memory is reclaimed primarily by <em>reference counting</em>, with a tracing collector only for cycles; and in the default build a single <em>Global Interpreter Lock</em> lets only one thread execute Python bytecode at a time. Intuitions such as "add threads to use more cores" or "GC pauses are the main memory risk" are wrong or incomplete in Python.</dd>
+    <dt>The modern approach</dt><dd>Use <code>asyncio</code> (with structured concurrency via <code>TaskGroup</code> and <code>asyncio.timeout</code>) for high-concurrency I/O, processes (or native extensions that release the GIL) for CPU-bound work, and threads for blocking I/O libraries and for offloading from the event loop. Watch the free-threaded build (PEP 703, officially supported since 3.14) as the long-term path to true multi-core threading.</dd>
+    <dt>Where Python and Go fit</dt><dd>Python's <code>asyncio</code> is closest to Netty/WebFlux or Kotlin coroutines: cooperative, single-threaded, explicit <code>await</code> points. Go's goroutines are closest to Java virtual threads: preemptively scheduled by the runtime across all cores with blocking-style code. Java virtual threads and Go goroutines give you parallelism for free; Python asyncio gives you concurrency, not parallelism.</dd>
+    <dt>In production</dt><dd>Python web services usually run as several <em>processes</em> (Gunicorn/Uvicorn workers), each with its own interpreter and GIL, each running an event loop or a thread pool. Scaling is "more processes per pod, more pods" rather than "bigger thread pool".</dd>
+    <dt>Use it when / avoid it when</dt><dd>Use Python where the ecosystem (ML, data, LLM tooling) dominates the value and the interpreter is mostly orchestrating native code or waiting on I/O. Avoid CPU-heavy pure-Python hot loops on the request path, and be wary of Python for ultra-low-latency, high-fan-in gateways where Go or Java will be cheaper per request.</dd>
+  </dl>
+</div>
+
+  <h3>1.1 Which Python are we talking about?</h3>
+  <p>"Python" is a language specification; CPython is the reference implementation written in C and the one you run in 99% of production. Others exist: PyPy (a tracing JIT, excellent for pure-Python CPU work but historically weaker C-extension compatibility), GraalPy (Python on GraalVM, relevant to Java interop and discussed in Chapter 4.4), MicroPython for embedded, and Meta's Cinder fork. Everything in this chapter refers to CPython unless stated otherwise.</p>
+  <div class="callout note"><p class="callout-title">Version baseline</p><p><span class="tag version">Version-sensitive · checked Nov 2026</span> Python 3.15 was released in October 2026; 3.14 (October 2025) is the version most production fleets are moving to; 3.12 and 3.13 remain widespread. We call out behaviour that changed across 3.11–3.15, notably: <code>TaskGroup</code>/<code>asyncio.timeout</code> (3.11), per-interpreter GIL and immortal objects (3.12), experimental free-threading and JIT (3.13), free-threading officially supported per PEP 779 and the default multiprocessing start method switching from <code>fork</code> to <code>forkserver</code> on Linux (3.14), and a stable ABI for free-threaded builds (3.15).</p></div>
+</section>
+
+<section id="history">
+  <h2>2. History: From a Hobby Interpreter to the Control Plane of AI</h2>
+  <p>Guido van Rossum began Python over the Christmas holidays of 1989 and published version 0.9.0 in February 1991. Its design priorities were readability and easy extension in C. That second priority shaped the runtime more than anything else: the C API exposes the object layout and reference-counting macros directly to extension authors, which is why the runtime has been so hard to change.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Year</th><th>Milestone</th><th>Why it matters for this chapter</th></tr></thead>
+    <tbody>
+      <tr><td>1991</td><td>Python 0.9.0 released</td><td>Reference counting from day one; simple, deterministic freeing.</td></tr>
+      <tr><td>1992</td><td>Thread support added with a single global lock</td><td>The GIL is born: the simplest way to make refcounts and interpreter state thread-safe.</td></tr>
+      <tr><td>2000</td><td>Python 2.0: cycle-detecting garbage collector</td><td>Refcounting cannot free reference cycles; a generational cycle collector is bolted on.</td></tr>
+      <tr><td>2006</td><td>Python 2.5: <code>with</code> statement, generator <code>send()</code></td><td>Generators become coroutines; the seed of asyncio.</td></tr>
+      <tr><td>2008</td><td>Python 3.0; <code>multiprocessing</code> added in 2.6</td><td>Processes as the official answer to the GIL for CPU work.</td></tr>
+      <tr><td>2009</td><td>Antoine Pitrou's "new GIL" (3.2, released 2011)</td><td>Time-based switch interval replaces the "every 100 ticks" check; fixes the convoy effect on multicore.</td></tr>
+      <tr><td>2011</td><td><code>concurrent.futures</code> (3.2, PEP 3148)</td><td>Executor/Future API, directly inspired by <code>java.util.concurrent</code>.</td></tr>
+      <tr><td>2014</td><td><code>asyncio</code> added in 3.4 (PEP 3156)</td><td>Standard event loop; Twisted/Tornado ideas enter the stdlib.</td></tr>
+      <tr><td>2015</td><td><code>async</code>/<code>await</code> in 3.5 (PEP 492)</td><td>Native coroutines replace generator-based ones.</td></tr>
+      <tr><td>2016</td><td>uvloop released; Instagram disables GC</td><td>libuv-based loop; production evidence that GC interacts badly with <code>fork</code>.</td></tr>
+      <tr><td>2021</td><td>Faster CPython project starts; Sam Gross's nogil prototype</td><td>Specialising adaptive interpreter lands in 3.11 (PEP 659).</td></tr>
+      <tr><td>2022</td><td>Python 3.11: TaskGroup, <code>asyncio.timeout</code>, exception groups</td><td>Structured concurrency arrives in the stdlib.</td></tr>
+      <tr><td>2023</td><td>Python 3.12: PEP 683 immortal objects, PEP 684 per-interpreter GIL; PEP 703 accepted</td><td>Refcount changes that prepare for free-threading; Meta's immortalisation work for Instagram.</td></tr>
+      <tr><td>2024</td><td>Python 3.13: experimental free-threaded build and JIT (PEP 744)</td><td><code>python3.13t</code> runs without the GIL; copy-and-patch JIT is off by default.</td></tr>
+      <tr><td>2025</td><td>Python 3.14: PEP 779 makes free-threaded build officially supported</td><td>Phase II of the no-GIL roadmap; still not the default build.</td></tr>
+      <tr><td>2026</td><td>Python 3.15 (October): lazy imports, faster experimental JIT, stable ABI for free-threaded builds</td><td>Extension authors can ship one wheel for free-threaded interpreters; ecosystem adoption accelerates.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The arc is clear: CPython's simplicity (refcounting plus a global lock) made the C ecosystem possible, and that ecosystem (NumPy since 2006, then SciPy, pandas, scikit-learn, TensorFlow, PyTorch) is what made Python the language of AI. The last five years have been about paying down the performance debt without breaking that ecosystem. Compare this with the JVM, which had a JIT (HotSpot, 1999) and parallel GC early, and whose native interface (JNI) was always awkward enough that the ecosystem stayed in pure Java. Python went the opposite way: slow interpreter, superb native interop.</p>
+  <div class="callout insight"><p class="callout-title">Insight</p><p>The GIL is not an accident of laziness; it is the price of a C API that lets any extension touch refcounts without locks. Every serious attempt to remove it (Greg Stein's 1999 patch, Larry Hastings' "Gilectomy" around 2016, and finally Sam Gross's nogil work that became PEP 703) had to solve the same problem: make refcounting thread-safe without making single-threaded code much slower.</p></div>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals: The Concepts Under Everything</h2>
+
+  <h3>3.1 Source, bytecode and the code object</h3>
+  <p>CPython compiles each module to a tree of <em>code objects</em>. A code object (type <code>code</code>) is roughly the equivalent of a compiled Java method plus its constant pool entry: it holds the bytecode (<code>co_code</code>), constants (<code>co_consts</code>), local variable names (<code>co_varnames</code>), free/cell variable names for closures, the exception table (3.11+) and line tables. Compiled modules are cached as <code>.pyc</code> files in <code>__pycache__</code>, keyed by interpreter version: the analogue of <code>.class</code> files, except they are an implementation detail and can change format between minor versions.</p>
+  <p>Unlike the JVM, there is no verifier, no class loading/linking phase with constraints, and no ahead-of-time type information. Every operation (<code>a + b</code>) is resolved dynamically at runtime by looking at the types of the operands. That dynamic dispatch is the core cost the interpreter pays and the thing the 3.11+ "specialising adaptive interpreter" attacks.</p>
+
+  <h3>3.2 Everything is an object (and every object is a PyObject)</h3>
+  <p>In Java, <code>int</code> is a primitive stored inline in a register or an array slot and <code>Integer</code> is a boxed object. Python has no primitives: <code>42</code>, <code>True</code>, <code>None</code>, a function, a class, a module and a code object are all heap-allocated objects with a common header. In C, every object begins with:</p>
+  <pre class="ascii">
+PyObject (default, GIL build, 64-bit)          PyVarObject (lists, tuples, ints...)
++-------------------------+                    +-------------------------+
+| ob_refcnt  (8 bytes)    |                    | ob_refcnt  (8 bytes)    |
+| ob_type -&gt; PyTypeObject |                    | ob_type    (8 bytes)    |
++-------------------------+                    | ob_size    (8 bytes)    |
+| ...type-specific fields |                    +-------------------------+
+                                               | ...items / digits       |
+</pre>
+  <p>Compare with a HotSpot object header: a mark word (hash, lock state, GC age) plus a compressed class pointer, 12–16 bytes. CPython's header is 16 bytes for fixed-size objects and 24 for variable-size ones, and objects that participate in cycle collection carry an extra GC header in front (two words in older versions, pointer-tagged in newer ones). A Python <code>int</code> holding 1 is 28 bytes; a Java <code>int</code> is 4. This is why a Python <code>list</code> of a million floats costs roughly 8 MB of pointers <em>plus</em> 24 MB of float objects, while a NumPy array costs 8 MB flat. The "everything is an object" model is the single biggest reason numerical Python must live in native arrays.</p>
+  <p>The <code>ob_type</code> pointer leads to a <code>PyTypeObject</code>, which is a vtable of C function pointers (<code>tp_hash</code>, <code>tp_call</code>, <code>tp_getattro</code>, <code>tp_as_number-&gt;nb_add</code>...). When the interpreter executes <code>a + b</code>, it ultimately calls <code>Py_TYPE(a)-&gt;tp_as_number-&gt;nb_add(a, b)</code>, falling back to the reflected method on <code>b</code>. Classes you define in Python are also <code>PyTypeObject</code>s whose slots point to generic wrappers that look up <code>__add__</code> in the class dictionary.</p>
+
+  <h3>3.3 Names, not variables</h3>
+  <p>A Python variable is a name bound to an object reference, stored in a dict (module globals), a fast-locals array (function locals), or a cell (closures). Assignment never copies an object; it increments a reference count and rebinds a name. This is the same as Java reference semantics for objects, but it applies to numbers too, so <code>x = 1000; y = x</code> makes both names point at one int object. Because ints are immutable, the difference is only visible through <code>is</code> and <code>id()</code>.</p>
+
+  <h3>3.4 Small-integer cache, interning and immortal objects</h3>
+  <p>To avoid allocating an object for every loop counter, CPython pre-allocates the integers from -5 to 256 at startup; <code>int</code> creation in that range returns the shared singleton. Java's <code>Integer.valueOf</code> cache (-128 to 127) is exactly the same trick, and causes exactly the same bug class: comparing with <code>is</code> (Python) or <code>==</code> on boxed <code>Integer</code> (Java) "works" for small values and fails for large ones.</p>
+  <p><em>String interning</em> stores one canonical copy of certain strings in an interned dictionary. Identifiers, attribute names and short identifier-like literals are interned automatically by the compiler, so attribute lookups can compare pointers before comparing characters. You can force it with <code>sys.intern()</code>, which is occasionally useful when you hold millions of repeated short keys (e.g. feature names in a parsed dataset) in memory; Java's <code>String.intern()</code> and G1's string deduplication solve the same problem.</p>
+  <p>Since 3.12 (PEP 683), objects like <code>None</code>, <code>True</code>, small ints and interned strings can be <em>immortal</em>: their reference count is set to a special value and increments/decrements leave it alone. This avoids writes to shared objects, which matters for two things: copy-on-write after <code>fork</code> (touching a refcount dirties a memory page) and free-threading (contended atomic writes to the refcount of <code>None</code> would be a disaster). Meta's engineering blog describes how immortalisation was motivated by Instagram's pre-fork server model.</p>
+
+  <h3>3.5 Reference counting</h3>
+  <p>Every time a reference is created (a name binding, a list slot, an argument passed on the stack), <code>Py_INCREF</code> increments <code>ob_refcnt</code>; when it is dropped, <code>Py_DECREF</code> decrements it, and if it reaches zero the type's <code>tp_dealloc</code> runs immediately, which may cascade to the objects it references. Consequences:</p>
+  <ul>
+    <li><strong>Deterministic destruction.</strong> A file object that goes out of scope is closed immediately in CPython. Do not rely on it (PyPy and free-threaded builds may delay it), but it explains why sloppy Python often "works" where equivalent Java would leak file handles until finalisation.</li>
+    <li><strong>No stop-the-world pauses for acyclic garbage.</strong> The cost is spread across every assignment instead of concentrated in GC pauses.</li>
+    <li><strong>Constant write traffic.</strong> Even reading an object (passing it to a function) writes to its header. That destroys copy-on-write sharing after <code>fork</code> and makes thread-safe refcounting expensive.</li>
+    <li><strong>Cycles never reach zero.</strong> Hence the second collector.</li>
+  </ul>
+
+  <h3>3.6 The cyclic garbage collector</h3>
+  <p>Container objects (lists, dicts, class instances, closures) are tracked by a generational cycle collector. It does not trace from roots like the JVM; instead it finds groups of objects whose reference counts are fully explained by references <em>from inside the group</em>. Those groups are unreachable from outside and can be freed. Collection is triggered by allocation counts: when allocations minus deallocations of tracked objects exceed a threshold (700 by default for the young generation historically; tunable with <code>gc.set_threshold</code>), a young collection runs; survivors are promoted. The details changed across versions, and 3.14 briefly shipped an incremental collector that was reverted in 3.14.5 because some applications saw memory growth <span class="tag version">Version-sensitive · checked Nov 2026</span>. We go step-by-step through the algorithm in §4.</p>
+
+  <h3>3.7 pymalloc: arenas, pools and blocks</h3>
+  <p>Allocating every 28-byte int with <code>malloc</code> would be slow and fragment badly, so CPython has its own small-object allocator for requests of 512 bytes or less. It is a three-level hierarchy:</p>
+  <pre class="ascii">
+Arena (1 MiB on 64-bit since 3.10; mmap'd)
+ +-- Pool (16 KiB since 3.10; one size class per pool)
+ |    +-- block 32 B | block 32 B | block 32 B | ... (free list threaded through blocks)
+ +-- Pool (size class 48 B)
+ |    +-- block 48 B | block 48 B | ...
+ +-- ...
+Size classes are multiples of 16 bytes: 16, 32, 48, ... 512
+Requests &gt; 512 bytes go straight to the system malloc (or mimalloc in free-threaded builds)
+</pre>
+  <p>An arena is returned to the OS only when <em>every</em> pool in it is empty. A long-running service that allocates a burst of objects, frees most of them, and keeps a few survivors scattered across many arenas will show high RSS that never comes down. That is not a leak in the Java sense; it is fragmentation, and it is the Python equivalent of a JVM heap that has grown to <code>-Xmx</code> and never shrinks. Mitigations: recycle worker processes (Gunicorn <code>--max-requests</code>, Celery <code>worker_max_tasks_per_child</code>), avoid creating huge numbers of tiny long-lived objects (use arrays, <code>__slots__</code>, NumPy), and measure with <code>tracemalloc</code>. Free-threaded builds use mimalloc instead of pymalloc because pymalloc's pools are protected by the GIL.</p>
+
+  <h3>3.8 The GIL in one paragraph</h3>
+  <p>The Global Interpreter Lock is a mutex (plus a condition variable and some flags) inside the interpreter state. A thread must hold it to execute bytecode or touch Python objects. A thread drops it when it performs blocking I/O, calls <code>time.sleep</code>, or when a C extension explicitly releases it (<code>Py_BEGIN_ALLOW_THREADS</code>), and it is asked to drop it when another thread has been waiting longer than the <em>switch interval</em> (5 ms by default, <code>sys.getswitchinterval()</code>). So two threads doing pure-Python arithmetic interleave on one core; two threads each waiting on a socket or each running a NumPy matrix multiply genuinely overlap.</p>
+
+  <h3>3.9 Concurrency vs parallelism, Python edition</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Mechanism</th><th>Unit</th><th>Scheduling</th><th>Parallel Python bytecode?</th><th>JVM analogue</th><th>Go analogue</th></tr></thead>
+    <tbody>
+      <tr><td><code>threading</code></td><td>OS thread</td><td>Preemptive by OS; GIL handoff</td><td>No (default build); yes (free-threaded)</td><td>Platform thread</td><td>OS thread via cgo/LockOSThread</td></tr>
+      <tr><td><code>multiprocessing</code></td><td>OS process</td><td>OS</td><td>Yes, one GIL per process</td><td>Multiple JVMs</td><td>Multiple processes</td></tr>
+      <tr><td><code>asyncio</code></td><td>Task (coroutine)</td><td>Cooperative at <code>await</code></td><td>No (single thread)</td><td>Netty event loop / Reactor / Kotlin coroutines on one dispatcher</td><td>No direct analogue (goroutines are preemptive)</td></tr>
+      <tr><td>Subinterpreters (3.12+/3.14 <code>concurrent.interpreters</code>)</td><td>Interpreter in a thread</td><td>OS</td><td>Yes, per-interpreter GIL</td><td>Isolates (GraalVM)</td><td>n/a</td></tr>
+      <tr><td>Free-threaded build</td><td>OS thread</td><td>OS</td><td>Yes</td><td>Platform thread</td><td>goroutine on M</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>3.10 Coroutines, tasks and futures</h3>
+  <p>A <em>coroutine</em> is the object returned by calling an <code>async def</code> function; nothing runs until it is awaited or wrapped in a task. A <em>Task</em> is a coroutine scheduled on the event loop: the loop repeatedly calls its <code>send()</code> method, and each time the coroutine hits an <code>await</code> on something not yet ready it suspends, yielding a <em>Future</em> back to the loop. A Future is a placeholder for a result with callbacks, the direct analogue of <code>CompletableFuture</code>, except that it is not thread-safe and belongs to one loop. <code>concurrent.futures.Future</code> is a different, thread-safe class used by executors; <code>asyncio.wrap_future</code> bridges them.</p>
+
+  <h3>3.11 The event loop</h3>
+  <p>An event loop is a single-threaded scheduler: a ready queue of callbacks, a heap of timers, and a selector (epoll/kqueue/IOCP) for I/O readiness. Each iteration runs all ready callbacks, computes the timeout until the next timer, blocks in <code>epoll_wait</code> for at most that long, and then queues callbacks for sockets that became ready. Netty's <code>NioEventLoop</code> is the same design. The consequence you must internalise: <strong>any callback that runs for 100 ms blocks every other connection in that process for 100 ms.</strong></p>
+
+  <h3>3.12 Structured concurrency</h3>
+  <p>Structured concurrency means that concurrent tasks have a lexical scope: they start inside a block and are guaranteed finished (completed, failed or cancelled) when the block exits. Python's <code>asyncio.TaskGroup</code> (3.11), Trio's nurseries, Java's <code>StructuredTaskScope</code> (preview since JDK 21) and Go's <code>errgroup</code> all express this. It solves the "orphaned background task" bug class: a task that keeps running after the request that spawned it has failed.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working: From <code>def</code> to Machine, Step by Step</h2>
+
+  <h3>4.1 Compilation pipeline</h3>
+  <p>When you import a module, CPython checks for a valid <code>.pyc</code>; if absent or stale, it runs: tokenizer &rarr; PEG parser (since 3.9, PEP 617) &rarr; AST &rarr; symbol table (decides which names are local, global, free or cell) &rarr; compiler emitting a control-flow graph &rarr; peephole/flow-graph optimiser &rarr; assembler producing the code object. Then the module's top-level code object is executed, which defines functions (creating function objects that wrap nested code objects) and classes.</p>
+  <p>Let us read real bytecode. The exact opcodes vary by version; this is what 3.13 produces (run it yourself, the shape is what matters):</p>
+  <pre data-file="dis_demo.py"><code class="language-python">import dis
+
+def total_price(items, tax):
+    s = 0
+    for it in items:
+        s += it.price * it.qty
+    return s * (1 + tax)
+
+dis.dis(total_price, adaptive=False)</code></pre>
+  <pre><code class="language-plaintext">  RESUME                   0
+  LOAD_CONST               1 (0)
+  STORE_FAST               2 (s)
+  LOAD_FAST                0 (items)
+  GET_ITER
+L1: FOR_ITER                23 (to L2)
+  STORE_FAST               3 (it)
+  LOAD_FAST                2 (s)
+  LOAD_FAST                3 (it)
+  LOAD_ATTR                0 (price)
+  LOAD_FAST                3 (it)
+  LOAD_ATTR                2 (qty)
+  BINARY_OP                5 (*)
+  BINARY_OP               13 (+=)
+  STORE_FAST               2 (s)
+  JUMP_BACKWARD           25 (to L1)
+L2: END_FOR
+  POP_TOP
+  LOAD_FAST                2 (s)
+  LOAD_CONST               2 (1)
+  LOAD_FAST                1 (tax)
+  BINARY_OP                0 (+)
+  BINARY_OP                5 (*)
+  RETURN_VALUE</code></pre>
+  <p>It is a stack machine, like the JVM: <code>LOAD_FAST</code> pushes a local onto the value stack (compare <code>aload_1</code>), <code>BINARY_OP</code> pops two and pushes the result (compare <code>imul</code>). The crucial difference: <code>imul</code> knows its operands are ints; <code>BINARY_OP 5</code> does not, so the generic version has to check types and dispatch through <code>nb_multiply</code> every time.</p>
+
+  <h3>4.2 The evaluation loop and the specialising adaptive interpreter</h3>
+  <p>The heart of CPython is <code>_PyEval_EvalFrameDefault</code> in <code>Python/ceval.c</code> (since 3.12 largely generated from a DSL in <code>Python/bytecodes.c</code>). Conceptually it is a giant <code>switch</code> (or computed-goto table, or in 3.14+ optionally a tail-calling interpreter on supported compilers) over opcodes:</p>
+  <pre><code class="language-plaintext">for (;;) {
+    opcode = next_instr-&gt;op.code;   // fetch
+    switch (opcode) {               // dispatch (computed goto in practice)
+    case LOAD_FAST:  PUSH(frame-&gt;localsplus[oparg]); Py_INCREF(top); break;
+    case BINARY_OP:  right = POP(); left = TOP();
+                     res = binary_ops[oparg](left, right);   // generic dispatch
+                     Py_DECREF(left); Py_DECREF(right); SET_TOP(res); break;
+    ...
+    }
+    if (eval_breaker_is_set) handle_pending();   // GIL drop request, signals, async exc
+}</code></pre>
+  <p>Since 3.11 (PEP 659) the interpreter is <em>adaptive</em>. Each instruction that benefits from type information has inline cache entries. After an instruction executes a few times (a warm-up counter), it is <em>quickened</em> into a specialised variant based on observed types: <code>BINARY_OP</code> on two ints becomes <code>BINARY_OP_MULTIPLY_INT</code>; <code>LOAD_ATTR</code> on instances of one class becomes <code>LOAD_ATTR_INSTANCE_VALUE</code> that checks a type version tag and reads the attribute at a cached offset. If the guard fails too often, it de-specialises. Run <code>dis.dis(total_price, adaptive=True)</code> after calling the function a few hundred times and you will see the specialised opcodes.</p>
+  <p>This is the same idea as HotSpot's inline caches and type profiling in the interpreter tier, minus the compiler tier. It is why 3.11 was roughly 25% faster than 3.10 on the pyperformance suite (the figure the release notes quote), and why the experimental JIT (3.13+, "copy-and-patch") is built on top of these specialised "micro-ops": it stitches pre-compiled machine-code templates for each micro-op into a trace. As of 3.15 the JIT remains experimental and off by default in most builds <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+
+  <h3>4.3 Frames</h3>
+  <p>Each call creates a frame holding the code object, the instruction pointer, the locals array and the value stack. Since 3.11 frames are allocated in a contiguous per-thread "data stack" and only materialised as full <code>PyFrameObject</code>s when something (a traceback, a debugger, <code>sys._getframe</code>) needs them. Function calls between Python functions no longer recurse on the C stack (3.11 "inlined" Python-to-Python calls), which made calls cheaper and deep recursion safer. Coroutine and generator frames are stored inside the generator object itself, which is why a suspended coroutine costs only a few hundred bytes to a couple of KB: far less than a thread stack, comparable to a goroutine's 2 KB initial stack or a virtual thread's heap-allocated stack chunk.</p>
+
+  <h3>4.4 Reference-counting in action</h3>
+  <pre data-file="refcount_demo.py"><code class="language-python">import sys
+
+class Node:
+    def __init__(self, name):
+        self.name = name
+        self.peer = None
+    def __del__(self):
+        print(f"freed {self.name}")
+
+a = Node("a")
+print(sys.getrefcount(a))   # 2: the name 'a' + the temporary argument reference
+b = a
+print(sys.getrefcount(a))   # 3
+del b
+del a                       # refcount hits 0 -&gt; "freed a" printed immediately
+
+x, y = Node("x"), Node("y")
+x.peer, y.peer = y, x       # a cycle
+del x, y                    # nothing printed: each still referenced by the other
+import gc
+print("collected", gc.collect())   # "freed x", "freed y", then collected 2 (or more)</code></pre>
+  <p>In 3.14+ some reference-count operations on local variables are elided by the compiler ("borrowed" references on the stack), so <code>sys.getrefcount</code> can report smaller numbers than older versions. Never write logic that depends on the exact count.</p>
+
+  <h3>4.5 How the cycle collector finds garbage</h3>
+  <p>The algorithm, for one generation being collected:</p>
+  <ol>
+    <li><strong>Copy refcounts.</strong> For every tracked container in the generation, copy <code>ob_refcnt</code> into a scratch field <code>gc_refs</code>.</li>
+    <li><strong>Subtract internal references.</strong> For each container, call its <code>tp_traverse</code>, which visits every object it references; for each referenced object in the same generation, decrement its <code>gc_refs</code>. Now <code>gc_refs</code> counts only references from <em>outside</em> the generation (from older generations, from C stack variables, from the interpreter).</li>
+    <li><strong>Seed reachable set.</strong> Any object with <code>gc_refs &gt; 0</code> is definitely reachable from outside. Move everything else to a tentatively-unreachable list.</li>
+    <li><strong>Propagate.</strong> Traverse from each reachable object; anything it references that was tentatively unreachable is moved back to reachable.</li>
+    <li><strong>Finalise and free.</strong> What remains is unreachable cyclic garbage. Call finalisers (<code>__del__</code>, PEP 442 made this safe for cycles in 3.4), handle weakref callbacks, resurrected objects are re-checked, then <code>tp_clear</code> breaks the cycles and refcounting frees everything.</li>
+    <li><strong>Promote survivors</strong> to the next generation.</li>
+  </ol>
+  <p>Notice the difference from a JVM tracing GC: CPython never needs to know the roots. The "roots" are implicit in the refcounts that are not explained by internal edges. The trade-off is that a full collection has to touch every tracked container in the process, which on a heap of tens of millions of dicts can take hundreds of milliseconds and, under the GIL, blocks every thread. That is the Python analogue of a long G1 mixed collection, and the reason large services tune <code>gc.set_threshold</code> or call <code>gc.freeze()</code> after start-up.</p>
+  <div class="callout java"><p class="callout-title">Java angle</p><p><code>gc.freeze()</code> (3.7+) moves every currently tracked object into a permanent generation that the collector ignores. Calling it in a pre-fork server after loading the application and before forking workers is the Python version of class data sharing plus "don't scan the old gen": workers stop dirtying shared pages during collections. Instagram's 2017 post on copy-on-write friendly GC describes exactly this motivation.</p></div>
+
+  <h3>4.6 The GIL handoff in detail</h3>
+  <p>The "new GIL" (3.2+) works like this. The lock has a <code>locked</code> flag, a mutex, a condition variable, a <code>switch_number</code> counter and a <code>drop_gil_request</code> flag that is part of the eval breaker.</p>
+  <ol>
+    <li>Thread T1 holds the GIL and runs bytecode.</li>
+    <li>Thread T2 wants it. It waits on the condition variable with a timeout equal to the switch interval (5 ms).</li>
+    <li>If the wait times out and the <code>switch_number</code> has not changed (T1 has held the GIL the whole time), T2 sets <code>drop_gil_request</code>, which sets the eval breaker.</li>
+    <li>T1, at its next eval-breaker check (on backward jumps and function entries, roughly every few instructions), sees the request, releases the GIL, signals the condition variable, and (with <code>FORCE_SWITCHING</code>) waits until another thread has actually taken it, so it cannot immediately re-grab it.</li>
+    <li>T2 acquires the GIL and runs. <code>switch_number</code> increments.</li>
+  </ol>
+  <p>If T1 instead performs a blocking system call (socket read, file read, <code>time.sleep</code>, <code>lock.acquire</code>), the C code wraps it in <code>Py_BEGIN_ALLOW_THREADS</code>/<code>Py_END_ALLOW_THREADS</code> and releases the GIL voluntarily. That is why I/O-bound threading works well in Python: while one thread waits for PostgreSQL, others run.</p>
+  <p>The <em>convoy effect</em> remains: an I/O thread that needs the GIL for just a microsecond after each <code>recv</code> may wait up to 5 ms behind a CPU-bound thread. Mixing a CPU-heavy thread with latency-sensitive I/O threads in one process therefore inflates tail latency in steps of the switch interval. Do not mix them; move CPU work to processes.</p>
+
+  <h3>4.7 Free-threaded CPython: what actually changed</h3>
+  <p>PEP 703 removes the GIL in a separate build (<code>python3.13t</code>/<code>python3.14t</code>; check with <code>sys._is_gil_enabled()</code>). Making that safe required:</p>
+  <ul>
+    <li><strong>Biased reference counting.</strong> Each object has a thread-local refcount field owned by the creating thread (non-atomic increments, cheap) and a shared field for other threads (atomic). Most objects are only touched by their owner, so most refcount operations stay cheap.</li>
+    <li><strong>Immortalisation and deferred refcounting</strong> for objects like functions, code objects and module-level globals that are touched by every thread.</li>
+    <li><strong>mimalloc</strong> replacing pymalloc, giving thread-safe allocation and the ability to scan heap pages for GC (the GC becomes stop-the-world across threads, closer to a classic tracing collector).</li>
+    <li><strong>Per-object locks</strong> ("critical sections") inside builtin containers, so <code>list.append</code> from two threads stays safe, plus optimistic lock-free reads for dict and list item access.</li>
+  </ul>
+  <p>The cost: single-threaded code was around 40% slower in 3.13's free-threaded build and the gap narrowed substantially in 3.14 (the PEP 779 acceptance criteria targeted at most about 10–15% overhead) <span class="tag version">Version-sensitive · checked Nov 2026</span>. The bigger practical issue is extensions: a C extension that has not declared itself free-threading-safe causes the interpreter to re-enable the GIL at import time (with a warning) unless you force <code>PYTHON_GIL=0</code>. In 2026 the scientific stack (NumPy, and many others) ships free-threaded wheels, and 3.15's <code>abi3t</code> stable ABI lowers the maintenance burden, but you must verify every native dependency before relying on it.</p>
+
+  <h3>4.8 How asyncio runs a coroutine</h3>
+  <p>Under the hood, <code>await</code> is <code>yield from</code> on an awaitable's <code>__await__</code> iterator. Walk through <code>await reader.read(100)</code> on a socket with no data:</p>
+  <ol>
+    <li>The Task's <code>__step</code> method calls <code>coro.send(None)</code>.</li>
+    <li>Execution reaches <code>StreamReader.read</code>, which finds its buffer empty and awaits a fresh Future (<code>self._waiter</code>).</li>
+    <li><code>Future.__await__</code> yields <em>itself</em> up through every <code>await</code> in the chain to the Task.</li>
+    <li>The Task sees a Future, registers <code>self.__wakeup</code> as its done-callback, and returns to the loop. The coroutine frame is suspended in memory.</li>
+    <li>The loop's selector reports the socket readable; the transport's <code>_read_ready</code> callback reads bytes, feeds them to the protocol, which feeds the <code>StreamReader</code>, which calls <code>self._waiter.set_result(None)</code>.</li>
+    <li>Setting the result schedules the Future's callbacks with <code>loop.call_soon</code>; next iteration, <code>Task.__wakeup</code> runs, calls <code>__step</code>, which calls <code>coro.send(None)</code> again, and the coroutine resumes after the <code>await</code>.</li>
+  </ol>
+  <p>Cancellation is the same machinery in reverse: <code>task.cancel()</code> arranges for <code>__step</code> to call <code>coro.throw(CancelledError())</code> at the suspension point. The coroutine can catch it to clean up (it <em>must</em> re-raise it, or call <code>uncancel()</code> deliberately), which is how <code>asyncio.timeout</code> and <code>TaskGroup</code> implement deadlines and sibling cancellation.</p>
+  <p>The C-accelerated <code>_asyncio</code> module implements Task and Future in C since 3.6; uvloop goes further and replaces the loop and transports with Cython code over libuv, typically giving meaningfully higher throughput for socket-heavy workloads (the project's own benchmarks claim 2–4x versus the default loop; treat as <span class="tag illus">vendor benchmark</span> and measure your own).</p>
+
+  <h3>4.9 multiprocessing start methods</h3>
+  <ul>
+    <li><strong><code>fork</code></strong>: <code>fork()</code> the parent; the child gets a copy-on-write image of everything, including locks held by other threads (which will never be released in the child, a classic deadlock), open sockets and the state of any thread pools (threads are not copied, only the calling thread exists in the child). Fast start, dangerous with threads.</li>
+    <li><strong><code>spawn</code></strong>: start a fresh interpreter and import the main module, then unpickle the target function and arguments. Safe, slow (hundreds of ms to seconds when importing PyTorch), and requires the <code>if __name__ == "__main__":</code> guard. Default on Windows and macOS (since 3.8).</li>
+    <li><strong><code>forkserver</code></strong>: a clean single-threaded server process is started early; children are forked from it. A compromise: faster than spawn, safer than fork. Default on Linux since 3.14 <span class="tag version">Version-sensitive · checked Nov 2026</span>; code that silently relied on <code>fork</code> inheriting globals breaks when upgrading.</li>
+  </ul>
+  <p>Arguments and results cross process boundaries by pickling over pipes. For large arrays use <code>multiprocessing.shared_memory.SharedMemory</code> (3.8+) and wrap the buffer with NumPy, so only a name crosses the pipe.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: Diagrams of the Runtime</h2>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  SRC["module.py"] --&gt; TOK["Tokenizer"] --&gt; PEG["PEG parser"] --&gt; AST["AST"]
+  AST --&gt; SYM["Symbol table"] --&gt; COMP["Compiler and CFG optimiser"]
+  COMP --&gt; CODE["Code object (bytecode + consts)"]
+  CODE --&gt; PYC[".pyc cache"]
+  CODE --&gt; EVAL["Eval loop (adaptive interpreter)"]
+  EVAL --&gt;|hot traces, optional| JIT["Experimental JIT (micro-ops)"]
+  EVAL --&gt; CAPI["C API: tp_* slots"]
+  CAPI --&gt; EXT["C/C++/Rust extensions (NumPy, PyTorch)"]
+  EVAL --&gt; MEM["pymalloc / mimalloc"]
+  MEM --&gt; RC["Refcounting"]
+  MEM --&gt; GC["Cycle collector"]
+</pre>
+  <figcaption>Figure 4.1.1 — CPython execution pipeline from source file to memory management.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the left half is the compiler, which runs once per module (and is skipped when a valid <code>.pyc</code> exists). Everything at runtime flows through the eval loop, which dispatches through C type slots, which may call into native extensions. That last arrow is where your performance lives: if the hot path is in <code>EXT</code>, the interpreter's speed barely matters and the extension may release the GIL; if it is in <code>EVAL</code>, every bytecode costs tens of nanoseconds. Contrast with the JVM, where the JIT box would be the main path, not an optional side branch.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+classDiagram
+  class PyObject {
+    +Py_ssize_t ob_refcnt
+    +PyTypeObject ob_type
+  }
+  class PyVarObject {
+    +Py_ssize_t ob_size
+  }
+  class PyTypeObject {
+    +tp_name
+    +tp_basicsize
+    +tp_dealloc()
+    +tp_traverse()
+    +tp_hash()
+    +tp_call()
+    +tp_getattro()
+    +tp_as_number
+    +tp_dict
+    +tp_mro
+  }
+  class PyLongObject {
+    +digit ob_digit[]
+  }
+  class PyListObject {
+    +PyObject_ptr_array ob_item
+    +allocated
+  }
+  class PyDictObject {
+    +ma_used
+    +ma_keys
+    +ma_values
+  }
+  PyObject &lt;|-- PyVarObject
+  PyVarObject &lt;|-- PyLongObject
+  PyVarObject &lt;|-- PyListObject
+  PyObject &lt;|-- PyDictObject
+  PyObject --&gt; PyTypeObject : ob_type
+  PyTypeObject --|&gt; PyVarObject
+</pre>
+  <figcaption>Figure 4.1.2 — The CPython object model: every object starts with a refcount and a type pointer; types are themselves objects.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> "inheritance" here is C struct prefixing, not language inheritance: a <code>PyListObject*</code> can be cast to <code>PyObject*</code> because its first fields are the header. A list stores <em>pointers</em> to objects, never values, which is why a Python list of ints has poor cache locality compared with a Java <code>int[]</code> and is closer to an <code>ArrayList&lt;Integer&gt;</code>. Types are objects too (<code>type(int) is type</code>), which is what makes metaclasses and runtime class creation possible.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant T1 as Thread 1 (CPU loop)
+  participant G as GIL
+  participant T2 as Thread 2 (I/O)
+  T1-&gt;&gt;G: holds GIL, executes bytecode
+  T2-&gt;&gt;G: wait on condvar (timeout 5 ms)
+  Note over T2: 5 ms pass, switch_number unchanged
+  T2-&gt;&gt;G: set drop_gil_request (eval breaker)
+  T1-&gt;&gt;G: next eval-breaker check: release GIL, signal
+  G--&gt;&gt;T2: acquire GIL
+  T2-&gt;&gt;T2: process recv() result, call send()
+  T2-&gt;&gt;G: release GIL around blocking send()
+  G--&gt;&gt;T1: re-acquire GIL, continue loop
+</pre>
+  <figcaption>Figure 4.1.3 — GIL handoff between a CPU-bound thread and an I/O thread.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the I/O thread only needed the GIL for a tiny amount of work but had to wait for the full switch interval before the CPU-bound thread was asked to yield. Multiply that by thousands of requests and you see why a single CPU-bound thread can add milliseconds of p99 latency to every request in a Python web worker. In the JVM, both threads would simply run on separate cores.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  START(["loop iteration"]) --&gt; READY["Run all callbacks in ready queue"]
+  READY --&gt; TIMER["Compute timeout = next timer deadline"]
+  TIMER --&gt; SEL["selector.select(timeout) via epoll or kqueue"]
+  SEL --&gt; IO["For each ready fd: queue transport callback"]
+  IO --&gt; EXP["Move expired timers to ready queue"]
+  EXP --&gt; START
+  READY -.-&gt;|"callback blocks for 200 ms"| BAD["Every other task waits 200 ms"]
+</pre>
+  <figcaption>Figure 4.1.4 — One iteration of the asyncio event loop (<code>BaseEventLoop._run_once</code>).</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the loop is a simple cycle, and its only blocking point is the selector call. Every Task step is one callback in the ready queue. The dotted edge is the cardinal sin: synchronous work inside a callback starves the selector, so timers fire late and sockets are not serviced. Enable debug mode (<code>PYTHONASYNCIODEBUG=1</code> or <code>loop.set_debug(True)</code>) and asyncio logs any callback slower than <code>loop.slow_callback_duration</code> (100 ms by default), which is the cheapest production-grade detector of blocking calls.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --&gt; Pending: create_task(coro)
+  Pending --&gt; Running: loop calls step
+  Running --&gt; Suspended: await unresolved Future
+  Suspended --&gt; Running: Future done, wakeup scheduled
+  Running --&gt; Done: return value
+  Running --&gt; Failed: exception raised
+  Suspended --&gt; Cancelling: task.cancel()
+  Cancelling --&gt; Running: CancelledError thrown into coro
+  Running --&gt; Cancelled: CancelledError propagates
+  Done --&gt; [*]
+  Failed --&gt; [*]
+  Cancelled --&gt; [*]
+</pre>
+  <figcaption>Figure 4.1.5 — Lifecycle of an asyncio Task including cancellation.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> cancellation is not a state the task jumps to; it is an exception injected at the current suspension point, so <code>finally</code> blocks and <code>async with</code> exits run. A coroutine that swallows <code>CancelledError</code> moves back to Running and never reaches Cancelled, which breaks <code>TaskGroup</code> and <code>asyncio.timeout</code>. Java's <code>Future.cancel(true)</code> sets an interrupt flag that blocking calls may or may not honour; Python's is deterministic at the next <code>await</code> but only there.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  Q{"What dominates the work?"} --&gt;|"Waiting on network or DB"| IOQ{"Async-capable libraries available?"}
+  IOQ --&gt;|yes| ASYNC["asyncio (+ uvloop), TaskGroup"]
+  IOQ --&gt;|no| THREADS["ThreadPoolExecutor or asyncio.to_thread"]
+  Q --&gt;|"Pure-Python CPU work"| CPU{"Can it be vectorised or moved native?"}
+  CPU --&gt;|yes| NATIVE["NumPy, Polars, Rust via PyO3 (releases GIL)"]
+  CPU --&gt;|no| PROC["ProcessPoolExecutor or separate worker service"]
+  Q --&gt;|"Native CPU work that releases GIL"| THREADS2["Threads are fine"]
+  PROC -.-&gt;|"all native deps free-threading safe"| FT["Consider free-threaded build"]
+</pre>
+  <figcaption>Figure 4.1.6 — Choosing a Python concurrency model.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> start from what the CPU is doing, not from which API looks nicest. Notice that "threads" appears twice: for blocking I/O libraries, and for native code that releases the GIL (NumPy, many compression and crypto libraries, PyTorch ops). The free-threaded build is drawn as an optional upgrade path for the process branch, not a default, reflecting its 2026 status.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math: Amdahl, the GIL, Little's Law and Memory Arithmetic</h2>
+  <h3>6.1 Amdahl's law with a GIL</h3>
+  <p>Intuition: if a fraction of each request must run while holding a global lock, that fraction is serialised no matter how many threads you add. Amdahl's law gives the ceiling. Let \( p \) be the fraction of work that can proceed without the GIL (I/O waits, native code that releases it) and \( N \) the number of threads:</p>
+  \[ S(N) = \frac{1}{(1-p) + \frac{p}{N}} \qquad \lim_{N \to \infty} S(N) = \frac{1}{1-p} \]
+  <p>A request that spends 90% of its wall time waiting on PostgreSQL and an LLM API and 10% executing Python (\( p = 0.9 \)) can get at most a 10x speed-up from threads within one process: one core's worth of Python execution is the cap. If the request is 50% Python serialisation and validation, the ceiling is 2x. That is why Python services scale with <em>processes</em>: each process has its own GIL, so with \( W \) workers the serial fraction is divided across \( W \) independent locks.</p>
+
+  <h3>6.2 Little's Law for sizing workers and concurrency</h3>
+  <p>Little's Law relates average concurrency \( L \), throughput \( \lambda \) and latency \( W \): \( L = \lambda W \). For an async service handling 2,000 requests per second where each request awaits an upstream for 150 ms, you need \( L = 2000 \times 0.15 = 300 \) in-flight requests. With asyncio, 300 suspended coroutines are trivial (a few hundred KB). With a thread-per-request model you need 300 threads; feasible in Python, but each has an 8 MB virtual stack reservation and contends for the GIL on every wakeup.</p>
+  <p>The CPU side is different: if each request needs 2 ms of Python CPU, one process can sustain at most \( 1 / 0.002 = 500 \) requests/s regardless of concurrency model. 2,000 req/s therefore needs at least 4 worker processes, and with a safe target utilisation of about 60–70%, six. This two-sided calculation (concurrency from Little's Law, process count from CPU per request) is the core of Python capacity planning.</p>
+
+  <h3>6.3 Memory arithmetic</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Object (64-bit, 3.12+, approx.)</th><th><code>sys.getsizeof</code></th><th>Java equivalent</th></tr></thead>
+    <tbody>
+      <tr><td>small <code>int</code></td><td>28 B</td><td><code>int</code> 4 B; <code>Integer</code> 16 B</td></tr>
+      <tr><td><code>float</code></td><td>24 B</td><td><code>double</code> 8 B; <code>Double</code> 16 B</td></tr>
+      <tr><td>empty <code>str</code> (ASCII)</td><td>41 B (+1 B per ASCII char)</td><td><code>String</code> 24 B + byte[] 16 B header</td></tr>
+      <tr><td>empty <code>list</code></td><td>56 B (+8 B per slot)</td><td><code>ArrayList</code> ~24 B + Object[]</td></tr>
+      <tr><td>empty <code>dict</code></td><td>64 B (grows in powers of two)</td><td><code>HashMap</code> 48 B + table</td></tr>
+      <tr><td>instance with <code>__dict__</code>, 3 attrs</td><td>~ 50–100 B (3.12+ inline values; varies)</td><td>12 B header + fields</td></tr>
+      <tr><td>instance with <code>__slots__</code>, 3 attrs</td><td>~ 56 B</td><td>12 B header + fields</td></tr>
+      <tr><td>suspended coroutine</td><td>~ 200 B + frame</td><td>virtual thread: stack chunk on heap, typically hundreds of bytes to a few KB</td></tr>
+      <tr><td>OS thread</td><td>8 MB virtual stack (Linux default), ~ tens of KB resident</td><td>platform thread: 1 MB default <code>-Xss</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Back-of-envelope: 10 million <code>(user_id, score)</code> pairs as a list of tuples of int and float costs roughly \( 10^7 \times (8 + 56 + 28 + 24) \approx 1.16 \) GB. As two NumPy arrays (<code>int64</code>, <code>float32</code>) it is \( 10^7 \times 12 = 120 \) MB. A Java <code>long[]</code> plus <code>float[]</code> is also 120 MB. The lesson: Python can match Java's memory footprint only when data lives in native buffers.</p>
+
+  <h3>6.4 Cost model of the interpreter</h3>
+  <p>A useful rule of thumb <span class="tag opinion">Opinion</span>: a simple bytecode instruction costs on the order of 5–30 ns in CPython 3.12+, so a pure-Python loop body of 10 instructions runs at roughly 5–20 million iterations per second per core. HotSpot's C2-compiled loop doing the same arithmetic runs 50–100x faster. A Go loop is in the same range as Java. If your hot path executes more than a few million Python-level operations per request, you will be CPU-bound, and no concurrency model will rescue you; vectorise or move it native.</p>
+
+  <h3>6.5 GC trigger arithmetic</h3>
+  <p>The young collection triggers when \( \text{allocations} - \text{deallocations} &gt; \text{threshold}_0 \). With the classic default of 700, a request that creates 70,000 container objects and keeps them until the end of the request triggers about 100 young collections, each traversing the young generation. Raising <code>threshold0</code> to 50,000 (as some large services do) cuts collections by 70x at the cost of larger young generations. Survivors promote; older generations collect when their counters exceed their thresholds, and the full collection is additionally rate-limited by the ratio of pending to long-lived objects (the 25% rule, which avoids quadratic behaviour when building big data structures).</p>
+</section>
+
+<section id="code">
+  <h2>7. Code: Runnable Examples in Java, Python and Go</h2>
+
+  <h3>7.1 Proving the GIL: CPU-bound work with threads vs processes</h3>
+  <p>The same job, "compute a CPU-heavy function over 8 inputs", in three runtimes. In Java and Go, threads/goroutines give near-linear speed-up; in default CPython, threads give none, processes do.</p>
+  <div class="code-tabs">
+  <pre data-lang="Java"><code class="language-java">// Java 21+: java CpuBound.java
+import java.util.concurrent.*;
+import java.util.stream.*;
+
+public class CpuBound {
+    static long burn(long n) {
+        long acc = 0;
+        for (long i = 0; i &lt; n; i++) acc += (i * i) % 7;
+        return acc;
+    }
+    public static void main(String[] args) throws Exception {
+        long n = 200_000_000L;
+        long t0 = System.nanoTime();
+        for (int i = 0; i &lt; 8; i++) burn(n);
+        System.out.printf("sequential %.2fs%n", (System.nanoTime() - t0) / 1e9);
+
+        t0 = System.nanoTime();
+        try (var pool = Executors.newFixedThreadPool(8)) {   // platform threads: CPU-bound
+            var fs = IntStream.range(0, 8).mapToObj(i -&gt; pool.submit(() -&gt; burn(n))).toList();
+            for (var f : fs) f.get();
+        }
+        System.out.printf("8 threads  %.2fs%n", (System.nanoTime() - t0) / 1e9);
+    }
+}</code></pre>
+  <pre data-lang="Python"><code class="language-python"># python3 cpu_bound.py  (default GIL build)
+import time
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+
+def burn(n: int) -&gt; int:
+    acc = 0
+    for i in range(n):
+        acc += (i * i) % 7
+    return acc
+
+def timed(label, fn):
+    t0 = time.perf_counter()
+    fn()
+    print(f"{label:&lt;12} {time.perf_counter() - t0:.2f}s")
+
+if __name__ == "__main__":          # required for spawn/forkserver start methods
+    N, JOBS = 5_000_000, 8
+    timed("sequential", lambda: [burn(N) for _ in range(JOBS)])
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        timed("8 threads", lambda: list(ex.map(burn, [N] * JOBS)))
+    with ProcessPoolExecutor(max_workers=8) as ex:
+        timed("8 processes", lambda: list(ex.map(burn, [N] * JOBS)))
+# Typical result on an 8-core box: threads ~= sequential; processes ~6-7x faster.
+# On python3.14t (free-threaded), "8 threads" also scales.</code></pre>
+  <pre data-lang="Go"><code class="language-go">// go run cpubound.go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+func burn(n int64) int64 {
+	var acc int64
+	for i := int64(0); i &lt; n; i++ {
+		acc += (i * i) % 7
+	}
+	return acc
+}
+
+func main() {
+	const n = 200_000_000
+	t0 := time.Now()
+	for i := 0; i &lt; 8; i++ {
+		burn(n)
+	}
+	fmt.Printf("sequential   %.2fs\n", time.Since(t0).Seconds())
+
+	t0 = time.Now()
+	var wg sync.WaitGroup
+	for i := 0; i &lt; 8; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); burn(n) }()
+	}
+	wg.Wait()
+	fmt.Printf("8 goroutines %.2fs\n", time.Since(t0).Seconds())
+}</code></pre>
+  </div>
+  <p>Note the iteration counts: Python's <code>N</code> is 40x smaller than Java's and Go's so it finishes in similar wall time. That ratio is itself the lesson of §6.4. Also note that Java uses platform threads here: virtual threads add nothing for CPU-bound work because they are multiplexed over a carrier pool sized to the core count.</p>
+
+  <h3>7.2 I/O-bound fan-out: CompletableFuture vs asyncio TaskGroup vs errgroup</h3>
+  <p>A realistic AI-backend task: given a user query, call an embedding service, a feature store and a policy service concurrently, with an overall deadline, failing fast if any call fails.</p>
+  <div class="code-tabs">
+  <pre data-lang="Java"><code class="language-java">// Java 21+, virtual threads + HttpClient
+import java.net.URI;
+import java.net.http.*;
+import java.time.Duration;
+import java.util.concurrent.*;
+
+public class FanOut {
+    static final HttpClient http = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(1)).build();
+
+    static String get(String url) throws Exception {
+        var req = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(2)).build();
+        return http.send(req, HttpResponse.BodyHandlers.ofString()).body();  // blocking is fine on a virtual thread
+    }
+
+    public static void main(String[] args) throws Exception {
+        try (var exec = Executors.newVirtualThreadPerTaskExecutor()) {
+            var emb = CompletableFuture.supplyAsync(() -&gt; call("http://localhost:8081/embed"), exec);
+            var feat = CompletableFuture.supplyAsync(() -&gt; call("http://localhost:8082/features"), exec);
+            var pol = CompletableFuture.supplyAsync(() -&gt; call("http://localhost:8083/policy"), exec);
+            CompletableFuture.allOf(emb, feat, pol).orTimeout(3, TimeUnit.SECONDS).join();
+            System.out.println(emb.join() + feat.join() + pol.join());
+        }
+        // Note: allOf does NOT cancel siblings on failure; StructuredTaskScope (preview) does.
+    }
+    static String call(String u) { try { return get(u); } catch (Exception e) { throw new CompletionException(e); } }
+}</code></pre>
+  <pre data-lang="Python"><code class="language-python"># Python 3.11+: pip install httpx
+import asyncio
+import httpx
+
+async def fetch(client: httpx.AsyncClient, url: str) -&gt; dict:
+    r = await client.get(url, timeout=2.0)
+    r.raise_for_status()
+    return r.json()
+
+async def enrich(query: str) -&gt; dict:
+    async with httpx.AsyncClient() as client:
+        try:
+            async with asyncio.timeout(3.0):              # overall deadline
+                async with asyncio.TaskGroup() as tg:     # structured concurrency
+                    emb = tg.create_task(fetch(client, "http://localhost:8081/embed"))
+                    feat = tg.create_task(fetch(client, "http://localhost:8082/features"))
+                    pol = tg.create_task(fetch(client, "http://localhost:8083/policy"))
+        except* httpx.HTTPError as eg:                    # ExceptionGroup handling (3.11+)
+            raise RuntimeError(f"{len(eg.exceptions)} upstream call(s) failed") from eg
+        except TimeoutError:
+            raise RuntimeError("enrichment deadline exceeded")
+    # Leaving the TaskGroup guarantees all three tasks are finished.
+    return {"embedding": emb.result(), "features": feat.result(), "policy": pol.result()}
+
+if __name__ == "__main__":
+    print(asyncio.run(enrich("refund policy for damaged items")))</code></pre>
+  <pre data-lang="Go"><code class="language-go">// go get golang.org/x/sync/errgroup
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+)
+
+func fetch(ctx context.Context, url string, out *map[string]any) error {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	g, ctx := errgroup.WithContext(ctx) // first error cancels ctx for siblings
+	var emb, feat, pol map[string]any
+	g.Go(func() error { return fetch(ctx, "http://localhost:8081/embed", &amp;emb) })
+	g.Go(func() error { return fetch(ctx, "http://localhost:8082/features", &amp;feat) })
+	g.Go(func() error { return fetch(ctx, "http://localhost:8083/policy", &amp;pol) })
+	if err := g.Wait(); err != nil {
+		fmt.Println("enrichment failed:", err)
+		return
+	}
+	fmt.Println(emb, feat, pol)
+}</code></pre>
+  </div>
+  <p>Three things to notice. First, Python's <code>TaskGroup</code> and Go's <code>errgroup.WithContext</code> both cancel siblings on the first failure; Java's <code>CompletableFuture.allOf</code> does not (you need <code>StructuredTaskScope</code>, still a preview API in JDK 25). Second, <code>TaskGroup</code> raises an <code>ExceptionGroup</code>, which is why <code>except*</code> exists. Third, in Python the HTTP client must be async-native (httpx, aiohttp); calling <code>requests</code> here would block the loop, while in Java and Go blocking calls are fine because the runtime parks the virtual thread or goroutine.</p>
+
+  <h3>7.3 Calling blocking code from asyncio correctly</h3>
+  <pre data-file="offload.py"><code class="language-python">import asyncio
+import hashlib
+import time
+from concurrent.futures import ProcessPoolExecutor
+
+def legacy_blocking_lookup(key: str) -&gt; str:
+    time.sleep(0.2)                      # e.g. a sync SDK with no async variant
+    return key.upper()
+
+def cpu_heavy_fingerprint(data: bytes) -&gt; str:
+    h = data
+    for _ in range(200_000):             # pure-Python CPU work holding the GIL
+        h = hashlib.sha256(h).digest()
+    return h.hex()
+
+async def handler(key: str, payload: bytes, pool: ProcessPoolExecutor) -&gt; tuple[str, str]:
+    loop = asyncio.get_running_loop()
+    # I/O-ish blocking call: default thread pool is fine (GIL released during sleep/socket wait)
+    looked_up = await asyncio.to_thread(legacy_blocking_lookup, key)
+    # CPU-bound: a thread would still hold the GIL most of the time -&gt; use a process pool
+    fp = await loop.run_in_executor(pool, cpu_heavy_fingerprint, payload)
+    return looked_up, fp
+
+async def main():
+    with ProcessPoolExecutor(max_workers=4) as pool:
+        results = await asyncio.gather(*(handler(f"k{i}", b"x" * 64, pool) for i in range(8)))
+        print(results[:2])
+
+if __name__ == "__main__":
+    asyncio.run(main())</code></pre>
+  <p>Note that SHA-256 itself is implemented in C and releases the GIL for large inputs, but this loop hashes 32 bytes 200,000 times, so interpreter overhead dominates: a good example of why "it calls C code" is not the same as "it releases the GIL". Profile first.</p>
+
+  <h3>7.4 Cancellation and timeouts done right</h3>
+  <pre data-file="cancellation.py"><code class="language-python">import asyncio
+import contextlib
+
+class Conn:
+    async def close(self): await asyncio.sleep(0.01); print("conn closed")
+
+async def stream_tokens(conn: Conn):
+    try:
+        for i in range(100):
+            await asyncio.sleep(0.05)     # e.g. reading tokens from an LLM stream
+            print("token", i)
+    except asyncio.CancelledError:
+        print("cancelled: flushing partial state")
+        raise                            # ALWAYS re-raise; swallowing breaks TaskGroup/timeout
+    finally:
+        # shield the cleanup so a second cancel during close() cannot interrupt it
+        await asyncio.shield(conn.close())
+
+async def main():
+    conn = Conn()
+    with contextlib.suppress(TimeoutError):
+        async with asyncio.timeout(0.18):
+            await stream_tokens(conn)
+    print("deadline handled; event loop still healthy")
+
+asyncio.run(main())</code></pre>
+
+  <h3>7.5 Shared memory between processes (zero-copy NumPy)</h3>
+  <pre data-file="shm_demo.py"><code class="language-python"># pip install numpy
+import numpy as np
+from multiprocessing import shared_memory
+from concurrent.futures import ProcessPoolExecutor
+
+def partial_norm(name: str, shape: tuple[int, int], start: int, stop: int) -&gt; float:
+    shm = shared_memory.SharedMemory(name=name)          # attach, no copy
+    try:
+        arr = np.ndarray(shape, dtype=np.float32, buffer=shm.buf)
+        return float(np.square(arr[start:stop]).sum())
+    finally:
+        shm.close()
+
+if __name__ == "__main__":
+    rows, dim = 1_000_000, 128
+    shm = shared_memory.SharedMemory(create=True, size=rows * dim * 4)
+    try:
+        emb = np.ndarray((rows, dim), dtype=np.float32, buffer=shm.buf)
+        emb[:] = np.random.default_rng(0).standard_normal((rows, dim), dtype=np.float32)
+        chunks = [(i, min(i + 250_000, rows)) for i in range(0, rows, 250_000)]
+        with ProcessPoolExecutor(4) as ex:
+            parts = ex.map(partial_norm, [shm.name] * 4, [emb.shape] * 4,
+                           [c[0] for c in chunks], [c[1] for c in chunks])
+            print("frobenius^2 =", sum(parts))
+    finally:
+        shm.close(); shm.unlink()                        # unlink exactly once, in the owner</code></pre>
+  <p>Only the segment name crosses the pipe; the 512 MB matrix is shared. The Java analogue is a memory-mapped file or the Foreign Function and Memory API's shared <code>Arena</code>; in Go you would simply share the slice between goroutines.</p>
+
+  <h3>7.6 Detecting a blocked event loop in production</h3>
+  <pre data-file="loop_lag.py"><code class="language-python">import asyncio
+import logging
+import time
+
+log = logging.getLogger("loop-lag")
+
+async def monitor_loop_lag(interval: float = 0.25, warn_ms: float = 50.0):
+    """Measures scheduling delay: the async equivalent of a JVM safepoint/GC pause monitor."""
+    loop = asyncio.get_running_loop()
+    while True:
+        t0 = loop.time()
+        await asyncio.sleep(interval)
+        lag_ms = (loop.time() - t0 - interval) * 1000
+        if lag_ms &gt; warn_ms:
+            log.warning("event loop lag %.1f ms", lag_ms)
+        # export lag_ms as a Prometheus histogram in real services
+
+async def bad_handler():
+    time.sleep(0.3)              # BUG: blocks the loop for 300 ms
+
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    mon = asyncio.create_task(monitor_loop_lag())
+    await asyncio.sleep(0.5)
+    await bad_handler()          # monitor logs ~300 ms lag
+    await asyncio.sleep(0.5)
+    mon.cancel()
+
+asyncio.run(main())</code></pre>
+
+  <h3>7.7 Thread-safety still matters with the GIL</h3>
+  <pre data-file="race.py"><code class="language-python">import threading
+
+counter = 0
+def work():
+    global counter
+    for _ in range(1_000_000):
+        counter += 1        # LOAD_GLOBAL, BINARY_OP, STORE_GLOBAL: a switch can occur between them
+
+threads = [threading.Thread(target=work) for _ in range(4)]
+for t in threads: t.start()
+for t in threads: t.join()
+print(counter)   # may be &lt; 4,000,000 on any build; very likely on free-threaded builds
+
+# Fix: protect the read-modify-write
+lock = threading.Lock()
+def safe_work():
+    global counter
+    for _ in range(1_000_000):
+        with lock:
+            counter += 1</code></pre>
+  <p>The GIL makes individual bytecodes atomic, not your read-modify-write sequences. It is like a JVM where every bytecode is <code>synchronized</code> but your methods are not. Whether the race is observable in a given run depends on version and timing (3.10+ only checks the eval breaker at certain instructions, so the race is rarer than it used to be), which makes such bugs nastier, not safer. Free-threading makes it routine.</p>
+</section>
+
+<section id="applications">
+  <h2>8. Applications: How Engineering Teams Use These Models</h2>
+  <h3>8.1 LLM gateways and RAG services: asyncio all the way down</h3>
+  <p>A retrieval-augmented generation endpoint spends almost all of its wall time waiting: on a vector database, on a reranker, on an LLM provider that streams tokens for several seconds. Teams build these on FastAPI or Starlette with async clients (httpx, the async variants of provider SDKs, asyncpg/psycopg 3) so that one process can hold hundreds or thousands of concurrent streams. The CPU-heavy parts (tokenisation via Rust-based <code>tokenizers</code>, JSON parsing with <code>orjson</code>, embedding math in NumPy) are native and short. This is the sweet spot for Python concurrency.</p>
+  <h3>8.2 Model inference servers: threads around native kernels</h3>
+  <p>PyTorch, ONNX Runtime and TensorFlow release the GIL inside their kernels and run their own intra-op thread pools. Inference servers therefore typically use a small number of threads or a dedicated executor for <code>model(batch)</code>, and an asyncio front end that batches requests (dynamic batching) before handing them over. Tools like NVIDIA Triton, Ray Serve and vLLM separate the Python orchestration from C++/CUDA execution engines for the same reason.</p>
+  <h3>8.3 Data pipelines: processes and vectorisation</h3>
+  <p>ETL and feature-engineering jobs use processes (multiprocessing, Dask, Ray, Spark's Python workers) or move to columnar engines (Polars, DuckDB, Arrow) whose Rust/C++ cores are multi-threaded internally. Pure-Python row-by-row loops are the first thing a performance review eliminates.</p>
+  <h3>8.4 Background workers: prefork pools</h3>
+  <p>Celery's default <code>prefork</code> pool is a multiprocessing pool: N child processes, each executing one task at a time. That gives CPU parallelism and isolation (a segfaulting C extension kills one child, not the worker). For I/O-heavy tasks, teams switch to <code>gevent</code>/<code>eventlet</code> pools or to async-native queues such as arq; Chapter 4.3 covers this in depth.</p>
+  <h3>8.5 Pre-fork web servers</h3>
+  <p>Gunicorn loads the application in a master process and forks workers. With <code>preload_app = True</code> the imported code and data are shared copy-on-write, saving memory, until refcount writes and GC traversal dirty the pages. This is exactly the context of Instagram's GC work described next.</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 Instagram: disabling, then taming, the cycle collector</h3>
+  <p><span class="tag fact">Verified</span> Instagram's engineering team reported in 2017 that its Django web tier, which ran as uWSGI pre-forked workers, lost shared memory as soon as workers started handling requests. The cause was that refcount updates and GC traversals wrote to object headers in shared pages, triggering copy-on-write. Disabling the cycle collector reduced memory and let them run with about 10% more efficiency. A follow-up post described a more principled solution, contributed upstream as <code>gc.freeze()</code> in Python 3.7, letting them re-enable GC while keeping startup objects out of collection. Later, Meta's work on immortal objects (PEP 683, Python 3.12) went further by preventing refcount writes to shared objects entirely.</p>
+  <p><strong>Lesson for Java engineers:</strong> in the JVM, sharing memory between processes is rare (CDS archives aside). In Python, pre-fork sharing is a mainstream memory optimisation, and the runtime's write-heavy memory management fights it.</p>
+  <h3>9.2 Meta's Cinder and the Faster CPython effort</h3>
+  <p><span class="tag fact">Verified</span> Meta open-sourced Cinder, its performance-oriented CPython fork used for Instagram, which included a method-at-a-time JIT, "Static Python" that uses type annotations for faster code, and eager evaluation of coroutines. Several ideas flowed upstream: eager task factories in asyncio (<code>asyncio.eager_task_factory</code>, 3.12) and immortal objects. In parallel, the Faster CPython project (initially funded by Microsoft, 2021) delivered the specialising adaptive interpreter in 3.11.</p>
+  <h3>9.3 Dropbox: type checking at scale (and why it matters for concurrency)</h3>
+  <p><span class="tag fact">Verified</span> Dropbox's 2019 post describes type checking 4 million lines of Python with mypy. Large async codebases especially benefit: forgetting an <code>await</code> produces a coroutine object instead of a value, a bug that type checkers catch immediately (pyright and mypy flag unused coroutines). Chapter 4.2 explores typing in depth.</p>
+  <h3>9.4 Netflix: Python where it is strong</h3>
+  <p><span class="tag fact">Verified</span> Netflix's 2019 "Python at Netflix" post on its technology blog describes Python across security automation, operations tooling, ML and notebooks, alongside a predominantly JVM service tier. That division (JVM for high-throughput online services, Python for data, ML and automation) is common and is the architecture this book recommends for Spring Boot shops adopting AI.</p>
+  <div class="callout warn"><p class="callout-title">What we did not include</p><p>Many blog posts claim "we got 10x by switching to asyncio" or "Python is 100x slower than Go". Without the original workload these are anecdotes. Measure your own service with the tools in Chapter 4.4.</p></div>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages, Limitations and Operational Cost</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Model</th><th>Strengths</th><th>Limitations</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>Threads (GIL build)</td><td>Works with any blocking library; simple mental model; good for native code that releases the GIL</td><td>No CPU parallelism for Python code; GIL convoy inflates tail latency; races still possible</td><td>Low; thread dumps via <code>py-spy dump</code> or <code>faulthandler</code></td></tr>
+      <tr><td>Processes</td><td>True parallelism; fault isolation; each has its own GC</td><td>Pickling overhead; memory duplicated (modulo CoW); slow spawn with heavy imports; no shared objects</td><td>Higher memory per pod; more connections to DBs (one pool per process)</td></tr>
+      <tr><td>asyncio</td><td>Tens of thousands of concurrent I/O tasks per process; explicit suspension points make reasoning about shared state easier; structured concurrency</td><td>Function colouring (<code>async</code> spreads through call stacks); any blocking call stalls everything; needs async-native libraries</td><td>Need loop-lag monitoring; debugging stack traces across awaits is harder</td></tr>
+      <tr><td>Free-threaded build</td><td>Real multi-core threads with shared memory</td><td>Single-thread slowdown; extension compatibility; new race conditions in code that relied on the GIL</td><td>Separate wheels and images; extra testing matrix</td></tr>
+      <tr><td>Subinterpreters</td><td>Isolation with lower overhead than processes; per-interpreter GIL</td><td>Very limited extension support; data must be shared via channels or queues</td><td>Immature tooling (2026)</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs and Decision Table</h2>
+  <p>The real decision is rarely "threads vs asyncio" in isolation; it is a combination of runtime choice, library availability and team skills.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Scenario</th><th>Recommended</th><th>Why</th><th>Java/Spring equivalent</th></tr></thead>
+    <tbody>
+      <tr><td>LLM proxy streaming responses to 5k concurrent clients</td><td>asyncio + uvloop, multiple worker processes</td><td>Mostly waiting; cheap suspended coroutines</td><td>WebFlux, or MVC on virtual threads</td></tr>
+      <tr><td>Django/Flask app with sync ORM, 200 req/s</td><td>Threaded or sync workers (gunicorn gthread)</td><td>No benefit to rewriting for async; DB pool is the bottleneck</td><td>Spring MVC on Tomcat</td></tr>
+      <tr><td>CPU-heavy document parsing (pure Python)</td><td>Process pool or separate Celery queue</td><td>Escape the GIL; isolate CPU from latency-sensitive handlers</td><td>Dedicated executor or separate service</td></tr>
+      <tr><td>Batch embedding with PyTorch on GPU</td><td>Single process, one thread per GPU, async front end with batching</td><td>Kernels release GIL; batching dominates throughput</td><td>DJL / ONNX Runtime Java with batching</td></tr>
+      <tr><td>Parallel in-memory graph algorithm in Python</td><td>Free-threaded build (if deps allow) or rewrite in Rust/Go</td><td>Shared-memory parallelism needed</td><td>ForkJoinPool</td></tr>
+      <tr><td>High-fan-in API gateway, strict p99 under 5 ms</td><td>Go or Java, not Python</td><td>Interpreter overhead and GIL convoy eat the budget</td><td>Spring Cloud Gateway / Envoy</td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout tip"><p class="callout-title">Rule of thumb <span class="tag opinion">Opinion</span></p><p>Default to asyncio for new I/O-bound services whose key libraries have mature async clients; default to sync code plus threads when the critical libraries are sync-only; never put CPU-heavy pure-Python work in the same process as latency-sensitive handlers.</p></div>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Production Failures</h2>
+  <ol>
+    <li><strong>Blocking calls in <code>async def</code>.</strong> <code>requests</code>, <code>time.sleep</code>, sync DB drivers, <code>open().read()</code> of large files, CPU-heavy JSON parsing of a 50 MB payload. Symptom: p99 latency equal to the slowest request in the process, loop-lag spikes. Fix: async libraries, <code>asyncio.to_thread</code>, process pool.</li>
+    <li><strong>Fire-and-forget tasks that get garbage-collected.</strong> The loop keeps only weak references to tasks. <code>asyncio.create_task(send_audit_event())</code> without storing the task can be collected mid-execution. Keep a strong reference set (and discard in a done-callback) or use a TaskGroup.</li>
+    <li><strong>Swallowing <code>CancelledError</code>.</strong> <code>except Exception</code> does not catch it (it inherits from <code>BaseException</code> since 3.8), but <code>except BaseException</code> or a bare <code>except:</code> does. Result: timeouts that never fire and shutdowns that hang.</li>
+    <li><strong>Assuming the GIL makes code thread-safe.</strong> See §7.7. Check-then-act on dicts, lazy singletons and counters all race.</li>
+    <li><strong>Fork after threads.</strong> Forking a process that has running threads (a logging handler thread, a gRPC channel, an OpenTelemetry exporter) can deadlock the child on a lock that was held at fork time. 3.12+ emits a <code>DeprecationWarning</code>; 3.14 moved the default to <code>forkserver</code>. Create clients after fork (Gunicorn <code>post_fork</code>, Celery <code>worker_process_init</code>).</li>
+    <li><strong>Unbounded <code>gather</code>.</strong> <code>await asyncio.gather(*[fetch(u) for u in ten_thousand_urls])</code> opens 10,000 sockets at once and is the async equivalent of an unbounded thread pool. Bound with an <code>asyncio.Semaphore</code> or a worker-queue pattern.</li>
+    <li><strong>Reading RSS as a leak.</strong> pymalloc fragmentation and arenas that cannot be released look like leaks. Use <code>tracemalloc</code> snapshots to compare live allocations before concluding.</li>
+    <li><strong>Calling <code>asyncio.run</code> inside a running loop</strong> (e.g. inside a FastAPI handler or a Jupyter cell). It raises <code>RuntimeError</code>; restructure so the loop is created once at the top.</li>
+    <li><strong>Huge thread pools for CPU work.</strong> A 64-thread pool for pure-Python work only adds GIL contention and context switching.</li>
+    <li><strong>Relying on <code>__del__</code> for resource cleanup.</strong> Order is not guaranteed for cycles, and free-threaded/PyPy builds delay it. Use context managers, exactly as you would use try-with-resources instead of <code>finalize()</code>.</li>
+  </ol>
+</section>
+
+<section id="production">
+  <h2>13. Production: Performance, Reliability and Observability</h2>
+  <h3>13.1 Process topology</h3>
+  <p>Run one worker process per core you intend to use (fewer if native libraries use their own thread pools), with asyncio inside each for I/O concurrency. In Kubernetes, prefer several smaller pods (e.g. 2 CPUs, 2–4 workers) over one huge pod: it bounds blast radius and simplifies autoscaling. Set CPU limits carefully; CPython does not read cgroup quotas to size anything automatically, so <code>os.cpu_count()</code> returns the node's cores. Use <code>os.process_cpu_count()</code> (3.13+, respects affinity) or configure worker counts explicitly.</p>
+  <h3>13.2 Memory hygiene</h3>
+  <ul>
+    <li>Recycle workers periodically (<code>--max-requests</code> with jitter) to cap fragmentation.</li>
+    <li>For pre-fork servers, load the app in the master, call <code>gc.freeze()</code> before forking, and disable or tune GC thresholds after measuring.</li>
+    <li>Use <code>__slots__</code> or dataclasses with <code>slots=True</code> for millions of small objects; NumPy/Arrow for numeric data.</li>
+    <li>Monitor RSS, Python heap (<code>tracemalloc</code> in canaries) and GC pause time (<code>gc.callbacks</code> to time collections).</li>
+  </ul>
+  <h3>13.3 Observability of concurrency</h3>
+  <ul>
+    <li><strong>Event-loop lag</strong> as a histogram metric (code in §7.6). Alert on p99 above tens of ms.</li>
+    <li><strong>Sampling profiler</strong>: <code>py-spy top --pid</code> and <code>py-spy dump</code> (all threads' stacks without stopping the process) are the <code>jstack</code>/async-profiler of Python. <code>py-spy record --gil</code> shows only samples where the GIL is held, which identifies GIL hogs. 3.15 also ships a sampling profiler in the stdlib (<code>profiling.sampling</code>, "Tachyon") <span class="tag version">Version-sensitive · checked Nov 2026</span>.</li>
+    <li><strong>asyncio introspection</strong>: <code>asyncio.all_tasks()</code> plus task names; 3.14 added <code>python -m asyncio ps PID</code> and <code>pstree</code> to inspect running tasks of a live process.</li>
+    <li><strong>Tracing</strong>: OpenTelemetry's context propagation uses <code>contextvars</code>, which automatically flow into tasks created with <code>create_task</code> (each task copies the current context), the analogue of MDC propagation that Java needs special executors for.</li>
+  </ul>
+  <h3>13.4 Reliability patterns</h3>
+  <ul>
+    <li>Every outbound call has a timeout; every request handler runs under an overall <code>asyncio.timeout</code>.</li>
+    <li>Bound concurrency with semaphores per downstream (bulkheads).</li>
+    <li>Graceful shutdown: on SIGTERM stop accepting, cancel the TaskGroup or wait with a deadline, flush telemetry, close pools.</li>
+    <li>Keep CPU-heavy work out of the web tier: queue it (Celery/arq) or use a dedicated process pool sized separately.</li>
+  </ul>
+  <h3>13.5 Security notes</h3>
+  <p>Never unpickle data from untrusted sources: pickle (used by multiprocessing and many task queues) executes arbitrary code during deserialisation, just like Java native serialisation gadgets. Use JSON/msgpack/protobuf for anything crossing a trust boundary. Also be aware that thread-local or <code>contextvars</code> state that holds tenant IDs must be reset per request; leaking it across tasks is a data-isolation bug.</p>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundation</p>
+    <p>Predict, then verify with <code>dis</code>, why <code>x = x + 1</code> on a global is not atomic but <code>lst.append(1)</code> on a shared list is atomic in the GIL build. What changes in the free-threaded build?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><code>x = x + 1</code> compiles to <code>LOAD_GLOBAL x</code>, <code>LOAD_CONST 1</code>, <code>BINARY_OP +</code>, <code>STORE_GLOBAL x</code>: four instructions; a GIL switch between load and store loses an update. <code>lst.append(1)</code> is a single call into C (<code>list_append</code>) that does not release the GIL, so it executes atomically. In the free-threaded build the list's internal per-object lock (critical section) keeps <code>append</code> safe, while the global read-modify-write still races, now far more often because threads truly run in parallel. In both builds use a <code>threading.Lock</code> or restructure to thread-confined state plus a queue.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Write a bounded-concurrency async crawler: fetch 1,000 URLs with at most 50 in flight, an overall 30-second deadline, per-request 5-second timeouts, and collect failures without cancelling siblings.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-python">import asyncio, httpx
+
+async def crawl(urls: list[str], limit: int = 50) -&gt; tuple[dict[str, int], dict[str, str]]:
+    sem = asyncio.Semaphore(limit)
+    ok: dict[str, int] = {}
+    failed: dict[str, str] = {}
+
+    async def one(client: httpx.AsyncClient, url: str) -&gt; None:
+        async with sem:
+            try:
+                r = await client.get(url, timeout=5.0)
+                ok[url] = r.status_code
+            except httpx.HTTPError as e:          # record, do not raise: siblings keep going
+                failed[url] = type(e).__name__
+
+    async with httpx.AsyncClient(limits=httpx.Limits(max_connections=limit)) as client:
+        try:
+            async with asyncio.timeout(30):
+                async with asyncio.TaskGroup() as tg:
+                    for u in urls:
+                        tg.create_task(one(client, u))
+        except TimeoutError:
+            pass                                   # whatever finished is in ok/failed
+    return ok, failed</code></pre>
+      <p>Catching errors inside <code>one</code> is the deliberate choice to <em>not</em> fail fast; the TaskGroup then only cancels on the deadline. For 1,000 tasks, creating them all up front is fine; for 10 million, use a fixed set of worker tasks pulling from an <code>asyncio.Queue</code> to bound memory.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Advanced</p>
+    <p>A FastAPI service's p99 latency jumped from 40 ms to 900 ms after a release that added "PII redaction" using a regex over each response body. CPU is 35% per pod. Explain the mechanism and propose two fixes with trade-offs.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>The redaction runs synchronously in an <code>async def</code> handler, on the event loop. A large body takes hundreds of ms of regex work holding the loop (and the GIL), so every other request in that worker waits: latency becomes the sum of co-scheduled redactions. Average CPU looks moderate because work is serialised per process. Fixes: (1) offload with <code>run_in_executor</code> to a process pool sized to spare cores: isolates CPU, costs pickling of the body and memory per process; (2) optimise the work (compile regexes once, use a linear-time engine such as the <code>re2</code> bindings, stream redaction in chunks with <code>await asyncio.sleep(0)</code> between chunks to yield): cheapest, but still consumes the worker's single core. Long-term: move redaction to a dedicated service or queue, and add loop-lag alerts so the next regression is caught in canary.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>Your Celery workers (prefork, 8 children, fork start method) show RSS growing from 300 MB to 1.2 GB per child over a day, but <code>tracemalloc</code> shows stable live allocations. Diagnose and remediate.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Two non-leak effects combine. Copy-on-write erosion: children start sharing the parent's pages, but refcount writes and GC traversals dirty them, so each child's private (USS) memory grows toward a full copy; RSS double-counts shared pages anyway, so measure PSS/USS (<code>smem</code>, <code>/proc/PID/smaps_rollup</code>). Fragmentation: pymalloc arenas partially occupied by long-lived objects cannot be returned. Remediation: <code>gc.freeze()</code> in the parent before forking; <code>worker_max_tasks_per_child</code> and/or <code>worker_max_memory_per_child</code> to recycle; avoid caching large per-task objects at module level; consider jemalloc/mimalloc via <code>LD_PRELOAD</code> for large allocations, after measuring.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Expert</p>
+    <p>Design an experiment to decide whether to adopt the free-threaded build for an in-process feature-computation service currently running 8 processes per pod. What would you measure and what are the go/no-go criteria?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Inventory native deps and check free-threading support (import with <code>-X gil=0</code> off, watch for the "GIL re-enabled" warning; check <code>sys._is_gil_enabled()</code>). Build a 3.14t/3.15t image. Benchmarks: (a) single-thread latency per request vs GIL build (expect some regression); (b) throughput of one process with 8 threads vs 8 processes; (c) memory per pod (expect a large win since shared caches are not duplicated); (d) race-detection: run the test suite under stress with thread sanitizer builds if available, and review module-level mutable state. Go criteria: equal or better throughput per pod, memory reduction worth the risk, p99 within SLO, all deps officially supported, and a rollback plan (two images). No-go if any critical dep re-enables the GIL or p99 regresses.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why does CPython have a GIL, and why is removing it hard?</summary><div><p>Reference counts are modified on almost every operation; making them atomic everywhere slows single-threaded code, and fine-grained locks on every object are worse. A single lock made the interpreter and every C extension thread-safe for free. Removal is hard because the C API exposes refcount macros and assumes the GIL protects global state; PEP 703 needed biased refcounting, immortalisation, deferred refcounting, a new allocator and per-object locks, plus ecosystem-wide extension changes.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Compare CPython memory management with the JVM's.</summary><div><p>CPython: reference counting frees most objects immediately; a generational cycle collector (based on subtracting internal references, not root tracing) handles cycles; pymalloc pools small objects; memory is rarely returned to the OS. JVM: no refcounts; tracing generational/regional collectors from roots with compaction (G1, ZGC), which defeats fragmentation but needs barriers and pauses or concurrent phases. CPython has predictable destruction and no compaction; JVM has higher throughput allocation (bump pointer) and compaction.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What exactly happens when you call an <code>async def</code> function?</summary><div><p>Nothing runs; it returns a coroutine object holding a suspended frame. Awaiting it runs it inline in the current task until it awaits an unresolved future; wrapping it in <code>create_task</code> schedules it independently on the loop. The task drives it via <code>send()</code> and resumes it when the awaited future completes.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> You must serve an LLM-backed chat API with 10k concurrent streaming connections in Python. Design the process and concurrency model.</summary><div><p>Async framework (FastAPI/Starlette) on Uvicorn with uvloop; workers = cores per pod; each worker holds thousands of streams as coroutines; async HTTP client with connection pooling to the LLM provider and per-provider semaphores; overall timeouts per stream; backpressure via bounded queues; CPU-bound pre/post-processing offloaded or native; horizontal scale by pods behind a load balancer with sticky-free design; observability: loop lag, in-flight streams, token throughput, provider latency. Gracefully drain streams on deploy.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> When would you choose processes over the free-threaded build in 2026?</summary><div><p>When any critical native dependency is not free-threading-safe, when isolation (crash containment, memory cap per worker) matters, when single-thread latency must not regress, or when the code base has unaudited shared mutable state. Choose free-threading when shared in-memory state is large (memory duplication across processes is expensive) and dependencies are certified.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Implement a function that runs coroutines with at most N concurrently and returns results in input order.</summary><div>
+<pre><code class="language-python">import asyncio
+from typing import Awaitable, Iterable, TypeVar
+T = TypeVar("T")
+
+async def bounded_gather(coros: Iterable[Awaitable[T]], n: int) -&gt; list[T]:
+    sem = asyncio.Semaphore(n)
+    async def run(c: Awaitable[T]) -&gt; T:
+        async with sem:
+            return await c
+    async with asyncio.TaskGroup() as tg:
+        tasks = [tg.create_task(run(c)) for c in coros]
+    return [t.result() for t in tasks]</code></pre>
+  <p>Note: coroutine objects are created eagerly by the caller but do not run until awaited inside the semaphore. For huge inputs use a worker-queue to avoid creating all tasks.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> A service's threads show 100% of one core and 0% on others, with 16 threads busy. What is happening?</summary><div><p>Classic GIL saturation: the threads are executing Python bytecode, so only one runs at a time. Confirm with <code>py-spy top --gil</code>. Fix by moving the CPU work to processes, vectorising, or native code that releases the GIL.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> After upgrading to Python 3.14, a batch job that used multiprocessing fails with errors about unpicklable objects or missing globals. Why?</summary><div><p>The default start method on Linux changed from <code>fork</code> to <code>forkserver</code>. Children no longer inherit the parent's memory, so module-level state set at runtime is missing and targets/arguments must be picklable (no lambdas, local functions or open connections). Fix by making task functions top-level and passing state explicitly, or opt in to <code>multiprocessing.get_context("fork")</code> knowingly, accepting the thread-safety risks.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> How do Java virtual threads, Go goroutines and asyncio tasks differ?</summary><div><p>Virtual threads and goroutines are runtime-scheduled, run blocking-style code, and are multiplexed across all cores (M:N); the runtime parks them on blocking I/O. Goroutines are also preempted asynchronously (signals since Go 1.14). asyncio tasks are cooperative on a single OS thread, switch only at <code>await</code>, need async-specific libraries, and give no parallelism. The upside of asyncio is that between awaits your code cannot be interleaved, which simplifies shared-state reasoning.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> Tell me about a time you diagnosed a performance problem in a runtime you did not know well.</summary><div><p>Good answers show a method: establish a baseline, form hypotheses from the runtime's model (e.g. GIL, event loop), pick the right profiler (py-spy vs async-profiler), confirm with an experiment, fix, and add a guardrail metric. Mention collaborating with the team that owns the service and documenting the learning.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>CPython is a stack-based bytecode interpreter with a specialising adaptive layer (3.11+) and an experimental JIT; it is far slower than HotSpot on pure-Python loops.</li>
+    <li>Every value is a heap <code>PyObject</code> with a refcount and type pointer; numeric data belongs in native buffers.</li>
+    <li>Refcounting frees most memory immediately; a generational cycle collector frees cycles; pymalloc fragmentation explains "leaks" that are not leaks.</li>
+    <li>The GIL serialises bytecode execution, is released for blocking I/O and by native code, and is handed off every 5 ms on request.</li>
+    <li>Free-threaded CPython is officially supported since 3.14 but is a separate build with ecosystem caveats.</li>
+    <li>asyncio provides cooperative single-threaded concurrency; never block the loop; use TaskGroup and <code>asyncio.timeout</code> for structured concurrency.</li>
+    <li>Use processes for CPU-bound Python; mind start methods (forkserver default on Linux since 3.14) and pickling.</li>
+  </ul>
+  <div class="quiz" data-answer="c">
+    <p class="q">Eight threads each running a pure-Python loop on an 8-core machine (default CPython build). Expected speed-up over sequential?</p>
+    <ol><li data-k="a">About 8x</li><li data-k="b">About 4x due to hyper-threading</li><li data-k="c">About 1x (possibly slower)</li><li data-k="d">It depends on the switch interval only</li></ol>
+    <div class="explain">Only one thread executes bytecode at a time under the GIL, so total CPU throughput stays one core; switching overhead can make it slightly slower.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">Which objects can the reference count alone NOT reclaim?</p>
+    <ol><li data-k="a">Large strings</li><li data-k="b">Objects in reference cycles</li><li data-k="c">Objects created in C extensions</li><li data-k="d">Small integers</li></ol>
+    <div class="explain">A cycle keeps each member's count above zero; the cycle collector finds such groups. Small ints are cached/immortal and never freed at all.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">An <code>async def</code> handler calls <code>time.sleep(1)</code>. What happens to other requests in the same worker?</p>
+    <ol><li data-k="a">They run on other threads automatically</li><li data-k="b">Only requests to the same route wait</li><li data-k="c">asyncio preempts the handler after 5 ms</li><li data-k="d">All of them stall for one second</li></ol>
+    <div class="explain">The event loop is single-threaded and cooperative; a blocking call prevents the loop from running any other callback.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">What does leaving an <code>async with asyncio.TaskGroup()</code> block guarantee?</p>
+    <ol><li data-k="a">All tasks created in it have finished, failed or been cancelled</li><li data-k="b">All tasks succeeded</li><li data-k="c">Tasks keep running in the background</li><li data-k="d">Exceptions are logged and suppressed</li></ol>
+    <div class="explain">TaskGroup is structured concurrency: it waits for all children; on the first failure it cancels the rest and raises an ExceptionGroup.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Why did Instagram's pre-forked workers lose shared memory?</p>
+    <ol><li data-k="a">The JIT recompiled shared code</li><li data-k="b">Python copies all memory on fork</li><li data-k="c">Refcount updates and GC traversal wrote to shared pages, triggering copy-on-write</li><li data-k="d">The kernel disabled CoW for Python</li></ol>
+    <div class="explain">Even reads update refcounts and GC headers, dirtying pages; <code>gc.freeze()</code> and immortal objects reduce this.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">On Linux with Python 3.14, what is the default multiprocessing start method?</p>
+    <ol><li data-k="a">fork</li><li data-k="b">forkserver</li><li data-k="c">spawn</li><li data-k="d">vfork</li></ol>
+    <div class="explain">3.14 changed the POSIX default (except macOS, which uses spawn) from fork to forkserver for safety with threads.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.python.org/3/library/asyncio-task.html">Python docs — Coroutines and Tasks (TaskGroup, timeouts, cancellation)</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.python.org/3/howto/free-threading-python.html">Python HOWTO — Python support for free threading</a></li>
+    <li><span class="ref-kind">Spec</span> <a href="https://peps.python.org/pep-0703/">PEP 703 — Making the Global Interpreter Lock Optional in CPython</a></li>
+    <li><span class="ref-kind">Spec</span> <a href="https://peps.python.org/pep-0779/">PEP 779 — Criteria for supported status for free-threaded Python</a></li>
+    <li><span class="ref-kind">Spec</span> <a href="https://peps.python.org/pep-0659/">PEP 659 — Specializing Adaptive Interpreter</a></li>
+    <li><span class="ref-kind">Spec</span> <a href="https://peps.python.org/pep-0683/">PEP 683 — Immortal Objects</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://github.com/python/cpython/blob/main/InternalDocs/garbage_collector.md">CPython InternalDocs — Garbage collector design</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.python.org/3.15/whatsnew/3.15.html">What's New in Python 3.15</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://instagram-engineering.com/dismissing-python-garbage-collection-at-instagram-4dca40b29172">Instagram Engineering — Dismissing Python Garbage Collection at Instagram</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://engineering.fb.com/2023/08/15/developer-tools/immortal-objects-for-python-instagram-meta/">Meta Engineering — Immortal Objects for Python</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://dropbox.tech/application/our-journey-to-type-checking-4-million-lines-of-python">Dropbox — Our journey to type checking 4 million lines of Python</a></li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/facebookincubator/cinder">Meta Cinder</a></li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/MagicStack/uvloop">uvloop</a></li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/benfred/py-spy">py-spy sampling profiler</a></li>
+    <li><span class="ref-kind">Spec</span> <a href="https://openjdk.org/jeps/444">JEP 444 — Virtual Threads (for comparison)</a></li>
+    <li><span class="ref-kind">Book</span> Anthony Shaw, <em>CPython Internals</em>, Real Python, 2021 — a guided tour of the interpreter source (pre-3.11 details have since changed).</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

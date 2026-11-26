@@ -1,0 +1,1370 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Consistency, CAP, Distributed Transactions, Sagas, Outbox &amp; Idempotency — AI-Era Software Engineering</title>
+<meta name="description" content="Consistency models, CAP and PACELC, Raft and quorums, 2PC/XA, sagas, the transactional outbox, idempotency and conflict resolution with CRDTs, for engineers who already know @Transactional.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p2-06-consistency-transactions" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 2 · Chapter 6</p>
+  <h1>Consistency, CAP, Distributed Transactions, Sagas, Outbox &amp; Idempotency</h1>
+  <p class="lede">The moment a business operation touches more than one database, one broker, or one region, <code>@Transactional</code> stops telling the whole truth. This chapter gives you a precise vocabulary for what "consistent" means, the theory that limits what any system can promise, and the production patterns (sagas, the transactional outbox, idempotent consumers, CRDTs) that real teams use to build correct systems on top of unreliable networks.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> <a href="p2-04-databases-indexing.html">Chapter 4 (databases, isolation levels)</a> and <a href="p2-05-replication-sharding.html">Chapter 5 (replication &amp; partitioning)</a>; working knowledge of Spring <code>@Transactional</code>, JPA and Kafka or RabbitMQ.</li>
+    <li><strong>You will be able to:</strong> name the consistency model a system actually offers; state CAP and PACELC without the usual misreadings; explain Raft leader election and log replication; choose between 2PC, sagas and outbox for a cross-service workflow; implement a Spring Boot transactional outbox and an idempotent consumer; design an idempotent public API; and pick a conflict-resolution strategy (LWW, vector clocks, CRDTs) for multi-writer data.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: When One Database Is No Longer the Source of Truth</h2>
+  <p>For most of your career, "consistency" has been the database's job. You annotate a service method with <code>@Transactional</code>, Spring opens a JDBC transaction through <code>PlatformTransactionManager</code>, every <code>save()</code> inside it either commits together or rolls back together, and PostgreSQL's MVCC engine makes sure concurrent requests do not see half-written rows. That model is so effective that many engineers never have to think about what consistency actually means.</p>
+  <p>Distributed systems take that comfort away in three ways at once:</p>
+  <ol>
+    <li><strong>Data is replicated.</strong> A read may hit a replica that has not yet received the latest write (Chapter 5). "Consistent" now means something about <em>which</em> values a read is allowed to return, and the answer is a spectrum of <em>consistency models</em>, not a yes/no.</li>
+    <li><strong>Data is partitioned across owners.</strong> In a microservice architecture the order lives in the Order service's PostgreSQL, the payment in the Payment service's database, and the stock reservation in Inventory's. No single transaction manager spans them. A business operation that touches all three needs a <em>distributed transaction</em> protocol (2PC) or, far more commonly, a <em>saga</em> of local transactions with compensations.</li>
+    <li><strong>Communication is unreliable.</strong> Messages are delayed, duplicated, reordered or lost; processes pause for garbage collection; clocks drift. Every remote call has three outcomes: success, failure, and "I do not know". The third one is what forces you to design for <em>idempotency</em> and to stop believing in exactly-once delivery as a transport property.</li>
+  </ol>
+  <p>The patterns in this chapter are the standard answers to those three problems. They are also the patterns that AI-era systems lean on heavily: an LLM agent that calls a payment tool twice because its first call timed out is exactly the "unknown outcome" problem, and the fix is the same idempotency key Stripe has used for a decade. Event-driven feature pipelines, vector-index updates fed by change data capture, and multi-step agent workflows orchestrated by Temporal are all applications of the outbox and saga patterns you will learn here.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd><code>@Transactional</code> with <code>Propagation.REQUIRED</code>, isolation levels (<code>READ_COMMITTED</code>, <code>REPEATABLE_READ</code>, <code>SERIALIZABLE</code>), optimistic locking with JPA <code>@Version</code>, <code>SELECT ... FOR UPDATE</code>, and perhaps <code>JtaTransactionManager</code> with Atomikos or Narayana if you ever had to span a database and a JMS queue.</dd>
+      <dt>Why that is not enough</dt><dd>A local ACID transaction cannot include a Kafka send, an HTTP call to another service, or a write to another team's database. <code>@Transactional</code> around <code>orderRepo.save()</code> and <code>kafkaTemplate.send()</code> gives you a <em>dual write</em>: either step can succeed while the other fails, and no rollback will fix it. JTA/XA can technically span resources, but it couples availability across services and is not supported by most cloud-native brokers and managed databases in practice.</dd>
+      <dt>The modern approach</dt><dd>Keep ACID <em>inside</em> each service boundary, and connect services with asynchronous, at-least-once messaging made safe by (1) a <strong>transactional outbox</strong> on the producer side, (2) an <strong>idempotent consumer</strong> (inbox/dedup table) on the receiving side, and (3) a <strong>saga</strong> with compensating actions for multi-step business processes. Choose explicit consistency models for reads (read-your-writes for a user's own data, eventual for feeds), and use consensus systems (etcd, ZooKeeper, KRaft, a Raft-based database) only where you genuinely need linearizability.</dd>
+      <dt>Where Python and Go fit</dt><dd>The patterns are language-neutral, and you will often have a Python ML service or a Go edge service in the same saga. Go is common for consensus infrastructure itself (etcd and its Raft library are Go). Python services typically use SQLAlchemy plus <code>confluent-kafka</code> for the same outbox/inbox pattern shown in Java below.</dd>
+      <dt>In production</dt><dd>Debezium (CDC) or a polling publisher ships outbox rows to Kafka; consumers dedupe on a message id with a unique constraint; public APIs accept an <code>Idempotency-Key</code> header; long-running processes run on a workflow engine such as Temporal or Camunda; dashboards track outbox lag, saga stuck-state counts and duplicate-delivery rates.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use sagas and outbox when a business process spans services that own their own data. Avoid them when a modular monolith with one database would do: one ACID transaction is simpler, faster and more correct than any distributed alternative. Use linearizable consensus for leader election, locks with fencing, and configuration, not for your whole order table.</dd>
+    </dl>
+  </div>
+
+  <p>The chapter is organised from theory to practice. Sections 3 and 4 build the vocabulary (consistency models, CAP/PACELC, consensus, 2PC) and the mechanics (Raft, sagas, outbox, idempotency, CRDTs). Section 5 shows them as diagrams and lets you play with two interactive simulations. Section 7 is a full Spring Boot implementation of outbox and idempotent consumer, with Python and Go equivalents. The remaining sections cover real-world use, trade-offs, failure modes and interview preparation.</p>
+</section>
+
+<section id="history">
+  <h2>2. History: From Two-Phase Commit to Sagas, Raft and CRDTs</h2>
+  <p>The ideas in this chapter were mostly invented to solve the same problem in different decades: how to keep multiple copies or multiple owners of data in agreement when machines and networks fail.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Year</th><th>Milestone</th><th>Why it matters to you</th></tr></thead>
+    <tbody>
+      <tr><td>1978</td><td>Leslie Lamport, "Time, Clocks, and the Ordering of Events in a Distributed System" (CACM)</td><td>Introduced the happens-before relation and logical clocks. Every vector clock, causal-consistency guarantee and Kafka offset ordering argument descends from it.</td></tr>
+      <tr><td>1978–1981</td><td>Two-phase commit described by Jim Gray (1978) and refined in the System R* and R* projects; three-phase commit by Dale Skeen (1981)</td><td>The canonical atomic-commit protocol; still used inside databases (e.g., distributed SQL) and in XA.</td></tr>
+      <tr><td>1987</td><td>Hector Garcia-Molina and Kenneth Salem, "Sagas" (SIGMOD)</td><td>Long-lived transactions broken into local steps with compensations. Rediscovered 30 years later as <em>the</em> microservice transaction pattern.</td></tr>
+      <tr><td>1990</td><td>Herlihy and Wing define <em>linearizability</em></td><td>The precise meaning of "strong consistency" used by Jepsen, etcd, and this chapter.</td></tr>
+      <tr><td>1991</td><td>X/Open publishes the XA specification</td><td>Standard interface between a transaction manager and resource managers; what JTA implements in Java EE / Jakarta EE.</td></tr>
+      <tr><td>1998 (journal publication)</td><td>Lamport, "The Part-Time Parliament" (Paxos)</td><td>First practical consensus algorithm; notoriously hard to understand and implement.</td></tr>
+      <tr><td>2000</td><td>Eric Brewer's PODC keynote conjecture (CAP); proved by Gilbert and Lynch in 2002</td><td>The most quoted and most misquoted theorem in system design interviews.</td></tr>
+      <tr><td>2007</td><td>Amazon Dynamo paper (SOSP)</td><td>Popularised eventual consistency, sloppy quorums, vector clocks and application-level conflict resolution (the shopping cart).</td></tr>
+      <tr><td>2011</td><td>Shapiro, Preguiça, Baquero, Zawirski: Conflict-free Replicated Data Types</td><td>Data types that merge automatically and deterministically: the formal basis of collaborative editing and multi-region counters.</td></tr>
+      <tr><td>2012</td><td>Daniel Abadi, PACELC (IEEE Computer); Brewer, "CAP Twelve Years Later"</td><td>Both say the same thing: the latency-versus-consistency trade-off in normal operation matters more than the partition case.</td></tr>
+      <tr><td>2012–2013</td><td>Google Spanner (OSDI 2012); Raft, "In Search of an Understandable Consensus Algorithm" (Ongaro &amp; Ousterhout, USENIX ATC 2014, tech report 2013)</td><td>Spanner showed external consistency at global scale using TrueTime; Raft became the consensus algorithm in etcd, Consul, CockroachDB, TiKV and Kafka's KRaft.</td></tr>
+      <tr><td>2015</td><td>Stripe publishes its idempotency-key design; Chris Richardson's microservices.io catalogues Saga and Transactional Outbox</td><td>The vocabulary used across the industry today.</td></tr>
+      <tr><td>2016–2019</td><td>Uber open-sources Cadence; Debezium matures as a CDC platform; Temporal is forked from Cadence (2019)</td><td>Durable workflow engines and log-based CDC turned the saga and outbox patterns from hand-rolled code into infrastructure.</td></tr>
+      <tr><td>2025</td><td>Apache Kafka 4.0 ships KRaft-only (ZooKeeper removed)</td><td>Your message broker's own metadata now runs on a Raft-style quorum. <span class="tag version">Version-sensitive · checked Nov 2026</span></td></tr>
+    </tbody>
+  </table></div>
+  <p>The arc is worth noticing. In the 1980s and 1990s the dominant answer was "make distributed transactions atomic" (2PC/XA). In the 2000s, internet-scale systems such as Dynamo chose availability and pushed reconciliation to the application. In the 2010s two things happened in parallel: consensus became understandable and embeddable (Raft), so strongly consistent infrastructure (etcd, Spanner, CockroachDB) became practical; and microservices made the old saga idea mainstream, with the outbox pattern as the glue. Today's well-designed system uses all three: consensus for metadata and coordination, local ACID transactions inside services, and sagas plus idempotent messaging between them.</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+  <p>This section defines every concept the rest of the chapter uses. Read it slowly; most production bugs in this area come from vague definitions ("it's consistent", "Kafka has exactly-once") rather than from wrong code.</p>
+
+  <h3>3.1 Two different meanings of "consistency"</h3>
+  <p>The word is overloaded, and interviewers love to probe whether you know it:</p>
+  <ul>
+    <li><strong>C in ACID</strong> means the application's invariants hold before and after a transaction (an account balance is never negative, every order line references an existing order). It is mostly the application's responsibility, helped by constraints.</li>
+    <li><strong>C in CAP and "consistency models"</strong> means a guarantee about which values reads may return when there are concurrent operations and replicas. It is a property of the storage system's replication and concurrency protocol.</li>
+  </ul>
+  <p>Isolation levels (the I in ACID) and consistency models are cousins: isolation describes how concurrent <em>transactions</em> on one logical database interleave; consistency models describe how operations on <em>replicated</em> objects appear to clients. Serializability is an isolation property about transactions; linearizability is a recency property about single objects. The combination of both is called <em>strict serializability</em>, which is what Spanner and FoundationDB offer.</p>
+
+  <h3>3.2 The consistency-model spectrum</h3>
+  <p>Think of consistency models as contracts between the storage system and your code. Stronger contracts are easier to program against and more expensive (latency, availability) to provide. From strongest to weakest for single-object operations:</p>
+
+  <h4>Linearizability (atomic consistency)</h4>
+  <p>Every operation appears to take effect atomically at some single instant between its invocation and its response, and all clients agree on the order of those instants. Practically: once a write has <em>returned</em> to anyone, every later read by anyone (later in real time) sees that write or something newer. The system behaves as if there were one copy of the data.</p>
+  <p><strong>Example.</strong> Alice sets a username reservation <code>"rohit" → userA</code> in etcd and receives OK at 10:00:00.100. Bob reads the key at 10:00:00.150 from a different node. Under linearizability Bob <em>must</em> see <code>userA</code>. This is exactly the property you need for leader election, unique-name reservation, and locks.</p>
+  <p><strong>Cost.</strong> Every linearizable write and read must involve a quorum (or a leader that knows it still holds a lease), so latency includes at least one round trip to a majority, and a minority partition cannot serve requests.</p>
+
+  <h4>Sequential consistency</h4>
+  <p>All clients see all operations in <em>some</em> single total order that respects each client's own program order, but that order need not match real time. Bob could see Alice's write "late" as long as everyone sees the same order. It is weaker than linearizability because it ignores wall-clock recency across clients. ZooKeeper is the best-known example: writes are linearizable, but reads served by a follower are only sequentially consistent unless the client calls <code>sync()</code> first.</p>
+
+  <h4>Causal consistency</h4>
+  <p>Operations that are causally related (one could have influenced the other: same client in order, or a read that observed a write followed by another write) are seen by everyone in that order; concurrent operations may be seen in different orders by different clients. <strong>Example:</strong> Alice posts "I lost my job"; Bob reads it and replies "So sorry!". Causal consistency forbids any third user from seeing Bob's reply without Alice's post. It is the strongest model that remains available during partitions (a known result for "always-available" systems), which is why it is attractive for geo-distributed systems; MongoDB offers causally consistent client sessions.</p>
+
+  <h4>Session guarantees: read-your-writes, monotonic reads, monotonic writes, writes-follow-reads</h4>
+  <p>Defined by Terry et al. for the Bayou system (1994), these are per-client guarantees that you can layer on an eventually consistent store:</p>
+  <ul>
+    <li><strong>Read-your-writes:</strong> after a client writes, its own subsequent reads see that write. Violation: you update your profile photo, refresh, and see the old one because the read hit a lagging replica.</li>
+    <li><strong>Monotonic reads:</strong> a client never sees time go backwards. Violation: refresh 1 hits replica A (has comment #5), refresh 2 hits lagging replica B (comment #5 vanishes).</li>
+    <li><strong>Monotonic writes:</strong> writes from one client are applied everywhere in the order issued.</li>
+    <li><strong>Writes-follow-reads:</strong> a write issued after reading value <em>v</em> is ordered after the write that produced <em>v</em>.</li>
+  </ul>
+  <p>Implementation techniques you will use: route a user's reads to the leader for a short window after they write; stick a user to one replica (session affinity); or carry a version token (a log sequence number, a Kafka offset, a DynamoDB-style version) with the client and make replicas wait until they have caught up to it.</p>
+
+  <h4>Eventual consistency</h4>
+  <p>If writes stop, all replicas eventually converge to the same value. That is the entire guarantee: it says nothing about what you read in the meantime or how long "eventually" is. It is a <em>liveness</em> property, not a safety property. Production systems that advertise eventual consistency nearly always add something stronger in practice (session guarantees, bounded staleness, or convergence via a defined conflict-resolution rule). When you design with eventual consistency, always state the conflict-resolution rule and the expected staleness bound.</p>
+
+  <div class="callout insight"><p class="callout-title">Insight</p><p>The useful design question is rarely "strong or eventual?" It is "which <em>specific</em> anomalies can this screen or API tolerate?" A shopping-cart page can tolerate stale reads but not losing an item (needs merge semantics). A balance-transfer API cannot tolerate lost updates (needs serializable or linearizable writes). A "who viewed your profile" counter can tolerate nearly anything.</p></div>
+
+  <h3>3.3 The CAP theorem, stated precisely</h3>
+  <p>Gilbert and Lynch's formalisation: in an asynchronous network where messages between nodes can be lost (a <em>partition</em>), no read/write register implementation can guarantee both</p>
+  <ul>
+    <li><strong>Consistency (C)</strong> = <em>linearizability</em>, and</li>
+    <li><strong>Availability (A)</strong> = <em>every request received by a non-failed node returns a non-error response</em> (eventually),</li>
+  </ul>
+  <p>for all executions that include partitions. When a partition happens you must choose: some nodes refuse or delay requests (CP), or nodes answer with possibly stale or divergent data (AP).</p>
+  <p>The proof intuition fits in one paragraph. Split the cluster into two sides that cannot talk. A client writes <em>x=1</em> on side G1. Availability forces G1 to acknowledge. Another client then reads <em>x</em> on side G2. Availability forces G2 to answer, but G2 has never heard of the write, so it returns the old value, violating linearizability. The only escape is to let one side refuse to answer, sacrificing availability.</p>
+
+  <h4>Common misreadings of CAP</h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Misreading</th><th>What is actually true</th></tr></thead>
+    <tbody>
+      <tr><td>"Pick two of three."</td><td>Partitions are not optional in a distributed system; P is a fact of life. The choice is only between C and A <em>during</em> a partition. When there is no partition you can have both.</td></tr>
+      <tr><td>"MongoDB is CP, Cassandra is AP."</td><td>Systems are configurable per operation. Cassandra with <code>QUORUM</code> reads and writes behaves very differently from <code>ONE</code>; MongoDB with <code>readConcern: "local"</code> on secondaries is not linearizable. Classify <em>operations under a configuration</em>, not products.</td></tr>
+      <tr><td>"CP systems are unavailable."</td><td>CAP availability means <em>every</em> non-failed node answers. A Raft cluster where the majority side keeps serving is "not CAP-available" but is highly available in the operational SLO sense. The two meanings of "available" differ.</td></tr>
+      <tr><td>"C in CAP is the C in ACID."</td><td>CAP's C is linearizability of a single register. It says nothing about multi-object transactions or invariants.</td></tr>
+      <tr><td>"CAP explains why my system is slow."</td><td>CAP says nothing about latency. That is PACELC's job.</td></tr>
+      <tr><td>"Eventual consistency is the AP side of CAP."</td><td>AP only says nodes answer. Many AP systems give much more than eventual consistency (causal, session guarantees).</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>3.4 PACELC</h3>
+  <p>Abadi's extension: <strong>if</strong> there is a <strong>P</strong>artition, choose between <strong>A</strong>vailability and <strong>C</strong>onsistency; <strong>E</strong>lse (normal operation) choose between <strong>L</strong>atency and <strong>C</strong>onsistency. The "else" clause is the important one, because partitions are rare and latency is every request. Synchronous replication to a quorum (consistency) costs at least one round trip; answering from the nearest replica (latency) risks staleness.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>System (typical configuration)</th><th>PACELC class</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Dynamo-style (Cassandra/Riak at low consistency levels)</td><td>PA/EL</td><td>Answers from any replica; reconciles later.</td></tr>
+      <tr><td>Spanner, CockroachDB, etcd</td><td>PC/EC</td><td>Quorum writes; refuses service in minority partitions; pays cross-replica latency always.</td></tr>
+      <tr><td>MongoDB (majority writes, primary reads)</td><td>PC/EC-ish</td><td>Abadi classified the default configuration as PA/EC; behaviour depends on read/write concerns.</td></tr>
+      <tr><td>PostgreSQL with async streaming replicas, reads from replicas</td><td>PA/EL for reads</td><td>Writes go to one primary; replica reads may be stale.</td></tr>
+    </tbody>
+  </table></div>
+  <p><span class="tag opinion">Opinion</span> In design reviews, phrase choices in PACELC terms per operation ("checkout writes are PC/EC; product-page reads are PA/EL with a 5-second staleness budget"). It forces the conversation onto concrete latency and staleness numbers.</p>
+
+  <h3>3.5 Quorums</h3>
+  <p>With <em>N</em> replicas, a write waits for <em>W</em> acknowledgements and a read queries <em>R</em> replicas. If \( W + R &gt; N \), every read set overlaps every write set in at least one replica, so a read <em>can</em> observe the latest acknowledged write (given versioning to pick the newest). Common settings: \( N=3, W=2, R=2 \). The overlap rule is necessary but not sufficient for linearizability: concurrent writes, sloppy quorums with hinted handoff, and partially-failed writes can still yield anomalies, which is why Dynamo-style stores add read repair and why linearizable systems use consensus instead of plain quorums. Quorums in consensus protocols are <em>majorities</em> (\( \lfloor N/2 \rfloor + 1 \)): any two majorities intersect, which is what lets a new leader discover every committed entry.</p>
+
+  <h3>3.6 Consensus and why it is needed</h3>
+  <p>Consensus means a set of nodes agree on a single value (or a sequence of values, a replicated log) such that: all non-faulty nodes decide the same value (agreement), the decided value was proposed by someone (validity), and every non-faulty node eventually decides (termination). The FLP result (Fischer, Lynch, Paterson, 1985) shows that in a fully asynchronous system with even one crash failure, no deterministic algorithm guarantees termination. Practical algorithms (Paxos, Raft, Zab) dodge this with timeouts: they are always <em>safe</em> and are <em>live</em> whenever the network behaves reasonably for long enough.</p>
+  <p>Consensus is the tool behind linearizable key-value stores (etcd, ZooKeeper, Consul), leader election, distributed locks with fencing, Kafka's KRaft controller quorum, and the replication layer of distributed SQL (CockroachDB, TiDB, YugabyteDB). You will rarely implement it; you will often depend on it and must understand its failure behaviour.</p>
+
+  <h3>3.7 Atomic commitment: 2PC and 3PC</h3>
+  <p>Consensus agrees on <em>one</em> value among replicas of the same data. Atomic commit asks a different question: several <em>different</em> participants (databases, queues) must all commit or all abort a transaction. Two-phase commit is the classic protocol:</p>
+  <ol>
+    <li><strong>Prepare (voting) phase.</strong> The coordinator asks every participant "can you commit?". Each participant durably writes its changes and a prepare record (so it can commit even after a crash), holds its locks, and votes YES or NO.</li>
+    <li><strong>Commit phase.</strong> If all vote YES, the coordinator durably logs COMMIT and tells everyone to commit; otherwise it logs ABORT and tells everyone to roll back.</li>
+  </ol>
+  <p>The weakness: once a participant votes YES it is <em>in doubt</em> and must wait for the coordinator's decision, holding locks. If the coordinator crashes after collecting votes, participants block until it recovers. 2PC is a <em>blocking</em> protocol. Three-phase commit adds a pre-commit phase so that participants can decide by timeout, but it is only safe under a synchronous network model with bounded delays; with real partitions it can produce inconsistent outcomes, so it is rarely used in practice. Modern distributed databases make 2PC non-blocking by making the coordinator itself a replicated, consensus-backed state machine (Spanner's Paxos groups, CockroachDB's transaction records).</p>
+
+  <h3>3.8 XA and JTA, and why microservices avoid them</h3>
+  <p>XA is the X/Open interface by which a transaction manager drives 2PC across resource managers (an Oracle database and an IBM MQ queue, for example). In Java, JTA exposes it via <code>UserTransaction</code>/<code>TransactionManager</code>, and Spring wires it with <code>JtaTransactionManager</code> plus an embedded manager such as Atomikos or Narayana. It works, but microservice architectures avoid it because:</p>
+  <ul>
+    <li><strong>Availability coupling:</strong> the transaction is only as available as the least available participant and the coordinator; a slow participant holds locks in all others.</li>
+    <li><strong>Lock duration:</strong> locks are held across network round trips, crushing throughput under contention.</li>
+    <li><strong>Ecosystem support:</strong> Kafka does not implement XA; many managed and NoSQL databases do not either; HTTP APIs cannot participate at all.</li>
+    <li><strong>Autonomy:</strong> a service exposing an XA resource lets other teams' transactions hold locks in its database, which breaks the "database per service" ownership rule.</li>
+    <li><strong>Operational pain:</strong> in-doubt transactions after crashes require manual heuristic resolution (heuristic commit/rollback), which can itself violate atomicity.</li>
+  </ul>
+
+  <h3>3.9 Sagas</h3>
+  <p>A saga is a sequence of <em>local</em> transactions \( T_1, T_2, \ldots, T_n \), each committed independently in one service, where every step \( T_i \) that can be undone has a <em>compensating transaction</em> \( C_i \). If step \( T_k \) fails, the saga runs \( C_{k-1}, \ldots, C_1 \). The result is <em>eventual</em> atomicity (all steps eventually take effect or are semantically undone) without distributed locks. What you give up is isolation: other transactions can observe intermediate states. Sections 4.4 and 4.5 cover choreography versus orchestration and the countermeasures for missing isolation.</p>
+  <p>Steps are classified (following Richardson's terminology) as <strong>compensatable</strong> (can be undone, e.g. reserve credit), the <strong>pivot</strong> (the go/no-go point; after it commits, the saga runs to completion, e.g. charge the card), and <strong>retriable</strong> (after the pivot; guaranteed to eventually succeed with retries, e.g. send confirmation email). Ordering steps so that risky, non-compensatable actions come at the pivot is the core design skill.</p>
+
+  <h3>3.10 The dual-write problem and the transactional outbox</h3>
+  <p>A service that must update its database <em>and</em> publish an event faces the dual-write problem: there is no atomic operation across PostgreSQL and Kafka. Publish-then-commit can publish an event for a rolled-back change; commit-then-publish can lose the event if the process dies between the two. The <strong>transactional outbox</strong> solves it by writing the event into an <code>outbox</code> table <em>in the same local transaction</em> as the business change. A separate relay later reads the outbox and publishes to the broker, retrying until it succeeds. The relay is either a <strong>polling publisher</strong> (query the table) or <strong>log-based CDC</strong> (tail the database's write-ahead log, e.g. with Debezium). Because the relay may publish a message more than once, consumers must be idempotent: that is the <strong>inbox</strong> or deduplication side.</p>
+
+  <h3>3.11 Idempotency</h3>
+  <p>An operation is idempotent if applying it more than once has the same effect as applying it once: \( f(f(x)) = f(x) \). <code>PUT /users/42 {name}</code> and <code>DELETE</code> are idempotent by HTTP semantics; <code>POST /payments</code> is not. Because at-least-once delivery and client retries are the norm, every state-changing handler in a distributed system must either be naturally idempotent or be made idempotent with a key. Three implementation families:</p>
+  <ul>
+    <li><strong>Natural idempotency:</strong> set-based writes (<code>UPDATE ... SET status='SHIPPED'</code>), upserts with deterministic keys, and conditional writes (<code>WHERE version = ?</code>).</li>
+    <li><strong>Deduplication by id:</strong> store processed message ids or idempotency keys with a unique constraint in the same transaction as the side effect.</li>
+    <li><strong>Request-level idempotency keys:</strong> the client generates a unique key per logical operation; the server stores the key with the request fingerprint and the response, and replays the stored response for retries (Stripe's design, section 4.7).</li>
+  </ul>
+
+  <h3>3.12 The exactly-once myth</h3>
+  <p>Over an unreliable network a sender cannot know whether a message whose acknowledgement was lost was processed, so <em>delivery</em> is at-most-once (do not retry) or at-least-once (retry). "Exactly-once" in product marketing always means <strong>effectively-once processing</strong>: at-least-once delivery combined with idempotent or transactional processing so that the <em>effect</em> occurs once. Kafka's exactly-once semantics, for example, cover a read-process-write cycle <em>within Kafka</em> (consume offsets and produced records committed atomically); the moment your consumer calls an external HTTP API or writes to PostgreSQL, you are back to needing idempotency. Chapter 7 covers Kafka transactions in depth.</p>
+
+  <h3>3.13 Conflict resolution under eventual consistency</h3>
+  <p>When multiple replicas accept writes (multi-leader or leaderless replication, offline-first mobile apps, multi-region active-active), concurrent writes to the same item will conflict. You must choose a resolution strategy:</p>
+  <ul>
+    <li><strong>Last-writer-wins (LWW):</strong> attach a timestamp; the highest wins. Simple, convergent, and silently loses concurrent updates. Wall clocks skew, so "last" can be wrong.</li>
+    <li><strong>Version vectors / vector clocks:</strong> detect whether two versions are causally ordered or concurrent. If concurrent, keep both as <em>siblings</em> and resolve in the application (merge, or ask the user).</li>
+    <li><strong>CRDTs:</strong> data types whose merge function is commutative, associative and idempotent, so replicas converge regardless of delivery order or duplication. Counters, sets, maps, registers and sequences (for text) all have CRDT designs.</li>
+    <li><strong>Operational transformation / application-specific merge:</strong> domain logic decides (e.g., union of cart items, max of bid, sum of inventory deltas).</li>
+  </ul>
+  <p>The fundamental choice is between <em>avoiding</em> conflicts (route all writes for a key to one home region or leader) and <em>resolving</em> them (CRDTs or custom merge). Avoidance is simpler and usually right for money; resolution is necessary for offline and collaborative features.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working: Raft, 2PC, Sagas, Outbox Relays and Idempotency Stores Step by Step</h2>
+
+  <h3>4.1 Raft leader election</h3>
+  <p>Raft decomposes consensus into leader election, log replication, and safety. Each node is a <em>follower</em>, <em>candidate</em> or <em>leader</em>. Time is divided into numbered <em>terms</em>; each term has at most one leader. Every message carries the sender's term, and a node that sees a higher term immediately steps down to follower and adopts it. This single rule resolves most stale-leader confusion.</p>
+  <ol>
+    <li>Followers expect periodic heartbeats (empty <code>AppendEntries</code> RPCs) from the leader. Each follower has a randomised <em>election timeout</em> (the paper suggests 150–300 ms).</li>
+    <li>If the timeout expires with no heartbeat, the follower increments its term, becomes a candidate, votes for itself, and sends <code>RequestVote(term, lastLogIndex, lastLogTerm)</code> to all peers.</li>
+    <li>A peer grants its vote if (a) it has not voted for someone else in this term and (b) the candidate's log is <em>at least as up to date</em> as its own: the candidate's last log term is higher, or equal with an index at least as large. This is the <strong>election restriction</strong> that guarantees a new leader already holds every committed entry.</li>
+    <li>A candidate that collects votes from a majority becomes leader and starts heartbeating. If two candidates split the vote, both time out (at different random times) and a new term starts. Randomisation makes repeated split votes unlikely.</li>
+  </ol>
+  <p>Consequences you will see in production: during an election (typically hundreds of milliseconds to a few seconds), writes are unavailable; a node isolated in a minority keeps incrementing its term and, when it rejoins, can force a disruptive election. Implementations add <em>PreVote</em> (ask "would you vote for me?" without bumping the term) and <em>CheckQuorum</em> (a leader steps down if it cannot reach a majority) to prevent this; etcd supports both.</p>
+
+  <h3>4.2 Raft log replication and commitment</h3>
+  <ol>
+    <li>A client sends a command to the leader. The leader appends it to its log as entry <em>(term, index, command)</em>.</li>
+    <li>The leader sends <code>AppendEntries(term, prevLogIndex, prevLogTerm, entries[], leaderCommit)</code> to every follower. A follower rejects the RPC if its log has no entry at <code>prevLogIndex</code> with term <code>prevLogTerm</code> (the <em>consistency check</em>). On rejection the leader backs up <code>nextIndex</code> for that follower and retries, overwriting any conflicting uncommitted suffix. This is how divergent logs are repaired.</li>
+    <li>When an entry from the <em>current</em> term is stored on a majority, the leader marks it <strong>committed</strong>, applies it to its state machine, and replies to the client. Followers learn the commit index via <code>leaderCommit</code> on subsequent RPCs and apply entries in order.</li>
+    <li>Entries from earlier terms are committed only indirectly, by committing a current-term entry after them (the subtle "Figure 8" case in the paper). Leaders therefore append a no-op entry at the start of their term.</li>
+  </ol>
+  <p><strong>Linearizable reads</strong> are not free: a leader that was partitioned away might not know it has been deposed. Options are (a) send the read through the log (slow), (b) <em>ReadIndex</em>: record the current commit index, confirm leadership with a heartbeat round to a majority, then serve once applied, or (c) <em>leader leases</em>, which rely on bounded clock drift. etcd uses ReadIndex for its default linearizable reads and offers serializable (possibly stale) reads as an option.</p>
+  <p><strong>Membership changes</strong> use joint consensus or single-server changes so that two disjoint majorities can never exist during reconfiguration. <strong>Snapshots</strong> truncate the log once the state machine is persisted.</p>
+
+  <h3>4.3 Two-phase commit, including failure cases</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Failure point</th><th>What happens</th><th>Recovery</th></tr></thead>
+    <tbody>
+      <tr><td>Participant fails before voting</td><td>Coordinator times out waiting for vote</td><td>Coordinator aborts; safe.</td></tr>
+      <tr><td>Participant votes NO</td><td>Coordinator decides ABORT</td><td>All roll back.</td></tr>
+      <tr><td>Coordinator fails before logging decision</td><td>Participants who voted YES are in doubt</td><td>They block holding locks until coordinator recovers, reads its log (no decision) and aborts.</td></tr>
+      <tr><td>Coordinator fails after logging COMMIT, before notifying all</td><td>Some participants committed, others in doubt</td><td>On recovery the coordinator re-sends COMMIT; in-doubt participants block until then. They cannot abort unilaterally.</td></tr>
+      <tr><td>Participant fails after voting YES</td><td>Its prepare record is durable</td><td>On restart it asks the coordinator for the outcome and completes it.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The table shows why 2PC is called blocking: rows 3 and 4 can hold locks for as long as the coordinator is down. That is acceptable inside a single database product whose coordinator is itself replicated; it is unacceptable across independently deployed services owned by different teams.</p>
+
+  <h3>4.4 Saga coordination: choreography versus orchestration</h3>
+  <p><strong>Choreography.</strong> There is no central coordinator. Each service listens for events and reacts by doing its local transaction and emitting the next event. <code>OrderCreated</code> → Payment reserves funds and emits <code>PaymentAuthorized</code> → Inventory reserves stock and emits <code>StockReserved</code> → Order marks itself approved. On failure, a service emits a failure event (<code>StockReservationFailed</code>) and upstream services react by compensating.</p>
+  <p><strong>Orchestration.</strong> A saga orchestrator (a class in the Order service, or a workflow on Temporal/Camunda) holds the saga's state machine. It sends commands (<code>AuthorizePayment</code>), waits for replies, persists the saga state after each step, and on failure issues compensating commands in reverse order.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Concern</th><th>Choreography</th><th>Orchestration</th></tr></thead>
+    <tbody>
+      <tr><td>Coupling</td><td>Services know event types of others; flow is implicit across many codebases</td><td>Participants know only their own commands; flow is explicit in one place</td></tr>
+      <tr><td>Understandability</td><td>Hard to see the whole process; needs tracing to reconstruct</td><td>Readable as code or BPMN; easy to answer "where is order 123?"</td></tr>
+      <tr><td>Cyclic dependencies</td><td>Easy to create event loops</td><td>Orchestrator depends on participants, not vice versa</td></tr>
+      <tr><td>Single point of failure</td><td>None beyond the broker</td><td>Orchestrator must be durable and highly available (workflow engines solve this)</td></tr>
+      <tr><td>Good fit</td><td>2–4 steps, stable flow, teams that already think in events</td><td>Many steps, branching, timeouts, human tasks, frequent change</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>4.5 Isolation anomalies in sagas and countermeasures</h3>
+  <p>Because each local transaction commits independently, a saga is ACD without I. Three anomalies appear:</p>
+  <ul>
+    <li><strong>Lost updates:</strong> saga A's compensation overwrites a change saga B made in between.</li>
+    <li><strong>Dirty reads:</strong> another request reads data that a later saga step will compensate (e.g., a credit limit temporarily reduced by a saga that later fails, causing a legitimate order to be rejected).</li>
+    <li><strong>Fuzzy / non-repeatable reads:</strong> two steps of the same saga read the same item and see different values because another saga changed it in between.</li>
+  </ul>
+  <p>Countermeasures, from Garcia-Molina's work and Richardson's catalogue (which draws on Lars Frank's research):</p>
+  <ul>
+    <li><strong>Semantic lock:</strong> a compensatable step sets an application-level flag such as <code>order.state = APPROVAL_PENDING</code>. Other requests that see the flag fail fast, wait, or treat the data as provisional. The flag is cleared by the final step or by compensation. This is the most common countermeasure.</li>
+    <li><strong>Commutative updates:</strong> design updates so order does not matter (debit/credit deltas rather than "set balance to X"), which makes lost updates impossible.</li>
+    <li><strong>Pessimistic view:</strong> reorder steps so the riskiest dirty-read exposure happens in a retriable step after the pivot.</li>
+    <li><strong>Reread value:</strong> before overwriting, reread and verify the record has not changed (optimistic locking with <code>@Version</code>); abort or restart if it has.</li>
+    <li><strong>Version file:</strong> record operations as they arrive so that out-of-order operations (e.g., a cancel arriving before the create) can be reordered correctly.</li>
+    <li><strong>By value:</strong> choose the mechanism per request based on business risk: high-value requests use a distributed transaction or manual review; low-value ones use a saga.</li>
+  </ul>
+
+  <h3>4.6 Outbox relays: polling publisher versus log-based CDC</h3>
+  <p><strong>Polling publisher.</strong> A scheduled job runs <code>SELECT ... FROM outbox WHERE published_at IS NULL ORDER BY id LIMIT 500 FOR UPDATE SKIP LOCKED</code>, sends each row to Kafka, waits for acks, and marks rows published (or deletes them). <code>SKIP LOCKED</code> lets several instances share the work without double-processing in the normal case. Pros: no extra infrastructure; works with any SQL database. Cons: polling load and latency (poll interval), ordering only per relay instance, and the table needs cleanup.</p>
+  <p><strong>Log-based CDC with Debezium.</strong> Debezium runs as a Kafka Connect source connector that reads the database's replication stream (PostgreSQL logical decoding via a replication slot with the <code>pgoutput</code> plugin, MySQL binlog). Inserts into the outbox table appear as change events; the <strong>Outbox Event Router</strong> single message transform (SMT) turns each into a clean domain event: by default it routes by the <code>aggregatetype</code> column to a topic, uses <code>aggregateid</code> as the Kafka key (so events for one aggregate land in one partition, preserving order), and puts <code>payload</code> as the value. Because the event is read from the WAL after commit, no rolled-back event is ever published, and there is no polling load. The application can insert and immediately delete the outbox row in the same transaction; the WAL still contains the insert. Cons: you operate Kafka Connect and Debezium, must monitor replication-slot lag (an unconsumed PostgreSQL slot retains WAL and can fill the disk), and need DBA cooperation for replication permissions.</p>
+  <p>Both relays deliver <strong>at least once</strong>: if the relay crashes after Kafka acknowledges but before it records progress (marks the row, or commits the Connect offset), it republishes. Hence the next subsection.</p>
+
+  <h3>4.7 Inbox / idempotent consumer, and Stripe-style idempotency keys</h3>
+  <p><strong>Idempotent consumer.</strong> Each event carries a unique id (the outbox row's UUID). The consumer, inside the same local transaction as its business change, inserts <code>(consumer_name, message_id)</code> into a <code>processed_message</code> table with a primary key on both columns. If the insert hits a unique violation, the message was already processed: skip it and acknowledge. Because the dedup record and the side effect commit atomically, there is no window where one exists without the other. Retain dedup rows for longer than the maximum redelivery window (e.g., Kafka retention plus replay horizon).</p>
+  <p><strong>Request idempotency keys (Stripe's design).</strong> The client generates a key (UUIDv4) per logical operation and sends it as <code>Idempotency-Key</code>. The server:</p>
+  <ol>
+    <li>Atomically inserts a row <code>(key, request_fingerprint, status=IN_PROGRESS, locked_at)</code>. If the key exists with a <em>different</em> fingerprint, return 422 (key reuse with different parameters). If it exists and is <code>IN_PROGRESS</code>, return 409 (concurrent duplicate). If it exists with a stored response, return that response verbatim.</li>
+    <li>Execute the operation. Stripe's engineers describe structuring complex operations as a series of <em>atomic phases</em> with <em>recovery points</em> stored on the key row, so that a retry can resume from the last completed phase rather than re-running external calls.</li>
+    <li>Store the response status and body on the key row and mark it complete. Expire keys after a retention period (Stripe documents 24 hours for its API). <span class="tag version">Version-sensitive · checked Nov 2026</span></li>
+  </ol>
+  <p>Errors need care: a validation error (4xx) can be stored and replayed; a transient server error (5xx before any side effect) should release the key so the retry can execute.</p>
+
+  <h3>4.8 Vector clocks and CRDT merges</h3>
+  <p>A <strong>version vector</strong> for an item is a map <code>replica → counter</code>. When replica <em>r</em> updates the item it increments its own entry. Comparing two vectors \( V_a \) and \( V_b \): if every entry of \( V_a \) is ≤ the corresponding entry of \( V_b \), then <em>a happened before b</em> and b can overwrite a; if neither dominates, the versions are <em>concurrent</em> and must be merged. Dynamo returned all concurrent siblings to the client, and the shopping-cart service merged them by union (which is why deleted items could reappear).</p>
+  <p><strong>CRDTs</strong> come in two flavours. <em>State-based</em> (CvRDT) replicas ship their full state and merge with a join operation on a semilattice (e.g., element-wise max). <em>Operation-based</em> (CmRDT) replicas ship operations that commute, relying on causal delivery. Key examples:</p>
+  <ul>
+    <li><strong>G-Counter:</strong> vector of per-replica counts; value = sum; merge = element-wise max.</li>
+    <li><strong>PN-Counter:</strong> two G-Counters (increments P, decrements N); value = sum(P) − sum(N).</li>
+    <li><strong>LWW-Register:</strong> (value, timestamp); merge keeps the larger timestamp (ties broken by replica id). A CRDT, but with LWW's lost-update semantics.</li>
+    <li><strong>OR-Set (observed-remove set):</strong> each add is tagged with a unique id; remove deletes only the tags it has observed; so a concurrent add and remove resolves to "add wins". This fixes the Dynamo cart resurrection problem for most cases.</li>
+    <li><strong>Sequence CRDTs</strong> (RGA, Logoot, and the designs behind Automerge and Yjs) for collaborative text.</li>
+  </ul>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: Diagrams and Simulations</h2>
+
+  <figure class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> Follower
+  Follower --> Candidate: election timeout, term+1
+  Candidate --> Candidate: split vote, timeout, term+1
+  Candidate --> Leader: votes from majority
+  Candidate --> Follower: sees higher term or valid leader
+  Leader --> Follower: sees higher term
+</pre>
+  <figcaption>Figure 6.1 — Raft node roles and transitions.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> every node starts as a follower. The only way to become leader is to win a majority vote in a fresh term, and the only way to stop being leader is to observe a higher term. There is no "demote" message: higher terms do all the work. When you debug an etcd or KRaft cluster that keeps changing leaders, look at the term number: if it climbs rapidly, nodes are timing out, usually from disk fsync latency, CPU starvation or network jitter exceeding the election timeout.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant L as Leader (term 7)
+  participant F1 as Follower 1
+  participant F2 as Follower 2
+  C->>L: put(x, 5)
+  L->>L: append (7, idx 42, x=5)
+  par replicate
+    L->>F1: AppendEntries(prev=41, entries=[42])
+    L->>F2: AppendEntries(prev=41, entries=[42])
+  end
+  F1-->>L: success
+  Note over L: 2 of 3 have idx 42, so commitIndex = 42
+  L->>L: apply x=5
+  L-->>C: OK
+  F2-->>L: success (late)
+  L->>F1: heartbeat(leaderCommit=42)
+  L->>F2: heartbeat(leaderCommit=42)
+</pre>
+  <figcaption>Figure 6.2 — Raft log replication: an entry commits once a majority stores it.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the client gets its OK as soon as the leader plus one follower have persisted entry 42; the slow follower does not affect latency. That is the core availability property of majority quorums: a 3-node cluster tolerates one slow or dead node, a 5-node cluster tolerates two. Followers apply the entry only after learning the new commit index from the next heartbeat, which is why follower reads are stale unless you use ReadIndex.</p>
+
+  <figure class="diagram">
+    <div class="widget" data-widget="quorum"></div>
+    <figcaption>Figure 6.3 — Interactive: N/W/R quorums with replica failures.</figcaption>
+  </figure>
+  <p><strong>What to try:</strong> start with N=3, W=2, R=2 and fail one replica: reads and writes still succeed, and reads see the latest write because \( W+R&gt;N \). Now set W=1, R=1 and write, then read from a different replica: you will see a stale read. Fail two replicas with W=2 and observe that writes become unavailable, which is the CAP trade-off made concrete. Finally try N=5, W=3, R=3 and count how many failures you can survive compared with N=3.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant TM as Coordinator
+  participant DB as Orders DB
+  participant MQ as Message Queue
+  TM->>DB: PREPARE
+  TM->>MQ: PREPARE
+  DB-->>TM: YES (locks held)
+  MQ-->>TM: YES (locks held)
+  TM->>TM: log COMMIT durably
+  Note over TM: crash here leaves both in doubt
+  TM->>DB: COMMIT
+  TM->>MQ: COMMIT
+  DB-->>TM: ack
+  MQ-->>TM: ack
+</pre>
+  <figcaption>Figure 6.4 — Two-phase commit with the blocking window marked.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> between each participant's YES and the COMMIT it receives, it holds locks and cannot decide on its own. If the coordinator dies at the note, both participants are stuck. Across microservices, the coordinator would be some other team's process, which is precisely why the industry moved to sagas.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph Orchestrated
+    O["Order Saga Orchestrator"] -->|AuthorizePayment| P1[Payment]
+    P1 -->|Authorized| O
+    O -->|ReserveStock| I1[Inventory]
+    I1 -->|OutOfStock| O
+    O -->|"VoidAuthorization (compensate)"| P1
+    O -->|RejectOrder| OR1[Order]
+  end
+  subgraph Choreographed
+    OR2[Order] -- OrderCreated --> P2[Payment]
+    P2 -- PaymentAuthorized --> I2[Inventory]
+    I2 -- StockReservationFailed --> P2
+    I2 -- StockReservationFailed --> OR2
+  end
+</pre>
+  <figcaption>Figure 6.5 — The same failing order saga, orchestrated versus choreographed.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> in the orchestrated version every arrow touches the orchestrator, so the whole flow, including the compensation <code>VoidAuthorization</code>, lives in one place. In the choreographed version, Payment and Order must each know to react to <code>StockReservationFailed</code>; the "compensation logic" is spread across services. Add a fourth step (shipping quote) and choreography's arrow count grows faster than orchestration's.</p>
+
+  <figure class="diagram">
+    <div class="widget" data-widget="saga"></div>
+    <figcaption>Figure 6.6 — Interactive: orchestrated saga with failure injection, compared with 2PC.</figcaption>
+  </figure>
+  <p><strong>What to try:</strong> run the happy path first and watch each local transaction commit independently. Then inject a failure at the last step and observe compensations running in reverse order; note that intermediate states were visible to other readers while the saga ran (no isolation). Switch to the 2PC comparison and inject a coordinator failure after prepare: participants stay locked. Ask yourself which of the saga's steps is the pivot.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  A["OrderService (@Transactional)"] -->|INSERT order| DB[(PostgreSQL)]
+  A -->|INSERT outbox row, same tx| DB
+  DB -->|"WAL / logical decoding"| DZ["Debezium connector (Kafka Connect)"]
+  DB -.->|"or: SELECT ... FOR UPDATE SKIP LOCKED"| PP[Polling publisher]
+  DZ -->|"EventRouter SMT, key=aggregateid"| K[(Kafka topic order.events)]
+  PP --> K
+  K --> C1["Payment consumer"]
+  C1 -->|"INSERT processed_message + business change, same tx"| DB2[(Payment DB)]
+</pre>
+  <figcaption>Figure 6.7 — Transactional outbox with both relay options and an idempotent consumer.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the only atomic step on the producer side is the local transaction that writes the order and the outbox row. Everything to the right of the database is at-least-once. The consumer restores effectively-once semantics by committing its dedup row and its business change together. Note the two paths out of PostgreSQL: the dashed polling path needs no new infrastructure; the WAL path gives lower latency and no polling load at the cost of running Kafka Connect.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant API as Payments API
+  participant K as idempotency_key table
+  participant PSP as Card network
+  C->>API: POST /charges (Idempotency-Key k1)
+  API->>K: INSERT k1, fingerprint, IN_PROGRESS
+  API->>PSP: charge
+  PSP-->>API: approved
+  API->>K: store 201 + body, COMPLETE
+  API--xC: response lost (timeout)
+  C->>API: retry POST /charges (k1)
+  API->>K: lookup k1
+  K-->>API: COMPLETE, 201 + body
+  API-->>C: replay stored 201
+</pre>
+  <figcaption>Figure 6.8 — Idempotency key turns an ambiguous timeout into a safe retry.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the client cannot know whether the first charge happened. Without the key, the retry would charge twice. With it, the server recognises the logical operation and replays the stored result. The same flow protects LLM agents that retry tool calls after a timeout: give every tool invocation a deterministic idempotency key derived from the agent's step id.</p>
+</section>
+
+<section id="math">
+  <h2>6. Math: Quorums, Availability, and the Cost of Consistency</h2>
+  <h3>6.1 Quorum intersection</h3>
+  <p>Intuition: if writers talk to "more than half" and readers talk to "more than half", they must share at least one member. Formally, with \( N \) replicas, write quorum \( W \) and read quorum \( R \), any write set and read set intersect when</p>
+  \[ W + R &gt; N \]
+  <p>and two write quorums intersect (preventing two concurrent conflicting writes from both succeeding without seeing each other) when \( 2W &gt; N \). Majority quorums \( Q = \lfloor N/2 \rfloor + 1 \) satisfy both.</p>
+
+  <h3>6.2 Fault tolerance of consensus clusters</h3>
+  <p>A majority-quorum cluster of size \( N \) tolerates \( f = \lfloor (N-1)/2 \rfloor \) crashed nodes. Hence \( N = 2f + 1 \): 3 nodes tolerate 1 failure, 5 tolerate 2. A 4-node cluster still tolerates only 1 (majority is 3), and costs more write latency than 3 nodes, which is why consensus clusters are odd-sized.</p>
+
+  <h3>6.3 Availability of quorum operations</h3>
+  <p>If each replica is independently up with probability \( p \), the probability that at least \( Q \) of \( N \) are up is the binomial tail</p>
+  \[ A(N, Q, p) = \sum_{k=Q}^{N} \binom{N}{k} p^{k} (1-p)^{N-k}. \]
+  <p>With \( p = 0.99 \): for \( N=3, Q=2 \), \( A = 3(0.99)^2(0.01) + 0.99^3 \approx 0.029403 + 0.970299 = 0.999702 \) (about 3.5 nines). For \( N=5, Q=3 \), \( A \approx 0.99999 \). Independence is the key assumption; correlated failures (same rack, same AZ, same bad deploy) destroy it, which is why replicas are spread across failure domains. <span class="tag illus">Illustrative</span></p>
+
+  <h3>6.4 Latency of a quorum write</h3>
+  <p>A quorum write completes when the \( W \)-th fastest replica acknowledges, so its latency is the \( W \)-th order statistic of the replica latencies. With replicas in three AZs at 1 ms, 1.5 ms and 2 ms RTT from the leader (leader's own disk write counted as one ack), a majority write of 3 completes at roughly the fastest remote replica plus fsync. Across regions (say 70 ms and 140 ms RTT), the same write costs ~70 ms minimum. That is PACELC's "else" clause in numbers: consistency across regions costs a WAN round trip on every write. <span class="tag illus">Illustrative</span></p>
+
+  <h3>6.5 2PC versus saga: lock time and failure probability</h3>
+  <p>For 2PC across \( k \) participants, each participant holds locks for at least two network round trips plus the slowest participant's prepare time: \( t_{lock} \gtrsim 2\cdot RTT + \max_i t_{prepare,i} \). Throughput on a contended row is bounded by \( 1/t_{lock} \). For a saga, each local transaction holds locks only for its own duration \( t_i \), so the bound on a hot row is \( 1/t_i \), typically an order of magnitude better. The probability that a 2PC transaction can proceed at all is the product of participant availabilities \( \prod_i a_i \): five services at 99.9% each give about 99.5%. A saga's forward progress is also a product, but failure leads to compensation instead of blocking.</p>
+
+  <h3>6.6 Idempotency key collisions and dedup-table sizing</h3>
+  <p>A random 122-bit UUIDv4 space makes accidental collision negligible: by the birthday bound, the probability of any collision among \( n \) keys is approximately \( n^2 / 2^{123} \); even \( n = 10^{12} \) gives about \( 10^{-13} \). Dedup storage is the real cost: at 5,000 messages/s retained for 7 days, \( 5000 \times 86400 \times 7 \approx 3.0 \times 10^{9} \) rows. At ~60 bytes per row plus index, that is roughly 200–300 GB, which tells you to partition the table by day and drop old partitions, or to dedupe with a shorter horizon plus a natural idempotency check. <span class="tag illus">Illustrative</span></p>
+
+  <h3>6.7 Vector clock comparison</h3>
+  <p>For vectors \( V_a, V_b \) over replicas \( r \):</p>
+  \[ V_a \le V_b \iff \forall r: V_a[r] \le V_b[r], \qquad a \parallel b \iff V_a \not\le V_b \wedge V_b \not\le V_a. \]
+  <p>Merge is the element-wise maximum \( (V_a \sqcup V_b)[r] = \max(V_a[r], V_b[r]) \), which is commutative, associative and idempotent: the three properties that make state-based CRDTs converge regardless of message order or duplication.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code: Transactional Outbox, Idempotent Consumer and Idempotent API in Spring Boot</h2>
+  <p>This section builds a complete, runnable slice of an order service and a payment consumer. Target stack: Java 21, Spring Boot 3.5 or 4.0, Spring for Apache Kafka, Spring Data JPA / JDBC, PostgreSQL 16+, Flyway. <span class="tag version">Version-sensitive · checked Nov 2026</span></p>
+  <div class="callout java"><p class="callout-title">Spring Boot 4 note</p><p>Spring Boot 4.0 (November 2025) moved to Jackson 3, whose packages are <code>tools.jackson.*</code> instead of <code>com.fasterxml.jackson.*</code>. The examples use the <code>ObjectMapper</code> API, which exists in both; adjust the import to your Boot generation. Everything else below compiles unchanged on 3.5 and 4.0.</p></div>
+
+  <h3>7.1 Schema</h3>
+  <pre data-file="V1__orders_outbox_inbox.sql"><code class="language-sql">-- Producer side (order-service database)
+CREATE TABLE orders (
+    id           UUID PRIMARY KEY,
+    customer_id  UUID         NOT NULL,
+    amount_cents BIGINT       NOT NULL CHECK (amount_cents &gt; 0),
+    status       VARCHAR(32)  NOT NULL,
+    version      BIGINT       NOT NULL DEFAULT 0,
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+
+CREATE TABLE outbox (
+    id             UUID PRIMARY KEY,           -- becomes the message id consumers dedupe on
+    aggregatetype  VARCHAR(64)  NOT NULL,      -- Debezium EventRouter default: routes to topic
+    aggregateid    VARCHAR(64)  NOT NULL,      -- Kafka key: preserves per-aggregate order
+    type           VARCHAR(64)  NOT NULL,      -- event type, e.g. OrderCreated
+    payload        JSONB        NOT NULL,
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    published_at   TIMESTAMPTZ                 -- used only by the polling publisher
+);
+CREATE INDEX outbox_unpublished ON outbox (created_at) WHERE published_at IS NULL;
+
+-- Public API idempotency keys
+CREATE TABLE idempotency_key (
+    key            VARCHAR(255) PRIMARY KEY,
+    fingerprint    CHAR(64)     NOT NULL,      -- SHA-256 of method + path + body
+    status         VARCHAR(16)  NOT NULL,      -- IN_PROGRESS | COMPLETE
+    response_code  INT,
+    response_body  TEXT,
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+
+-- Consumer side (payment-service database)
+CREATE TABLE processed_message (
+    consumer      VARCHAR(64)  NOT NULL,
+    message_id    UUID         NOT NULL,
+    processed_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    PRIMARY KEY (consumer, message_id)
+);
+CREATE TABLE payment_authorization (
+    order_id      UUID PRIMARY KEY,           -- natural idempotency as a second line of defence
+    amount_cents  BIGINT      NOT NULL,
+    status        VARCHAR(32) NOT NULL
+);</code></pre>
+  <p>Two details matter. The outbox columns are named to match Debezium's Outbox Event Router defaults so the same table works with both relays. And <code>payment_authorization</code> uses <code>order_id</code> as its primary key: even if the dedup table were bypassed, a second authorization for the same order would fail. Defence in depth for idempotency is cheap.</p>
+
+  <h3>7.2 Writing business state and the event atomically</h3>
+  <pre data-file="OrderService.java"><code class="language-java">package com.example.order;
+
+import com.fasterxml.jackson.databind.ObjectMapper; // Boot 4: tools.jackson.databind.ObjectMapper
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.Map;
+import java.util.UUID;
+
+@Service
+public class OrderService {
+
+    private final JdbcTemplate jdbc;
+    private final ObjectMapper json;
+
+    public OrderService(JdbcTemplate jdbc, ObjectMapper json) {
+        this.jdbc = jdbc;
+        this.json = json;
+    }
+
+    public record CreateOrder(UUID customerId, long amountCents) {}
+    public record OrderCreated(UUID orderId, UUID customerId, long amountCents) {}
+
+    /**
+     * One local ACID transaction: the order row and the outbox row commit together or not at all.
+     * No Kafka call happens here, so there is no dual write.
+     */
+    @Transactional
+    public UUID createOrder(CreateOrder cmd) {
+        UUID orderId = UUID.randomUUID();
+        jdbc.update("""
+            INSERT INTO orders (id, customer_id, amount_cents, status)
+            VALUES (?, ?, ?, 'APPROVAL_PENDING')
+            """, orderId, cmd.customerId(), cmd.amountCents());   // APPROVAL_PENDING = semantic lock
+
+        appendToOutbox("Order", orderId.toString(), "OrderCreated",
+                new OrderCreated(orderId, cmd.customerId(), cmd.amountCents()));
+        return orderId;
+    }
+
+    private void appendToOutbox(String aggregateType, String aggregateId, String type, Object event) {
+        try {
+            jdbc.update("""
+                INSERT INTO outbox (id, aggregatetype, aggregateid, type, payload)
+                VALUES (?, ?, ?, ?, ?::jsonb)
+                """, UUID.randomUUID(), aggregateType, aggregateId, type, json.writeValueAsString(event));
+        } catch (Exception e) {
+            // Serialization failure must roll back the business change too.
+            throw new IllegalStateException("cannot serialize " + type, e);
+        }
+    }
+}</code></pre>
+  <div class="callout warn"><p class="callout-title">Do not do this</p><p><code>@Transactional void create() { repo.save(order); kafkaTemplate.send("orders", evt); }</code> is the classic dual-write bug. If the commit fails after the send, consumers act on an order that does not exist. If the send fails after commit (or the pod is killed), the event is lost. <code>@TransactionalEventListener(phase = AFTER_COMMIT)</code> narrows the window but still loses events on a crash between commit and send.</p></div>
+
+  <h3>7.3 Relay option A: polling publisher</h3>
+  <pre data-file="OutboxRelay.java"><code class="language-java">package com.example.order;
+
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+
+@Component
+public class OutboxRelay {
+
+    private final JdbcTemplate jdbc;
+    private final KafkaTemplate&lt;String, String&gt; kafka;
+
+    public OutboxRelay(JdbcTemplate jdbc, KafkaTemplate&lt;String, String&gt; kafka) {
+        this.jdbc = jdbc;
+        this.kafka = kafka;
+    }
+
+    record Row(UUID id, String aggregateType, String aggregateId, String type, String payload) {}
+
+    /**
+     * Runs on every instance. FOR UPDATE SKIP LOCKED lets instances split the batch
+     * without blocking each other. Rows stay locked until this transaction commits.
+     * Requires @EnableScheduling on a configuration class.
+     */
+    @Scheduled(fixedDelayString = "${outbox.poll-ms:200}")
+    @Transactional
+    public void publishBatch() throws Exception {
+        List&lt;Row&gt; rows = jdbc.query("""
+            SELECT id, aggregatetype, aggregateid, type, payload::text
+              FROM outbox
+             WHERE published_at IS NULL
+             ORDER BY created_at
+             LIMIT 500
+             FOR UPDATE SKIP LOCKED
+            """, (rs, i) -&gt; new Row(rs.getObject(1, UUID.class), rs.getString(2),
+                                    rs.getString(3), rs.getString(4), rs.getString(5)));
+        if (rows.isEmpty()) return;
+
+        // Send all, then wait for all acks: pipelining keeps the batch fast.
+        CompletableFuture&lt;?&gt;[] acks = rows.stream().map(r -&gt; {
+            var rec = new ProducerRecord&lt;String, String&gt;(
+                    r.aggregateType().toLowerCase() + ".events", r.aggregateId(), r.payload());
+            rec.headers().add("id", r.id().toString().getBytes(StandardCharsets.UTF_8));
+            rec.headers().add("type", r.type().getBytes(StandardCharsets.UTF_8));
+            return kafka.send(rec);
+        }).toArray(CompletableFuture[]::new);
+        CompletableFuture.allOf(acks).get(10, TimeUnit.SECONDS); // throws -&gt; tx rolls back -&gt; retried
+
+        jdbc.batchUpdate("UPDATE outbox SET published_at = now() WHERE id = ?",
+                rows.stream().map(r -&gt; new Object[]{r.id()}).toList());
+        // Crash after Kafka acks but before commit =&gt; rows republished =&gt; consumers dedupe on "id".
+    }
+
+    /** Housekeeping: keep the table small so the partial index stays hot. */
+    @Scheduled(cron = "0 15 * * * *")
+    public void purge() {
+        jdbc.update("DELETE FROM outbox WHERE published_at &lt; now() - interval '3 days'");
+    }
+}</code></pre>
+  <pre data-file="application.yml"><code class="language-yaml">spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all                      # wait for all in-sync replicas
+      properties:
+        enable.idempotence: true     # no duplicates from producer retries within a session
+        max.in.flight.requests.per.connection: 5
+        delivery.timeout.ms: 30000
+outbox:
+  poll-ms: 200</code></pre>
+  <p><strong>Ordering caveat.</strong> With several relay instances using <code>SKIP LOCKED</code>, two events for the same aggregate could be picked by different instances and race to Kafka. If per-aggregate order matters, either run a single active relay (leader-elected with ShedLock or a Kubernetes lease), or partition the work by <code>hash(aggregateid) % instances</code>, or use CDC, which reads the WAL in commit order.</p>
+
+  <h3>7.4 Relay option B: Debezium CDC with the Outbox Event Router</h3>
+  <pre data-file="order-outbox-connector.json"><code class="language-json">{
+  "name": "order-outbox",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "plugin.name": "pgoutput",
+    "database.hostname": "orders-db",
+    "database.port": "5432",
+    "database.user": "debezium",
+    "database.password": "${file:/secrets/db.properties:password}",
+    "database.dbname": "orders",
+    "topic.prefix": "orders",
+    "table.include.list": "public.outbox",
+    "slot.name": "order_outbox_slot",
+    "publication.autocreate.mode": "filtered",
+    "tombstones.on.delete": "false",
+    "transforms": "outbox",
+    "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+    "transforms.outbox.route.topic.replacement": "${routedByValue}.events",
+    "transforms.outbox.table.fields.additional.placement": "type:header:type,id:header:id",
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "org.apache.kafka.connect.storage.StringConverter"
+  }
+}</code></pre>
+  <p>POST this to the Kafka Connect REST API (<code>POST /connectors</code>). The router reads <code>aggregatetype</code> ("Order") into <code>${routedByValue}</code>, producing topic <code>Order.events</code>; keys are <code>aggregateid</code>. With CDC you can drop the <code>published_at</code> column and even delete the row in the same transaction right after inserting it, because the WAL already holds the insert. Check option names against the Debezium version you deploy. <span class="tag version">Version-sensitive · checked Nov 2026</span></p>
+
+  <h3>7.5 Idempotent consumer (inbox)</h3>
+  <pre data-file="PaymentConsumer.java"><code class="language-java">package com.example.payment;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper; // Boot 4: tools.jackson.databind.*
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.nio.charset.StandardCharsets;
+import java.util.UUID;
+
+@Component
+public class PaymentConsumer {
+
+    private static final Logger log = LoggerFactory.getLogger(PaymentConsumer.class);
+    private static final String CONSUMER = "payment-authorizer";
+
+    private final JdbcTemplate jdbc;
+    private final ObjectMapper json;
+
+    public PaymentConsumer(JdbcTemplate jdbc, ObjectMapper json) {
+        this.jdbc = jdbc;
+        this.json = json;
+    }
+
+    /**
+     * The DB transaction commits before the listener returns; the container then commits
+     * the Kafka offset. If we crash in between, Kafka redelivers and the dedup insert
+     * below turns the redelivery into a no-op.
+     */
+    @KafkaListener(topics = "order.events", groupId = "payment-service")
+    @Transactional
+    public void onEvent(ConsumerRecord&lt;String, String&gt; rec) throws Exception {
+        UUID messageId = UUID.fromString(header(rec, "id"));
+
+        int inserted = jdbc.update("""
+            INSERT INTO processed_message (consumer, message_id)
+            VALUES (?, ?) ON CONFLICT DO NOTHING
+            """, CONSUMER, messageId);
+        if (inserted == 0) {
+            log.info("duplicate message {} skipped", messageId);
+            return;                                   // already processed: ack and move on
+        }
+
+        if (!"OrderCreated".equals(header(rec, "type"))) return;
+        JsonNode evt = json.readTree(rec.value());
+        UUID orderId = UUID.fromString(evt.get("orderId").asText());
+        long amount = evt.get("amountCents").asLong();
+
+        // Business change in the SAME transaction as the dedup row.
+        jdbc.update("""
+            INSERT INTO payment_authorization (order_id, amount_cents, status)
+            VALUES (?, ?, 'AUTHORIZED')
+            ON CONFLICT (order_id) DO NOTHING
+            """, orderId, amount);
+        // The reply event (PaymentAuthorized) would be appended to THIS service's outbox here.
+    }
+
+    private static String header(ConsumerRecord&lt;?, ?&gt; rec, String name) {
+        var h = rec.headers().lastHeader(name);
+        if (h == null) throw new IllegalArgumentException("missing header " + name);
+        return new String(h.value(), StandardCharsets.UTF_8);
+    }
+}</code></pre>
+  <p>Note the chain: consumer dedup row + business change + its own outbox row all commit in one local transaction. That one pattern, repeated in every service, is how a choreographed saga achieves effectively-once processing end to end. Configure the listener container's error handler (<code>DefaultErrorHandler</code> with a <code>DeadLetterPublishingRecoverer</code>) so a poison message does not block the partition; Chapter 7 covers retry topics in detail.</p>
+
+  <h3>7.6 Idempotency keys on a public API</h3>
+  <pre data-file="IdempotentOrderController.java"><code class="language-java">package com.example.order;
+
+import org.springframework.dao.DuplicateKeyException;
+import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.web.bind.annotation.*;
+
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.HexFormat;
+import java.util.UUID;
+
+@RestController
+@RequestMapping("/orders")
+public class IdempotentOrderController {
+
+    private final JdbcTemplate jdbc;
+    private final TransactionTemplate tx;
+    private final OrderService orders;
+
+    public IdempotentOrderController(JdbcTemplate jdbc, TransactionTemplate tx, OrderService orders) {
+        this.jdbc = jdbc; this.tx = tx; this.orders = orders;
+    }
+
+    record Stored(String status, String fingerprint, Integer code, String body) {}
+
+    @PostMapping
+    public ResponseEntity&lt;String&gt; create(@RequestHeader("Idempotency-Key") String key,
+                                         @RequestBody String rawBody) throws Exception {
+        String fp = sha256("POST /orders " + rawBody);
+
+        // 1. Claim the key. The PK makes this atomic across all instances.
+        try {
+            jdbc.update("INSERT INTO idempotency_key (key, fingerprint, status) VALUES (?, ?, 'IN_PROGRESS')",
+                    key, fp);
+        } catch (DuplicateKeyException dup) {
+            Stored s = jdbc.queryForObject(
+                "SELECT status, fingerprint, response_code, response_body FROM idempotency_key WHERE key = ?",
+                (rs, i) -&gt; new Stored(rs.getString(1), rs.getString(2),
+                                      (Integer) rs.getObject(3), rs.getString(4)), key);
+            if (!s.fingerprint().equals(fp))
+                return ResponseEntity.unprocessableEntity().body("Idempotency-Key reused with a different request");
+            if ("IN_PROGRESS".equals(s.status()))
+                return ResponseEntity.status(409).body("Request with this key is in progress; retry later");
+            return ResponseEntity.status(s.code()).body(s.body());          // 2. Replay
+        }
+
+        // 3. Execute and record the result atomically with the business change.
+        try {
+            String body = tx.execute(status -&gt; {
+                UUID id = orders.createOrder(parse(rawBody));               // joins this tx
+                String resp = "{\"orderId\":\"" + id + "\"}";
+                jdbc.update("""
+                    UPDATE idempotency_key SET status='COMPLETE', response_code=201, response_body=?
+                     WHERE key=?""", resp, key);
+                return resp;
+            });
+            return ResponseEntity.status(201).body(body);
+        } catch (RuntimeException e) {
+            // Nothing committed: release the key so the client's retry can execute.
+            jdbc.update("DELETE FROM idempotency_key WHERE key = ? AND status = 'IN_PROGRESS'", key);
+            throw e;
+        }
+    }
+
+    private static OrderService.CreateOrder parse(String body) {
+        // Partial: use your ObjectMapper here. Kept minimal to focus on the idempotency flow.
+        throw new UnsupportedOperationException("map JSON to CreateOrder");
+    }
+
+    private static String sha256(String s) throws Exception {
+        return HexFormat.of().formatHex(
+            MessageDigest.getInstance("SHA-256").digest(s.getBytes(StandardCharsets.UTF_8)));
+    }
+}</code></pre>
+  <p>Because the whole operation here is a single local transaction (order + outbox + key completion), there are no "recovery points" to manage: either everything commits or nothing does. When the operation includes an external call (a card network), split it into phases as Stripe describes: record "about to call PSP" with the PSP-side idempotency key you will send, make the call, record the result. A retry that finds the key in phase 2 re-calls the PSP <em>with the same downstream idempotency key</em>, which is safe. A crash that leaves a key stuck in <code>IN_PROGRESS</code> needs a sweeper that resumes or releases stale keys.</p>
+
+  <h3>7.7 Orchestrated saga as a durable workflow (Temporal Java SDK)</h3>
+  <pre data-file="OrderSagaWorkflowImpl.java"><code class="language-java">package com.example.saga;
+
+import io.temporal.activity.ActivityOptions;
+import io.temporal.common.RetryOptions;
+import io.temporal.failure.ActivityFailure;
+import io.temporal.workflow.Saga;
+import io.temporal.workflow.Workflow;
+import io.temporal.workflow.WorkflowInterface;
+import io.temporal.workflow.WorkflowMethod;
+import io.temporal.activity.ActivityInterface;
+
+import java.time.Duration;
+
+@WorkflowInterface
+interface OrderSagaWorkflow {
+    @WorkflowMethod
+    String placeOrder(String orderId, long amountCents);
+}
+
+@ActivityInterface
+interface OrderActivities {
+    void authorizePayment(String orderId, long amountCents);  // compensatable
+    void voidAuthorization(String orderId);                     // compensation
+    void reserveStock(String orderId);                          // compensatable
+    void releaseStock(String orderId);                          // compensation
+    void capturePayment(String orderId);                        // pivot
+    void approveOrder(String orderId);                          // retriable
+    void rejectOrder(String orderId);
+}
+
+public class OrderSagaWorkflowImpl implements OrderSagaWorkflow {
+
+    private final OrderActivities act = Workflow.newActivityStub(OrderActivities.class,
+        ActivityOptions.newBuilder()
+            .setStartToCloseTimeout(Duration.ofSeconds(10))
+            .setRetryOptions(RetryOptions.newBuilder().setMaximumAttempts(5).build())
+            .build());
+
+    @Override
+    public String placeOrder(String orderId, long amountCents) {
+        Saga saga = new Saga(new Saga.Options.Builder().setParallelCompensation(false).build());
+        try {
+            act.authorizePayment(orderId, amountCents);
+            saga.addCompensation(act::voidAuthorization, orderId);
+
+            act.reserveStock(orderId);
+            saga.addCompensation(act::releaseStock, orderId);
+
+            act.capturePayment(orderId);   // pivot: after this, only forward progress
+        } catch (ActivityFailure e) {
+            saga.compensate();             // runs releaseStock, then voidAuthorization
+            act.rejectOrder(orderId);
+            return "REJECTED";
+        }
+        act.approveOrder(orderId);         // retriable step, retried by Temporal until success
+        return "APPROVED";
+    }
+}</code></pre>
+  <p>Temporal persists the workflow's event history, so if the worker JVM dies mid-saga, another worker replays the history and continues from the last completed activity. Activities are still executed at least once, so each activity implementation must be idempotent (use <code>orderId</code> plus step name as the downstream idempotency key). Workflow code must be deterministic: no <code>System.currentTimeMillis()</code>, random UUIDs or direct I/O; use <code>Workflow.currentTimeMillis()</code> and <code>Workflow.randomUUID()</code>. Camunda (BPMN) and Axon (event-sourced sagas) offer comparable orchestration; Spring State Machine is suitable for an in-service state machine whose persistence you manage yourself.</p>
+
+  <h3>7.8 The same idempotent consumer in Python and Go</h3>
+  <div class="code-tabs">
+  <pre data-lang="Python"><code class="language-python"># pip install confluent-kafka psycopg[binary]   (Python 3.11+)
+import json
+import psycopg
+from confluent_kafka import Consumer
+
+CONSUMER = "payment-authorizer"
+
+def header(msg, name: str) -&gt; str:
+    for k, v in (msg.headers() or []):
+        if k == name:
+            return v.decode()
+    raise ValueError(f"missing header {name}")
+
+def main() -&gt; None:
+    c = Consumer({
+        "bootstrap.servers": "localhost:9092",
+        "group.id": "payment-service-py",
+        "enable.auto.commit": False,          # commit only after the DB transaction commits
+        "auto.offset.reset": "earliest",
+    })
+    c.subscribe(["order.events"])
+    with psycopg.connect("dbname=payments user=app") as conn:
+        while True:
+            msg = c.poll(1.0)
+            if msg is None or msg.error():
+                continue
+            mid = header(msg, "id")
+            with conn.transaction():
+                cur = conn.execute(
+                    "INSERT INTO processed_message (consumer, message_id) VALUES (%s, %s) "
+                    "ON CONFLICT DO NOTHING", (CONSUMER, mid))
+                if cur.rowcount == 1 and header(msg, "type") == "OrderCreated":
+                    evt = json.loads(msg.value())
+                    conn.execute(
+                        "INSERT INTO payment_authorization (order_id, amount_cents, status) "
+                        "VALUES (%s, %s, 'AUTHORIZED') ON CONFLICT (order_id) DO NOTHING",
+                        (evt["orderId"], evt["amountCents"]))
+            c.commit(message=msg, asynchronous=False)   # crash before this =&gt; redelivery =&gt; dedup
+
+if __name__ == "__main__":
+    main()</code></pre>
+  <pre data-lang="Go"><code class="language-go">// go get github.com/twmb/franz-go/pkg/kgo github.com/jackc/pgx/v5
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/twmb/franz-go/pkg/kgo"
+)
+
+const consumerName = "payment-authorizer"
+
+func header(r *kgo.Record, name string) string {
+	for _, h := range r.Headers {
+		if h.Key == name {
+			return string(h.Value)
+		}
+	}
+	return ""
+}
+
+func main() {
+	ctx := context.Background()
+	db, err := pgx.Connect(ctx, "postgres://app@localhost/payments")
+	if err != nil {
+		log.Fatal(err)
+	}
+	cl, err := kgo.NewClient(
+		kgo.SeedBrokers("localhost:9092"),
+		kgo.ConsumerGroup("payment-service-go"),
+		kgo.ConsumeTopics("order.events"),
+		kgo.DisableAutoCommit(),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer cl.Close()
+
+	for {
+		fetches := cl.PollFetches(ctx)
+		fetches.EachRecord(func(r *kgo.Record) {
+			err := pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+				tag, err := tx.Exec(ctx,
+					`INSERT INTO processed_message (consumer, message_id) VALUES ($1, $2)
+					 ON CONFLICT DO NOTHING`, consumerName, header(r, "id"))
+				if err != nil || tag.RowsAffected() == 0 || header(r, "type") != "OrderCreated" {
+					return err // duplicate or other event: nothing more to do
+				}
+				var evt struct {
+					OrderID     string `json:"orderId"`
+					AmountCents int64  `json:"amountCents"`
+				}
+				if err := json.Unmarshal(r.Value, &amp;evt); err != nil {
+					return err
+				}
+				_, err = tx.Exec(ctx,
+					`INSERT INTO payment_authorization (order_id, amount_cents, status)
+					 VALUES ($1, $2, 'AUTHORIZED') ON CONFLICT (order_id) DO NOTHING`,
+					evt.OrderID, evt.AmountCents)
+				return err
+			})
+			if err != nil {
+				log.Printf("record %d failed: %v", r.Offset, err) // route to DLQ in real code
+			}
+		})
+		if err := cl.CommitUncommittedOffsets(ctx); err != nil {
+			log.Printf("commit failed: %v", err)
+		}
+	}
+}</code></pre>
+  </div>
+
+  <h3>7.9 A G-Counter CRDT in Go</h3>
+  <pre data-file="gcounter.go"><code class="language-go">package crdt
+
+// GCounter is a grow-only counter. Each replica increments only its own slot.
+// Merge is element-wise max, so merges are commutative, associative and idempotent.
+type GCounter map[string]uint64
+
+func (g GCounter) Inc(replica string, n uint64) { g[replica] += n }
+
+func (g GCounter) Value() (sum uint64) {
+	for _, v := range g {
+		sum += v
+	}
+	return
+}
+
+func (g GCounter) Merge(other GCounter) {
+	for r, v := range other {
+		if v &gt; g[r] {
+			g[r] = v
+		}
+	}
+}
+
+// PNCounter supports decrements with two G-Counters.
+type PNCounter struct{ P, N GCounter }
+
+func NewPN() PNCounter                                 { return PNCounter{GCounter{}, GCounter{}} }
+func (c PNCounter) Inc(r string, n uint64)             { c.P.Inc(r, n) }
+func (c PNCounter) Dec(r string, n uint64)             { c.N.Inc(r, n) }
+func (c PNCounter) Value() int64                       { return int64(c.P.Value()) - int64(c.N.Value()) }
+func (c PNCounter) Merge(o PNCounter)                  { c.P.Merge(o.P); c.N.Merge(o.N) }</code></pre>
+  <p>Try it: two replicas each increment while partitioned, then merge in either order or merge twice; the value is identical every time. Contrast with an LWW counter where the "later" write would discard the other replica's increments.</p>
+</section>
+
+<section id="applications">
+  <h2>8. Applications: How Engineering Teams Use These Patterns</h2>
+  <ul>
+    <li><strong>E-commerce checkout.</strong> Order, payment, inventory and shipping are separate services. An orchestrated saga (often on Temporal or Camunda) runs authorize → reserve → capture → ship, with the order held in a <code>PENDING</code> semantic lock state visible to the customer as "processing". Each step publishes via outbox; each consumer dedupes.</li>
+    <li><strong>Payments and ledgers.</strong> Payment APIs require idempotency keys (Stripe, Adyen and PayPal all document them). Internally, ledgers are append-only with commutative debit/credit entries, so retries and reordering cannot corrupt balances; a unique constraint on <code>(transfer_id, leg)</code> enforces once-only posting.</li>
+    <li><strong>Search and AI indexing.</strong> Debezium streams product-table changes to Kafka; consumers update Elasticsearch/OpenSearch and re-embed changed documents into a vector store. The outbox (or raw CDC) guarantees the index eventually reflects every committed change; idempotent upserts by document id make replays safe. This is the standard way to keep a RAG index fresh (see Part 8).</li>
+    <li><strong>LLM agents calling tools.</strong> An agent framework retries a <code>create_refund</code> tool call after a timeout. Deriving an idempotency key from <code>(conversation_id, step_index)</code> makes the retry harmless. Long-running agent plans are run as durable workflows so a crash does not repeat side-effecting steps.</li>
+    <li><strong>Coordination and metadata.</strong> Kubernetes stores all cluster state in etcd (Raft). Leader election for singleton jobs (Kubernetes <code>Lease</code> objects, Spring Cloud Kubernetes leader election, ShedLock) relies on linearizable compare-and-set.</li>
+    <li><strong>Collaborative and offline-first apps.</strong> Figma, Linear-style issue trackers and note apps use CRDT-like or server-ordered merge designs so concurrent edits converge; multi-region counters (likes, view counts) use PN-counters.</li>
+    <li><strong>Read-your-writes at the edge.</strong> After a user updates their profile, the API returns a version token (e.g., the commit LSN); the next read includes it and the read path either finds a replica caught up to that LSN or falls back to the primary.</li>
+  </ul>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 Stripe: idempotency keys as an API contract <span class="tag fact">Verified</span></h3>
+  <p>Stripe's 2017 engineering post "Designing robust and predictable APIs with idempotency" explains why every mutating request should accept an <code>Idempotency-Key</code>, how clients should retry with exponential backoff and jitter, and how the server stores results for replay. Brandur Leach's companion article "Implementing Stripe-like Idempotency Keys in Postgres" details atomic phases and recovery points on an idempotency-key row, the model followed in section 7.6. Stripe's API reference documents that keys can be pruned after 24 hours. Lesson: idempotency is part of the API contract, not a server implementation detail. Sources: <a href="https://stripe.com/blog/idempotency">stripe.com/blog/idempotency</a>, <a href="https://brandur.org/idempotency-keys">brandur.org/idempotency-keys</a>, <a href="https://docs.stripe.com/api/idempotent_requests">Stripe API: idempotent requests</a>.</p>
+
+  <h3>9.2 Amazon Dynamo: the shopping cart and application-level merge <span class="tag fact">Verified</span></h3>
+  <p>The 2007 SOSP paper describes a store designed so that "add to cart" is always writable, even during failures. Concurrent versions are tracked with vector clocks; on read, divergent siblings are returned and the cart application merges them by union. The paper openly notes the consequence that deleted items can resurface. Lesson: choosing availability forces you to define merge semantics, and the merge you choose becomes visible business behaviour. Source: <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo paper (PDF)</a>.</p>
+
+  <h3>9.3 Kubernetes and etcd: consensus as the control-plane backbone <span class="tag fact">Verified</span></h3>
+  <p>Every Kubernetes object is stored in etcd, a Raft-based key-value store. Controllers rely on etcd's linearizable writes and resource versions (optimistic concurrency) to avoid lost updates. The Kubernetes documentation recommends odd-sized etcd clusters (typically 3 or 5) for the reasons derived in section 6.2. Lesson: you probably already run a consensus system in production; its disk latency is a first-class SLO for your cluster. Sources: <a href="https://etcd.io/docs/">etcd docs</a>, <a href="https://kubernetes.io/docs/tasks/administer-cluster/configure-upgrade-etcd/">Operating etcd clusters for Kubernetes</a>.</p>
+
+  <h3>9.4 Uber and Temporal: durable execution for sagas <span class="tag fact">Verified</span></h3>
+  <p>Uber built Cadence, an open-source workflow engine for long-running, fault-tolerant business processes; its creators later founded Temporal as a fork. Both persist workflow history so that orchestration code survives process crashes and executes compensations reliably. Lesson: an orchestrated saga's coordinator is itself a distributed-systems problem; using a durable-execution engine is usually cheaper than hand-building one. Sources: <a href="https://cadenceworkflow.io/">cadenceworkflow.io</a>, <a href="https://docs.temporal.io/">Temporal documentation</a>.</p>
+
+  <h3>9.5 Jepsen: what databases actually guarantee <span class="tag fact">Verified</span></h3>
+  <p>Kyle Kingsbury's Jepsen analyses test databases under partitions and clock faults and have repeatedly found anomalies that contradicted documented guarantees (published analyses cover MongoDB, etcd, PostgreSQL, Redis-Raft and many others). Lesson: verify the consistency model you depend on under the exact configuration you run, and read the Jepsen consistency-model map when reasoning about guarantees. Sources: <a href="https://jepsen.io/analyses">jepsen.io/analyses</a>, <a href="https://jepsen.io/consistency">jepsen.io/consistency</a>.</p>
+
+  <h3>9.6 Debezium outbox in practice <span class="tag fact">Verified</span></h3>
+  <p>The Debezium project documents the outbox pattern and ships the Outbox Event Router SMT used in section 7.4; its blog post "Reliable Microservices Data Exchange With the Outbox Pattern" (2019) walks through an order/shipment example with the same column conventions. Source: <a href="https://debezium.io/blog/2019/02/19/reliable-microservices-data-exchange-with-the-outbox-pattern/">Debezium blog</a>, <a href="https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html">Outbox Event Router docs</a>.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages, Limitations and Operational Cost</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Technique</th><th>Advantages</th><th>Limitations</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>Linearizable store (etcd, ZooKeeper, Spanner)</td><td>Simplest mental model; safe for locks, elections, uniqueness</td><td>Quorum latency on every write; minority partitions unavailable; small data sizes for etcd/ZooKeeper</td><td>Disk-latency-sensitive; needs careful sizing, backups and odd member counts</td></tr>
+      <tr><td>2PC / XA</td><td>Atomic across heterogeneous resources; familiar JTA API</td><td>Blocking; locks across round trips; few cloud resources support XA</td><td>In-doubt transaction recovery, heuristic outcomes, transaction-manager logs</td></tr>
+      <tr><td>Saga (orchestrated)</td><td>No distributed locks; explicit, testable flow; handles long-running and human steps</td><td>No isolation; compensations must be designed; not every action is reversible</td><td>Workflow engine to run and upgrade; versioning of in-flight workflows</td></tr>
+      <tr><td>Saga (choreographed)</td><td>Loose coupling; no central component</td><td>Flow is implicit; cyclic dependencies; hard to answer "status of X"</td><td>Distributed tracing is mandatory to debug</td></tr>
+      <tr><td>Outbox + polling</td><td>No extra infrastructure; any SQL DB</td><td>Polling latency and DB load; ordering across instances needs care</td><td>Table cleanup; relay leader election</td></tr>
+      <tr><td>Outbox + CDC (Debezium)</td><td>Low latency, commit-ordered, no polling</td><td>More moving parts; DB replication privileges</td><td>Kafka Connect cluster; replication-slot lag can fill disk</td></tr>
+      <tr><td>Idempotency keys / inbox</td><td>Turns at-least-once into effectively-once; safe client retries</td><td>Storage growth; key scope and expiry must be designed</td><td>Partitioned dedup tables; sweeper for stuck keys</td></tr>
+      <tr><td>LWW</td><td>Trivial, convergent</td><td>Silently loses concurrent writes; clock skew</td><td>Low</td></tr>
+      <tr><td>Vector clocks + siblings</td><td>Never loses concurrent writes</td><td>Application must merge; vector growth with many writers</td><td>Sibling explosion monitoring</td></tr>
+      <tr><td>CRDTs</td><td>Automatic convergence; offline-friendly</td><td>Limited data types; metadata overhead (tombstones); cannot enforce global invariants such as "balance &#8805; 0"</td><td>Garbage collection of tombstones</td></tr>
+    </tbody>
+  </table></div>
+  <p>A crucial limit to internalise: <strong>no eventually consistent technique can enforce a global invariant that requires coordination</strong> (uniqueness of a username, "never oversell the last item", "balance never negative"). The CALM theorem (Hellerstein and Alvaro) formalises this: only monotonic logic is coordination-free. Invariants like these need a single owner, a reservation/escrow scheme, or consensus.</p>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs: Choosing a Mechanism</h2>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A[Business operation spans multiple data stores?] -->|No| B["Single local ACID transaction (prefer this)"]
+  A -->|Yes| C{Can you move the data under one owner?}
+  C -->|Yes| B
+  C -->|No| D{All participants in one DB product that supports distributed tx?}
+  D -->|"Yes (e.g. CockroachDB, Spanner)"| E[Use the database's distributed transactions]
+  D -->|No| F{Needs atomic visibility, no intermediate states?}
+  F -->|Yes| G["Rethink boundaries, or use reservation with semantic lock"]
+  F -->|No| H{Steps more than 3, branching, timeouts or humans?}
+  H -->|Yes| I["Orchestrated saga on a workflow engine"]
+  H -->|No| J["Choreographed saga"]
+  I --> K["Every step: outbox out, idempotent consumer in"]
+  J --> K
+</pre>
+  <figcaption>Figure 6.9 — Decision flow for cross-boundary consistency.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the first two questions eliminate most distributed transactions: the cheapest saga is the one you avoid by drawing service boundaries around transactional consistency needs. If you truly need atomic visibility across owners, a saga will not give it to you; you either change the design (semantic lock makes intermediate states explicit) or use a database that implements distributed transactions internally. Regardless of saga style, every hop uses outbox plus idempotent consumer.</p>
+
+  <div class="table-wrap"><table>
+    <thead><tr><th>Decision</th><th>Choose A when…</th><th>Choose B when…</th></tr></thead>
+    <tbody>
+      <tr><td>Polling outbox vs CDC</td><td>Low/moderate volume, small team, no Kafka Connect, latency of 100s of ms is fine</td><td>High volume, strict per-aggregate ordering, platform team already runs Connect</td></tr>
+      <tr><td>Orchestration vs choreography</td><td>Complex, evolving process; need status queries and timeouts</td><td>Simple, stable fan-out where producers should not know consumers</td></tr>
+      <tr><td>Strong vs eventual reads</td><td>User just wrote; money; inventory decisions</td><td>Feeds, analytics, recommendations, search</td></tr>
+      <tr><td>Conflict avoidance vs resolution</td><td>Data with invariants (money, stock): give each key a home region or leader</td><td>Collaborative/offline data with natural merges</td></tr>
+      <tr><td>Dedup table vs natural idempotency</td><td>Side effects are not naturally idempotent (increment, send email)</td><td>Upserts by business key, state transitions guarded by current state</td></tr>
+      <tr><td>Temporal vs Camunda vs hand-rolled</td><td>Temporal: code-first, developer-owned workflows</td><td>Camunda: BPMN models shared with business analysts; hand-rolled state machine only for 2–3-step flows</td></tr>
+    </tbody>
+  </table></div>
+  <p><span class="tag opinion">Opinion</span> Start every new system as a modular monolith with one database (Chapter 8), put an outbox in from day one for events other systems need, and introduce sagas only when a module is actually extracted. Teams that start with sagas everywhere pay the distributed-systems tax long before they have the scale that justifies it.</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Production Failures</h2>
+  <ol>
+    <li><strong>Dual writes.</strong> Saving to the database and publishing to Kafka in the same method, with or without <code>@Transactional</code>. Fix: outbox.</li>
+    <li><strong>Assuming Kafka transactions cover the database.</strong> Kafka's transactional producer is atomic across Kafka partitions only. <code>ChainedKafkaTransactionManager</code> (deprecated) was best-effort, not atomic. Fix: outbox for DB→Kafka; idempotent consumer for Kafka→DB.</li>
+    <li><strong>Dedup check outside the transaction.</strong> <code>if (!repo.existsById(msgId)) { process(); repo.save(msgId); }</code> has a race between check and insert, and a crash after process before save duplicates the side effect. Fix: insert-first with a unique constraint, in the same transaction as the side effect.</li>
+    <li><strong>Compensations that are not idempotent or not commutative.</strong> A <code>refund</code> compensation retried three times refunds three times; a compensation arriving before the action it undoes (reordering) does nothing and the action later succeeds. Fix: idempotent compensations keyed by saga id, and record "cancelled" so a late action is rejected (version-file countermeasure).</li>
+    <li><strong>Forgetting that sagas lack isolation.</strong> Reporting queries count orders that will be compensated; a second saga reads a temporarily reduced credit limit. Fix: semantic locks (<code>PENDING</code> states) and filter them out of reads that need committed facts.</li>
+    <li><strong>Using LWW with wall clocks for money or counters.</strong> Concurrent increments disappear. Fix: commutative deltas, PN-counters, or a single writer.</li>
+    <li><strong>Even-sized or two-node consensus clusters.</strong> Two nodes tolerate zero failures; four tolerate one, like three, but are slower. Fix: 3 or 5 members across failure domains.</li>
+    <li><strong>Treating ZooKeeper/etcd follower reads as linearizable.</strong> Fix: <code>sync()</code> before read in ZooKeeper; default linearizable reads in etcd; understand your client library's defaults.</li>
+    <li><strong>Unbounded outbox and dedup tables.</strong> The polling query slows, vacuum struggles. Fix: partial index on unpublished rows, partition by day, drop old partitions.</li>
+    <li><strong>Debezium replication slot left behind.</strong> A stopped connector keeps its PostgreSQL slot, which retains WAL until the disk fills and the primary goes down. Fix: alert on <code>pg_replication_slots</code> retained WAL; drop abandoned slots; consider <code>max_slot_wal_keep_size</code>.</li>
+    <li><strong>Idempotency key scope errors.</strong> Keys scoped globally instead of per tenant/account (one customer's key can collide with or reveal another's response), or reused across different endpoints. Fix: primary key on <code>(account_id, key)</code> and request fingerprinting.</li>
+    <li><strong>Using a distributed lock as a substitute for idempotency.</strong> Locks expire under GC pauses and partitions; two holders happen. Fix: fencing tokens or idempotent, conditional writes (Chapter 8 covers this deeply).</li>
+  </ol>
+  <div class="callout danger"><p class="callout-title">Production failure pattern</p><p><span class="tag illus">Illustrative</span> A team wraps <code>orderRepository.save()</code> and <code>kafkaTemplate.send()</code> in <code>@Transactional</code>. During a database failover, commits fail after sends succeed. Downstream services ship 300 orders that do not exist. Reconciliation takes days. The same incident with an outbox would have produced zero phantom events, because unsent events and uncommitted orders are the same row set.</p></div>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Performance</h3>
+  <ul>
+    <li>Batch outbox publishing (hundreds of rows per poll, pipelined sends), and keep the outbox table small so the partial index stays in memory.</li>
+    <li>Dedup inserts add one indexed write per message. Use <code>ON CONFLICT DO NOTHING</code> rather than exceptions on hot paths (exceptions inside a PostgreSQL transaction abort the transaction unless you use savepoints).</li>
+    <li>For consensus stores, put the WAL on low-latency SSDs; etcd's documentation stresses fsync latency as the dominant factor in leader stability.</li>
+  </ul>
+  <h3>13.2 Security</h3>
+  <ul>
+    <li>Outbox payloads end up in Kafka and often in data lakes: do not put secrets or unnecessary PII in events; encrypt sensitive fields or reference them by id.</li>
+    <li>Debezium needs replication privileges: create a dedicated least-privilege user and restrict the publication to the outbox table.</li>
+    <li>Idempotency-key replay must check that the caller is the same principal that created the key; otherwise a leaked key exposes another user's response.</li>
+  </ul>
+  <h3>13.3 Monitoring</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Signal</th><th>Why</th><th>Alert idea</th></tr></thead>
+    <tbody>
+      <tr><td>Outbox age of oldest unpublished row</td><td>Relay stalled or slow</td><td>&gt; 60 s for 5 min</td></tr>
+      <tr><td>Debezium <code>MilliSecondsBehindSource</code>, replication slot retained WAL</td><td>CDC lag, disk risk</td><td>Retained WAL &gt; 20% of disk</td></tr>
+      <tr><td>Duplicate-skip rate in consumers</td><td>Spikes indicate rebalances, relay restarts or bugs</td><td>Baseline deviation</td></tr>
+      <tr><td>Sagas in non-terminal state older than SLA</td><td>Stuck workflows, failed compensations</td><td>Count &gt; 0 for critical sagas</td></tr>
+      <tr><td>Compensation rate</td><td>Business health (stock-outs, payment declines) and bugs</td><td>Sudden increase</td></tr>
+      <tr><td>Raft leader changes, proposal failures, fsync p99</td><td>Consensus instability</td><td>&gt; N leader changes per hour</td></tr>
+      <tr><td>Idempotency keys stuck IN_PROGRESS</td><td>Crashed requests</td><td>Age &gt; 5 min</td></tr>
+    </tbody>
+  </table></div>
+  <h3>13.4 Reliability and maintainability</h3>
+  <ul>
+    <li>Version event schemas (Schema Registry, Chapter 7) because outbox events outlive code deployments.</li>
+    <li>Workflow engines need a strategy for changing in-flight workflow code (Temporal's versioning/patching APIs).</li>
+    <li>Build an operator tool to inspect and manually advance or compensate stuck sagas; you will need it at 3 a.m.</li>
+    <li>Run periodic reconciliation jobs that compare source-of-truth tables across services (e.g., captured payments vs shipped orders). Reconciliation is the safety net for every pattern in this chapter.</li>
+  </ul>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>For each scenario, name the weakest consistency model that is still acceptable, and say how you would implement it on PostgreSQL with async read replicas: (a) user edits their display name and reloads the page; (b) a public "trending products" list; (c) reserving a unique username; (d) a comment thread where replies must never appear before the comment they reply to.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>(a) Read-your-writes: route this user's reads to the primary for a window after a write, or pass the commit LSN and read from a replica only if <code>pg_last_wal_replay_lsn()</code> ≥ LSN. (b) Eventual consistency with a staleness budget: any replica, even a cache. (c) Linearizable: a unique constraint on the primary (single-writer) is enough; across regions you need one home region or a consensus store. (d) Causal consistency: simplest is to store reply and parent in the same partition/primary and read the thread from one replica in one snapshot; a lagging replica then shows neither or both, never only the reply.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>A 5-node Raft cluster is split into partitions {A, B} and {C, D, E}. A was leader in term 4. Describe what happens to writes sent to A, what happens in {C, D, E}, and what happens when the partition heals. What changes if the split is {A, B, C} and {D, E}?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>A cannot replicate to a majority (needs 3), so writes sent to A are appended to its log but never committed; clients time out. With CheckQuorum, A steps down. In {C, D, E} a follower times out, starts term 5, wins 3 votes, and serves writes. On healing, A and B see term 5, step down, and their uncommitted term-4 entries are overwritten by the new leader's log via the AppendEntries consistency check. In the {A, B, C}/{D, E} split, A keeps leadership (it has a majority), writes continue, and D, E cannot elect a leader (only 2 votes); with PreVote they do not even bump their terms, avoiding a disruptive election on heal.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>Design the saga for "book trip": reserve flight, reserve hotel, charge card, issue tickets, email itinerary. Classify each step as compensatable, pivot, or retriable; define compensations; and specify which semantic locks you need.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Compensatable: reserve flight (cancel hold), reserve hotel (cancel hold). Pivot: charge card (after success, commit to completion). Retriable: issue tickets (retry with idempotency key until success; if the airline truly cannot issue, this becomes a business exception handled by refund and manual workflow), email itinerary. Order: holds first (cheap, reversible), then charge, then issue. Semantic locks: trip <code>PENDING</code> visible as "booking in progress"; flight seat and hotel room in <code>HELD</code> state with expiry so abandoned sagas release inventory automatically. Each step uses a key <code>tripId:stepName</code> for downstream idempotency.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>Your polling outbox relay runs on 4 pods with <code>FOR UPDATE SKIP LOCKED</code>. Consumers report that <code>OrderCancelled</code> sometimes arrives before <code>OrderCreated</code> for the same order. Explain the race precisely and give three fixes with their trade-offs.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Pod 1 locks a batch containing <code>OrderCreated</code>; pod 2's query skips those locked rows and picks the next unlocked rows, including <code>OrderCancelled</code>. Pod 2 sends first. Both have the same key so they land in the same partition, but in the wrong order. Fixes: (1) single active relay via leader election (simple; throughput limited to one pod, failover delay). (2) Shard relays by <code>hash(aggregateid) mod 4</code> with a <code>WHERE</code> clause so each aggregate is owned by one pod (scales; needs rebalancing on pod count changes). (3) Switch to Debezium CDC, which reads the WAL in commit order (best ordering; more infrastructure). Additionally make consumers tolerant: keep a per-aggregate version and park out-of-order events (version-file countermeasure).</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>Implement an OR-Set in Java or Go supporting <code>add</code>, <code>remove</code>, <code>contains</code>, <code>merge</code>. Show that a concurrent add and remove of the same element on two replicas converges to "present" after merging in either order.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-java">import java.util.*;
+
+public final class OrSet&lt;E&gt; {
+    private final String replica;
+    private long counter;
+    private final Map&lt;E, Set&lt;String&gt;&gt; adds = new HashMap&lt;&gt;();     // element -&gt; live tags
+    private final Map&lt;E, Set&lt;String&gt;&gt; removes = new HashMap&lt;&gt;();  // element -&gt; tombstoned tags
+
+    public OrSet(String replica) { this.replica = replica; }
+
+    public void add(E e) {
+        adds.computeIfAbsent(e, k -&gt; new HashSet&lt;&gt;()).add(replica + ":" + (++counter));
+    }
+    public void remove(E e) {   // removes only tags observed locally
+        Set&lt;String&gt; seen = adds.getOrDefault(e, Set.of());
+        removes.computeIfAbsent(e, k -&gt; new HashSet&lt;&gt;()).addAll(seen);
+    }
+    public boolean contains(E e) {
+        Set&lt;String&gt; live = new HashSet&lt;&gt;(adds.getOrDefault(e, Set.of()));
+        live.removeAll(removes.getOrDefault(e, Set.of()));
+        return !live.isEmpty();
+    }
+    public void merge(OrSet&lt;E&gt; other) {
+        other.adds.forEach((e, t) -&gt; adds.computeIfAbsent(e, k -&gt; new HashSet&lt;&gt;()).addAll(t));
+        other.removes.forEach((e, t) -&gt; removes.computeIfAbsent(e, k -&gt; new HashSet&lt;&gt;()).addAll(t));
+    }
+}</code></pre>
+      <p>Scenario: both replicas start with "milk" tagged <code>A:1</code>. Replica B removes milk (tombstones <code>A:1</code>); concurrently replica A adds milk again (new tag <code>A:2</code>). After merge in either order, live tags = {A:1, A:2} − {A:1} = {A:2}, so milk is present: add wins. Union is commutative, associative and idempotent, so merge order and duplication do not matter. Production implementations compact tombstones using causal context (dotted version vectors).</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain the difference between linearizability and serializability.</summary><div><p>Serializability is a transaction isolation property: the outcome of concurrent multi-object transactions equals some serial order, which need not match real time. Linearizability is a single-object recency property: each operation appears atomic at an instant within its real-time interval, so once a write completes everyone sees it. A system can be serializable but serve stale snapshots (not linearizable), or linearizable per key without multi-key transactions. Strict serializability combines both (Spanner).</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> State CAP precisely and give two common misreadings.</summary><div><p>In a system subject to network partitions, a replicated register cannot be both linearizable and available (every non-failed node responds) during a partition. Misreadings: "pick any two of three" (partitions are not optional; the choice is only during a partition), and "product X is CP" (consistency is per operation and configuration). Also CAP's availability is not the same as an SLO's availability, and CAP says nothing about latency, which PACELC adds.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Why do microservice architectures avoid 2PC/XA, and what do they use instead?</summary><div><p>2PC blocks participants holding locks if the coordinator fails, couples the availability of all participants, holds locks across network round trips, and most cloud-native resources (Kafka, many managed or NoSQL databases, HTTP APIs) cannot participate. Instead: local ACID transactions per service, transactional outbox for reliable publishing, idempotent consumers, and sagas with compensations for multi-step processes, accepting eventual consistency and designing countermeasures for the lack of isolation.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Choreography or orchestration for a 7-step loan-origination saga with a manual underwriting step?</summary><div><p>Orchestration, ideally on a durable workflow engine (Temporal, Camunda). Seven steps, a human task with timeouts and escalations, and a need to answer "where is application X" all favour an explicit, centrally persisted state machine. Choreography would scatter the flow across services and make timeouts and status queries painful. Each participant still uses outbox/inbox; the orchestrator issues idempotent commands keyed by application id and step.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Write the core of an idempotent Kafka consumer that updates PostgreSQL.</summary><div><p>Inside one DB transaction: <code>INSERT INTO processed_message(consumer, message_id) VALUES (?, ?) ON CONFLICT DO NOTHING</code>; if 0 rows were inserted, return (duplicate); otherwise apply the business change; commit; then commit the Kafka offset. Crash before DB commit: redelivery reprocesses cleanly. Crash after DB commit but before offset commit: redelivery hits the dedup row and is skipped. See section 7.5.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> A client times out calling POST /payments and retries. How do you guarantee the customer is charged once?</summary><div><p>Require an <code>Idempotency-Key</code>. The server claims the key atomically (unique constraint), fingerprints the request, executes, stores the response, and replays it on retries; it returns 409 for concurrent in-progress duplicates and 422 for key reuse with different parameters. Calls to the card network carry a deterministic downstream idempotency key so that a resumed attempt does not double-charge. Keys are scoped per account and expire after a documented period.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Does Kafka provide exactly-once delivery?</summary><div><p>No transport provides exactly-once delivery over an unreliable network. Kafka provides an idempotent producer (no duplicates from producer retries per partition) and transactions that atomically commit produced records and consumer offsets, giving effectively-once processing for read-process-write pipelines entirely within Kafka with <code>read_committed</code> consumers. Side effects outside Kafka still need idempotency.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Your Debezium-based outbox stopped publishing and the database disk is filling. What happened and what do you do?</summary><div><p>The connector stopped consuming (crash, misconfiguration, Connect cluster down), but its PostgreSQL logical replication slot still exists, so the server retains all WAL since the slot's confirmed position. Immediate: restart the connector or, if abandoned, drop the slot (accepting a re-snapshot or gap). Longer term: alert on retained WAL per slot, set <code>max_slot_wal_keep_size</code>, use heartbeats for low-traffic databases, and run Connect with HA.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How would you design a "likes" counter that is writable in three regions during a network partition?</summary><div><p>A PN-counter CRDT (or simply a per-region G-counter if unlikes are tracked separately): each region increments its own slot; regions exchange state asynchronously and merge with element-wise max; the displayed count is the sum. It is always writable and converges. It cannot enforce invariants like "at most one like per user"; enforce that per user in the user's home region with a unique constraint, and treat the counter as a derived aggregate.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> Tell me about a time you had to fix a data inconsistency across services.</summary><div><p>Strong answers follow a structure: the symptom (e.g., orders paid but not shipped), how you detected it (reconciliation job, customer reports), root cause (dual write, non-idempotent consumer, missing compensation), the immediate remediation (scripted repair, replaying events), and the systemic fix (outbox, dedup table, reconciliation alerts), plus what you changed in review checklists so the class of bug does not recur.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>"Consistency" means ACID invariants or replica-read guarantees; always say which. Consistency models range from linearizable to eventual, with causal and session guarantees as practical middle ground.</li>
+    <li>CAP: during a partition, choose linearizability or availability. PACELC: otherwise, choose latency or consistency. Classify operations, not products.</li>
+    <li>Raft elects a leader per term by majority vote with an up-to-date-log restriction, and commits entries once a majority stores them; \( N = 2f+1 \).</li>
+    <li>2PC is atomic but blocking; XA is avoided across microservices. Sagas trade isolation for availability and need compensations and semantic locks.</li>
+    <li>The transactional outbox removes dual writes; relays are polling or CDC; everything downstream is at-least-once, so consumers must be idempotent.</li>
+    <li>Exactly-once is effectively-once: at-least-once delivery plus idempotent or transactional processing.</li>
+    <li>Concurrent writes need a resolution policy: LWW loses data, vector clocks detect concurrency, CRDTs converge automatically but cannot enforce global invariants.</li>
+  </ul>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">A user updates their avatar and immediately sees the old one after refreshing. Which guarantee is violated?</p>
+    <ol>
+      <li data-k="a">Monotonic writes</li>
+      <li data-k="b">Linearizability only</li>
+      <li data-k="c">Read-your-writes</li>
+      <li data-k="d">Causal consistency for other users</li>
+    </ol>
+    <div class="explain">Read-your-writes is the session guarantee that a client sees its own prior writes. Linearizability would also prevent it, but the specific, weaker guarantee violated is read-your-writes.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">With N=5 replicas, which (W, R) configuration guarantees every read quorum overlaps every write quorum while tolerating the most write-side failures?</p>
+    <ol>
+      <li data-k="a">W=2, R=3</li>
+      <li data-k="b">W=3, R=3</li>
+      <li data-k="c">W=5, R=1</li>
+      <li data-k="d">W=1, R=4</li>
+    </ol>
+    <div class="explain">Overlap requires W+R&gt;N=5. (a) 5 is not &gt; 5 and (d) 5 is not &gt; 5. (c) overlaps but any single failure blocks writes. (b) overlaps and tolerates two failures for both reads and writes.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">Why is two-phase commit called a blocking protocol?</p>
+    <ol>
+      <li data-k="a">The coordinator locks all tables in the database</li>
+      <li data-k="b">Participants cannot vote NO once prepared</li>
+      <li data-k="c">It requires synchronous clocks</li>
+      <li data-k="d">A participant that voted YES must wait for the coordinator's decision, holding locks, if the coordinator fails</li>
+    </ol>
+    <div class="explain">After voting YES a participant is in doubt; it may neither commit nor abort unilaterally, so it blocks until the coordinator recovers.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">Which step should be the pivot transaction in an order saga: reserve stock, authorize payment, capture payment, send email?</p>
+    <ol>
+      <li data-k="a">Capture payment</li>
+      <li data-k="b">Reserve stock</li>
+      <li data-k="c">Send email</li>
+      <li data-k="d">Authorize payment</li>
+    </ol>
+    <div class="explain">Reservations and authorizations are cheaply compensatable; email is retriable. Capturing payment is the commit point after which the saga runs to completion.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Your consumer checks <code>existsById(messageId)</code>, processes, then saves the id, all in one transaction. What can still go wrong?</p>
+    <ol>
+      <li data-k="a">Nothing: the transaction makes it atomic</li>
+      <li data-k="b">The Kafka offset commit makes duplicates impossible</li>
+      <li data-k="c">Two concurrent deliveries can both pass the existence check before either inserts</li>
+      <li data-k="d">The outbox relay loses messages</li>
+    </ol>
+    <div class="explain">Check-then-act races under READ COMMITTED. Insert-first with a unique constraint (or ON CONFLICT DO NOTHING) makes the database arbitrate.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">Which invariant can a CRDT-based, coordination-free design NOT enforce?</p>
+    <ol>
+      <li data-k="a">The like count equals the number of like events</li>
+      <li data-k="b">An account balance never goes below zero across concurrent withdrawals in different regions</li>
+      <li data-k="c">A set contains every element added and not later removed</li>
+      <li data-k="d">All replicas converge after messages stop</li>
+    </ol>
+    <div class="explain">Non-negative balance under concurrent decrements requires coordination (non-monotonic invariant, CALM). The others are exactly what CRDTs provide.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, O'Reilly, 2017 — ch. 5 (replication), 7 (transactions), 9 (consistency and consensus).</li>
+    <li><span class="ref-kind">Book</span> Chris Richardson, <em>Microservices Patterns</em>, Manning, 2018 — ch. 3–4 (messaging, sagas, countermeasures).</li>
+    <li><span class="ref-kind">Paper</span> <a href="https://raft.github.io/raft.pdf">Ongaro &amp; Ousterhout, "In Search of an Understandable Consensus Algorithm" (Raft)</a>; visualisation at <a href="https://raft.github.io/">raft.github.io</a>.</li>
+    <li><span class="ref-kind">Paper</span> <a href="https://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf">Garcia-Molina &amp; Salem, "Sagas" (1987)</a>.</li>
+    <li><span class="ref-kind">Paper</span> <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">DeCandia et al., "Dynamo: Amazon's Highly Available Key-value Store" (2007)</a>.</li>
+    <li><span class="ref-kind">Paper</span> <a href="https://inria.hal.science/inria-00609399">Shapiro et al., "Conflict-free Replicated Data Types" (2011)</a>.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://www.infoq.com/articles/cap-twelve-years-later-how-the-rules-have-changed/">Eric Brewer, "CAP Twelve Years Later: How the Rules Have Changed"</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://jepsen.io/consistency">Jepsen: consistency models map</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://microservices.io/patterns/data/saga.html">microservices.io: Saga</a> and <a href="https://microservices.io/patterns/data/transactional-outbox.html">Transactional Outbox</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html">Debezium Outbox Event Router</a>.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://www.morling.dev/blog/revisiting-the-outbox-pattern/">Gunnar Morling, "Revisiting the Outbox Pattern"</a>.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://stripe.com/blog/idempotency">Stripe, "Designing robust and predictable APIs with idempotency"</a>; <a href="https://brandur.org/idempotency-keys">Brandur Leach, "Implementing Stripe-like Idempotency Keys in Postgres"</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.temporal.io/">Temporal documentation</a> (sagas, durable execution, versioning).</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://etcd.io/docs/">etcd documentation</a> (Raft, linearizable reads, tuning).</li>
+  </ul>
+  <p>Continue with <a href="p2-07-kafka-event-driven.html">Chapter 7: Kafka Internals, Message Queues &amp; Event-Driven Architecture</a>, which takes the messaging half of this chapter to full depth, and <a href="p2-08-microservices-resilience.html">Chapter 8</a> for distributed locks and fencing tokens.</p>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

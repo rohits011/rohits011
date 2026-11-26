@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI-Era Software Engineering — An Interactive Textbook</title>
+<meta name="description" content="A deep, interactive textbook that takes an experienced Java/Spring Boot engineer through system design, DSA, Python, Go, ML, deep learning, LLM engineering, data, MLOps, security and cloud-native engineering.">
+<link rel="stylesheet" href="assets/css/book.css">
+<script src="assets/js/theme-init.js"></script>
+</head>
+<body data-page="home" data-root=".">
+<article class="page" id="content">
+
+<header class="hero">
+  <p class="eyebrow">An interactive textbook · 2026 edition</p>
+  <h1>AI-Era Software Engineering</h1>
+  <p class="lede">From experienced Java &amp; Spring Boot backend engineer to an engineer who can design, build, scale, secure and operate AI-powered distributed systems. Built as a textbook rather than a reading list: fundamentals first, internals next, then production practice. Diagrams, runnable code, interactive simulations, exercises and interview preparation in every chapter.</p>
+  <div class="hero-actions">
+    <a class="btn" href="chapters/roadmap.html">Start with the 12-month roadmap</a>
+    <a class="btn secondary" href="chapters/p2-01-system-design-foundations.html">Jump to System Design</a>
+    <span id="continue"></span>
+  </div>
+  <div class="stat-row" id="book-stats"></div>
+</header>
+
+<section id="parts">
+  <h2>The thirteen parts</h2>
+  <p>Parts marked <strong>★ priority</strong> carry the most weight for a senior backend engineer moving into AI-era work. The roadmap sequences them for a 10–15 hour week.</p>
+  <div class="parts-grid" id="parts-grid"></div>
+</section>
+
+<section id="who">
+  <h2>Who this book is for</h2>
+  <p>You have around five years of professional backend experience, mostly Java and Spring Boot, and you can read and write Python and Go. You do not need another explanation of loops, classes, REST controllers or JPA repositories. You do need:</p>
+  <ul>
+    <li>the distributed-systems depth to defend an architecture under senior-level scrutiny;</li>
+    <li>fluent DSA for interviews that still gate senior roles;</li>
+    <li>Python and Go at production level, not tutorial level;</li>
+    <li>enough mathematics, ML and deep learning to reason about models instead of treating them as magic;</li>
+    <li>the engineering discipline to ship LLM, RAG and agent systems that are evaluated, observable, secure and affordable;</li>
+    <li>the data, MLOps, security and cloud-native foundations those systems stand on.</li>
+  </ul>
+  <p>Every chapter opens with a <strong>Java bridge</strong> box: what you already know from Spring, why it is not enough, the modern approach, where Python and Go fit, how it looks in production, and when <em>not</em> to use it.</p>
+</section>
+
+<section id="anatomy">
+  <h2>How every chapter is built</h2>
+  <p>Each chapter follows the same seventeen-step structure, so you always know where to look:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>#</th><th>Section</th><th>What you get</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Introduction</td><td>What it is, why it exists, the Java bridge</td></tr>
+      <tr><td>2</td><td>Historical context</td><td>How the idea evolved and why it matters now</td></tr>
+      <tr><td>3</td><td>Core fundamentals</td><td>Every underlying concept, one subtopic at a time</td></tr>
+      <tr><td>4</td><td>Internal working</td><td>Step-by-step mechanics</td></tr>
+      <tr><td>5</td><td>Architecture &amp; visualisations</td><td>Mermaid diagrams and interactive simulations, each explained</td></tr>
+      <tr><td>6</td><td>Mathematics</td><td>Intuition first, then formal notation and worked numbers</td></tr>
+      <tr><td>7</td><td>Code</td><td>Runnable Java/Spring, Python and Go, side by side</td></tr>
+      <tr><td>8</td><td>Real-world applications</td><td>How engineering teams use it</td></tr>
+      <tr><td>9</td><td>Industry case studies</td><td>Verifiable sources: engineering blogs, papers, docs</td></tr>
+      <tr><td>10</td><td>Advantages &amp; limitations</td><td>Benefits, costs, operational burden</td></tr>
+      <tr><td>11</td><td>Engineering trade-offs</td><td>Why one design over another</td></tr>
+      <tr><td>12</td><td>Common mistakes</td><td>Misconceptions and production failure modes</td></tr>
+      <tr><td>13</td><td>Production considerations</td><td>Performance, security, scale, monitoring, reliability</td></tr>
+      <tr><td>14</td><td>Practical exercises</td><td>Graded exercises with worked solutions</td></tr>
+      <tr><td>15</td><td>Interview preparation</td><td>Conceptual, architectural, coding and scenario Q&amp;A</td></tr>
+      <tr><td>16</td><td>Knowledge check</td><td>Key takeaways plus a scored quiz</td></tr>
+      <tr><td>17</td><td>Further reading</td><td>Books, docs, papers and courses</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="legend">
+  <h2>Reading conventions</h2>
+  <div class="legend-grid">
+    <div><span class="tag fact">Verified</span> The claim is backed by the cited source.</div>
+    <div><span class="tag illus">Illustrative</span> Numbers or scenarios made up for teaching. Do not quote them as facts.</div>
+    <div><span class="tag opinion">Opinion</span> Engineering judgement. Reasonable people disagree.</div>
+    <div><span class="tag version">Version-sensitive</span> True at the date shown. Re-check before relying on it.</div>
+  </div>
+  <p style="margin-top:1rem">Press <kbd>/</kbd> or <kbd>Ctrl</kbd>+<kbd>K</kbd> anywhere to search every chapter. Progress, quiz answers and bookmarks are stored in your browser only.</p>
+</section>
+
+<section id="your-bookmarks">
+  <h2>Your bookmarks</h2>
+  <div id="bookmarks"></div>
+</section>
+
+<section id="offline">
+  <h2>Using the book offline and as a PDF</h2>
+  <p>The book is plain HTML, CSS and JavaScript. Open <code>index.html</code> directly from disk, or serve the folder with any static server (<code>python3 -m http.server</code>). Syntax highlighting, diagrams and maths are loaded from public CDNs the first time. Without network access the text, code and interactive widgets still work, and diagrams fall back to their source.</p>
+  <p>To export a chapter as a PDF, use <em>Print / PDF</em> at the top of the chapter (or your browser's print dialog) and choose “Save as PDF”. Navigation is hidden, and every solution and answer is expanded for print.</p>
+</section>
+
+</article>
+<script src="assets/js/toc.js"></script>
+<script src="assets/js/widgets.js"></script>
+<script src="assets/js/book.js"></script>
+</body>
+</html>

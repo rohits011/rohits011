@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CI/CD, GitOps, Infrastructure as Code &amp; Terraform — AI-Era Software Engineering</title>
+<meta name="description" content="Continuous integration and delivery pipelines, progressive delivery with Argo Rollouts and feature flags, GitOps with Argo CD and Flux, and infrastructure as code with Terraform and OpenTofu — state, modules, testing and drift.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p12-03-cicd-gitops-terraform" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 12 · Chapter 3</p>
+  <h1>CI/CD, GitOps, Infrastructure as Code &amp; Terraform</h1>
+  <p class="lede">A container image and a Helm chart are only useful if a trustworthy, automated path takes a commit to production — and if the cloud resources underneath are just as reproducible as the code. This chapter builds that path for the Lumen platform: GitHub Actions pipelines that test, build, sign and publish; Argo CD reconciling clusters from Git; Argo Rollouts and feature flags limiting blast radius; and Terraform (or OpenTofu) describing the VPCs, clusters and databases themselves.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Chapter 12.2 (images, Kubernetes manifests, Helm/Kustomize); Git branching and pull requests; experience with a Jenkins or similar pipeline.</li>
+    <li><strong>You will be able to:</strong> design a pipeline with the right tests at the right stage; publish immutable, signed artifacts; explain push vs pull deployment and GitOps principles; promote releases across environments; run canary and blue-green rollouts with automated analysis; and write, structure, test and safely operate Terraform with remote state and locking.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: Making Change Safe, Fast and Repeatable</h2>
+  <p>Every production incident has a trigger, and the most common trigger is change: a deploy, a configuration update, an infrastructure modification. Yet organisations that deploy <em>more</em> often tend to have <em>fewer</em> and shorter incidents, because each change is small, tested automatically, observable and easy to reverse. That is the core insight behind continuous delivery, documented in the DORA research programme and the book <em>Accelerate</em> (2018): deployment frequency, lead time for changes, change failure rate and time to restore service move together in high-performing teams.</p>
+  <p>This chapter covers three disciplines that together make change safe:</p>
+  <ul>
+    <li><strong>CI/CD</strong> — every commit is built and tested automatically; every artifact that passes is a release candidate; delivery to environments is automated, gradual and reversible.</li>
+    <li><strong>GitOps</strong> — the desired state of each environment lives in Git; agents in the clusters pull and reconcile it; Git history is the audit log and <code>git revert</code> is the rollback.</li>
+    <li><strong>Infrastructure as Code</strong> — VPCs, clusters, databases, IAM and DNS are declared in version-controlled code (Terraform/OpenTofu), reviewed like application code, and applied by automation.</li>
+  </ul>
+
+<div class="bridge">
+  <h4>Bridging from Java &amp; Spring Boot</h4>
+  <dl>
+    <dt>What you already know</dt><dd>Maven/Gradle lifecycles (<code>test</code>, <code>verify</code>, <code>deploy</code>); a Jenkinsfile with stages for build, unit tests, SonarQube, and a manual "deploy to prod" job that runs a script against servers; artifacts in Nexus or Artifactory; perhaps Flyway or Liquibase migrations run at application startup; infrastructure created through the AWS console or tickets to an ops team.</dd>
+    <dt>Why that is not enough</dt><dd>Push-based Jenkins jobs hold production credentials, have no notion of drift (someone edits a server and the pipeline never notices), and make rollbacks bespoke scripts. Rebuilding an artifact per environment means what you tested is not what you shipped. Console-created infrastructure cannot be reviewed, reproduced or recovered.</dd>
+    <dt>The modern approach</dt><dd>Build once, produce an immutable, signed image referenced by digest; promote that digest through environments by changing Git; let Argo CD/Flux reconcile clusters; use Argo Rollouts to shift traffic gradually with automated metric analysis; declare infrastructure in Terraform with remote state, locking, plans reviewed in pull requests and policy checks.</dd>
+    <dt>Where Python and Go fit</dt><dd>Pipelines are polyglot: the same workflow template runs <code>mvn verify</code>, <code>pytest</code> and <code>go test -race</code>. Go dominates the tooling layer (Terraform, Argo CD, Flux, Helm, kubectl are all Go), and Terratest writes infrastructure tests in Go. Python is common for pipeline glue and for evaluating AI models as a pipeline gate.</dd>
+    <dt>In production</dt><dd>Most outages trace back to a change. The controls in this chapter — small batches, automated tests, progressive delivery, fast rollback, reviewed infrastructure plans, drift detection — are how teams keep change failure rate low without slowing down.</dd>
+    <dt>Use it when / avoid it when</dt><dd>Adopt all of it for any service with real users. Scale down rather than skip: a two-person team can use one workflow file, one Argo CD instance and a small Terraform repo. Avoid building bespoke deployment platforms when the off-the-shelf combination works.</dd>
+  </dl>
+</div>
+
+  <h3>1.1 Lumen's delivery path in one paragraph</h3>
+  <p>A developer opens a pull request against <code>orders-service</code>. GitHub Actions runs unit tests, Testcontainers-based integration tests, static analysis and a container build. On merge to <code>main</code> the workflow builds a multi-architecture image once, scans it, generates an SBOM, signs it with Sigstore cosign using GitHub's OIDC identity, pushes it to Amazon ECR, and opens a pull request in the <code>lumen-gitops</code> repository updating the image digest for the <code>dev</code> environment. Argo CD in the dev cluster syncs. Promotion to staging and production is another reviewed digest change in Git. In production, Argo Rollouts shifts 10%, 25%, 50% then 100% of traffic to the new version while querying Prometheus; if the error rate or latency degrades, it aborts and returns all traffic to the old version automatically. The EKS cluster, VPC, RDS database and IAM roles all come from Terraform modules applied by a separate pipeline after a plan is reviewed.</p>
+</section>
+
+<section id="history">
+  <h2>2. History</h2>
+  <p><strong>Continuous integration</strong> was named by Grady Booch (1991) and made a core practice by Extreme Programming in the late 1990s; Martin Fowler's 2000 article (revised 2006) popularised it. CruiseControl (2001) was an early CI server; Hudson (2005, Kohsuke Kawaguchi at Sun) was forked as <strong>Jenkins</strong> in 2011 after Oracle's acquisition of Sun, and Jenkins Pipeline (Jenkinsfile, 2016) brought pipeline-as-code. Hosted CI followed: Travis CI (2011), CircleCI (2011), GitLab CI (2012–2015), and <strong>GitHub Actions</strong> (announced 2018, generally available with CI/CD in November 2019).</p>
+  <p><strong>Continuous delivery</strong> was codified by Jez Humble and David Farley's book <em>Continuous Delivery</em> (2010), which introduced the deployment pipeline as a sequence of increasingly expensive quality gates and the rule "build your binaries only once". <em>Accelerate</em> (Forsgren, Humble, Kim, 2018) summarised the DORA research linking delivery practices to organisational performance.</p>
+  <p><strong>Infrastructure as code</strong> grew from configuration management — CFEngine (1993), Puppet (2005), Chef (2009), Ansible (2012) — which configured existing servers. Cloud APIs enabled <em>provisioning</em> as code: AWS CloudFormation (2011) and HashiCorp <strong>Terraform</strong> (v0.1 in July 2014), whose provider model made one tool work across clouds and SaaS. Terraform 1.0 shipped in June 2021 with compatibility promises. In August 2023 HashiCorp relicensed Terraform from the MPL 2.0 to the <strong>Business Source License 1.1</strong> (effective from 1.6), restricting competitive commercial use. The community responded with the OpenTF manifesto and a fork that the Linux Foundation adopted as <strong>OpenTofu</strong> in September 2023; OpenTofu 1.6.0 reached GA in January 2024 and the project joined the CNCF as a Sandbox project in April 2025. IBM completed its acquisition of HashiCorp in February 2025. Both tools continue to evolve: Terraform's 1.x line (1.16 per release trackers as of late 2026) and OpenTofu's 1.13 line, with features diverging (e.g., OpenTofu's client-side state encryption since 1.7) <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+  <p><strong>GitOps</strong> was coined by Alexis Richardson of Weaveworks in 2017, building on Kubernetes' declarative model. Weaveworks created <strong>Flux</strong>; Intuit created <strong>Argo CD</strong> (open-sourced 2018). Both became CNCF Graduated projects in late 2022. The OpenGitOps project (CNCF) published the four GitOps principles in 2021. Weaveworks itself shut down in February 2024, but Flux continued under the CNCF. Argo CD 3.0 shipped in 2025. Progressive delivery — canaries, blue-green, feature flags — has roots in practices at Google, Facebook and Netflix (Netflix and Google open-sourced the Spinnaker CD platform and its Kayenta canary analysis in 2015 and 2018); Argo Rollouts and Flagger brought it to Kubernetes.</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 Continuous integration, delivery and deployment</h3>
+  <ul>
+    <li><strong>Continuous integration</strong>: everyone merges small changes to the mainline frequently (at least daily), and every merge is built and tested automatically. A broken mainline is fixed immediately.</li>
+    <li><strong>Continuous delivery</strong>: every change that passes the pipeline is <em>releasable</em>; deploying to production is a business decision executed by a button or a merge.</li>
+    <li><strong>Continuous deployment</strong>: every change that passes the pipeline goes to production automatically, usually with progressive delivery and automated rollback as the safety net.</li>
+  </ul>
+  <p><strong>Trunk-based development</strong> — short-lived branches merged to <code>main</code> within a day or two, with incomplete features hidden behind flags — is the branching model that makes CI real. Long-lived feature branches and GitFlow's release branches delay integration and create merge risk.</p>
+
+  <h3>3.2 Pipeline stages</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Stage</th><th>Purpose</th><th>Lumen implementation</th><th>Time budget</th></tr></thead>
+    <tbody>
+      <tr><td>Commit / PR checks</td><td>Fast feedback: compile, unit tests, lint, format, secret scanning</td><td><code>mvn -B verify -DskipITs</code>, <code>ruff</code>, <code>pytest -m "not integration"</code>, <code>go vet</code>, <code>go test</code></td><td>&lt; 10 min</td></tr>
+      <tr><td>Integration</td><td>Real dependencies in containers</td><td>Testcontainers (PostgreSQL, LocalStack for SQS), contract tests</td><td>&lt; 15 min</td></tr>
+      <tr><td>Static analysis &amp; SCA</td><td>Code quality, vulnerable dependencies, licences</td><td>CodeQL/SonarQube, OWASP Dependency-Check or Dependabot/Renovate</td><td>Parallel</td></tr>
+      <tr><td>Build artifact</td><td>Build once, immutable, multi-arch image</td><td>BuildKit with registry/GHA cache</td><td>&lt; 5 min</td></tr>
+      <tr><td>Artifact security</td><td>Scan image, SBOM, sign, provenance</td><td>Trivy, Syft, cosign keyless, SLSA provenance</td><td>&lt; 3 min</td></tr>
+      <tr><td>Deploy to dev/staging</td><td>GitOps promotion, smoke and end-to-end tests</td><td>PR to gitops repo; Argo CD sync; k6 smoke test</td><td>Minutes</td></tr>
+      <tr><td>Production</td><td>Progressive rollout with automated analysis</td><td>Argo Rollouts canary + Prometheus analysis</td><td>15–60 min</td></tr>
+      <tr><td>Post-deploy</td><td>Verify SLOs, annotate dashboards, notify</td><td>Grafana annotations, Slack</td><td>Continuous</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>3.3 The testing pyramid in CI</h3>
+  <p>The pyramid says: many fast unit tests, fewer integration tests, very few end-to-end tests — because cost and flakiness grow toward the top. In Spring Boot terms: plain JUnit tests of domain logic at the base; <em>slice tests</em> (<code>@WebMvcTest</code>, <code>@DataJpaTest</code>) and <code>@SpringBootTest</code> with Testcontainers in the middle; contract tests (Spring Cloud Contract or Pact) between <code>edge-gateway</code> and <code>orders-service</code> to catch API breakage without spinning up both; and a thin layer of end-to-end smoke tests against a deployed environment. For AI services, add an <strong>evaluation stage</strong>: run a fixed evaluation set through <code>assist-service</code> and fail the pipeline if answer quality, groundedness or latency regress beyond a threshold (Part 8).</p>
+  <div class="callout tip"><p class="callout-title">Flaky tests are pipeline bugs</p><p>A test that fails 2% of the time fails one in fifty builds and trains engineers to click "re-run". Quarantine flaky tests automatically (tag and exclude from the gating stage), track them, and fix them as you would a production bug.</p></div>
+
+  <h3>3.4 Artifact management and immutability</h3>
+  <p>"Build once, deploy many": the artifact tested in staging must be byte-for-byte the one deployed to production. For containers, that means referencing images by <strong>digest</strong> (<code>sha256:…</code>), not tag, and never rebuilding per environment. Environment differences come from configuration (ConfigMaps, Helm values). Registries (ECR, GHCR, Artifactory, Harbor) should have tag immutability enabled, lifecycle policies to expire untagged images, and replication to the regions you deploy to. Helm charts and even Terraform modules are also distributed as versioned artifacts (OCI registries can host all three).</p>
+
+  <h3>3.5 Supply-chain security</h3>
+  <p>The pipeline itself is an attack surface: a compromised action, dependency or build runner can inject code into artifacts that every environment trusts. Controls: pin third-party actions by commit SHA; least-privilege <code>GITHUB_TOKEN</code> permissions; short-lived cloud credentials via <strong>OIDC federation</strong> instead of stored keys; dependency pinning and review (lockfiles, Renovate); <strong>SBOMs</strong> (SPDX/CycloneDX) for every image; <strong>signing</strong> with Sigstore cosign (keyless signing binds the signature to the workflow's OIDC identity and records it in a transparency log); <strong>provenance</strong> attestations describing how the artifact was built (SLSA framework); and admission policies in the cluster that only accept images signed by your pipeline. Part 11 covers these in depth.</p>
+
+  <h3>3.6 Deployment strategies</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Strategy</th><th>How</th><th>Pros</th><th>Cons</th></tr></thead>
+    <tbody>
+      <tr><td>Recreate</td><td>Stop all old, start all new</td><td>Simple; no version mixing</td><td>Downtime</td></tr>
+      <tr><td>Rolling update</td><td>Replace instances gradually (Kubernetes default)</td><td>No extra capacity; no downtime</td><td>Both versions serve simultaneously; slow rollback; no traffic control</td></tr>
+      <tr><td>Blue-green</td><td>Run full new stack (green) beside old (blue); switch traffic at once; keep blue for instant rollback</td><td>Instant switch and rollback; test green before switch</td><td>Double capacity during deploy; all users switch at once</td></tr>
+      <tr><td>Canary</td><td>Send a small % of traffic to the new version, increase stepwise while analysing metrics</td><td>Limits blast radius; data-driven promotion</td><td>Needs traffic splitting and good metrics; versions coexist</td></tr>
+      <tr><td>Shadow / mirroring</td><td>Copy live traffic to the new version, discard responses</td><td>Real-load testing with no user impact</td><td>Side effects must be suppressed; doubles load</td></tr>
+      <tr><td>Feature flags</td><td>Deploy code dark; enable per user/segment at runtime</td><td>Decouples deploy from release; instant kill switch</td><td>Flag debt; combinatorial testing</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>3.7 Progressive delivery with Argo Rollouts</h3>
+  <p><strong>Argo Rollouts</strong> provides a <code>Rollout</code> CRD that replaces a Deployment and adds canary and blue-green strategies with steps (<code>setWeight</code>, <code>pause</code>, <code>analysis</code>), traffic management through a mesh, an ingress controller or Gateway API (via plugin), and <strong>AnalysisTemplates</strong> that query Prometheus, Datadog, CloudWatch or a web hook and decide success or failure. On failure the Rollout aborts and shifts traffic back to the stable ReplicaSet without human intervention. Flagger (Flux ecosystem) offers similar functionality.</p>
+
+  <h3>3.8 Feature flags</h3>
+  <p>A feature flag is a runtime decision point: <code>if (flags.isEnabled("new-pricing", user)) …</code>. Flags enable trunk-based development (merge incomplete work disabled), targeted releases (internal users, then 1% of customers, then everyone), experiments (A/B tests) and kill switches (turn off an expensive LLM-powered feature under load). <strong>OpenFeature</strong> (a CNCF project) standardises the SDK API across languages and vendors (LaunchDarkly, Unleash, flagd, AWS AppConfig). Flags have a lifecycle: create, roll out, clean up. Stale flags are technical debt and a source of incidents — the Knight Capital case in §9 involved a repurposed flag.</p>
+
+  <h3>3.9 GitOps principles</h3>
+  <p>The OpenGitOps project defines four principles:</p>
+  <ol>
+    <li><strong>Declarative</strong> — the system's desired state is expressed declaratively.</li>
+    <li><strong>Versioned and immutable</strong> — desired state is stored in a way that enforces immutability and versioning and retains a complete history (Git).</li>
+    <li><strong>Pulled automatically</strong> — software agents automatically pull the desired state from the source.</li>
+    <li><strong>Continuously reconciled</strong> — agents continuously observe actual state and attempt to apply the desired state.</li>
+  </ol>
+  <p>Notice that principle 4 is the Kubernetes controller pattern (Chapter 2 §3.7) applied one level up: Argo CD is a controller whose desired state is a Git repository.</p>
+
+  <h3>3.10 Push vs pull deployment</h3>
+  <p>In <strong>push</strong> deployment, the CI system holds cluster credentials and runs <code>kubectl apply</code> or <code>helm upgrade</code>. It is simple, but the CI system becomes a high-value target with production access, and nothing notices if someone changes the cluster afterward. In <strong>pull</strong> (GitOps) deployment, an agent inside the cluster has the credentials; CI only writes to Git. The cluster's state is continuously compared with Git, so manual changes are detected (and optionally reverted — <em>self-heal</em>). The trade-off: an extra repository and an extra hop of latency, and the need to wire feedback (sync status) back to developers.</p>
+
+  <h3>3.11 Argo CD and Flux</h3>
+  <p><strong>Argo CD</strong> models deployments as <code>Application</code> resources (source: repo, path, revision, Helm/Kustomize options; destination: cluster and namespace; sync policy), offers a rich UI with resource trees and diffs, SSO and RBAC, multi-cluster management from one instance, sync waves and hooks for ordering, and <code>ApplicationSet</code> to generate Applications from templates (per cluster, per directory, per pull request). <strong>Flux</strong> is a set of composable controllers (<code>GitRepository</code>/<code>OCIRepository</code> sources, <code>Kustomization</code> and <code>HelmRelease</code> appliers, image automation that writes new tags back to Git) designed to run in each cluster, with no UI by default. Both are mature CNCF Graduated projects; Argo CD tends to win when teams want a central UI and multi-cluster view, Flux when they want lightweight, per-cluster, CRD-only automation <span class="tag opinion">Opinion</span>.</p>
+
+  <h3>3.12 Environment promotion</h3>
+  <p>Common repository layouts: <em>directory per environment</em> (<code>envs/dev</code>, <code>envs/staging</code>, <code>envs/prod</code>, each a Kustomize overlay or a values file) on a single branch — recommended — versus <em>branch per environment</em>, which causes painful merges and drift between branches. Promotion is a pull request that copies the digest (and any config changes) from one environment directory to the next, approved by the appropriate owners. Tools such as Kargo automate promotion pipelines on top of Argo CD; Argo CD Image Updater and Flux image automation can bump dev automatically.</p>
+
+  <h3>3.13 Infrastructure as code: declarative vs imperative</h3>
+  <p><strong>Imperative</strong> IaC (shell scripts with the AWS CLI, Ansible playbooks for provisioning) describes steps: "create a VPC, then create subnets". Running it twice may create two VPCs. <strong>Declarative</strong> IaC (Terraform, CloudFormation, Pulumi's model, Crossplane) describes the end state: "there exists a VPC with these subnets"; the tool computes the steps by comparing the desired state with the current state. Declarative tools are idempotent and can show a plan before acting. Pulumi and the AWS CDK let you write the declaration in general-purpose languages (Java, Python, Go, TypeScript), which is attractive to application engineers but makes it easier to write non-deterministic code; Crossplane manages cloud resources as Kubernetes CRDs reconciled continuously.</p>
+
+  <h3>3.14 Drift and immutable infrastructure</h3>
+  <p><strong>Drift</strong> is the difference between the declared state and reality, caused by console edits, scripts, other tools, or cloud-side changes. Terraform detects drift at plan time (it refreshes the real state); scheduled "drift detection" plans in CI catch it between changes. <strong>Immutable infrastructure</strong> means you never modify running servers in place: you build a new image (AMI, container) and replace instances. Combined with IaC, it eliminates snowflake servers and makes rollback a matter of pointing back to the previous image.</p>
+
+  <h3>3.15 Terraform concepts</h3>
+  <ul>
+    <li><strong>Providers</strong> — plugins that translate resources to API calls (<code>hashicorp/aws</code>, <code>hashicorp/kubernetes</code>, <code>hashicorp/helm</code>, Datadog, GitHub, Cloudflare…). Versions are pinned in <code>required_providers</code> and locked in <code>.terraform.lock.hcl</code>.</li>
+    <li><strong>Resources</strong> (things Terraform manages), <strong>data sources</strong> (things Terraform reads), <strong>variables</strong>, <strong>outputs</strong>, <strong>locals</strong>.</li>
+    <li><strong>State</strong> — a JSON document mapping each resource address (<code>module.vpc.aws_subnet.private["eu-west-1a"]</code>) to the real object ID and its last known attributes. Terraform needs it to know what it manages. State often contains secrets (database passwords, keys) and must be stored remotely, encrypted and access-controlled.</li>
+    <li><strong>Backends and locking</strong> — remote state in S3 (with native S3 lockfiles via <code>use_lockfile</code> since 1.10; DynamoDB locking is deprecated since 1.11), HCP Terraform, GCS, Azure Blob, or a Kubernetes Secret. Locking prevents two concurrent applies from corrupting state.</li>
+    <li><strong>Plan and apply</strong> — <code>plan</code> refreshes state, builds a dependency graph, and computes create/update/replace/destroy actions; <code>apply</code> executes a saved plan. Reviewing plans in pull requests is the single most important Terraform safety practice.</li>
+    <li><strong>Modules</strong> — reusable directories of configuration with inputs and outputs (like a Java library with a public API). Use registry modules (<code>terraform-aws-modules/vpc/aws</code>) or internal ones, versioned by Git tag or registry version.</li>
+    <li><strong>Workspaces</strong> — multiple state files for one configuration. Convenient for ephemeral copies, but separate root modules (or directories) per environment are clearer for long-lived environments with different shapes.</li>
+    <li><strong>Lifecycle and refactoring</strong> — <code>prevent_destroy</code>, <code>create_before_destroy</code>, <code>ignore_changes</code>; <code>moved</code> blocks to rename resources without destroying them; <code>import</code> blocks (1.5+) to adopt existing resources; <code>removed</code> blocks (1.7+) to stop managing without destroying.</li>
+    <li><strong>Testing</strong> — <code>terraform validate</code>, <code>fmt</code>, TFLint, policy checks (Checkov, tfsec/Trivy, OPA/Conftest on the plan JSON), the native <code>terraform test</code> framework (1.6+) with <code>.tftest.hcl</code> files and mocked providers, and Terratest for full integration tests that create and destroy real infrastructure.</li>
+  </ul>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working</h2>
+  <h3>4.1 How a GitHub Actions run executes</h3>
+  <p>A push or pull request emits an event; GitHub evaluates every workflow file in <code>.github/workflows/</code> whose <code>on:</code> filter matches (branches, paths). Each workflow has <strong>jobs</strong>, which run in parallel unless linked by <code>needs</code>; each job runs on a fresh <strong>runner</strong> (a GitHub-hosted VM, a larger runner, or a self-hosted runner such as Actions Runner Controller pods on Kubernetes) and executes <strong>steps</strong> sequentially. Steps either run shell commands or invoke <strong>actions</strong> (reusable units from repositories, pinned by tag or SHA). Jobs share data through <em>artifacts</em> and <em>caches</em>; secrets are injected as masked environment variables. When a job declares <code>permissions: id-token: write</code>, the runner can request a short-lived OIDC token from GitHub, signed by GitHub and containing claims such as <code>repo</code>, <code>ref</code>, <code>environment</code> and <code>workflow</code>. AWS STS validates that token against an IAM OIDC identity provider and a role trust policy that restricts which repository and branch may assume the role, and returns temporary credentials — no long-lived AWS keys exist anywhere. <strong>Environments</strong> add protection rules (required reviewers, wait timers, branch restrictions) and environment-scoped secrets. <strong>Reusable workflows</strong> (<code>workflow_call</code>) let a platform team publish one pipeline used by all services, like a Maven parent POM.</p>
+
+  <h3>4.2 How Argo CD reconciles</h3>
+  <ol>
+    <li>The <strong>repo-server</strong> clones (and caches) the Git repository at the target revision and <em>renders</em> manifests — plain YAML, Kustomize build, Helm template with the given values, or a config management plugin. Rendering is deterministic for a given commit.</li>
+    <li>The <strong>application controller</strong> watches live resources in the destination cluster (via informers, like any controller) and compares the rendered desired state to live state, normalising fields that the cluster mutates (defaults, status). The result is a sync status (<code>Synced</code>/<code>OutOfSync</code>) and a health status computed by resource-specific health checks (a Deployment is <code>Healthy</code> when its rollout is complete; a Rollout when it is not paused/degraded).</li>
+    <li>If auto-sync is enabled (or a user clicks Sync), the controller applies the difference in <strong>sync waves</strong> (ordered by the <code>argocd.argoproj.io/sync-wave</code> annotation) with optional <code>PreSync</code>/<code>PostSync</code> hook Jobs (e.g., a Flyway migration Job before the Deployment). With <code>prune</code>, resources removed from Git are deleted; with <code>selfHeal</code>, live changes that diverge from Git are reverted.</li>
+    <li>Polling (default every 3 minutes) or a Git webhook triggers refresh; the controller also re-checks periodically, so drift is detected even without commits.</li>
+  </ol>
+
+  <h3>4.3 How an Argo Rollouts canary progresses</h3>
+  <p>When the Rollout's pod template changes, the controller creates a canary ReplicaSet and executes the steps. For <code>setWeight: 10</code> with a traffic router, it scales the canary to an appropriate size and updates the router (e.g., HTTPRoute backend weights, or an ALB's weighted target groups) so 10% of requests reach it. An <code>analysis</code> step creates an <code>AnalysisRun</code> from the template, which periodically executes the metric query and compares results against <code>successCondition</code>/<code>failureCondition</code>; exceeding <code>failureLimit</code> marks the run failed. A failed analysis aborts the Rollout: weight returns to 0, the canary scales down, and the Rollout is <code>Degraded</code> until a new revision is pushed (or the old one is re-applied — in GitOps, by reverting the commit). On success after the final step, the canary becomes the new stable ReplicaSet.</p>
+
+  <h3>4.4 How Terraform plans and applies</h3>
+  <ol>
+    <li><strong>init</strong> — downloads providers matching version constraints (verifying checksums against the lock file), downloads modules, configures the backend.</li>
+    <li><strong>Lock</strong> — acquires the state lock (an S3 lock object or DynamoDB item); a second concurrent run fails fast.</li>
+    <li><strong>Refresh</strong> — for each resource in state, calls the provider's read operation to get current real attributes. This is where drift becomes visible.</li>
+    <li><strong>Graph</strong> — builds a directed acyclic graph of resources from references (<code>aws_subnet.private.id</code> referenced by an EKS node group creates an edge).</li>
+    <li><strong>Diff</strong> — for each resource, the provider compares configuration with state and decides: no-op, update in place, or <em>replace</em> (destroy and create) if a "ForceNew" attribute changed — for example changing an RDS instance's <code>identifier</code> or a subnet's CIDR. Replacement of stateful resources is the most dangerous line in any plan.</li>
+    <li><strong>Apply</strong> — walks the graph, executing independent operations in parallel (default parallelism 10), writing state after each resource, and releasing the lock at the end. A failure midway leaves state reflecting what was actually done; re-running continues from there.</li>
+  </ol>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture Diagrams</h2>
+  <h3>5.1 The Lumen CI/CD and GitOps flow</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  DEV["Developer PR"] --> CI["GitHub Actions: test, build once, scan, SBOM, sign"]
+  CI -->|"push image by digest"| ECR[("Amazon ECR")]
+  CI -->|"PR: bump digest in envs/dev"| GITOPS[("lumen-gitops repo")]
+  GITOPS -->|"merge"| ARGO_DEV["Argo CD (dev cluster)"]
+  ARGO_DEV -->|"pull + reconcile"| DEVK8S["dev EKS"]
+  GITOPS -->|"promotion PR to envs/prod (approved)"| ARGO_PROD["Argo CD (prod)"]
+  ARGO_PROD --> ROLL["Argo Rollouts canary"]
+  ROLL -->|"AnalysisRun queries"| PROM[("Prometheus")]
+  ROLL --> PRODK8S["prod EKS"]
+  ECR -.->|"pull image"| DEVK8S
+  ECR -.->|"pull image"| PRODK8S
+</pre>
+<figcaption>Figure 12.13 — CI produces artifacts and Git commits; it never touches clusters. Argo CD pulls.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> the arrows out of CI go only to the registry and to Git — CI holds no cluster credentials. Each environment is reconciled by an Argo CD instance (or one central instance managing several clusters) that pulls from the gitops repository. Promotion to production is a reviewed pull request, giving an audit trail and a one-commit rollback. The production rollout is gated by metrics: Argo Rollouts decides whether to continue based on Prometheus, closing the loop between delivery and observability (Chapter 5).</p>
+
+  <h3>5.2 Canary rollout timeline</h3>
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant G as Git (prod overlay)
+  participant A as Argo CD
+  participant R as Rollouts controller
+  participant T as Gateway (HTTPRoute weights)
+  participant P as Prometheus
+  G->>A: new digest committed
+  A->>R: apply Rollout spec (new pod template)
+  R->>R: create canary ReplicaSet
+  R->>T: weights stable 90 / canary 10
+  R->>P: AnalysisRun: error ratio, p99 latency (every 1m)
+  P-->>R: 0.2% errors, p99 180ms (pass)
+  R->>T: weights 50 / 50
+  R->>P: AnalysisRun
+  P-->>R: 4.1% errors (fail, limit exceeded)
+  R->>T: weights 100 / 0 (abort)
+  R->>R: scale canary down, status Degraded
+  Note over G,A: Engineer reverts the commit; Argo CD syncs the old digest
+</pre>
+<figcaption>Figure 12.14 — A canary aborted automatically by metric analysis.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> users exposed to the faulty version were at most 50% of traffic for a few minutes — and in a well-tuned setup, the first analysis at 10% would catch most regressions. The key design choice is that rollback is <em>automatic</em> and does not depend on a human noticing a dashboard. In GitOps, Git still says "new version", so the final step is a revert commit; Argo CD then reports Synced and Healthy again.</p>
+
+  <h3>5.3 Terraform repository and state layout</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  subgraph MOD["modules (versioned)"]
+    MV["vpc"]
+    ME["eks-cluster"]
+    MR["rds-postgres"]
+  end
+  subgraph LIVE["live (root modules, one state each)"]
+    DN["prod/network"] --> DC["prod/eks"]
+    DC --> DD["prod/data"]
+    SN["staging/network"]
+  end
+  MV --> DN
+  ME --> DC
+  MR --> DD
+  DN -->|"state: s3://lumen-tfstate/prod/network.tfstate"| S3[("S3 backend with lockfiles, versioning, KMS")]
+  DC --> S3
+  DD --> S3
+</pre>
+<figcaption>Figure 12.15 — Small root modules per environment and layer, each with its own state, composed from versioned modules.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> splitting state by environment and layer limits the blast radius of any one apply (a mistake in the <code>eks</code> root cannot touch the network), shortens plan times, and lets different teams own different layers. Dependencies between layers flow through outputs read with <code>terraform_remote_state</code> or, better, via data sources/SSM parameters, so layers are loosely coupled. Modules are versioned like libraries so that staging can test <code>vpc v3.2.0</code> before production adopts it.</p>
+
+  <h3>5.4 Pipeline as a state machine</h3>
+<figure class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> Commit
+  Commit --> Verified: unit + integration + static checks pass
+  Commit --> Rejected: any gate fails
+  Verified --> Published: image built once, scanned, signed, pushed
+  Published --> InDev: GitOps sync dev
+  InDev --> InStaging: smoke + e2e pass, promotion PR merged
+  InStaging --> Canary: prod promotion approved
+  Canary --> Production: analysis passes all steps
+  Canary --> RolledBack: analysis fails
+  RolledBack --> [*]
+  Production --> [*]
+  Rejected --> [*]
+</pre>
+<figcaption>Figure 12.16 — Every artifact moves through the same gates; failures exit early.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> each state is a stronger claim about the artifact ("it compiles", "it is published and signed", "it has run in staging"). Because the artifact is immutable, a promotion never repeats earlier work — it just records that the same digest has satisfied one more gate.</p>
+</section>
+
+<section id="math">
+  <h2>6. Metrics and Numbers</h2>
+  <h3>6.1 DORA metrics</h3>
+  <p>The four key metrics are deployment frequency, lead time for changes (commit to production), change failure rate (fraction of deployments causing a failure in production), and time to restore service. A fifth, reliability, was added later. Compute change failure rate as</p>
+  \[ \text{CFR} = \frac{\text{deployments causing incidents or rollbacks}}{\text{total deployments}} \]
+  <p>Track them from your pipeline and incident data rather than surveys once you can. Use them for team learning, never as individual targets (Goodhart's law).</p>
+  <h3>6.2 Batch size and risk</h3>
+  <p>Intuition: if each change has an independent probability \(p\) of being faulty, a deploy that bundles \(n\) changes fails with probability \(1 - (1-p)^n\), and diagnosing <em>which</em> change failed takes longer as \(n\) grows. With \(p = 0.02\): a 1-change deploy fails 2% of the time; a 30-change monthly release fails \(1 - 0.98^{30} \approx 45\%\) of the time, and bisecting it is painful <span class="tag illus">Illustrative</span>. Small, frequent deploys reduce both probability per deploy and time to restore.</p>
+  <h3>6.3 Canary detection power</h3>
+  <p>To detect that a canary's error rate \(e_c\) is worse than baseline \(e_b\), you need enough requests. A rough rule from the normal approximation: the standard error of an observed error rate is \(\sqrt{e(1-e)/N}\). With baseline \(e_b = 0.5\%\) and the canary receiving \(N = 6{,}000\) requests (10% of 1,000 rps for 1 minute), the standard error is \(\sqrt{0.005 \times 0.995 / 6000} \approx 0.09\%\). A jump to 1% (five standard errors) is detectable in a minute; a jump to 0.6% is not. Low-traffic services need longer analysis windows or larger canary weights — or synthetic traffic.</p>
+  <h3>6.4 Pipeline speed and parallelism</h3>
+  <p>Pipeline duration is the critical path through the job graph, not the sum of jobs. If unit tests (6 min), static analysis (5 min) and image build (4 min) run in parallel before integration tests (8 min) and signing (1 min), duration is \(\max(6,5,4) + 8 + 1 = 15\) minutes. Caching (Maven repository, BuildKit layers, Go build cache) often halves stage times; test sharding divides the slowest stage by the shard count at the cost of runner minutes.</p>
+  <h3>6.5 Terraform blast radius</h3>
+  <p>The expected cost of a bad apply scales with the number of resources in the state file. Splitting a 2,000-resource monolith into ten 200-resource roots reduces both plan time (refresh is roughly linear in resources, bounded by API rate limits) and the worst-case damage of a single mistaken change by an order of magnitude.</p>
+</section>

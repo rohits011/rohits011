@@ -1,0 +1,994 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mathematics for ML: Linear Algebra, Probability, Statistics, Calculus — AI-Era Software Engineering</title>
+<meta name="description" content="The linear algebra, probability, statistics, calculus and information theory that every machine-learning algorithm in this book is built from, taught intuition-first for backend engineers.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p6-01-math-for-ml" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 6 · Chapter 1</p>
+  <h1>Mathematics for ML: Linear Algebra, Probability, Statistics, Calculus</h1>
+  <p class="lede">Every model you will train in Parts 6 to 8 is a composition of five ideas: vectors and matrices that hold data, probability that describes uncertainty, statistics that tells you whether a number means anything, calculus that tells you which way to nudge parameters, and information theory that turns "how wrong is the model" into a single number. This chapter builds each one from the ground up, always with a concrete numeric example before any symbol appears, so that the formulas in later chapters read like code you already understand.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> High-school algebra, comfort reading Python/NumPy. No prior linear algebra or calculus beyond "slope of a line" is assumed.</li>
+    <li><strong>You will be able to:</strong> compute dot products, cosine similarity, matrix products, eigen-decompositions and SVDs by hand and in NumPy; reason about Bernoulli, binomial, Gaussian and Poisson variables; apply Bayes' theorem; derive maximum-likelihood and MAP estimators; build a confidence interval and run an A/B test correctly; differentiate composite functions with the chain rule and Jacobians; explain why cross-entropy is the default classification loss; and implement gradient descent from scratch.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: Why an Engineer Needs the Math</h2>
+  <p>You can call <code>model.fit(X, y)</code> without knowing any of this chapter. You can also run a JVM in production without knowing what a garbage collector does, until the day p99 latency triples and the only way out is to read GC logs. Machine learning is the same: the libraries hide the math until something goes wrong, and when it goes wrong (loss turns into <code>NaN</code>, a model is confidently wrong, an A/B test "wins" and then the metric drifts back), the diagnosis is always mathematical. A learning rate that is too large is a calculus problem. A model that outputs probabilities of 0.9999 for everything is an information-theory problem. An experiment that "won" with p = 0.04 after you peeked at it twenty times is a statistics problem.</p>
+  <p>Machine learning, stripped down, is this loop: represent data as <em>vectors</em>; define a parametric function that maps input vectors to predictions; define a <em>loss</em> that measures how wrong the predictions are, usually derived from <em>probability</em>; use <em>calculus</em> to find which direction to move the parameters to reduce the loss; repeat; and finally use <em>statistics</em> to decide whether the result generalises beyond the data you trained on. Each of the five branches covered here owns one step of that loop. That is the reason for the order of this chapter.</p>
+  <p>The approach throughout is: a plain-language explanation, then a small numeric example you could check on a napkin, then the formal notation, then NumPy code. If a formula ever appears without you already knowing what it is going to say, that is a bug in the chapter.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>You have reasoned about averages and percentiles in Micrometer/Prometheus dashboards, set SLO error budgets, computed hash codes and modular arithmetic for sharding, and maybe used <code>java.util.Random</code> with a seed for reproducible tests. You have read big-O analyses. All of that is applied math: percentiles are quantiles of a distribution; an error budget is a tail probability; a seeded RNG is a sampled random variable.</dd>
+      <dt>Why that is not enough</dt><dd>ML models are defined as optimisation problems over high-dimensional vector spaces. Reading a paper, a PyTorch loss implementation, or even a scikit-learn docstring ("minimises the L2-penalised negative log-likelihood") requires linear algebra, gradients and likelihoods. Without them, hyperparameters are magic numbers and failures are mysteries.</dd>
+      <dt>The modern approach</dt><dd>Training happens in Python with NumPy/PyTorch, where every operation is a vectorised linear-algebra primitive (BLAS/cuBLAS underneath). Gradients are computed automatically by autodiff, but you still choose the loss, the learning rate, the regularisation and the evaluation statistics, and all of those choices are mathematical.</dd>
+      <dt>Where Python and Go fit</dt><dd>Python owns training and analysis because NumPy, SciPy, statsmodels and PyTorch give you the math as first-class operations. Go and Java appear at inference time: a trained model is exported (ONNX, XGBoost JSON, TorchScript/<code>torch.export</code>) and executed by ONNX Runtime's Java API, DJL (Deep Java Library) or Tribuo inside a Spring Boot service. The math in this chapter is what those runtimes execute: matrix multiplies, softmaxes, sigmoid functions.</dd>
+      <dt>In production</dt><dd>Linear algebra becomes latency (a 768-dimensional dot product per candidate in a vector search); probability becomes calibrated scores that downstream business rules threshold; statistics becomes the A/B-testing platform that decides whether a model ships; information theory becomes the cross-entropy metric on your training dashboard.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use the formal tools whenever you choose a loss, a metric, a threshold, or a ship/no-ship decision. Avoid re-deriving what libraries already implement correctly (do not hand-roll a matrix inverse or a t-test in production), but understand them well enough to know when their assumptions are violated.</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="history">
+  <h2>2. History: Where These Tools Came From</h2>
+  <p>The mathematics in this chapter is old; what is new is applying it to billions of parameters on GPUs. A short timeline makes clear that ML is a recombination of established fields rather than a new one.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Year</th><th>Development</th><th>Why it matters to ML today</th></tr></thead>
+    <tbody>
+      <tr><td>1763</td><td>Thomas Bayes' essay on inverse probability published posthumously (communicated by Richard Price)</td><td>Bayes' theorem: updating beliefs from evidence; basis of naive Bayes, MAP estimation and Bayesian optimisation.</td></tr>
+      <tr><td>1805–1809</td><td>Legendre and Gauss publish the method of least squares</td><td>Linear regression; the squared-error loss used everywhere.</td></tr>
+      <tr><td>1810</td><td>Laplace's work on what became the central limit theorem</td><td>Why averages are approximately Gaussian; confidence intervals and A/B tests.</td></tr>
+      <tr><td>1847</td><td>Cauchy describes the method of steepest descent</td><td>Gradient descent, the optimiser behind nearly every neural network.</td></tr>
+      <tr><td>1901</td><td>Karl Pearson introduces principal component analysis</td><td>Dimensionality reduction; the eigenvector view of data.</td></tr>
+      <tr><td>1908</td><td>William Gosset ("Student") publishes the t-distribution while at Guinness</td><td>Small-sample inference; the t-test still used in experimentation platforms.</td></tr>
+      <tr><td>1912–1922</td><td>R. A. Fisher develops maximum likelihood</td><td>Almost every loss function is a negative log-likelihood.</td></tr>
+      <tr><td>1936</td><td>Eckart and Young prove the best low-rank approximation result via what we now call SVD</td><td>PCA, recommender-system matrix factorisation, LoRA fine-tuning.</td></tr>
+      <tr><td>1948</td><td>Claude Shannon, "A Mathematical Theory of Communication"</td><td>Entropy and cross-entropy, the classification loss.</td></tr>
+      <tr><td>1951</td><td>Kullback and Leibler define the divergence that bears their names; Robbins and Monro publish stochastic approximation</td><td>KL divergence (VAEs, distillation, RLHF penalties); the theoretical root of SGD.</td></tr>
+      <tr><td>1970s–1980s</td><td>Reverse-mode automatic differentiation (Linnainmaa 1970) and its popularisation for neural nets (Rumelhart, Hinton, Williams 1986)</td><td>Backpropagation: the chain rule executed efficiently.</td></tr>
+      <tr><td>2000s–present</td><td>BLAS on GPUs (cuBLAS), NumPy (2006), autodiff frameworks (Theano, TensorFlow, PyTorch)</td><td>The same linear algebra, executed at enormous scale.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The takeaway for an engineer: you are not learning a fad. These are the same tools that statisticians and physicists have used for two centuries, and the textbooks on them are stable. What changes quickly is the tooling, which is why version-sensitive facts in this book carry a tag.</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 Vectors: data as points and arrows</h3>
+  <p>A <strong>vector</strong> is an ordered list of numbers. In ML, a vector almost always means "one example described by several measurements". A house described by (square metres, bedrooms, age in years) is the vector (120, 3, 15). A 28×28 grayscale image is a vector of 784 pixel intensities. A word embedding is a vector of, say, 384 learned numbers. The number of entries is the <em>dimension</em>.</p>
+  <p>There are two equally useful mental pictures. As a <em>point</em>, the vector is a location in space, and similar examples are nearby points. As an <em>arrow</em> from the origin, it has a length and a direction, and we can add arrows tip-to-tail and stretch them. Adding (1, 2) and (3, 1) gives (4, 3); multiplying (1, 2) by 3 gives (3, 6). Formally, for vectors \( \mathbf{x}, \mathbf{y} \in \mathbb{R}^n \) and a scalar \( c \):</p>
+  \[ \mathbf{x} + \mathbf{y} = (x_1 + y_1, \ldots, x_n + y_n), \qquad c\,\mathbf{x} = (c x_1, \ldots, c x_n). \]
+  <p>The notation \( \mathbb{R}^n \) just means "all lists of n real numbers". By convention in ML, vectors are columns, so \( \mathbf{x}^\top \) (the transpose) is the same numbers laid out as a row.</p>
+
+  <h3>3.2 Norms: how long is a vector?</h3>
+  <p>A <strong>norm</strong> measures size. The everyday one is straight-line (Euclidean) length: for (3, 4) it is 5, by Pythagoras. That is the <strong>L2 norm</strong>. Another is the "Manhattan" distance a taxi drives on a grid: for (3, 4) it is 3 + 4 = 7. That is the <strong>L1 norm</strong>. A third is "the largest single component", 4 here: the <strong>L∞ norm</strong>.</p>
+  \[ \|\mathbf{x}\|_2 = \sqrt{\textstyle\sum_i x_i^2}, \qquad \|\mathbf{x}\|_1 = \textstyle\sum_i |x_i|, \qquad \|\mathbf{x}\|_\infty = \max_i |x_i|. \]
+  <p>Why should you care? Because regularisation (Chapter 6.3) is literally "add a norm of the weight vector to the loss". An L2 penalty dislikes large weights smoothly and shrinks all of them; an L1 penalty pushes many weights to exactly zero, giving sparse models. The geometric reason, which we will return to, is that the set of vectors with L1 norm at most 1 is a diamond with sharp corners on the axes, while the L2 unit ball is a round circle. The distance between two vectors is simply the norm of their difference, \( \|\mathbf{x} - \mathbf{y}\| \), and k-NN, k-means and vector databases all depend on that choice.</p>
+
+  <h3>3.3 The dot product and cosine similarity</h3>
+  <p>The <strong>dot product</strong> multiplies matching components and adds them up. For a = (1, 2, 3) and b = (4, 0, −1): 1·4 + 2·0 + 3·(−1) = 4 + 0 − 3 = 1. That is all there is to compute it. Its meaning is richer: the dot product is large and positive when the two arrows point the same way, zero when they are perpendicular, and negative when they point in opposite directions. Precisely, it equals the product of the lengths times the cosine of the angle between them:</p>
+  \[ \mathbf{a}\cdot\mathbf{b} = \mathbf{a}^\top\mathbf{b} = \sum_{i=1}^{n} a_i b_i = \|\mathbf{a}\|_2\,\|\mathbf{b}\|_2\cos\theta. \]
+  <p>Dividing out the lengths leaves only direction, which is <strong>cosine similarity</strong>. For our a and b, \( \|\mathbf{a}\| = \sqrt{14} \approx 3.742 \) and \( \|\mathbf{b}\| = \sqrt{17} \approx 4.123 \), so cosine similarity is 1 / (3.742 × 4.123) ≈ 0.065: nearly perpendicular, barely related.</p>
+  \[ \cos(\mathbf{a},\mathbf{b}) = \frac{\mathbf{a}^\top\mathbf{b}}{\|\mathbf{a}\|_2\,\|\mathbf{b}\|_2} \in [-1, 1]. \]
+  <p>This one formula underlies semantic search, recommendation and retrieval-augmented generation: embed a query and documents as vectors, rank documents by cosine similarity. If the vectors are already normalised to unit length (most embedding APIs do this), cosine similarity <em>is</em> the dot product, which is why vector databases offer "inner product" as a metric. Note also that a linear model's prediction, \( w_1x_1 + w_2x_2 + \dots + b \), is a dot product \( \mathbf{w}^\top\mathbf{x} + b \): a linear model scores an input by how much it points in the direction of the weight vector.</p>
+  <div class="callout java"><p class="callout-title">Engineering analogy</p><p>Think of an embedding as a learned, similarity-preserving hash. A normal hash (<code>String.hashCode()</code>) deliberately scatters similar inputs; an embedding is trained so that similar inputs land at nearby coordinates. Cosine similarity is then the "equality check" with a tolerance: 1.0 means identical direction, 0 means unrelated.</p></div>
+
+  <h3>3.4 Matrices as data tables and as transformations</h3>
+  <p>A <strong>matrix</strong> is a rectangular grid of numbers with m rows and n columns. ML uses matrices in two distinct ways, and keeping them apart avoids a lot of confusion.</p>
+  <p><strong>As a data table.</strong> The design matrix \( X \in \mathbb{R}^{m\times n} \) holds m examples (rows) by n features (columns). A dataset of 20,640 California districts with 8 features is a 20,640 × 8 matrix. This is a <code>pandas.DataFrame</code> with the index stripped off.</p>
+  <p><strong>As a transformation.</strong> A matrix \( A \in \mathbb{R}^{m\times n} \) is a function that takes an n-dimensional vector and returns an m-dimensional vector, in a very particular way: it is <em>linear</em>, meaning it maps straight lines to straight lines and keeps the origin fixed. Take</p>
+  \[ A = \begin{pmatrix} 2 &amp; 0 \\ 0 &amp; 1 \end{pmatrix}, \qquad A\begin{pmatrix}3\\4\end{pmatrix} = \begin{pmatrix}6\\4\end{pmatrix}. \]
+  <p>This A stretches the x-direction by 2 and leaves y alone. A rotation by 90° is \( \begin{pmatrix} 0 &amp; -1 \\ 1 &amp; 0\end{pmatrix} \), which sends (1, 0) to (0, 1). The key fact: <em>the columns of A are where the basis vectors land</em>. Column 1 is A applied to (1, 0, …, 0); column 2 is A applied to (0, 1, 0, …). Once you know where the axes go, linearity tells you where everything goes. Every layer of a neural network is "apply a matrix, then a non-linear squashing function", so a network is a sequence of learned stretches, rotations and projections, interleaved with bends.</p>
+
+  <h3>3.5 Matrix multiplication</h3>
+  <p>Multiplying a matrix by a vector, \( A\mathbf{x} \), produces a new vector whose i-th entry is the dot product of row i of A with x. For \( A = \begin{pmatrix}1 &amp; 2\\3 &amp; 4\end{pmatrix} \) and x = (5, 6): row 1 gives 1·5 + 2·6 = 17, row 2 gives 3·5 + 4·6 = 39, so Ax = (17, 39).</p>
+  <p>Multiplying two matrices, AB, means "apply B first, then A". Entry (i, j) of the product is the dot product of row i of A with column j of B, which requires the inner dimensions to match: an (m × k) times a (k × n) gives an (m × n).</p>
+  \[ (AB)_{ij} = \sum_{t=1}^{k} A_{it} B_{tj}. \]
+  <p>Three properties trip people up. Matrix multiplication is <em>associative</em>, (AB)C = A(BC), which compilers and frameworks exploit to choose cheaper evaluation orders. It is <em>not commutative</em>: AB ≠ BA in general (rotate-then-stretch differs from stretch-then-rotate). And the transpose reverses order: \( (AB)^\top = B^\top A^\top \). Computing an (m × k)(k × n) product costs about 2mkn floating-point operations (one multiply and one add per term), which is the number you use in Chapter 7.4 to estimate GPU time. In a batch forward pass, \( XW \) with X of shape (batch, inputs) and W of shape (inputs, outputs) computes every example's layer output in one call, which is why GPUs, built for exactly this, dominate deep learning.</p>
+
+  <h3>3.6 Linear independence, span and rank</h3>
+  <p>A set of vectors is <strong>linearly independent</strong> if none of them can be built from the others by scaling and adding. (1, 0) and (0, 1) are independent; (1, 2) and (2, 4) are not, because the second is twice the first. The <strong>span</strong> of some vectors is everything you can build from them. The <strong>rank</strong> of a matrix is the number of linearly independent columns (equivalently rows), which is the dimension of the space its outputs can reach.</p>
+  <p>Example: \( \begin{pmatrix}1 &amp; 2\\2 &amp; 4\end{pmatrix} \) has rank 1. Whatever you feed it, the output lies on the single line through (1, 2). Information has been destroyed: two different inputs, (2, 0) and (0, 1), both map to (2, 4).</p>
+  <p>Rank matters in ML in two very practical ways. First, <strong>multicollinearity</strong>: if one feature is an exact combination of others (price in USD and price in EUR at a fixed rate; one-hot columns that always sum to 1 plus an intercept), the design matrix is rank-deficient and ordinary least squares has no unique answer. Second, <strong>low-rank structure</strong>: a user-item rating matrix with millions of rows is often well approximated by a rank-50 matrix, which is the idea behind matrix-factorisation recommenders and behind LoRA, which fine-tunes large models by learning low-rank weight updates.</p>
+
+  <h3>3.7 Inverses and solving linear systems</h3>
+  <p>If a square matrix A maps x to y without destroying information (full rank), there is an <strong>inverse</strong> \( A^{-1} \) that maps y back to x, so \( A^{-1}A = I \), where I is the identity matrix (ones on the diagonal). For the stretch matrix diag(2, 1) above, the inverse is diag(0.5, 1): un-stretch. For a 2 × 2 matrix there is a closed form:</p>
+  \[ \begin{pmatrix} a &amp; b\\ c &amp; d\end{pmatrix}^{-1} = \frac{1}{ad - bc}\begin{pmatrix} d &amp; -b\\ -c &amp; a\end{pmatrix}. \]
+  <p>The quantity ad − bc is the <strong>determinant</strong>: the factor by which A scales areas. If it is zero, A squashes the plane onto a line (rank 1), and no inverse exists, matching the formula's division by zero. For \( \begin{pmatrix}1 &amp; 2\\3 &amp; 4\end{pmatrix} \), the determinant is 1·4 − 2·3 = −2, so the inverse is \( \frac{1}{-2}\begin{pmatrix}4 &amp; -2\\-3 &amp; 1\end{pmatrix} = \begin{pmatrix}-2 &amp; 1\\1.5 &amp; -0.5\end{pmatrix} \). Check: multiplying back gives the identity.</p>
+  <div class="callout warn"><p class="callout-title">Never invert in production code</p><p>Mathematically, solving Ax = b is \( x = A^{-1}b \). Numerically, you should almost never form \( A^{-1} \). Use <code>np.linalg.solve</code> (LU factorisation) or <code>np.linalg.lstsq</code> (QR/SVD), which are faster and far more accurate. The accuracy issue is measured by the <em>condition number</em>, the ratio of the largest to smallest singular value: if it is 10<sup>10</sup>, you can lose about ten decimal digits of precision. Nearly collinear features produce exactly this.</p></div>
+
+  <h3>3.8 Eigenvalues and eigenvectors</h3>
+  <p>Most vectors change direction when a matrix is applied to them. A few special ones do not: they only get stretched or flipped. Those are <strong>eigenvectors</strong>, and the stretch factor is the <strong>eigenvalue</strong>. Take</p>
+  \[ A = \begin{pmatrix} 2 &amp; 1\\ 1 &amp; 2\end{pmatrix}. \]
+  <p>Apply it to (1, 1): you get (3, 3), which is 3 × (1, 1). Same direction, stretched by 3, so (1, 1) is an eigenvector with eigenvalue 3. Apply it to (1, −1): you get (1, −1), stretched by 1, so that is an eigenvector with eigenvalue 1. Apply it to (1, 0): you get (2, 1), a different direction, so (1, 0) is not an eigenvector. Formally:</p>
+  \[ A\mathbf{v} = \lambda\mathbf{v}, \quad \mathbf{v}\neq \mathbf{0}. \]
+  <p>To find them by hand, note \( (A - \lambda I)\mathbf{v} = 0 \) needs a non-zero solution, which requires \( \det(A - \lambda I) = 0 \). Here \( (2-\lambda)^2 - 1 = 0 \), so λ = 1 or λ = 3, as we found.</p>
+  <p>Symmetric matrices (A equal to its transpose) are the ones ML meets most, notably covariance matrices, and they have a beautiful property: their eigenvalues are real and their eigenvectors are mutually perpendicular. That means you can write \( A = Q\Lambda Q^\top \), with Q's columns the orthonormal eigenvectors and Λ a diagonal matrix of eigenvalues. Read right to left: rotate into the eigenvector coordinate system, stretch each axis independently, rotate back. <strong>PCA</strong> is exactly this applied to the covariance matrix of your data: the eigenvectors are the directions of greatest spread, the eigenvalues are how much variance lies along each (Chapter 6.4). Eigenvalues also explain training stability: gradient descent on a quadratic loss converges only if the learning rate is below 2 divided by the largest eigenvalue of the loss's curvature matrix (derived in §6).</p>
+
+  <h3>3.9 Singular value decomposition (SVD)</h3>
+  <p>Eigen-decomposition needs a square matrix and behaves best for symmetric ones. The <strong>SVD</strong> works for any matrix, including a rectangular data matrix. It says: every linear transformation, however complicated, is a rotation, followed by an axis-aligned stretch, followed by another rotation.</p>
+  \[ A = U \Sigma V^\top, \qquad A\in\mathbb{R}^{m\times n},\; U\in\mathbb{R}^{m\times m},\; \Sigma\in\mathbb{R}^{m\times n},\; V\in\mathbb{R}^{n\times n}. \]
+  <p>U and V have orthonormal columns (they are rotations/reflections), and Σ is diagonal with non-negative <strong>singular values</strong> σ<sub>1</sub> ≥ σ<sub>2</sub> ≥ … ≥ 0. The number of non-zero singular values is the rank. The connection to eigenvalues: the columns of V are eigenvectors of \( A^\top A \), and \( \sigma_i^2 \) are its eigenvalues.</p>
+  <p>The practical superpower is truncation. Keep only the top k singular values and you get \( A_k = U_k\Sigma_kV_k^\top \), and the Eckart–Young theorem says this is the best rank-k approximation of A in the least-squares sense. Concretely, a 1000 × 1000 image stored as rank 50 needs 50 × (1000 + 1000 + 1) ≈ 100,000 numbers instead of 1,000,000, often with little visible loss. The same idea compresses user-item matrices into user and item embeddings, and is how PCA is computed in practice (scikit-learn's <code>PCA</code> uses SVD of the centred data, not an explicit covariance matrix).</p>
+
+  <h3>3.10 Random variables and distributions</h3>
+  <p>A <strong>random variable</strong> is a quantity whose value is uncertain, together with a rule for how likely each value is. "The number of 5xx errors in the next minute", "whether this user clicks", "tomorrow's latency p50" are random variables. A <strong>discrete</strong> variable takes countable values and is described by a probability mass function (PMF), P(X = k). A <strong>continuous</strong> variable takes real values and is described by a probability density function (PDF) p(x), where probabilities are areas under the curve: \( P(a\le X\le b) = \int_a^b p(x)\,dx \). A density can exceed 1 (a very narrow Gaussian), but the total area is always 1.</p>
+  <p>Four distributions cover most of what you will model:</p>
+  <p><strong>Bernoulli(p)</strong> — one yes/no trial. A click happens with probability p = 0.03. \( P(X=1)=p,\ P(X=0)=1-p \), or compactly \( P(X=x) = p^x(1-p)^{1-x} \) for x in {0, 1}. That compact form is the source of the log-loss in logistic regression, as §6 shows.</p>
+  <p><strong>Binomial(n, p)</strong> — the number of successes in n independent Bernoulli trials. If 1,000 users each click with p = 0.03, the click count has mean 30. The probability of exactly k successes counts the ways to choose which k trials succeed and multiplies the probabilities:</p>
+  \[ P(X=k) = \binom{n}{k} p^k (1-p)^{n-k}. \]
+  <p>With n = 3, p = 0.5, the probability of exactly 2 heads is 3 × 0.25 × 0.5 = 0.375.</p>
+  <p><strong>Poisson(λ)</strong> — counts of rare, independent events in a fixed window, when you know the average rate λ but not a fixed number of trials. If a service averages λ = 4 errors per minute, the probability of zero errors in a given minute is \( e^{-4} \approx 0.018 \).</p>
+  \[ P(X=k) = \frac{\lambda^k e^{-\lambda}}{k!}. \]
+  <p>Poisson is the default model for request arrivals, queue inputs and incident counts, and the Poisson regression loss in LightGBM/XGBoost (<code>objective="poisson"</code>) comes from it.</p>
+  <p><strong>Gaussian (normal) N(μ, σ²)</strong> — the bell curve, centred at mean μ with spread σ. About 68% of the mass is within 1σ, 95% within 1.96σ, 99.7% within 3σ. Its density is</p>
+  \[ p(x) = \frac{1}{\sqrt{2\pi\sigma^2}}\exp\!\left(-\frac{(x-\mu)^2}{2\sigma^2}\right). \]
+  <p>Read the exponent: the density falls off with the <em>squared</em> distance from the mean, scaled by the variance. That squared distance is why least-squares regression is equivalent to assuming Gaussian noise (§6). Latency is famously <em>not</em> Gaussian (it is right-skewed with a long tail), which is why you use percentiles rather than mean ± 2σ for SLOs.</p>
+
+  <h3>3.11 Expectation, variance and covariance</h3>
+  <p>The <strong>expectation</strong> E[X] is the probability-weighted average, the long-run mean if you sampled forever. For a fair die, (1+2+3+4+5+6)/6 = 3.5. For a Bernoulli, E[X] = p. The <strong>variance</strong> measures spread as the expected squared deviation from the mean; its square root is the <strong>standard deviation</strong>. For the die, Var = E[X²] − (E[X])² = 91/6 − 12.25 ≈ 2.917.</p>
+  \[ \mathbb{E}[X] = \sum_x x\,P(X=x), \qquad \operatorname{Var}(X) = \mathbb{E}[(X-\mathbb{E}X)^2] = \mathbb{E}[X^2]-(\mathbb{E}[X])^2. \]
+  <p>Two rules do most of the work. Expectation is linear: E[aX + bY] = aE[X] + bE[Y], always, even for dependent variables. Variance scales quadratically and adds for independent variables: Var(aX) = a²Var(X) and Var(X + Y) = Var(X) + Var(Y) if independent. From these, the variance of the average of n independent samples is σ²/n, so its standard deviation (the <strong>standard error</strong>) is σ/√n. To halve your uncertainty you need four times the data, a fact that sizes every A/B test.</p>
+  <p><strong>Covariance</strong> measures whether two variables move together: Cov(X, Y) = E[(X − EX)(Y − EY)]. <strong>Correlation</strong> divides by both standard deviations to land in [−1, 1]. Correlation is exactly the cosine similarity of the two mean-centred data columns, which ties statistics back to geometry. The <strong>covariance matrix</strong> of a feature vector collects every pairwise covariance; it is symmetric, and its eigenvectors are the principal components.</p>
+
+  <h3>3.12 Conditional probability, independence and Bayes' theorem</h3>
+  <p><strong>Conditional probability</strong> P(A | B) is the probability of A once you know B happened: you restrict attention to the world where B is true and renormalise. Suppose 2% of transactions are fraudulent, and among fraudulent ones, 90% come from new devices, while among legitimate ones only 10% do. Out of 10,000 transactions, 200 are fraud, of which 180 are from new devices; 9,800 are legitimate, of which 980 are from new devices. So given "new device", the chance of fraud is 180 / (180 + 980) ≈ 15.5%. Note how much smaller that is than the 90% you might naively have guessed. This mistake (confusing P(new device | fraud) with P(fraud | new device)) is called the <em>base-rate fallacy</em>, and it is behind most alerting systems that page people for nothing.</p>
+  \[ P(A\mid B) = \frac{P(A\cap B)}{P(B)}, \qquad P(A\mid B) = \frac{P(B\mid A)\,P(A)}{P(B)}. \]
+  <p>The second equation is <strong>Bayes' theorem</strong>, and we just computed it with counts: P(fraud | new) = 0.9 × 0.02 / (0.9 × 0.02 + 0.1 × 0.98) = 0.018 / 0.116 ≈ 0.155. The vocabulary: P(A) is the <em>prior</em> (what you believed before), P(B | A) the <em>likelihood</em> (how well A explains the evidence), P(A | B) the <em>posterior</em> (updated belief). The denominator, the <em>evidence</em>, is often expanded with the law of total probability, \( P(B) = \sum_i P(B\mid A_i)P(A_i) \).</p>
+  <p>Two events are <strong>independent</strong> if knowing one tells you nothing about the other: P(A | B) = P(A), equivalently P(A ∩ B) = P(A)P(B). Independence is an assumption that ML leans on constantly ("training examples are i.i.d."; naive Bayes assumes features independent given the class) and that production data violates constantly (user sessions, time series, duplicated rows). Many evaluation bugs in later chapters are really violated-independence bugs.</p>
+
+  <h3>3.13 Maximum likelihood and MAP estimation</h3>
+  <p>Given data and a model family with unknown parameters, which parameters should we pick? <strong>Maximum likelihood estimation (MLE)</strong> answers: the ones under which the observed data would have been most probable. You flip a coin 10 times and see 7 heads. If the coin's head-probability were 0.5, the probability of exactly this sequence is 0.5<sup>10</sup> ≈ 0.00098; if it were 0.7, it is 0.7<sup>7</sup> × 0.3<sup>3</sup> ≈ 0.00222. 0.7 explains the data better, and in fact it is the best possible choice. The MLE for a Bernoulli parameter is the sample proportion, as derived in §6.</p>
+  \[ \hat\theta_{\text{MLE}} = \arg\max_\theta \prod_{i=1}^{m} p(x_i\mid\theta) = \arg\max_\theta \sum_{i=1}^{m}\log p(x_i\mid\theta). \]
+  <p>We take logs because products of many small probabilities underflow floating point (10,000 values of 0.01 multiply to 10<sup>−20000</sup>, which is zero in float64), and because sums are easier to differentiate. Since log is increasing, the maximiser is unchanged. ML frameworks <em>minimise</em>, so the loss is the <strong>negative log-likelihood (NLL)</strong>. Mean squared error, binary cross-entropy and categorical cross-entropy are all NLLs under Gaussian, Bernoulli and categorical assumptions respectively.</p>
+  <p><strong>Maximum a posteriori (MAP)</strong> estimation adds a prior belief about the parameters and maximises the posterior instead. If you had seen only 2 flips, both heads, MLE says p = 1.0, which is absurd for a coin. With a prior that favours values near 0.5, MAP gives something more sensible. Using Bayes' theorem and dropping the evidence term (it does not depend on θ):</p>
+  \[ \hat\theta_{\text{MAP}} = \arg\max_\theta \Big[\sum_{i}\log p(x_i\mid\theta) + \log p(\theta)\Big]. \]
+  <p>The extra term \( \log p(\theta) \) is a regulariser. A Gaussian prior on weights gives exactly an L2 penalty; a Laplace prior gives an L1 penalty. So "regularisation as a complexity budget" has a probabilistic reading: you are stating, before seeing data, that you believe small weights are more likely.</p>
+
+  <h3>3.14 Sampling, the central limit theorem and confidence intervals</h3>
+  <p>You almost never see a whole population; you see a <strong>sample</strong>, and you compute a statistic (a mean, a click-through rate, an accuracy). The statistic would be different with a different sample, so it has a distribution of its own, the <strong>sampling distribution</strong>. The <strong>central limit theorem (CLT)</strong> says that, for a sample of n independent draws from almost any distribution with finite variance σ², the sample mean is approximately Gaussian with mean μ and standard deviation σ/√n, and the approximation improves as n grows. That is why you can put error bars on a mean of skewed latencies, or on a click-through rate (a mean of Bernoullis), without knowing the underlying distribution.</p>
+  <p>A <strong>95% confidence interval</strong> is then roughly mean ± 1.96 standard errors. Example: a model is correct on 870 of 1,000 test examples. Accuracy is 0.87, the standard error is \( \sqrt{0.87 \times 0.13 / 1000} \approx 0.0106 \), so the interval is about 0.87 ± 0.021, or [0.849, 0.891]. If a competing model scores 0.88 on the same size test set, you cannot claim it is better from this alone.</p>
+  \[ \bar{x} \pm z_{1-\alpha/2}\,\frac{s}{\sqrt{n}}, \qquad z_{0.975}\approx 1.96. \]
+  <p>The correct interpretation is subtle: the procedure, repeated over many samples, produces intervals that contain the true value 95% of the time. It does not mean "95% probability the true value is in this particular interval" (that is a Bayesian credible interval). In practice the distinction matters less than remembering that the interval exists.</p>
+
+  <h3>3.15 Hypothesis tests, p-values and A/B tests</h3>
+  <p>A <strong>hypothesis test</strong> asks: if nothing interesting were happening (the <em>null hypothesis</em> H<sub>0</sub>, e.g. "the new model's conversion rate equals the old one"), how surprising would the data be? The <strong>p-value</strong> is the probability, under H<sub>0</sub>, of seeing a result at least as extreme as the one observed. If it falls below a pre-chosen threshold α (commonly 0.05), you reject H<sub>0</sub>.</p>
+  <p>Worked A/B example. Control: 10,000 users, 500 conversions (5.00%). Treatment: 10,000 users, 560 conversions (5.60%). The pooled rate is 1,060 / 20,000 = 5.3%. The standard error of the difference is \( \sqrt{0.053\times0.947\times(1/10000+1/10000)} \approx 0.00317 \). The z-statistic is 0.006 / 0.00317 ≈ 1.89. The two-sided p-value for z = 1.89 is about 0.058. Not significant at α = 0.05, despite a 12% relative lift. You need more data.</p>
+  \[ z = \frac{\hat p_B - \hat p_A}{\sqrt{\hat p(1-\hat p)\left(\frac{1}{n_A}+\frac{1}{n_B}\right)}}. \]
+  <p>Two error types frame test design. A <strong>Type I error</strong> (false positive) happens with probability α. A <strong>Type II error</strong> (missing a real effect) happens with probability β, and <strong>power</strong> = 1 − β, typically targeted at 0.8. Sample size is chosen in advance so that a minimum detectable effect is found with that power; the approximate per-arm size for a proportion is \( n \approx 2(z_{1-\alpha/2}+z_{1-\beta})^2\,p(1-p)/\delta^2 \). For p = 0.05, δ = 0.005 (a 10% relative lift), α = 0.05, power 0.8: n ≈ 2 × (1.96 + 0.84)² × 0.0475 / 0.000025 ≈ 29,800 users per arm.</p>
+  <div class="callout danger"><p class="callout-title">The peeking problem</p><p>If you check a running experiment every day and stop the first time p &lt; 0.05, your real false-positive rate is far above 5%, because you gave chance many opportunities to cross the line. Either fix the sample size in advance, or use a method designed for continuous monitoring (sequential tests, always-valid p-values). Mature experimentation platforms build this in; home-grown dashboards often do not.</p></div>
+
+  <h3>3.16 Derivatives: the local slope</h3>
+  <p>A <strong>derivative</strong> answers: if I nudge the input a tiny bit, how much does the output change, per unit of nudge? For f(x) = x² at x = 3, f(3) = 9 and f(3.001) = 9.006001, so the output changed by about 0.006 for a 0.001 nudge: a slope of about 6. The exact answer is f′(x) = 2x = 6.</p>
+  \[ f'(x) = \lim_{h\to 0}\frac{f(x+h)-f(x)}{h}. \]
+  <p>The rules you need are few: the derivative of \( x^n \) is \( n x^{n-1} \); of \( e^x \) is \( e^x \); of \( \ln x \) is \( 1/x \); derivatives add; constants factor out. The geometric meaning drives optimisation: where the derivative is positive the function increases to the right, so to decrease it you step left. Gradient descent is this observation, automated.</p>
+
+  <h3>3.17 Partial derivatives and the gradient</h3>
+  <p>A loss depends on many parameters at once. A <strong>partial derivative</strong> is the slope with respect to one input while freezing the others. For \( f(x, y) = x^2 + 3xy \): treating y as constant, ∂f/∂x = 2x + 3y; treating x as constant, ∂f/∂y = 3x. At (1, 2): ∂f/∂x = 8, ∂f/∂y = 3.</p>
+  <p>Stack all the partials into a vector and you get the <strong>gradient</strong>, ∇f = (8, 3) at that point. The gradient has a crucial geometric property: it points in the direction of steepest increase, and its length is the rate of that increase. So −∇f is the direction of steepest decrease, and the update rule of gradient descent is</p>
+  \[ \boldsymbol\theta_{t+1} = \boldsymbol\theta_t - \eta\,\nabla_{\boldsymbol\theta} L(\boldsymbol\theta_t), \]
+  <p>where η (eta) is the <strong>learning rate</strong>, the step size.</p>
+  <div class="callout java"><p class="callout-title">Engineering analogy: a feedback control loop</p><p>Gradient descent is a proportional controller. The "error signal" is the gradient; the controller output is a parameter adjustment proportional to it, with gain η. Too little gain and the system converges sluggishly; too much and it overshoots and oscillates, or diverges outright, exactly like an autoscaler with an aggressive scaling factor that thrashes between 2 and 40 pods. Momentum (Chapter 7.1) adds an integral-like term that smooths the response.</p></div>
+
+  <h3>3.18 The chain rule and Jacobians</h3>
+  <p>Neural networks are functions of functions of functions. The <strong>chain rule</strong> says the sensitivity of a composition is the product of the sensitivities of each stage. If y = g(x) and z = f(y), then a small change in x is multiplied by g′(x) on its way to y, then by f′(y) on its way to z. Example: z = (3x + 1)². Let y = 3x + 1, so dy/dx = 3, and z = y², so dz/dy = 2y. At x = 1, y = 4, so dz/dx = 2 · 4 · 3 = 24. Check numerically: at x = 1.001, z = 4.003² = 16.024009, a change of 0.024 for a 0.001 nudge. Correct.</p>
+  \[ \frac{dz}{dx} = \frac{dz}{dy}\cdot\frac{dy}{dx}. \]
+  <p>When the stages map vectors to vectors, each stage's "derivative" is a matrix, the <strong>Jacobian</strong>, whose entry (i, j) is how output i responds to input j. For y = Wx, the Jacobian is simply W. The multivariate chain rule then multiplies Jacobians: \( J_{z\leftarrow x} = J_{z\leftarrow y}\,J_{y\leftarrow x} \). Backpropagation is the chain rule evaluated from the loss backwards, multiplying a row vector (the gradient of a scalar loss) by successive Jacobians. Going backwards is the efficient direction because the loss is a single number: every step is a vector-times-matrix product rather than a matrix-times-matrix product. Chapter 7.1 derives this in full.</p>
+  \[ J = \frac{\partial \mathbf{y}}{\partial \mathbf{x}} = \begin{pmatrix} \frac{\partial y_1}{\partial x_1} &amp; \cdots &amp; \frac{\partial y_1}{\partial x_n}\\ \vdots &amp; \ddots &amp; \vdots\\ \frac{\partial y_m}{\partial x_1} &amp; \cdots &amp; \frac{\partial y_m}{\partial x_n}\end{pmatrix}. \]
+  <p>The matrix of <em>second</em> derivatives, the <strong>Hessian</strong> H, describes curvature: how fast the gradient itself changes. XGBoost uses second-order information (Chapter 6.3), and the Hessian's eigenvalues determine the safe learning rate.</p>
+
+  <h3>3.19 Optimisation and convexity</h3>
+  <p>Training is optimisation: find parameters minimising the loss. A function is <strong>convex</strong> if the straight line between any two points on its graph lies on or above the graph: a bowl, with no bumps. For convex functions, every local minimum is the global minimum, so gradient descent with a suitable step size finds the best answer. Linear regression with squared error, logistic regression with log-loss, and their L1/L2-regularised versions are all convex. That is a big reason they remain the reliable baselines.</p>
+  \[ f(\lambda a + (1-\lambda)b) \le \lambda f(a) + (1-\lambda) f(b), \qquad \forall\, a, b,\ \lambda\in[0,1]. \]
+  <p>For a twice-differentiable function, convexity is equivalent to the Hessian being positive semi-definite (all its eigenvalues ≥ 0): curving upward in every direction. Neural network losses are <em>non-convex</em>: they have many minima, saddle points and plateaus. Empirically, in very high dimensions most critical points are saddles rather than bad minima, and stochastic gradients help escape them, which is part of why deep learning works better than classical theory would predict.</p>
+
+  <h3>3.20 Information theory: entropy, cross-entropy and KL divergence</h3>
+  <p>Information theory measures surprise. If an event has probability p, observing it carries −log₂ p bits of "surprise": a certain event (p = 1) carries zero bits; a fair coin flip carries 1 bit; a 1-in-1024 event carries 10 bits. <strong>Entropy</strong> is the average surprise of a distribution, its inherent unpredictability. A fair coin has entropy 1 bit; a coin with p = 0.9 has entropy −(0.9 log₂ 0.9 + 0.1 log₂ 0.1) ≈ 0.469 bits: more predictable, less information per flip.</p>
+  \[ H(p) = -\sum_x p(x)\log p(x). \]
+  <p>Engineers have met entropy before: it is the lower bound on the average number of bits per symbol any lossless compressor can achieve. Gzip compresses log files well because their entropy is low.</p>
+  <p><strong>Cross-entropy</strong> H(p, q) is the average surprise when events come from the true distribution p but you predict with q. If the truth is "class 2" (p = [0, 1, 0]) and your model says q = [0.2, 0.7, 0.1], the cross-entropy is −log(0.7) ≈ 0.357 nats (using natural log). Had the model said 0.99 it would be 0.010; had it said 0.01, it would be 4.6. Confident wrong answers are punished heavily, which is exactly the behaviour you want from a classification loss.</p>
+  \[ H(p, q) = -\sum_x p(x)\log q(x). \]
+  <p><strong>KL divergence</strong> is the extra surprise caused by using q instead of the truth p: cross-entropy minus entropy. It is always ≥ 0 and equals 0 only when q = p. It is not symmetric, so it is not a true distance.</p>
+  \[ D_{\mathrm{KL}}(p\,\|\,q) = \sum_x p(x)\log\frac{p(x)}{q(x)} = H(p,q) - H(p). \]
+  <p>Because H(p) does not depend on the model, minimising cross-entropy is the same as minimising KL divergence from the data distribution, which (§6 shows) is the same as maximum likelihood. Three names, one objective. KL also appears directly in variational autoencoders, knowledge distillation, and the penalty that keeps an RLHF-tuned language model close to its reference model.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working: What the Computer Actually Does</h2>
+  <h3>4.1 Arrays, memory layout and BLAS</h3>
+  <p>A NumPy array is a contiguous block of memory plus metadata: dtype, shape and <em>strides</em> (how many bytes to jump to move one step along each axis). A 1000 × 1000 float64 matrix is 8 MB of doubles laid out row-major (C order) by default. Transposing it does not copy anything; it swaps the strides, so <code>A.T</code> is O(1). Slicing likewise returns a view. This is the same idea as a Java <code>ByteBuffer</code> slice: a window onto shared memory.</p>
+  <p>When you write <code>A @ B</code>, NumPy dispatches to a BLAS library (OpenBLAS or Intel MKL on CPUs, cuBLAS on NVIDIA GPUs via PyTorch). BLAS "level 3" routines (matrix-matrix, GEMM) are tiled to keep blocks in L1/L2 cache and use SIMD instructions (AVX2/AVX-512), reaching a large fraction of peak FLOPs. A pure Python triple loop over the same matrices is typically thousands of times slower. The engineering lesson: express computation as whole-array operations ("vectorise"), so the inner loops run in optimised native code.</p>
+  <pre class="ascii">
+ Row-major (C order) 2x3 float64 array  a = [[1, 2, 3],
+                                             [4, 5, 6]]
+ memory:  | 1.0 | 2.0 | 3.0 | 4.0 | 5.0 | 6.0 |
+ shape=(2,3)   strides=(24, 8)  -> next row: +24 bytes, next col: +8 bytes
+ a.T:  shape=(3,2) strides=(8, 24)  -> same buffer, no copy
+</pre>
+  <h3>4.2 Floating point: where the math meets the hardware</h3>
+  <p>Real numbers are stored as IEEE-754 floats: a sign, an exponent and a mantissa. float64 has about 16 significant decimal digits; float32 about 7; bfloat16 about 3 (but float32's exponent range). Consequences you will hit in ML:</p>
+  <ul>
+    <li><strong>Overflow in exp.</strong> <code>np.exp(1000)</code> is <code>inf</code>. Softmax over logits like [1000, 1001] therefore needs the "subtract the max" trick: softmax is unchanged by adding a constant to every input, so compute exp(z − max z).</li>
+    <li><strong>log(0).</strong> <code>np.log(0)</code> is <code>-inf</code>; a model that outputs exactly 0 for the true class produces infinite loss. Frameworks compute cross-entropy directly from logits using <em>log-sum-exp</em>: \( \log\sum_j e^{z_j} = m + \log\sum_j e^{z_j - m} \) with m = max z.</li>
+    <li><strong>Catastrophic cancellation.</strong> Var = E[X²] − (E[X])² subtracts two nearly equal large numbers when the mean is large compared with the spread, destroying precision. Use two-pass or Welford's online algorithm (the same algorithm behind a well-implemented streaming metrics library).</li>
+    <li><strong>Non-associativity.</strong> (a + b) + c can differ from a + (b + c) in floating point, so parallel reductions on GPUs are not bit-for-bit reproducible by default. Chapter 7.4 covers deterministic modes.</li>
+  </ul>
+  <h3>4.3 How a library computes eigenvalues and SVDs</h3>
+  <p>Nobody computes eigenvalues by solving det(A − λI) = 0 beyond 3 × 3; polynomial roots are numerically unstable. LAPACK (behind <code>np.linalg.eigh</code> and <code>np.linalg.svd</code>) first reduces a symmetric matrix to tridiagonal form with orthogonal Householder reflections, then iterates (QR algorithm or divide-and-conquer) until off-diagonal entries vanish. The cost is O(n³). For huge sparse matrices or when you need only the top k components, <em>iterative</em> methods (power iteration, Lanczos, randomised SVD) cost roughly O(k · nnz) per pass. scikit-learn's <code>PCA(svd_solver="randomized")</code> and <code>TruncatedSVD</code> use randomised methods.</p>
+  <p>Power iteration is worth seeing because it is simple and illuminating: start with a random vector, multiply by A, normalise, repeat. Each multiplication amplifies the component along the top eigenvector by λ<sub>1</sub> and the others by smaller λ<sub>i</sub>, so the vector rotates towards the dominant eigenvector, at a speed governed by the ratio λ<sub>2</sub>/λ<sub>1</sub>. Google's original PageRank was computed this way on the web's link matrix.</p>
+  <h3>4.4 How derivatives are computed: three approaches</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Method</th><th>How</th><th>Accuracy</th><th>Cost for gradient of n params</th><th>Used for</th></tr></thead>
+    <tbody>
+      <tr><td>Numerical (finite differences)</td><td>(f(x + h) − f(x − h)) / 2h for each parameter</td><td>Approximate; sensitive to h</td><td>2n function evaluations</td><td>Gradient checking in tests</td></tr>
+      <tr><td>Symbolic</td><td>Manipulate the formula (SymPy, Mathematica)</td><td>Exact</td><td>Expression swell for deep compositions</td><td>Deriving formulas by hand</td></tr>
+      <tr><td>Automatic differentiation (reverse mode)</td><td>Record operations on a graph, apply the chain rule backwards with exact local derivatives</td><td>Exact to floating point</td><td>About 2 to 3 times one forward pass, regardless of n</td><td>PyTorch, JAX, TensorFlow</td></tr>
+    </tbody>
+  </table></div>
+  <p>Reverse-mode autodiff's cost being independent of the number of parameters is the single fact that makes training billion-parameter models feasible. With finite differences, a 1-billion-parameter model would need 2 billion forward passes per gradient.</p>
+  <h3>4.5 How a gradient-descent step executes</h3>
+  <ol>
+    <li><strong>Forward:</strong> compute predictions \( \hat{\mathbf{y}} = X\boldsymbol\theta \) (one GEMV/GEMM) and the loss (a reduction).</li>
+    <li><strong>Backward:</strong> compute ∇L, for least squares \( \frac{2}{m}X^\top(X\boldsymbol\theta - \mathbf{y}) \): one more GEMV with the transpose (free, via strides).</li>
+    <li><strong>Update:</strong> θ ← θ − η∇L, an element-wise "axpy" operation.</li>
+    <li><strong>Check:</strong> log the loss; stop when the change falls below a tolerance or after a budget of iterations.</li>
+  </ol>
+  <p>That is the entire inner loop of every model in this part of the book. Chapter 7 adds non-linearities and autodiff, but the skeleton does not change.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: How the Pieces Connect</h2>
+  <p>The five branches are not independent topics; they form a pipeline. The diagrams below show who feeds whom.</p>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  D["Raw data (rows, events, images)"] --> LA["Linear algebra: vectors and matrices X"]
+  LA --> M["Model f(X; theta) built from matrix ops"]
+  P["Probability: assume y ~ distribution"] --> L["Loss = negative log-likelihood"]
+  IT["Information theory: cross-entropy, KL"] --> L
+  M --> L
+  L --> C["Calculus: gradient via chain rule"]
+  C --> O["Optimisation: theta minus eta times gradient"]
+  O --> M
+  M --> S["Statistics: CI, tests on held-out data"]
+  S --> DEC["Ship / do not ship"]
+</pre>
+  <figcaption>Figure 6.1.1 — The five branches of math as stages of the training-and-evaluation pipeline.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> linear algebra is the <em>representation</em> layer: data become a matrix X and the model is built from matrix operations. Probability and information theory are the <em>specification</em> layer: they turn "be accurate" into a precise loss. Calculus and optimisation are the <em>control loop</em>: the arrow from O back to M is the training iteration. Statistics sits outside the loop as the <em>acceptance test</em>: it judges the trained model on data the loop never saw. If you map this to a CI/CD pipeline, training is the build, and statistics is the gate that decides promotion to production.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  x["x (input)"] --> mul["u = w * x"]
+  w["w (parameter)"] --> mul
+  mul --> add["v = u + b"]
+  b["b (parameter)"] --> add
+  add --> sq["L = (v - y) squared"]
+  y["y (target)"] --> sq
+  sq -. "dL/dv = 2(v - y)" .-> add
+  add -. "dL/du = dL/dv" .-> mul
+  add -. "dL/db = dL/dv" .-> b
+  mul -. "dL/dw = dL/du * x" .-> w
+</pre>
+  <figcaption>Figure 6.1.2 — A computational graph for one-variable linear regression, with gradients (dashed) flowing backwards.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> solid arrows are the forward computation; dashed arrows are the backward pass. Each node knows only its own local derivative: the squaring node knows dL/dv = 2(v − y); the addition node passes the incoming gradient unchanged to both inputs (because ∂v/∂u = ∂v/∂b = 1); the multiplication node multiplies the incoming gradient by the <em>other</em> input. Numerically, with x = 2, w = 0.5, b = 0, y = 3: forward gives u = 1, v = 1, L = 4. Backward: dL/dv = 2(1 − 3) = −4, so dL/db = −4 and dL/dw = −4 × 2 = −8. Both are negative, meaning increasing w and b would lower the loss, which is right since the prediction 1 is below the target 3. This local-rule-plus-chain-rule structure is exactly what PyTorch's autograd records.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  prior["Prior P(theta)"] --> post["Posterior P(theta given data)"]
+  lik["Likelihood P(data given theta)"] --> post
+  post --> mapE["MAP: argmax posterior = MLE + regulariser"]
+  lik --> mle["MLE: argmax likelihood"]
+  mle --> nll["Loss = NLL: MSE, log-loss, cross-entropy"]
+  mapE --> reg["Loss = NLL + lambda times norm of theta"]
+</pre>
+  <figcaption>Figure 6.1.3 — How Bayes' theorem connects to the loss functions you actually optimise.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> starting from Bayes' theorem, dropping the prior gives MLE, whose negative log is the familiar loss. Keeping the prior gives MAP, which is the same loss plus a penalty term. So when a scikit-learn docstring says "L2-regularised logistic regression", you can read it as "MAP estimation with a Gaussian prior on the weights", and the regularisation strength corresponds to how narrow that prior is.</p>
+
+  <figure class="diagram">
+    <div class="widget" data-widget="gradient-descent"></div>
+    <figcaption>Figure 6.1.4 — Interactive: gradient descent on a 1-D/2-D loss surface with adjustable learning rate and momentum.</figcaption>
+  </figure>
+  <p><strong>What to try:</strong> start with a small learning rate and watch the iterate creep down the slope, taking many steps. Increase it until the path starts zig-zagging across the valley: that is the step overshooting along the steep direction while still crawling along the shallow one (the curvature imbalance measured by the Hessian's condition number). Increase it further and the loss grows without bound: divergence, the η &gt; 2/λ<sub>max</sub> regime derived in §6.6. Then add momentum and observe how it damps the zig-zag and accelerates along the valley floor. Relate each behaviour to the feedback-controller analogy: gain too low, critically tuned, oscillating, unstable.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math: Derivations You Will Reuse</h2>
+  <p>This section derives the results that later chapters quote. Each starts with what the result says in words.</p>
+
+  <h3>6.1 Least squares: the normal equation</h3>
+  <p><strong>In words:</strong> for a linear model, the best weights (in squared error) are those whose residual vector is perpendicular to every feature column. If the residuals still correlated with some feature, you could adjust that feature's weight and do better.</p>
+  <p><strong>Numeric example:</strong> points (1, 2), (2, 3), (3, 5). Fit y ≈ w x with no intercept. Squared error is (2 − w)² + (3 − 2w)² + (5 − 3w)². Its derivative, −2[(2 − w) + 2(3 − 2w) + 3(5 − 3w)] = −2[23 − 14w], is zero at w = 23/14 ≈ 1.643. Note 23 = Σ x<sub>i</sub>y<sub>i</sub> and 14 = Σ x<sub>i</sub>²: the formula is (xᵀy)/(xᵀx).</p>
+  <p><strong>Formal derivation:</strong> with X ∈ ℝ<sup>m×n</sup>, minimise \( L(\mathbf{w}) = \|X\mathbf{w}-\mathbf{y}\|_2^2 = (X\mathbf{w}-\mathbf{y})^\top(X\mathbf{w}-\mathbf{y}) \). Expanding, \( L = \mathbf{w}^\top X^\top X\mathbf{w} - 2\mathbf{y}^\top X\mathbf{w} + \mathbf{y}^\top\mathbf{y} \). Using \( \nabla_{\mathbf{w}}(\mathbf{w}^\top A\mathbf{w}) = 2A\mathbf{w} \) for symmetric A and \( \nabla_{\mathbf{w}}(\mathbf{c}^\top\mathbf{w}) = \mathbf{c} \):</p>
+  \[ \nabla_{\mathbf{w}} L = 2X^\top X\mathbf{w} - 2X^\top\mathbf{y} = 2X^\top(X\mathbf{w}-\mathbf{y}) = 0 \;\Longrightarrow\; X^\top X\,\mathbf{w}^* = X^\top\mathbf{y}. \]
+  <p>If \( X^\top X \) is invertible (X has full column rank), \( \mathbf{w}^* = (X^\top X)^{-1}X^\top\mathbf{y} \). The middle expression \( X^\top(X\mathbf{w}-\mathbf{y}) = 0 \) is the "residuals orthogonal to every column" statement. Cost: forming \( X^\top X \) is O(mn²), solving is O(n³). That is cheap for n = 100 features and impossible for n = 10⁶, which is when gradient descent wins.</p>
+
+  <h3>6.2 Least squares is MLE under Gaussian noise</h3>
+  <p><strong>In words:</strong> if you believe each target equals a linear prediction plus bell-curve noise, the most likely weights are the least-squares weights.</p>
+  <p>Assume \( y_i = \mathbf{w}^\top\mathbf{x}_i + \varepsilon_i \) with \( \varepsilon_i\sim\mathcal{N}(0,\sigma^2) \) independent. The log-likelihood is</p>
+  \[ \log\prod_i \frac{1}{\sqrt{2\pi\sigma^2}}e^{-\frac{(y_i-\mathbf{w}^\top\mathbf{x}_i)^2}{2\sigma^2}} = -\frac{m}{2}\log(2\pi\sigma^2) - \frac{1}{2\sigma^2}\sum_i (y_i-\mathbf{w}^\top\mathbf{x}_i)^2. \]
+  <p>The first term does not involve w, and the second is a negative constant times the sum of squared errors. Maximising it is minimising squared error. If you instead assume Laplace-distributed noise (heavier tails), the same derivation yields absolute error (L1 loss), which is more robust to outliers. Your loss choice is a noise assumption.</p>
+
+  <h3>6.3 Bernoulli MLE and the log-loss</h3>
+  <p><strong>In words:</strong> for yes/no data, the most likely probability is the observed fraction, and the loss you minimise for a probabilistic classifier is the average surprise of the true labels.</p>
+  <p>For labels y<sub>i</sub> ∈ {0, 1} with a single parameter p, the log-likelihood is \( \ell(p) = \sum_i [y_i\log p + (1-y_i)\log(1-p)] = k\log p + (m-k)\log(1-p) \) where k is the number of ones. Setting the derivative to zero: \( k/p - (m-k)/(1-p) = 0 \Rightarrow p = k/m \). With 7 heads in 10, p̂ = 0.7, confirming the intuition from §3.13. If instead each example gets its own predicted probability \( \hat{p}_i = \sigma(\mathbf{w}^\top\mathbf{x}_i) \), the negative average log-likelihood is the <strong>binary cross-entropy</strong> or log-loss:</p>
+  \[ \mathcal{L}(\mathbf{w}) = -\frac{1}{m}\sum_{i=1}^{m}\Big[y_i\log\hat p_i + (1-y_i)\log(1-\hat p_i)\Big]. \]
+  <p>Numeric check: a positive example predicted at 0.9 costs −log 0.9 = 0.105; predicted at 0.1, it costs 2.303. Twenty-two times worse for being confidently wrong.</p>
+
+  <h3>6.4 MAP with a Gaussian prior is L2 regularisation</h3>
+  <p>Put a prior \( w_j\sim\mathcal{N}(0,\tau^2) \) on each weight. Then \( \log p(\mathbf{w}) = -\frac{1}{2\tau^2}\|\mathbf{w}\|_2^2 + \text{const} \). The MAP objective, negated, becomes</p>
+  \[ \text{NLL}(\mathbf{w}) + \frac{1}{2\tau^2}\|\mathbf{w}\|_2^2 \;=\; \text{NLL}(\mathbf{w}) + \lambda\|\mathbf{w}\|_2^2, \quad \lambda = \frac{1}{2\tau^2}. \]
+  <p>A narrow prior (small τ, strong belief weights are near zero) means a large λ. A Laplace prior \( p(w_j)\propto e^{-|w_j|/b} \) gives \( \lambda\|\mathbf{w}\|_1 \) instead. For least squares with L2, the normal equation becomes \( (X^\top X + \lambda I)\mathbf{w} = X^\top\mathbf{y} \), and adding λI also fixes rank deficiency: every eigenvalue of \( X^\top X \) is shifted up by λ, so the matrix is always invertible. That is ridge regression.</p>
+
+  <h3>6.5 Cross-entropy minimisation equals MLE equals KL minimisation</h3>
+  <p>Let \( \hat p_{\text{data}} \) be the empirical distribution of the training labels and \( q_\theta \) the model. Then</p>
+  \[ \frac{1}{m}\sum_i -\log q_\theta(y_i\mid x_i) = H(\hat p_{\text{data}}, q_\theta) = H(\hat p_{\text{data}}) + D_{\mathrm{KL}}(\hat p_{\text{data}}\,\|\,q_\theta). \]
+  <p>The left side is the average NLL; the entropy term is constant in θ. So all three objectives have the same minimiser. <strong>Why KL ≥ 0:</strong> log is concave, so by Jensen's inequality \( -D_{\mathrm{KL}} = \sum p\log(q/p) \le \log\sum p\cdot (q/p) = \log\sum q = \log 1 = 0 \), with equality only if q/p is constant, i.e. q = p. Numeric check: p = [0.5, 0.5], q = [0.9, 0.1]: KL = 0.5 ln(0.5/0.9) + 0.5 ln(0.5/0.1) = −0.294 + 0.805 = 0.511 nats; reversed, KL(q‖p) = 0.9 ln 1.8 + 0.1 ln 0.2 = 0.529 − 0.161 = 0.368. Positive both ways, and asymmetric.</p>
+
+  <h3>6.6 Why the learning rate must be below 2/λ<sub>max</sub></h3>
+  <p><strong>In words:</strong> along each eigen-direction of the curvature, gradient descent multiplies the remaining error by (1 − η × curvature) per step. If that factor's magnitude exceeds 1, the error grows. The steepest direction sets the limit.</p>
+  <p><strong>Numeric example:</strong> f(x) = 5x², so f′(x) = 10x and the curvature is 10. Starting at x = 1 with η = 0.1: x ← 1 − 0.1 × 10 = 0, converged in one step. With η = 0.15: x ← 1 − 1.5 = −0.5, then 0.25, −0.125: converging while oscillating. With η = 0.25: x ← 1 − 2.5 = −1.5, then 2.25: diverging. The threshold is η = 2/10 = 0.2.</p>
+  <p><strong>Formal:</strong> for \( L(\boldsymbol\theta) = \tfrac12\boldsymbol\theta^\top H\boldsymbol\theta \) with H symmetric positive definite, the update is \( \boldsymbol\theta_{t+1} = (I - \eta H)\boldsymbol\theta_t \). Writing θ in H's eigenbasis, each coordinate evolves as \( c_{i,t+1} = (1-\eta\lambda_i)c_{i,t} \). Convergence requires \( |1-\eta\lambda_i| &lt; 1 \) for all i, i.e.</p>
+  \[ 0 &lt; \eta &lt; \frac{2}{\lambda_{\max}}, \qquad \text{rate} \approx \max_i |1-\eta\lambda_i| \ge \frac{\kappa-1}{\kappa+1},\quad \kappa = \frac{\lambda_{\max}}{\lambda_{\min}}. \]
+  <p>The condition number κ controls how slowly the shallowest direction converges when η is capped by the steepest. That is why feature scaling (Chapter 6.2) speeds up gradient descent: unscaled features (income in dollars next to age in years) create a large κ.</p>
+
+  <h3>6.7 The CLT standard error and sample-size formula</h3>
+  <p>For i.i.d. X<sub>i</sub> with variance σ², \( \operatorname{Var}(\bar X) = \operatorname{Var}(\frac1n\sum X_i) = \frac{1}{n^2}\cdot n\sigma^2 = \sigma^2/n \). For a difference of two independent arm means with equal n, the variance is 2σ²/n. Requiring the effect δ to sit \( z_{1-\alpha/2}+z_{1-\beta} \) standard errors from zero gives \( \delta = (z_{1-\alpha/2}+z_{1-\beta})\sqrt{2\sigma^2/n} \), so</p>
+  \[ n = \frac{2\,(z_{1-\alpha/2}+z_{1-\beta})^2\,\sigma^2}{\delta^2}, \qquad \sigma^2 = p(1-p)\text{ for conversions}. \]
+  <p>The 1/δ² dependence is the important part: detecting an effect half as large requires four times the traffic.</p>
+
+  <h3>6.8 Complexity reference</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Operation</th><th>Shapes</th><th>FLOPs (approx.)</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td>Dot product</td><td>n, n</td><td>2n</td><td>768-d embedding similarity: ~1.5k FLOPs</td></tr>
+      <tr><td>Matrix-vector</td><td>(m × n)(n)</td><td>2mn</td><td>Score 1M docs × 768-d: ~1.5 GFLOP</td></tr>
+      <tr><td>Matrix-matrix</td><td>(m × k)(k × n)</td><td>2mkn</td><td>4096³ GEMM: ~137 GFLOP</td></tr>
+      <tr><td>Solve / inverse / eigh</td><td>n × n</td><td>O(n³)</td><td>n = 10,000: ~10<sup>12</sup> operations</td></tr>
+      <tr><td>Full SVD</td><td>m × n, m ≥ n</td><td>O(mn²)</td><td>PCA on 1M × 100: ~10<sup>10</sup></td></tr>
+      <tr><td>Normal-equation fit</td><td>m × n</td><td>O(mn² + n³)</td><td>Fine below ~10⁴ features</td></tr>
+      <tr><td>One GD epoch (linear model)</td><td>m × n</td><td>O(mn)</td><td>Scales to any n</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="code">
+  <h2>7. Code: The Math in NumPy, SciPy and PyTorch</h2>
+  <p>All scripts below are complete and runnable with Python 3.11+, <code>numpy</code>, <code>scipy</code>, <code>scikit-learn</code> and <code>torch</code> installed (<code>pip install numpy scipy scikit-learn torch</code>). Printed outputs shown in comments are <span class="tag illus">Illustrative</span> approximations; exact digits can vary with library versions and BLAS backends.</p>
+
+  <h3>7.1 Cosine similarity: Java versus Python</h3>
+  <p>The same computation in a Spring service and in NumPy. The Java version is what you would write inside an inference service doing in-memory re-ranking; the Python version shows the vectorised form that scores all documents at once.</p>
+  <div class="code-tabs">
+<pre data-lang="Java"><code class="language-java">package com.example.similarity;
+
+public final class Cosine {
+    private Cosine() {}
+
+    /** Cosine similarity of two equal-length vectors. */
+    public static double cosine(float[] a, float[] b) {
+        if (a.length != b.length) throw new IllegalArgumentException("dimension mismatch");
+        double dot = 0, na = 0, nb = 0;
+        for (int i = 0; i &lt; a.length; i++) {
+            dot += a[i] * b[i];
+            na  += a[i] * a[i];
+            nb  += b[i] * b[i];
+        }
+        if (na == 0 || nb == 0) return 0.0;  // undefined for zero vectors; choose a convention
+        return dot / (Math.sqrt(na) * Math.sqrt(nb));
+    }
+
+    public static void main(String[] args) {
+        float[] a = {1, 2, 3};
+        float[] b = {4, 0, -1};
+        System.out.printf("%.4f%n", cosine(a, b)); // 0.0648
+    }
+}</code></pre>
+<pre data-lang="Python"><code class="language-python">import numpy as np
+
+a = np.array([1.0, 2.0, 3.0])
+b = np.array([4.0, 0.0, -1.0])
+print(a @ b)                                              # 1.0
+print(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))    # ~0.0648
+
+# Vectorised: score a query against 100k documents at once.
+rng = np.random.default_rng(0)
+docs = rng.normal(size=(100_000, 384)).astype(np.float32)
+docs /= np.linalg.norm(docs, axis=1, keepdims=True)       # unit-normalise once
+q = rng.normal(size=384).astype(np.float32)
+q /= np.linalg.norm(q)
+scores = docs @ q                                         # cosine == dot for unit vectors
+top5 = np.argpartition(-scores, 5)[:5]                    # O(n) partial sort
+print(top5[np.argsort(-scores[top5])])</code></pre>
+  </div>
+
+  <h3>7.2 Linear algebra tour</h3>
+<pre data-file="linalg_tour.py"><code class="language-python">import numpy as np
+
+np.set_printoptions(precision=4, suppress=True)
+
+A = np.array([[1.0, 2.0], [3.0, 4.0]])
+x = np.array([5.0, 6.0])
+print("A @ x =", A @ x)                       # [17. 39.]
+print("det(A) =", np.linalg.det(A))           # -2.0
+print("inv(A) =\n", np.linalg.inv(A))         # [[-2. 1.] [1.5 -0.5]]
+
+# Solve Ax = b without forming the inverse
+b = np.array([1.0, 2.0])
+print("solve:", np.linalg.solve(A, b))        # [0.  0.5]
+
+# Rank and multicollinearity
+R = np.array([[1.0, 2.0], [2.0, 4.0]])
+print("rank(R) =", np.linalg.matrix_rank(R))  # 1
+print("cond(A) =", np.linalg.cond(A))         # ~14.93
+
+# Eigen-decomposition of a symmetric matrix
+S = np.array([[2.0, 1.0], [1.0, 2.0]])
+vals, vecs = np.linalg.eigh(S)                # eigh: for symmetric matrices, sorted ascending
+print("eigenvalues:", vals)                   # [1. 3.]
+print("eigenvectors (columns):\n", vecs)      # ~[[-0.707 0.707] [0.707 0.707]]
+print("reconstruct:\n", vecs @ np.diag(vals) @ vecs.T)
+
+# Power iteration converges to the top eigenvector
+v = np.random.default_rng(0).normal(size=2)
+for _ in range(50):
+    v = S @ v
+    v /= np.linalg.norm(v)
+print("power iteration:", v, "Rayleigh quotient:", v @ S @ v)  # ~[0.707 0.707], 3.0
+
+# SVD and low-rank approximation
+rng = np.random.default_rng(42)
+M = rng.normal(size=(100, 5)) @ rng.normal(size=(5, 80))   # true rank 5
+M += 0.01 * rng.normal(size=M.shape)                       # plus a little noise
+U, s, Vt = np.linalg.svd(M, full_matrices=False)
+print("top singular values:", s[:8])          # five large, then ~0.1-scale noise
+k = 5
+Mk = U[:, :k] @ np.diag(s[:k]) @ Vt[:k]
+print("relative error rank-5:", np.linalg.norm(M - Mk) / np.linalg.norm(M))  # ~1e-3
+
+# Norms
+w = np.array([3.0, -4.0])
+print(np.linalg.norm(w, 1), np.linalg.norm(w, 2), np.linalg.norm(w, np.inf))  # 7.0 5.0 4.0</code></pre>
+
+  <h3>7.3 Linear regression two ways on real data</h3>
+  <p>California housing (20,640 districts, 8 features, target is median house value in units of $100k) ships with scikit-learn and is downloaded on first use. We fit it with the normal equation and with batch gradient descent, from scratch, and compare to scikit-learn.</p>
+<pre data-file="linreg_from_scratch.py"><code class="language-python">import numpy as np
+from sklearn.datasets import fetch_california_housing
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(42)
+X, y = fetch_california_housing(return_X_y=True)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Standardise using TRAIN statistics only (see Chapter 6.2 on leakage)
+mu, sd = X_tr.mean(axis=0), X_tr.std(axis=0)
+X_tr_s, X_te_s = (X_tr - mu) / sd, (X_te - mu) / sd
+
+def add_bias(X):
+    return np.hstack([np.ones((X.shape[0], 1)), X])
+
+Xb_tr, Xb_te = add_bias(X_tr_s), add_bias(X_te_s)
+
+# 1) Normal equation: solve (X^T X) w = X^T y  (lstsq is the numerically safe route)
+w_ne, *_ = np.linalg.lstsq(Xb_tr, y_tr, rcond=None)
+
+# 2) Batch gradient descent on MSE
+def mse(w, X, y):
+    r = X @ w - y
+    return (r @ r) / len(y)
+
+w = np.zeros(Xb_tr.shape[1])
+eta = 0.1
+for epoch in range(2000):
+    grad = (2.0 / len(y_tr)) * Xb_tr.T @ (Xb_tr @ w - y_tr)
+    w -= eta * grad
+    if epoch % 500 == 0:
+        print(f"epoch {epoch:4d}  train MSE {mse(w, Xb_tr, y_tr):.4f}")
+
+# Curvature check: Hessian of MSE is (2/m) X^T X; eta must be below 2 / lambda_max
+H = (2.0 / len(y_tr)) * Xb_tr.T @ Xb_tr
+lam = np.linalg.eigvalsh(H)
+print(f"lambda_max={lam[-1]:.3f}  limit 2/lambda_max={2/lam[-1]:.3f}  condition={lam[-1]/lam[0]:.1f}")
+
+sk = LinearRegression().fit(X_tr_s, y_tr)
+print("test MSE normal eq :", mse(w_ne, Xb_te, y_te))
+print("test MSE grad desc :", mse(w, Xb_te, y_te))
+print("test MSE sklearn   :", np.mean((sk.predict(X_te_s) - y_te) ** 2))
+print("max |w_ne - w_gd|  :", np.abs(w_ne - w).max())
+# Illustrative output:
+# epoch    0  train MSE 4.6...   ... test MSE ~0.556 for all three;
+# GD agrees with the normal equation to ~1e-3 after 2000 epochs.</code></pre>
+  <p>Try η = 0.5: depending on the computed λ<sub>max</sub>, it may exceed 2/λ<sub>max</sub> and diverge, which is the §6.6 result happening on real data. Try it without standardisation and watch the condition number explode and convergence stall.</p>
+
+  <h3>7.4 Probability and statistics with SciPy</h3>
+<pre data-file="prob_stats.py"><code class="language-python">import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(7)
+
+# Distributions
+print(stats.binom.pmf(2, n=3, p=0.5))          # 0.375
+print(stats.poisson.pmf(0, mu=4))              # ~0.0183
+print(stats.norm.cdf(1.96) - stats.norm.cdf(-1.96))  # ~0.95
+
+# Bayes: fraud given new device
+p_fraud, p_new_given_fraud, p_new_given_legit = 0.02, 0.9, 0.1
+p_new = p_new_given_fraud * p_fraud + p_new_given_legit * (1 - p_fraud)
+print("P(fraud | new) =", p_new_given_fraud * p_fraud / p_new)   # ~0.155
+
+# CLT demo: means of skewed (exponential) samples look Gaussian
+means = rng.exponential(scale=100.0, size=(10_000, 50)).mean(axis=1)
+print("mean of means ~100:", means.mean(), " sd ~100/sqrt(50)=14.1:", means.std())
+print("skew of raw ~2:", stats.skew(rng.exponential(100.0, 100_000)), " skew of means:", stats.skew(means))
+
+# 95% CI for accuracy 870/1000
+acc, n = 0.87, 1000
+se = np.sqrt(acc * (1 - acc) / n)
+print("95% CI:", (acc - 1.96 * se, acc + 1.96 * se))            # ~(0.849, 0.891)
+
+# Bootstrap CI (no normality assumption) for a median latency
+lat = rng.lognormal(mean=4.0, sigma=0.6, size=2_000)            # ms, right-skewed
+boot = [np.median(rng.choice(lat, size=lat.size, replace=True)) for _ in range(2_000)]
+print("median:", np.median(lat), "bootstrap 95% CI:", np.percentile(boot, [2.5, 97.5]))
+
+# Two-proportion z-test for an A/B experiment
+def ab_test(conv_a, n_a, conv_b, n_b):
+    pa, pb = conv_a / n_a, conv_b / n_b
+    pooled = (conv_a + conv_b) / (n_a + n_b)
+    se = np.sqrt(pooled * (1 - pooled) * (1 / n_a + 1 / n_b))
+    z = (pb - pa) / se
+    p_value = 2 * (1 - stats.norm.cdf(abs(z)))
+    return pb - pa, z, p_value
+
+print(ab_test(500, 10_000, 560, 10_000))    # (0.006, ~1.89, ~0.058)
+
+# Sample size per arm for alpha=0.05, power=0.8, base 5%, absolute lift 0.5pp
+z_a, z_b = stats.norm.ppf(0.975), stats.norm.ppf(0.8)
+p, delta = 0.05, 0.005
+print("n per arm ~", int(np.ceil(2 * (z_a + z_b) ** 2 * p * (1 - p) / delta ** 2)))  # ~29,800
+
+# Peeking simulation: A/A test, check daily, stop at first p &lt; 0.05
+false_pos = 0
+for trial in range(1_000):
+    a = rng.binomial(1, 0.05, size=20_000)
+    b = rng.binomial(1, 0.05, size=20_000)
+    for day in range(1, 21):
+        k = day * 1_000
+        if ab_test(a[:k].sum(), k, b[:k].sum(), k)[2] &lt; 0.05:
+            false_pos += 1
+            break
+print("false positive rate with peeking:", false_pos / 1_000)   # well above 0.05 (often ~0.2+)</code></pre>
+
+  <h3>7.5 MLE versus MAP for a coin</h3>
+<pre data-file="mle_map.py"><code class="language-python">import numpy as np
+
+def mle(heads, n):
+    return heads / n
+
+def map_beta(heads, n, a=10.0, b=10.0):
+    # Beta(a, b) prior; posterior mode = (heads + a - 1) / (n + a + b - 2)
+    return (heads + a - 1) / (n + a + b - 2)
+
+for heads, n in [(2, 2), (7, 10), (700, 1000)]:
+    print(f"{heads}/{n}: MLE={mle(heads, n):.3f}  MAP={map_beta(heads, n):.3f}")
+# 2/2: MLE=1.000 MAP=0.550   (prior dominates with little data)
+# 7/10: MLE=0.700 MAP=0.600
+# 700/1000: MLE=0.700 MAP=0.696  (data dominates with lots of data)
+
+# Numerical MLE by grid search on the log-likelihood (log avoids underflow)
+p_grid = np.linspace(0.001, 0.999, 999)
+ll = 7 * np.log(p_grid) + 3 * np.log(1 - p_grid)
+print("grid MLE:", p_grid[np.argmax(ll)])     # 0.7</code></pre>
+
+  <h3>7.6 Entropy, cross-entropy, KL and stable softmax</h3>
+<pre data-file="info_theory.py"><code class="language-python">import numpy as np
+from scipy.special import logsumexp
+
+def entropy(p):
+    p = np.asarray(p, dtype=float)
+    nz = p &gt; 0
+    return -np.sum(p[nz] * np.log2(p[nz]))
+
+def cross_entropy(p, q, eps=1e-12):
+    return -np.sum(np.asarray(p) * np.log(np.clip(q, eps, 1.0)))
+
+def kl(p, q):
+    p, q = np.asarray(p, float), np.asarray(q, float)
+    nz = p &gt; 0
+    return np.sum(p[nz] * np.log(p[nz] / q[nz]))
+
+print(entropy([0.5, 0.5]), entropy([0.9, 0.1]))          # 1.0  ~0.469 bits
+print(cross_entropy([0, 1, 0], [0.2, 0.7, 0.1]))         # ~0.357 nats
+print(kl([0.5, 0.5], [0.9, 0.1]), kl([0.9, 0.1], [0.5, 0.5]))  # ~0.511 ~0.368
+
+def softmax_naive(z):
+    e = np.exp(z)
+    return e / e.sum()
+
+def softmax_stable(z):
+    z = np.asarray(z, float)
+    e = np.exp(z - z.max())
+    return e / e.sum()
+
+z = np.array([1000.0, 1001.0, 1002.0])
+with np.errstate(over="ignore", invalid="ignore"):
+    print("naive :", softmax_naive(z))                   # [nan nan nan]
+print("stable:", softmax_stable(z))                      # [0.090 0.245 0.665]
+
+# Cross-entropy from logits via log-sum-exp (what frameworks do internally)
+true_class = 2
+print("CE from logits:", logsumexp(z) - z[true_class])  # ~0.408</code></pre>
+
+  <h3>7.7 Gradients: by hand, numerically, and with autograd</h3>
+<pre data-file="gradients.py"><code class="language-python">import numpy as np
+import torch
+
+torch.manual_seed(0)
+
+# f(x, y) = x^2 + 3xy ; analytic gradient (2x + 3y, 3x)
+def f(v):
+    x, y = v
+    return x ** 2 + 3 * x * y
+
+def numerical_grad(fn, v, h=1e-5):
+    g = np.zeros_like(v)
+    for i in range(len(v)):
+        e = np.zeros_like(v); e[i] = h
+        g[i] = (fn(v + e) - fn(v - e)) / (2 * h)   # central difference: error O(h^2)
+    return g
+
+v = np.array([1.0, 2.0])
+print("analytic :", [2 * v[0] + 3 * v[1], 3 * v[0]])   # [8, 3]
+print("numerical:", numerical_grad(f, v))              # ~[8, 3]
+
+t = torch.tensor([1.0, 2.0], requires_grad=True)
+out = t[0] ** 2 + 3 * t[0] * t[1]
+out.backward()
+print("autograd :", t.grad)                            # tensor([8., 3.])
+
+# Chain rule: z = (3x + 1)^2 at x = 1 -> 24
+x = torch.tensor(1.0, requires_grad=True)
+z = (3 * x + 1) ** 2
+z.backward()
+print("dz/dx:", x.grad)                                # tensor(24.)
+
+# Jacobian of y = W x is W
+W = torch.randn(3, 4)
+J = torch.autograd.functional.jacobian(lambda inp: W @ inp, torch.randn(4))
+print(torch.allclose(J, W))                            # True
+
+# The computational graph from Figure 6.1.2
+w = torch.tensor(0.5, requires_grad=True)
+b = torch.tensor(0.0, requires_grad=True)
+L = (w * 2.0 + b - 3.0) ** 2
+L.backward()
+print("dL/dw, dL/db:", w.grad.item(), b.grad.item())   # -8.0 -4.0</code></pre>
+
+  <h3>7.8 Gradient descent with momentum on an ill-conditioned bowl</h3>
+<pre data-file="gd_momentum.py"><code class="language-python">import numpy as np
+
+H = np.diag([1.0, 50.0])          # curvature 1 along x, 50 along y: condition number 50
+
+def loss(t):
+    return 0.5 * t @ H @ t
+
+def grad(t):
+    return H @ t
+
+def run(eta, beta=0.0, steps=200):
+    t = np.array([10.0, 1.0])
+    v = np.zeros(2)
+    for k in range(steps):
+        v = beta * v + grad(t)    # heavy-ball momentum (beta=0 is plain GD)
+        t = t - eta * v
+        if not np.isfinite(t).all() or loss(t) &gt; 1e12:
+            return k, float("inf")
+    return steps, loss(t)
+
+for eta in [0.01, 0.035, 0.039, 0.041]:
+    print(f"GD eta={eta}: final loss {run(eta)[1]:.3e}")   # 0.041 &gt; 2/50 diverges
+print(f"Momentum eta=0.02 beta=0.9: {run(0.02, 0.9)[1]:.3e}")  # far lower than plain GD at 0.02</code></pre>
+</section>
+
+<section id="applications">
+  <h2>8. Applications: Where Each Idea Shows Up in Real Systems</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Math concept</th><th>Production use</th><th>What goes wrong without understanding it</th></tr></thead>
+    <tbody>
+      <tr><td>Dot product, cosine similarity, norms</td><td>Semantic search, RAG retrieval, "more like this", deduplication, recommendation candidate generation</td><td>Mixing normalised and unnormalised embeddings; using L2 distance on vectors whose magnitude encodes popularity rather than meaning</td></tr>
+      <tr><td>Matrix multiplication</td><td>Every neural-network layer; batched scoring</td><td>Underestimating inference cost; looping row by row in Java instead of batching</td></tr>
+      <tr><td>Rank, conditioning</td><td>Feature design for linear/GLM pricing and risk models</td><td>Unstable coefficients that flip sign between retrains because of collinear features</td></tr>
+      <tr><td>Eigenvectors, SVD</td><td>PCA for compression and visualisation, latent-factor recommenders, LoRA adapters, spectral clustering, PageRank</td><td>Choosing k blindly; forgetting to centre data before PCA</td></tr>
+      <tr><td>Bernoulli/binomial</td><td>Click-through and conversion modelling; error-rate SLOs</td><td>Reporting a CTR without its confidence interval on a tiny segment</td></tr>
+      <tr><td>Poisson</td><td>Demand forecasting, request-arrival modelling, alert thresholds on event counts</td><td>Treating counts as Gaussian and predicting negative orders</td></tr>
+      <tr><td>Bayes' theorem</td><td>Spam filters, fraud scoring, alert triage, probabilistic calibration</td><td>Base-rate fallacy: high-recall detectors that mostly fire on legitimate traffic</td></tr>
+      <tr><td>MLE/MAP</td><td>Every loss function; regularisation; smoothing of sparse rates (e.g. Bayesian average ratings)</td><td>Ranking a product with one 5-star review above one with 4.8 stars from 2,000 reviews</td></tr>
+      <tr><td>CLT, confidence intervals, tests</td><td>A/B testing platforms, offline model comparison, capacity planning</td><td>Shipping noise; peeking; multiple comparisons across dozens of metrics</td></tr>
+      <tr><td>Gradients, chain rule</td><td>Training every neural network and gradient-boosted model</td><td>NaN losses, exploding gradients, wrong learning rates</td></tr>
+      <tr><td>Convexity</td><td>Choosing models with reliable convergence for regulated domains (credit, insurance)</td><td>Expecting identical results from retraining a non-convex model with a different seed</td></tr>
+      <tr><td>Entropy, cross-entropy, KL</td><td>Classification losses, decision-tree splits, drift detection (KL/PSI between feature distributions), distillation, LLM perplexity</td><td>Monitoring accuracy only, missing calibration collapse; misreading perplexity</td></tr>
+    </tbody>
+  </table></div>
+  <p>Two applications deserve a closer look because backend engineers own them directly.</p>
+  <p><strong>Feature drift monitoring.</strong> A deployed model assumes the production feature distribution matches training. A common monitor bins each feature, computes the training distribution p and the last hour's distribution q, and alerts on a divergence such as KL or the closely related Population Stability Index, \( \text{PSI} = \sum_i (q_i - p_i)\ln(q_i/p_i) \), which is the symmetrised KL (KL(p‖q) + KL(q‖p)). This is a scheduled job you would write in Spring Batch or a Kafka Streams aggregation; the math is two lines.</p>
+  <p><strong>Bayesian smoothing for ranking.</strong> Sorting items by raw rating or raw CTR promotes items with tiny sample sizes. A MAP estimate with a Beta prior, (clicks + α) / (impressions + α + β), shrinks small-sample rates toward a global mean. It is a one-line SQL change that measurably improves "top rated" lists, and it is exactly §7.5's <code>map_beta</code>.</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 PageRank: eigenvectors at web scale</h3>
+  <p><span class="tag fact">Verified</span> Brin and Page's 1998 paper describing the Google prototype defines PageRank as a stationary distribution of a random surfer over the link graph, which is the principal eigenvector of a (damped) link matrix, computed iteratively. That is power iteration (§4.3) on a matrix with billions of rows; it worked because only sparse matrix-vector products were needed, never a dense O(n³) decomposition. Source: <a href="http://infolab.stanford.edu/~backrub/google.html">"The Anatomy of a Large-Scale Hypertextual Web Search Engine"</a>.</p>
+  <h3>9.2 Netflix Prize: low-rank matrix factorisation</h3>
+  <p><span class="tag fact">Verified</span> During the Netflix Prize (2006–2009), Simon Funk publicly described fitting a low-rank factorisation of the sparse user-movie rating matrix with stochastic gradient descent, a direct descendant of truncated SVD that handles missing entries. The approach became a core component of leading entries. Source: <a href="https://sifter.org/~simon/journal/20061211.html">Simon Funk, "Netflix Update: Try This at Home"</a>. <span class="tag opinion">Opinion</span> The lesson for engineers is that "a giant sparse matrix is approximately low rank" is one of the most productive assumptions in applied ML.</p>
+  <h3>9.3 Booking.com: model metrics are not business metrics</h3>
+  <p><span class="tag fact">Verified</span> Bernardi, Mavridis and Estevez (KDD 2019) analysed around 150 customer-facing models at Booking.com, each validated by randomised controlled trials. A key finding was that improvements in offline model metrics did not reliably translate into business gains, which is why they measured every model with an online experiment; they also reported that added prediction latency had a measurable cost in conversion. The statistics of §3.15 are therefore the final gate. Summary: <a href="https://blog.acolyer.org/2019/10/07/150-successful-machine-learning-models/">The Morning Paper review of "150 Successful Machine Learning Models"</a>.</p>
+  <h3>9.4 Netflix artwork personalisation: probability in the loop</h3>
+  <p><span class="tag fact">Verified</span> Netflix has described choosing which artwork to show each member as a contextual multi-armed bandit problem, balancing exploration and exploitation online rather than relying only on batch-trained models and periodic A/B tests, and reported validating the approach with replay-based offline evaluation and an online A/B test. Source: <a href="https://netflixtechblog.com/artwork-personalization-c589f074ad76">Netflix Technology Blog, "Artwork Personalization at Netflix"</a>. The underlying math is Bayesian updating of reward probabilities (Bernoulli/Beta) per context.</p>
+  <h3>9.5 Airbnb search: from boosted trees to neural nets</h3>
+  <p><span class="tag fact">Verified</span> Airbnb's search team reported that gradient-boosted decision trees drove early ranking gains, which then plateaued, and documented the practical lessons from moving to neural networks, including the importance of feature normalisation so that inputs have comparable scales for gradient-based training. That is the conditioning argument of §6.6 appearing in a production ranking system. Source: <a href="https://arxiv.org/abs/1810.09591">Haldar et al., "Applying Deep Learning to Airbnb Search", arXiv:1810.09591</a>.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages and Limits of the Mathematical Tools</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Tool</th><th>Advantage</th><th>Limitation</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>Closed-form solutions (normal equation)</td><td>Exact, no hyperparameters, deterministic</td><td>O(n³) in features; requires full-rank or regularisation; only for special models</td><td>Fits in memory only for modest n</td></tr>
+      <tr><td>Gradient descent</td><td>Works for any differentiable model; scales to billions of parameters; streams data</td><td>Hyperparameters (η, batch size); non-convex losses give seed-dependent results</td><td>GPU hours; needs monitoring of loss curves</td></tr>
+      <tr><td>Exact eigen/SVD</td><td>Complete spectrum; stable LAPACK implementations</td><td>O(n³) and dense memory</td><td>Impractical beyond tens of thousands of dimensions</td></tr>
+      <tr><td>Randomised/iterative SVD</td><td>Top-k components cheaply; works on sparse data</td><td>Approximate; needs oversampling and power iterations for accuracy</td><td>Cheap; tunable accuracy</td></tr>
+      <tr><td>Parametric distributions (Gaussian, Poisson)</td><td>Few parameters, closed-form estimators, interpretable</td><td>Real data are skewed, heavy-tailed, multimodal, dependent</td><td>Wrong assumption leads to wrong intervals and alert thresholds</td></tr>
+      <tr><td>Frequentist tests (z/t)</td><td>Simple, standard, well understood by stakeholders</td><td>Peeking, multiple comparisons, non-independent units (users vs sessions)</td><td>Long experiments to reach power on small effects</td></tr>
+      <tr><td>Bootstrap</td><td>Distribution-free CIs for any statistic (median, AUC)</td><td>Compute-heavy; still assumes i.i.d. resampling units</td><td>Thousands of re-evaluations</td></tr>
+      <tr><td>Bayesian / MAP</td><td>Encodes prior knowledge; good with little data</td><td>Prior choice can be contested; full posteriors are expensive</td><td>MAP is free; MCMC is not</td></tr>
+      <tr><td>KL divergence</td><td>Principled measure of distribution mismatch</td><td>Asymmetric; infinite if q = 0 where p &gt; 0 (needs smoothing)</td><td>Cheap per feature, but many features means many alerts</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs: Choosing the Right Tool</h2>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  Q["Need to fit parameters?"] --> C1{"Closed form exists?"}
+  C1 -- "yes, features under ~10k" --> NE["Solve with lstsq / Cholesky"]
+  C1 -- "no, or huge data" --> GD{"Convex loss?"}
+  GD -- yes --> LB["L-BFGS or SGD; global optimum guaranteed"]
+  GD -- no --> AD["Mini-batch SGD/Adam with autodiff; tune LR, seeds"]
+  Q2["Need to compare two models or variants?"] --> T1{"Online traffic available?"}
+  T1 -- yes --> AB["Pre-registered A/B test with power analysis"]
+  T1 -- no --> T2{"Metric has known sampling distribution?"}
+  T2 -- yes --> CI["Analytic CI / paired test on same test set"]
+  T2 -- no --> BS["Bootstrap CI over test examples"]
+</pre>
+  <figcaption>Figure 6.1.5 — Decision flow for optimisation method and for evaluation statistics.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the top half chooses how to fit parameters, preferring exact methods when they are affordable and moving to iterative methods as scale and non-convexity grow. The bottom half chooses how to decide whether a difference is real: online experiments are the gold standard, analytic intervals are cheap when their assumptions hold, and the bootstrap is the general fallback for metrics such as AUC or median latency.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Decision</th><th>Option A</th><th>Option B</th><th>Choose A when</th><th>Choose B when</th></tr></thead>
+    <tbody>
+      <tr><td>Similarity metric</td><td>Cosine / inner product on normalised vectors</td><td>Euclidean distance</td><td>Embeddings from contrastive or language models (direction carries meaning)</td><td>Raw continuous features where magnitude matters (k-means on scaled features)</td></tr>
+      <tr><td>Loss for regression</td><td>Squared error (Gaussian)</td><td>Absolute / Huber (Laplace-like)</td><td>Noise roughly symmetric, few outliers, you care about the mean</td><td>Heavy tails, outliers, you care about the median</td></tr>
+      <tr><td>Count targets</td><td>Poisson / Tweedie loss</td><td>Squared error on log1p(y)</td><td>Predicting expected counts, need non-negative outputs</td><td>Quick baseline; acceptable bias on the mean</td></tr>
+      <tr><td>Estimator</td><td>MLE</td><td>MAP / regularised</td><td>Lots of data relative to parameters</td><td>Small data, many parameters, sparse categories</td></tr>
+      <tr><td>Experiment analysis</td><td>Fixed-horizon frequentist test</td><td>Sequential or Bayesian method</td><td>You can commit to a sample size and not peek</td><td>Stakeholders need to monitor continuously and stop early</td></tr>
+      <tr><td>Precision</td><td>float64</td><td>float32 / bfloat16</td><td>Statistics, small linear solves, gradient checks</td><td>Neural network training and inference (speed, memory)</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Misconceptions</h2>
+  <ul>
+    <li><strong>"Correlation of 0 means independent."</strong> Correlation measures only linear association. Y = X² with X symmetric around zero has zero correlation and complete dependence.</li>
+    <li><strong>Confusing P(A | B) with P(B | A).</strong> "The detector catches 99% of attacks" says nothing about how many alerts are real when attacks are rare. Always ask for the base rate.</li>
+    <li><strong>"p = 0.03 means a 97% chance the treatment works."</strong> A p-value is computed assuming the null is true; it is not the probability that the null is false.</li>
+    <li><strong>Peeking and multiple comparisons.</strong> Checking twenty metrics at α = 0.05 means about one "significant" result by chance alone. Pre-register a primary metric, correct for multiplicity (Bonferroni or Benjamini–Hochberg) for secondary ones.</li>
+    <li><strong>Wrong randomisation unit.</strong> Randomising by user but computing variance as if sessions or page views were independent understates the standard error, because one user's sessions are correlated.</li>
+    <li><strong>Inverting matrices explicitly.</strong> Use <code>solve</code>/<code>lstsq</code>. Explicit inverses amplify rounding errors on ill-conditioned problems.</li>
+    <li><strong>Forgetting to centre before PCA or covariance.</strong> Without centring, the first "principal component" just points at the mean.</li>
+    <li><strong>Naive softmax / log.</strong> Computing <code>np.log(softmax(z))</code> instead of a log-softmax from logits produces <code>-inf</code> and NaN gradients. Use <code>torch.nn.functional.cross_entropy</code> on raw logits, never on probabilities.</li>
+    <li><strong>Treating dense-looking numbers as the truth.</strong> A metric reported to four decimals on 300 test examples has a standard error in the second decimal. Report intervals.</li>
+    <li><strong>Assuming the loss surface is convex.</strong> A neural network retrained with a different seed can make different predictions on individual examples even with the same aggregate accuracy. That matters for reproducibility and for user-facing consistency.</li>
+    <li><strong>Learning rate tuned on unscaled features.</strong> Changing feature units (seconds to milliseconds) changes curvature by a factor of a million, invalidating the learning rate.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Performance</h3>
+  <p>Vectorise and batch. A Spring service scoring 500 candidates should build one 500 × d matrix and make one ONNX Runtime call, not 500 calls. On the JVM, the Java Vector API (an incubator module in recent JDKs <span class="tag version">Version-sensitive · checked Nov 2026</span>) and native BLAS bindings help for in-process dot products; for anything heavier, call an optimised runtime. Pre-normalise embeddings at write time so query-time cosine is a plain dot product.</p>
+  <h3>13.2 Numerical reliability</h3>
+  <p>Guard every log and division; use log-sum-exp; prefer float64 for statistics and float32 or lower for neural nets with appropriate safeguards (loss scaling, Chapter 7.4). Add a NaN/Inf check on model outputs at the service boundary and fail closed (fallback model or default ranking) rather than propagating NaN scores into sort orders, where they produce undefined ordering.</p>
+  <h3>13.3 Statistical hygiene in experimentation</h3>
+  <p>Treat the experimentation platform like a payment system: correctness over convenience. Log assignment and exposure separately; check for <em>sample ratio mismatch</em> (a chi-squared test that the observed split matches the intended 50/50; a mismatch signals a bucketing or logging bug and invalidates the test); fix the analysis plan before launch; and keep experiment metadata versioned.</p>
+  <h3>13.4 Monitoring</h3>
+  <p>Monitor input distributions (PSI/KL per feature), output score distributions (mean, quantiles, fraction above threshold), and calibration once labels arrive. All are cheap aggregations over Kafka topics or request logs. Alert on sustained shifts rather than single windows, using the CLT to set thresholds relative to window size.</p>
+  <h3>13.5 Security</h3>
+  <p>Mathematical properties can be attacked. Gradient-based adversarial examples exploit the very gradients used in training; models exposing raw scores leak more information to model-extraction and membership-inference attacks than models exposing only labels. Defensive practice: return the coarsest output the client needs, rate-limit scoring endpoints, and keep training data access controlled since MLE models memorise rare examples.</p>
+  <h3>13.6 Maintainability</h3>
+  <p>Write the math as tested functions. Gradient-check custom losses with finite differences in unit tests; assert shapes; seed RNGs; pin library versions. These are the ML equivalents of contract tests.</p>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>Let u = (2, −1, 2) and v = (1, 2, 2). Compute u·v, ‖u‖₂, ‖v‖₂, ‖u‖₁, the cosine similarity, and the angle between them in degrees.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>u·v = 2·1 + (−1)·2 + 2·2 = 2 − 2 + 4 = 4. ‖u‖₂ = √(4 + 1 + 4) = 3; ‖v‖₂ = √(1 + 4 + 4) = 3; ‖u‖₁ = 2 + 1 + 2 = 5. Cosine similarity = 4 / 9 ≈ 0.444. Angle = arccos(0.444) ≈ 63.6°.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Foundational</p>
+    <p>Find the eigenvalues and eigenvectors of \( A = \begin{pmatrix}4 &amp; 1\\2 &amp; 3\end{pmatrix} \). Verify one eigenpair by multiplication.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>det(A − λI) = (4 − λ)(3 − λ) − 2 = λ² − 7λ + 10 = (λ − 5)(λ − 2). So λ = 5 and λ = 2. For λ = 5: (A − 5I)v = 0 gives −v₁ + v₂ = 0, so v = (1, 1). Check: A(1, 1) = (5, 5) = 5(1, 1). For λ = 2: 2v₁ + v₂ = 0, so v = (1, −2). Check: A(1, −2) = (4 − 2, 2 − 6) = (2, −4) = 2(1, −2). Note A is not symmetric, so the eigenvectors are not perpendicular: (1, 1)·(1, −2) = −1 ≠ 0.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>A disease affects 1 in 1,000 people. A test has sensitivity 99% (P(positive | sick)) and specificity 95% (P(negative | healthy)). (a) What is P(sick | positive)? (b) A second, independent test with the same characteristics is also positive. What is the probability now? (c) Relate this to a two-stage fraud pipeline.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>(a) P(pos) = 0.99 × 0.001 + 0.05 × 0.999 = 0.00099 + 0.04995 = 0.05094. P(sick | pos) = 0.00099 / 0.05094 ≈ 0.0194, under 2%.</p>
+      <p>(b) Use the posterior as the new prior, 0.0194. P(pos) = 0.99 × 0.0194 + 0.05 × 0.9806 = 0.01921 + 0.04903 = 0.06824. Posterior = 0.01921 / 0.06824 ≈ 0.2815, about 28%. (Equivalently, the likelihood ratio of each positive is 0.99/0.05 = 19.8, so the prior odds 1:999 become 392:999 after two positives.)</p>
+      <p>(c) A cheap, high-recall first-stage model flags candidates; an independent second model (or human review) on only the flagged set raises precision dramatically, because the second stage sees a much higher base rate. Independence of the stages is the critical assumption; two models trained on the same features are not independent, and the gain will be smaller.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Intermediate</p>
+    <p>Derive the MLE for the rate λ of a Poisson distribution from observed counts k₁, …, k<sub>m</sub>. Then compute it for per-minute error counts [3, 5, 4, 2, 6].</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Log-likelihood: \( \ell(\lambda) = \sum_i [k_i\log\lambda - \lambda - \log k_i!] = (\textstyle\sum_i k_i)\log\lambda - m\lambda + \text{const} \). Derivative: \( (\sum k_i)/\lambda - m = 0 \Rightarrow \hat\lambda = \frac{1}{m}\sum_i k_i \), the sample mean. Second derivative \( -(\sum k_i)/\lambda^2 &lt; 0 \), so it is a maximum. For the data: (3 + 5 + 4 + 2 + 6) / 5 = 4.0 errors per minute.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>For logistic regression, \( \hat p = \sigma(z) \), \( z = \mathbf{w}^\top\mathbf{x} \), \( \sigma(z) = 1/(1+e^{-z}) \), and per-example loss \( \ell = -[y\log\hat p + (1-y)\log(1-\hat p)] \). (a) Show σ′(z) = σ(z)(1 − σ(z)). (b) Show \( \partial\ell/\partial\mathbf{w} = (\hat p - y)\mathbf{x} \). (c) Compute the gradient for x = (1, 2), w = (0.5, −0.25), y = 1.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>(a) σ(z) = (1 + e<sup>−z</sup>)<sup>−1</sup>, so σ′(z) = e<sup>−z</sup>/(1 + e<sup>−z</sup>)² = [1/(1 + e<sup>−z</sup>)] · [e<sup>−z</sup>/(1 + e<sup>−z</sup>)] = σ(z)(1 − σ(z)).</p>
+      <p>(b) By the chain rule, ∂ℓ/∂p̂ = −y/p̂ + (1 − y)/(1 − p̂). Multiply by dp̂/dz = p̂(1 − p̂): −y(1 − p̂) + (1 − y)p̂ = p̂ − y. Multiply by ∂z/∂w = x: (p̂ − y)x. The sigmoid's derivative cancels the log's derivative, leaving a strikingly simple "error times input" form; the same cancellation happens for softmax with cross-entropy.</p>
+      <p>(c) z = 0.5 − 0.5 = 0, p̂ = 0.5, error = −0.5, gradient = (−0.5, −1.0). A descent step increases both weights, raising the score of this positive example.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 6 · Advanced</p>
+    <p>An experiment's control converts at 2.0%. Product wants to detect a 5% relative lift (to 2.1%) with α = 0.05 (two-sided) and power 0.8. The site has 40,000 eligible users per day. How many days must the test run? What would you tell product?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>δ = 0.001, p(1 − p) ≈ 0.02 × 0.98 = 0.0196. n ≈ 2 × (1.96 + 0.84)² × 0.0196 / 0.000001 = 2 × 7.84 × 19,600 ≈ 307,000 per arm, so about 614,000 users total, roughly 15–16 days at 40,000 per day. Recommend running whole weeks (21 days) to cover weekly seasonality, or accept a larger minimum detectable effect, or use a variance-reduction technique (such as regression adjustment on pre-experiment covariates) to cut the required sample.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why is the cross-entropy loss preferred to squared error for classification?</summary><div><p>Cross-entropy is the negative log-likelihood of a Bernoulli/categorical model, so minimising it is principled maximum likelihood. Practically, with a sigmoid or softmax output, its gradient with respect to the logits is (p̂ − y), which stays large when the model is confidently wrong. Squared error on a sigmoid output has gradient (p̂ − y)p̂(1 − p̂), which vanishes when p̂ saturates near 0 or 1, so a confidently wrong model learns slowly. Squared error with sigmoid is also non-convex in the weights, while log-loss with logistic regression is convex.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain the relationship between PCA, eigenvectors and SVD.</summary><div><p>PCA finds orthogonal directions of maximal variance. The variance along a unit direction v is vᵀCv with C the covariance matrix, which is maximised by C's top eigenvector, with the variance equal to its eigenvalue. If X is the centred data matrix, C = XᵀX/(m − 1), and X's SVD X = UΣVᵀ gives the eigenvectors directly as V's columns and eigenvalues σᵢ²/(m − 1). Libraries use SVD because it avoids forming XᵀX, which squares the condition number.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is the difference between MLE and MAP, and how does it relate to regularisation?</summary><div><p>MLE maximises p(data | θ); MAP maximises p(θ | data) ∝ p(data | θ)p(θ). Taking negative logs, MAP's objective is the NLL plus −log p(θ). A zero-mean Gaussian prior adds a squared L2 penalty; a Laplace prior adds an L1 penalty. With abundant data the likelihood dominates and they converge; with scarce data the prior prevents overfitting.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Implement a numerically stable log-softmax in NumPy.</summary><div><pre><code class="language-python">import numpy as np
+
+def log_softmax(z, axis=-1):
+    m = np.max(z, axis=axis, keepdims=True)
+    return z - m - np.log(np.sum(np.exp(z - m), axis=axis, keepdims=True))</code></pre><p>Subtracting the max makes every exponent ≤ 0 so nothing overflows, and at least one term is exp(0) = 1 so the log never sees zero. Mention that frameworks fuse this into the cross-entropy op for the same reason.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Your training loss becomes NaN after 3,000 steps. Walk through your diagnosis.</summary><div><p>Check for: a learning rate too high for current curvature (loss spiking before NaN; lower η, add warmup or gradient clipping); log/softmax on probabilities instead of logits; division by a zero variance in a normalisation layer or a feature with zero standard deviation; overflow in reduced precision (FP16 without loss scaling); bad data (an Inf or NaN feature value in one batch; add assertions in the data loader). Enable anomaly detection (<code>torch.autograd.set_detect_anomaly(True)</code>) on a reproduction to find the first op producing NaN, log gradient norms per layer, and replay the exact batch with a fixed seed.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> An A/B test shows +3% conversion with p = 0.01, but sample ratio is 50.8/49.2 on 2 million users. Do you ship?</summary><div><p>Not yet. A chi-squared test on a 50.8/49.2 split of 2M users gives an enormous statistic (expected 1M per arm, observed difference of 16,000 is about 22 standard deviations), so this is a sample ratio mismatch: something is dropping or duplicating users asymmetrically (a redirect, a crash in one variant, bot filtering interacting with the treatment). The effect estimate is untrustworthy until the cause is found and fixed. Investigate logging, assignment, and exposure events by segment.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why can a gradient-descent learning rate that worked yesterday diverge today on the same model?</summary><div><p>Stability depends on η relative to the largest curvature eigenvalue of the loss. Changes in data scale (a feature's units changed upstream, a new outlier-heavy segment), batch composition, or model state (sharper regions later in training) change that eigenvalue. Remedies: standardise features with monitored statistics, use adaptive optimisers and learning-rate warmup, clip gradients, and alert on input-distribution drift.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> You need to serve cosine-similarity search over 50M 768-dimensional embeddings from a Spring Boot service with p99 under 50 ms. What do you consider?</summary><div><p>Brute force is 50M × 768 × 2 ≈ 77 GFLOP per query and 150 GB of float32, too slow and large for one node. Use an approximate nearest-neighbour index (HNSW or IVF with product quantisation) in a vector database or a library such as FAISS behind a service; normalise vectors at ingestion so inner product equals cosine; consider reducing dimension (PCA or Matryoshka-style truncation) and quantisation (int8) to fit memory; shard by ID with scatter-gather; measure recall@k against brute force on a sample. The Spring service calls the index over gRPC and applies business filters and re-ranking.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What does KL divergence measure and why is it asymmetric? Give a case where direction matters.</summary><div><p>KL(p‖q) is the expected extra log-loss from coding samples of p with q. It weights mismatches by p, so it heavily penalises q assigning near-zero probability where p has mass (mode-covering), but barely cares where q has mass and p does not. KL(q‖p) does the reverse (mode-seeking). In variational inference, minimising KL(q‖p) makes q lock onto one mode of a multimodal posterior; in drift monitoring, KL(train‖prod) flags categories that disappeared in production more than new ones that appeared, so a symmetric measure (PSI or Jensen–Shannon) is often preferred.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> How would you unit-test a custom loss function's gradient?</summary><div><p>Gradient checking: for random inputs in float64, compare the analytic or autograd gradient with central differences (f(θ + h e<sub>i</sub>) − f(θ − h e<sub>i</sub>)) / 2h for h ≈ 1e−6, asserting relative error below about 1e−6. PyTorch provides <code>torch.autograd.gradcheck</code> for exactly this. Also test edge cases: extreme logits, zero-variance batches, empty masks.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Vectors represent examples; the dot product scores alignment; cosine similarity is the dot product of unit vectors and powers semantic search.</li>
+    <li>Matrices are linear transformations; their columns are the images of the basis vectors; multiplication composes transformations and costs about 2mkn FLOPs.</li>
+    <li>Rank measures how many independent directions survive; rank deficiency (collinearity) breaks closed-form least squares, and regularisation fixes it.</li>
+    <li>Eigenvectors are directions a matrix only stretches; SVD factorises any matrix into rotate-stretch-rotate and gives the best low-rank approximation.</li>
+    <li>Almost every loss is a negative log-likelihood: Gaussian gives MSE, Bernoulli gives log-loss, categorical gives cross-entropy. Adding a prior (MAP) gives regularisation.</li>
+    <li>The CLT makes standard errors shrink as 1/√n; confidence intervals and A/B tests follow, and peeking or wrong randomisation units break them.</li>
+    <li>The gradient points uphill; gradient descent is a feedback loop whose gain (learning rate) must stay below 2/λ<sub>max</sub>; feature scaling reduces the condition number.</li>
+    <li>Backpropagation is the chain rule applied backwards through a computational graph, costing a small multiple of one forward pass.</li>
+    <li>Minimising cross-entropy, minimising KL from the data, and maximising likelihood are the same objective.</li>
+  </ul>
+  <div class="quiz" data-answer="c">
+    <p class="q">Two embedding vectors have cosine similarity −0.98. What does that indicate?</p>
+    <ol>
+      <li data-k="a">They are nearly identical.</li>
+      <li data-k="b">They are unrelated (orthogonal).</li>
+      <li data-k="c">They point in nearly opposite directions.</li>
+      <li data-k="d">One of them has a much larger norm.</li>
+    </ol>
+    <div class="explain">Cosine similarity is the cosine of the angle: −1 is opposite, 0 is orthogonal, 1 is identical direction. It is independent of the norms, so (d) cannot be inferred.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">Gradient descent on f(x) = 10x² diverges for which learning rate?</p>
+    <ol>
+      <li data-k="a">0.05</li>
+      <li data-k="b">0.11</li>
+      <li data-k="c">0.09</li>
+      <li data-k="d">0.01</li>
+    </ol>
+    <div class="explain">Curvature f″ = 20, so the stability limit is η &lt; 2/20 = 0.1. At 0.11 the multiplier is 1 − 0.11 × 20 = −1.2, magnitude above 1, so the iterates grow.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">Minimising mean squared error in linear regression is equivalent to maximum likelihood under which noise assumption?</p>
+    <ol>
+      <li data-k="a">Independent Gaussian noise with constant variance</li>
+      <li data-k="b">Laplace-distributed noise</li>
+      <li data-k="c">Poisson-distributed targets</li>
+      <li data-k="d">No assumption; MSE is distribution-free</li>
+    </ol>
+    <div class="explain">The Gaussian log-density is a constant minus squared error over 2σ². Laplace noise gives absolute error; Poisson gives the Poisson deviance.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">A test with 99% sensitivity and 99% specificity is positive for a condition with prevalence 0.1%. Roughly what is P(condition | positive)?</p>
+    <ol>
+      <li data-k="a">99%</li>
+      <li data-k="b">50%</li>
+      <li data-k="c">90%</li>
+      <li data-k="d">9%</li>
+    </ol>
+    <div class="explain">0.99 × 0.001 / (0.99 × 0.001 + 0.01 × 0.999) = 0.00099 / 0.01098 ≈ 0.09. The low base rate dominates.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Why do libraries compute PCA through the SVD of the centred data matrix rather than eigen-decomposing XᵀX?</p>
+    <ol>
+      <li data-k="a">SVD gives different, better components.</li>
+      <li data-k="b">Eigen-decomposition cannot handle symmetric matrices.</li>
+      <li data-k="c">Forming XᵀX squares the condition number and loses precision; SVD avoids it.</li>
+      <li data-k="d">SVD does not require centring.</li>
+    </ol>
+    <div class="explain">Both yield the same components mathematically, but cond(XᵀX) = cond(X)², so precision is lost. Centring is required for both.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">You need to detect an effect half as large as in your previous experiment, with the same α and power. Roughly how much more traffic do you need?</p>
+    <ol>
+      <li data-k="a">2×</li>
+      <li data-k="b">4×</li>
+      <li data-k="c">√2×</li>
+      <li data-k="d">The same</li>
+    </ol>
+    <div class="explain">Required n scales with 1/δ², so halving δ quadruples n.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Marc Peter Deisenroth, A. Aldo Faisal, Cheng Soon Ong, <em>Mathematics for Machine Learning</em>, Cambridge University Press, 2020 — <a href="https://mml-book.github.io/">free PDF at mml-book.github.io</a>. The closest single book to this chapter's scope.</li>
+    <li><span class="ref-kind">Book</span> Ian Goodfellow, Yoshua Bengio, Aaron Courville, <em>Deep Learning</em>, MIT Press, 2016 — <a href="https://www.deeplearningbook.org/">deeplearningbook.org</a>, chapters 2–4 (linear algebra, probability and information theory, numerical computation).</li>
+    <li><span class="ref-kind">Video</span> 3Blue1Brown, <a href="https://www.3blue1brown.com/topics/linear-algebra">Essence of Linear Algebra</a> and <a href="https://www.3blue1brown.com/topics/calculus">Essence of Calculus</a> — the best visual intuition for matrices as transformations and eigenvectors.</li>
+    <li><span class="ref-kind">Course</span> Stanford CS229, <a href="https://cs229.stanford.edu/">course page and notes</a> — the linear algebra and probability review handouts.</li>
+    <li><span class="ref-kind">Book</span> Aston Zhang et al., <em>Dive into Deep Learning</em> — <a href="https://d2l.ai/chapter_appendix-mathematics-for-deep-learning/index.html">Appendix: Mathematics for Deep Learning</a>, with runnable code.</li>
+    <li><span class="ref-kind">Course</span> Gilbert Strang, MIT 18.06 Linear Algebra, <a href="https://ocw.mit.edu/courses/18-06-linear-algebra-spring-2010/">MIT OpenCourseWare</a>.</li>
+    <li><span class="ref-kind">Book</span> Ron Kohavi, Diane Tang, Ya Xu, <em>Trustworthy Online Controlled Experiments</em>, Cambridge University Press, 2020 — the practitioner's reference for A/B testing, sample ratio mismatch and peeking.</li>
+    <li><span class="ref-kind">Paper</span> C. E. Shannon, "A Mathematical Theory of Communication", <em>Bell System Technical Journal</em>, 1948 — <a href="https://people.math.harvard.edu/~ctm/home/text/others/shannon/entropy/entropy.pdf">PDF hosted at Harvard</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://numpy.org/doc/stable/reference/routines.linalg.html">NumPy linear algebra reference</a> and <a href="https://docs.scipy.org/doc/scipy/reference/stats.html">SciPy stats reference</a>.</li>
+    <li><span class="ref-kind">Paper</span> Atılım Güneş Baydin et al., "Automatic Differentiation in Machine Learning: a Survey", JMLR 2018 — <a href="https://arxiv.org/abs/1502.05767">arXiv:1502.05767</a>.</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

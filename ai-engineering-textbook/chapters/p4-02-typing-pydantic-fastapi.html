@@ -1,0 +1,1066 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Type Hints, Pydantic, FastAPI &amp; Dependency Injection — AI-Era Software Engineering</title>
+<meta name="description" content="Static typing in Python (generics, Protocol, TypedDict, ParamSpec, strict mypy/pyright), Pydantic v2 validation and settings, FastAPI on ASGI/Starlette, the request lifecycle, async vs sync endpoints, and dependency injection compared with Spring IoC.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p4-02-typing-pydantic-fastapi" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 4 · Chapter 2</p>
+  <h1>Type Hints, Pydantic, FastAPI &amp; Dependency Injection</h1>
+  <p class="lede">Spring Boot gives you a compiler, Bean Validation, Jackson, an IoC container and Spring Security out of the box. Modern Python assembles the same capabilities from separate, composable pieces: a gradual type system checked by mypy or pyright, Pydantic v2 for runtime validation and serialisation, FastAPI on top of the ASGI standard and Starlette, and a function-parameter-based dependency injection system. This chapter shows how each piece works internally and how to combine them into an API that a Spring team would trust in production.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Chapter 4.1 (event loop, threads); Spring MVC, Jackson, Bean Validation, Spring IoC and Spring Security experience.</li>
+    <li><strong>You will be able to:</strong> write strictly typed Python with generics, Protocols and ParamSpec; design Pydantic v2 models, validators, settings and serialisers with correct performance characteristics; trace a FastAPI request from socket to response; choose between async and sync endpoints; build scoped dependencies with clean test overrides; and implement JWT auth and cross-cutting middleware.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: Rebuilding the Spring Toolbox from Python Parts</h2>
+  <p>When a Spring Boot developer writes <code>@PostMapping</code> with a <code>@Valid @RequestBody OrderRequest</code>, at least five frameworks cooperate: the Java compiler checks types, Jackson deserialises JSON, Hibernate Validator enforces constraints, Spring's <code>DispatcherServlet</code> routes and resolves arguments, and the IoC container injects the service. Springdoc then derives an OpenAPI spec from the same annotations.</p>
+  <p>FastAPI achieves the same developer experience with a different philosophy: <em>the type hints are the single source of truth</em>. A parameter annotated <code>order: OrderIn</code> (a Pydantic model) tells FastAPI to read and validate the JSON body; <code>limit: int = 20</code> becomes a validated query parameter; <code>svc: Annotated[OrderService, Depends(get_order_service)]</code> is injection; the return annotation drives response serialisation; and all of it is emitted into the OpenAPI document. Static checkers read the same hints to catch bugs before runtime. Understanding where static checking ends and runtime validation begins is the key mental shift.</p>
+  <p>This matters for AI systems specifically. LLM-backed services live and die by schemas: tool/function-calling definitions are JSON Schema, structured outputs are validated against models, and agent frameworks (the OpenAI and Anthropic SDKs, LangChain, LlamaIndex, Pydantic AI, instructor) all use Pydantic models to describe what a model may return. Mastering Pydantic is mastering the contract layer of AI applications.</p>
+
+<div class="bridge">
+  <h4>Bridging from Java &amp; Spring Boot</h4>
+  <dl>
+    <dt>What you already know</dt><dd>Static types enforced by <code>javac</code>; generics with erasure; <code>record</code> DTOs; Jackson annotations (<code>@JsonProperty</code>, <code>@JsonIgnore</code>); Bean Validation (<code>@NotNull</code>, <code>@Size</code>, custom <code>ConstraintValidator</code>); <code>@ConfigurationProperties</code> with relaxed binding; constructor injection with singleton/request/prototype scopes; <code>@ControllerAdvice</code>; servlet filters and <code>HandlerInterceptor</code>s; Spring Security's filter chain; <code>@MockBean</code>/<code>@MockitoBean</code> in tests.</dd>
+    <dt>Why that is not enough</dt><dd>Python's types are not enforced at runtime at all: an annotation is metadata. A typo in a dict key or a <code>None</code> where a string was expected passes silently unless a checker or a validator catches it. There is no container scanning the classpath; there are no annotations on classes driving injection; scopes are expressed by function lifetimes and generators.</dd>
+    <dt>The modern approach</dt><dd>Treat mypy/pyright in strict mode as your compiler, Pydantic v2 models at every trust boundary (HTTP, queues, LLM outputs, config) as your Jackson plus Bean Validation, FastAPI's <code>Depends</code> as your container, and ASGI middleware as your filter chain.</dd>
+    <dt>Where Python and Go fit</dt><dd>Go has static types without runtime validation frameworks (you use struct tags plus a validator library) and favours explicit wiring in <code>main()</code> over containers. Python sits between: dynamic at runtime, statically checkable, with powerful runtime introspection that FastAPI and Pydantic exploit.</dd>
+    <dt>In production</dt><dd>FastAPI services run on Uvicorn (often under Gunicorn or as multiple Uvicorn workers), behind an ingress, with Pydantic settings from environment variables and secrets, typed end to end and gated by a strict type check in CI.</dd>
+    <dt>Use it when / avoid it when</dt><dd>Use FastAPI for JSON/HTTP APIs, model-serving endpoints and LLM gateways where Python's ecosystem is the reason you are in Python. Prefer Django when you need an admin, ORM migrations and server-rendered pages in one batteries-included package; prefer Spring Boot or Go when the service has no Python-specific dependency.</dd>
+  </dl>
+</div>
+  <div class="callout note"><p class="callout-title">Versions used</p><p><span class="tag version">Version-sensitive · checked Nov 2026</span> Python 3.12+ syntax (PEP 695 generics), Pydantic 2.14 (pydantic-core in Rust), pydantic-settings 2.x, FastAPI 0.165 (the latest on PyPI when this chapter was tested; still pre-1.0 with frequent minor releases, so pin it), Starlette, Uvicorn. Where a feature is newer (e.g. FastAPI dependency <code>scope</code>, added in 0.121), it is called out.</p></div>
+</section>
+
+<section id="history">
+  <h2>2. History: From Duck Typing to Typed, Validated APIs</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Year</th><th>Event</th><th>Significance</th></tr></thead>
+    <tbody>
+      <tr><td>2003</td><td>WSGI (PEP 333)</td><td>Synchronous, one-call-per-request server/app interface: Python's servlet API.</td></tr>
+      <tr><td>2006</td><td>PEP 3107 function annotations (Python 3.0, 2008)</td><td>Syntax for annotations with no defined meaning.</td></tr>
+      <tr><td>2012</td><td>mypy started by Jukka Lehtosalo</td><td>Gradual typing research project; later developed at Dropbox.</td></tr>
+      <tr><td>2014</td><td>PEP 484 type hints (Python 3.5, 2015)</td><td>The <code>typing</code> module; annotations gain a standard meaning for checkers.</td></tr>
+      <tr><td>2016</td><td>PEP 526 variable annotations (3.6); ASGI drafted around Django Channels</td><td>Class-level field annotations make dataclass-like libraries possible.</td></tr>
+      <tr><td>2017</td><td>Pydantic first released (Samuel Colvin); PEP 544 Protocols accepted (3.8, 2019)</td><td>Runtime validation from annotations; structural typing.</td></tr>
+      <tr><td>2018</td><td>Starlette and Uvicorn released (Tom Christie / Encode); dataclasses in 3.7</td><td>ASGI toolkit and server foundation.</td></tr>
+      <tr><td>2018</td><td>FastAPI first released (Sebastián Ramírez)</td><td>Starlette + Pydantic + DI + automatic OpenAPI.</td></tr>
+      <tr><td>2019</td><td>pyright released by Microsoft; TypedDict, Literal, Final (3.8)</td><td>Fast incremental checker; richer type vocabulary.</td></tr>
+      <tr><td>2020</td><td>PEP 604 <code>X | Y</code>, PEP 612 ParamSpec (3.10, 2021)</td><td>Readable unions; typing decorators properly.</td></tr>
+      <tr><td>2022</td><td>PEP 673 Self, PEP 646 variadic generics (3.11)</td><td>Fluent APIs and tensor shapes become typeable.</td></tr>
+      <tr><td>2023</td><td>Pydantic v2 (June) with pydantic-core in Rust; PEP 695 generics syntax (3.12)</td><td>Large validation speed-up; <code>class Repo[T]:</code> syntax.</td></tr>
+      <tr><td>2024</td><td>PEP 742 TypeIs, PEP 696 TypeVar defaults (3.13)</td><td>Better narrowing; defaults for generics.</td></tr>
+      <tr><td>2025</td><td>PEP 649/749 deferred evaluation of annotations (3.14)</td><td>Forward references without string quotes; runtime libraries adapt via <code>annotationlib</code>.</td></tr>
+      <tr><td>2025–2026</td><td>FastAPI adds dependency scopes (0.121); Astral's "ty" and Meta's "Pyrefly" Rust-based checkers appear</td><td>Faster type checking for very large codebases; ecosystem still settling.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The pattern: Python spent two decades adding an optional, gradual type system that the interpreter ignores, and then libraries (Pydantic, FastAPI, SQLAlchemy 2.0, Typer) discovered that the same annotations could drive runtime behaviour. Spring went the other way: runtime annotations first, with compile-time checking provided by the language.</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 Gradual typing and what a checker actually proves</h3>
+  <p>Python's type system is <em>gradual</em>: unannotated code is typed as <code>Any</code>, which is compatible with everything in both directions. A codebase can be 5% or 100% typed, and a checker only proves properties about the typed parts. That is fundamentally different from Java, where everything has a static type. Strict mode (<code>mypy --strict</code>, pyright <code>"typeCheckingMode": "strict"</code>) closes the gaps: it rejects untyped definitions, implicit <code>Any</code> from missing stubs, and unchecked generics.</p>
+  <p>Checkers use <em>nominal</em> subtyping for classes (like Java) and <em>structural</em> subtyping for <code>Protocol</code>s (like Go interfaces). They perform flow-sensitive <em>narrowing</em>: after <code>if x is not None:</code>, <code>x</code> is narrowed from <code>str | None</code> to <code>str</code>, giving you null-safety that Java only approximates with <code>Optional</code> and annotations like <code>@Nullable</code>.</p>
+
+  <h3>3.2 Generics: TypeVar, PEP 695 syntax, variance</h3>
+  <pre><code class="language-python"># Python 3.12+ syntax (PEP 695)
+from collections.abc import Callable, Iterable, Sequence
+
+class Page[T]:                                 # like class Page&lt;T&gt;
+    def __init__(self, items: Sequence[T], total: int) -&gt; None:
+        self.items, self.total = items, total
+    def map[U](self, fn: Callable[[T], U]) -&gt; "Page[U]":   # generic method, like &lt;U&gt; Page&lt;U&gt; map(...)
+        return Page([fn(i) for i in self.items], self.total)
+
+def first[T](xs: Iterable[T], default: T) -&gt; T:
+    return next(iter(xs), default)
+
+type JsonValue = str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]   # recursive alias</code></pre>
+  <p>Unlike Java, Python generics are not erased in a way you can observe: <code>Page[int]</code> is a real runtime object (<code>typing._GenericAlias</code>), which is how Pydantic validates <code>list[Order]</code> element by element. But instances do not remember their type argument (<code>Page[int]([1], 1)</code> yields a plain <code>Page</code>), so it is erasure at the instance level and reification at the annotation level.</p>
+  <p>Variance is inferred for PEP 695 type parameters. <code>Sequence[T]</code> is covariant (read-only, like <code>List&lt;? extends T&gt;</code>), <code>list[T]</code> is invariant (mutable), and <code>Callable[[T], R]</code> is contravariant in <code>T</code>. A classic bug the checker catches: passing <code>list[Dog]</code> where <code>list[Animal]</code> is expected. Java rejects the same thing for <code>List</code>.</p>
+
+  <h3>3.3 Protocol: structural typing</h3>
+  <pre><code class="language-python">from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class EmbeddingModel(Protocol):
+    dim: int
+    def embed(self, texts: list[str]) -&gt; list[list[float]]: ...
+
+class OpenAIEmbedder:                      # does NOT inherit from EmbeddingModel
+    dim = 1536
+    def embed(self, texts: list[str]) -&gt; list[list[float]]:
+        return [[0.0] * self.dim for _ in texts]
+
+def index(docs: list[str], model: EmbeddingModel) -&gt; None: ...
+index(["a"], OpenAIEmbedder())             # OK: structurally compatible, checked statically</code></pre>
+  <p>This is Go's implicit interface satisfaction brought to Python. It is ideal for ports-and-adapters architectures: the domain defines a Protocol, adapters satisfy it without importing it. In Java you would declare <code>implements EmbeddingModel</code>; in Python you do not have to, and the checker still verifies compatibility. <code>@runtime_checkable</code> lets <code>isinstance</code> check method presence (not signatures) at runtime.</p>
+
+  <h3>3.4 TypedDict, Literal, NewType, Annotated</h3>
+  <ul>
+    <li><strong><code>TypedDict</code></strong> types a dict with known keys: useful for JSON you pass around without converting to objects (e.g. LLM message dicts). <code>Required</code>/<code>NotRequired</code> and <code>ReadOnly</code> (3.13) refine it. Zero runtime cost: it is a plain dict.</li>
+    <li><strong><code>Literal["asc", "desc"]</code></strong> is a type with fixed values: Python's lightweight enum, and FastAPI/Pydantic validate it.</li>
+    <li><strong><code>NewType("UserId", int)</code></strong> creates a distinct static type with no runtime wrapper: prevents passing an <code>OrderId</code> where a <code>UserId</code> is expected, like a Java value class but free.</li>
+    <li><strong><code>Annotated[int, Field(gt=0)]</code></strong> attaches metadata to a type. Checkers see <code>int</code>; Pydantic and FastAPI read the metadata. This is the mechanism behind constraints and <code>Depends</code>, the Python equivalent of annotating a parameter in Java.</li>
+  </ul>
+
+  <h3>3.5 ParamSpec, Concatenate and typed decorators</h3>
+  <pre><code class="language-python">import functools, time
+from collections.abc import Awaitable, Callable
+
+def timed[**P, R](fn: Callable[P, Awaitable[R]]) -&gt; Callable[P, Awaitable[R]]:
+    @functools.wraps(fn)
+    async def wrapper(*args: P.args, **kwargs: P.kwargs) -&gt; R:
+        t0 = time.perf_counter()
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            print(f"{fn.__name__} took {time.perf_counter() - t0:.3f}s")
+    return wrapper
+
+@timed
+async def get_user(user_id: int, *, include_orders: bool = False) -&gt; dict[str, object]: ...
+# get_user("x") is now a type error: the decorator preserves the exact signature.</code></pre>
+  <p>Without <code>ParamSpec</code>, decorators erase signatures to <code>Callable[..., Any]</code>. This is the Python equivalent of what Spring AOP proxies do transparently; in Python, decorators are explicit and the type system must be told how to preserve signatures.</p>
+
+  <h3>3.6 Pydantic v2 in one page</h3>
+  <p>A Pydantic <code>BaseModel</code> subclass is analysed once at class creation: annotations plus <code>Field(...)</code> metadata and validators are compiled into a <em>core schema</em>, which pydantic-core (Rust) turns into a tree of validator and serializer objects. Validation then runs in Rust with no Python bytecode per field in the common case. Key concepts:</p>
+  <ul>
+    <li><strong>Lax vs strict mode.</strong> By default, <code>"42"</code> is coerced to <code>42</code> for an <code>int</code> field (lax, like Jackson's coercion). <code>model_config = ConfigDict(strict=True)</code> or <code>Field(strict=True)</code> rejects it.</li>
+    <li><strong>Validators.</strong> <code>@field_validator</code> (before/after/wrap/plain modes) and <code>@model_validator</code> for cross-field rules; equivalent to <code>ConstraintValidator</code> and class-level constraints.</li>
+    <li><strong>Serialisation.</strong> <code>model_dump()</code> (to Python objects), <code>model_dump_json()</code> (direct to JSON bytes in Rust), with <code>by_alias</code>, <code>exclude_none</code>, <code>@field_serializer</code> and <code>@computed_field</code>.</li>
+    <li><strong>TypeAdapter</strong> validates any type (e.g. <code>list[Order]</code> or a <code>TypedDict</code>) without a model class.</li>
+    <li><strong>Discriminated unions.</strong> <code>Field(discriminator="type")</code> selects the right model by a tag in O(1), like Jackson's <code>@JsonTypeInfo</code>/<code>@JsonSubTypes</code>.</li>
+    <li><strong>JSON Schema.</strong> <code>model_json_schema()</code>, used for OpenAPI and for LLM tool/structured-output definitions.</li>
+  </ul>
+
+  <h3>3.7 ASGI</h3>
+  <p>ASGI (Asynchronous Server Gateway Interface) is the contract between a server (Uvicorn, Hypercorn, Granian) and an application. An ASGI app is just an async callable:</p>
+  <pre><code class="language-python">async def app(scope: dict, receive, send) -&gt; None:
+    # scope: {"type": "http", "method": "GET", "path": "/x", "headers": [...], ...}
+    if scope["type"] == "http":
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [(b"content-type", b"text/plain")]})
+        await send({"type": "http.response.body", "body": b"hello"})</code></pre>
+  <p>It is analogous to the Servlet API but event-driven: <code>receive()</code> yields request body chunks and disconnect events; <code>send()</code> emits response start and body chunks, which makes streaming (Server-Sent Events for LLM tokens) and WebSockets first-class. A <em>lifespan</em> scope delivers startup/shutdown events, the equivalent of Spring's <code>ApplicationReadyEvent</code> and <code>@PreDestroy</code>. Middleware in ASGI is simply an app that wraps another app: the same onion as servlet filters.</p>
+
+  <h3>3.8 Starlette and FastAPI layering</h3>
+  <p>Starlette provides routing, the <code>Request</code>/<code>Response</code> classes, middleware, background tasks, WebSockets and a test client. FastAPI subclasses Starlette's application and router and adds: parameter declaration from type hints, Pydantic validation, the dependency injection system, response models and OpenAPI generation. Most "FastAPI" runtime behaviour (middleware order, exception handling, streaming) is actually Starlette's.</p>
+
+  <h3>3.9 Dependency injection with <code>Depends</code></h3>
+  <p>A FastAPI dependency is any callable (function, class, async function, generator) whose parameters are themselves declared like endpoint parameters. FastAPI builds a dependency graph per route at startup, and at request time resolves it depth-first, caching each dependency's result per request (so two consumers of <code>get_db</code> share one session, like a request-scoped bean). Generator dependencies (<code>yield</code>) provide setup and teardown, giving you request-scoped resources with deterministic cleanup. <code>app.dependency_overrides[get_db] = fake_db</code> replaces a node in the graph for tests, the equivalent of <code>@MockitoBean</code>.</p>
+  <p>Critically, there is no container holding singletons. Application-lifetime objects (connection pools, HTTP clients, model weights) are created in the <em>lifespan</em> handler and stored on <code>app.state</code>, or held in module-level objects, and dependencies hand them out. That explicitness is closer to Go's "wire it in main" than to Spring's component scanning.</p>
+
+  <h3>3.10 Async vs sync endpoints</h3>
+  <p>If you declare an endpoint (or dependency) with <code>async def</code>, FastAPI awaits it directly on the event loop. If you declare it with plain <code>def</code>, FastAPI runs it in a worker thread via AnyIO's <code>to_thread.run_sync</code>, using a capacity limiter of 40 threads by default. So a <code>def</code> endpoint that calls a sync DB driver is safe (it blocks a worker thread, not the loop), while an <code>async def</code> endpoint that calls the same driver blocks everything. This single rule is the most important operational fact about FastAPI.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working: Class Creation, Validation and a Request's Journey</h2>
+
+  <h3>4.1 What happens when you define a Pydantic model</h3>
+  <ol>
+    <li><code>class OrderIn(BaseModel): ...</code> invokes Pydantic's metaclass (<code>ModelMetaclass.__new__</code>).</li>
+    <li>It collects annotations (resolving forward references; on 3.14 via the deferred-annotations machinery), <code>Field()</code> defaults and metadata, and decorated validators/serialisers, and merges with parent classes.</li>
+    <li>For each field type, the <code>GenerateSchema</code> machinery produces a <em>core schema</em>: a nested dict like <code>{"type": "model-fields", "fields": {"qty": {"schema": {"type": "int", "gt": 0}}}}</code>. Custom types can participate via <code>__get_pydantic_core_schema__</code>.</li>
+    <li>pydantic-core compiles the core schema into a tree of Rust <code>SchemaValidator</code> and <code>SchemaSerializer</code> nodes, stored as <code>__pydantic_validator__</code> and <code>__pydantic_serializer__</code> on the class.</li>
+    <li>A JSON Schema can be generated lazily from the same core schema.</li>
+  </ol>
+  <p>This is a one-time compilation step, like Jackson building and caching a <code>BeanDeserializer</code> per type, or Hibernate Validator building constraint metadata. It is why defining thousands of models dynamically in a hot path is slow and why you should create <code>TypeAdapter</code>s once at module level, not per request.</p>
+
+  <h3>4.2 How validation executes</h3>
+  <p><code>OrderIn.model_validate_json(raw_bytes)</code> parses JSON in Rust (the <code>jiter</code> parser) and validates in a single pass, never building an intermediate Python dict for the whole document. <code>model_validate(dict_obj)</code> walks existing Python objects. For each field: lookup by name or alias, run "before" validators (Python callbacks), the core type validator (Rust), constraint checks, then "after" validators. Errors are accumulated, not thrown at the first failure, producing a <code>ValidationError</code> with a list of <code>{loc, msg, type, input}</code> entries; FastAPI turns that into a 422 response. Python-level validators are the slow part: each call crosses from Rust into the interpreter, so prefer declarative constraints (<code>Field(gt=0, max_length=200)</code>, <code>Annotated</code> types, <code>pattern</code>) over custom validators in hot models.</p>
+  <div class="callout tip"><p class="callout-title">Performance tip</p><p>Prefer <code>model_validate_json(body_bytes)</code> over <code>model_validate(json.loads(body))</code>: it avoids building throwaway Python dicts and strings. FastAPI does this for request bodies that are a single model in recent versions; for your own Kafka consumers and HTTP clients, do it yourself.</p></div>
+
+  <h3>4.3 FastAPI startup: building the route graph</h3>
+  <p>When you decorate <code>@app.post("/orders")</code>, FastAPI creates an <code>APIRoute</code>. Its constructor inspects the endpoint signature with <code>inspect.signature</code> and the resolved type hints and builds a <code>Dependant</code> tree: path params, query params, headers, cookies, body fields, and sub-dependants for each <code>Depends</code>, recursively. It also builds a response field from <code>response_model</code> or the return annotation. All of this happens once at import, analogous to Spring's <code>RequestMappingHandlerMapping</code> scanning <code>@RequestMapping</code> methods and building <code>HandlerMethodArgumentResolver</code> chains.</p>
+
+  <h3>4.4 A request's journey</h3>
+  <ol>
+    <li><strong>Uvicorn</strong> accepts the TCP connection on its event loop (uvloop if installed), parses HTTP/1.1 with <code>httptools</code> or <code>h11</code>, builds the ASGI <code>scope</code> and calls the app.</li>
+    <li><strong>Middleware stack</strong> (outermost first): Starlette's <code>ServerErrorMiddleware</code> (turns unhandled exceptions into 500), your user middleware in reverse order of addition (CORS, GZip, tracing, auth...), then <code>ExceptionMiddleware</code> (maps <code>HTTPException</code> and registered handlers), then the router.</li>
+    <li><strong>Routing</strong>: the router iterates routes and matches path regexes compiled at startup; first full match wins (unlike Spring's "most specific pattern wins", order matters).</li>
+    <li><strong>Request parsing</strong>: for routes with a body, FastAPI reads the body (awaiting <code>receive()</code>), parses JSON or form data.</li>
+    <li><strong>Dependency resolution</strong> (<code>solve_dependencies</code>): depth-first through the <code>Dependant</code> tree; each sub-dependency's parameters are extracted and validated; results are cached per request by (callable, security scopes); <code>async def</code> dependencies are awaited, <code>def</code> ones run in the thread pool; generator dependencies are entered into an <code>AsyncExitStack</code>.</li>
+    <li><strong>Validation errors</strong> from all parameters are collected; if any, a <code>RequestValidationError</code> is raised, producing a 422 with all errors at once.</li>
+    <li><strong>Endpoint call</strong>: awaited if async; run via <code>run_in_threadpool</code> if sync.</li>
+    <li><strong>Response serialisation</strong>: if a response model is declared, the return value is validated/serialised through it (filtering fields, which is a security feature: you cannot accidentally leak <code>password_hash</code>), then rendered as JSON.</li>
+    <li><strong>Teardown</strong>: the exit code of yield dependencies runs. With the default <code>scope="request"</code> it runs after the response has been sent; with <code>Depends(..., scope="function")</code> (FastAPI 0.121+) it runs right after the endpoint returns, before sending <span class="tag version">Version-sensitive · checked Nov 2026</span>. Background tasks run after the response is sent, in the same worker.</li>
+  </ol>
+
+  <h3>4.5 The thread pool behind sync code</h3>
+  <p>Sync endpoints and sync dependencies are executed with <code>anyio.to_thread.run_sync</code>, which uses a process-global capacity limiter (default 40 tokens). If 40 sync requests are in flight, the 41st waits for a token even though the event loop is idle. This is equivalent to Tomcat's <code>server.tomcat.threads.max</code>: a hidden concurrency cap. You can raise it at startup:</p>
+  <pre><code class="language-python">from contextlib import asynccontextmanager
+import anyio.to_thread
+from fastapi import FastAPI
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    limiter = anyio.to_thread.current_default_thread_limiter()
+    limiter.total_tokens = 100        # size to your DB pool, not "as high as possible"
+    yield
+
+app = FastAPI(lifespan=lifespan)</code></pre>
+  <p>Remember Chapter 4.1: those threads share the GIL. A sync endpoint doing CPU work still blocks other sync endpoints from executing Python in parallel; it just does not freeze the event loop's scheduling entirely (the loop thread still competes for the GIL every 5 ms).</p>
+
+  <h3>4.6 How the static checker sees the same code</h3>
+  <p>mypy and pyright never run your code. They parse it, build symbol tables, and infer types using annotations, typeshed stubs for the stdlib, inline types or stub packages (<code>types-requests</code>) for third-party libraries, and plugins (Pydantic ships a mypy plugin; pyright understands Pydantic via <code>dataclass_transform</code>, PEP 681). PEP 681 is the reason static checkers know that <code>OrderIn(qty=1, sku="A")</code> has a synthesised <code>__init__</code> with typed keyword arguments: the library declares "I behave like a dataclass".</p>
+  <p>FastAPI's <code>Annotated[Session, Depends(get_db)]</code> is understood statically as <code>Session</code>; the checker ignores <code>Depends</code>. Thus the type of an injected parameter is checked in your endpoint body, but whether <code>get_db</code> actually returns a <code>Session</code> is checked only in <code>get_db</code>'s own annotation. Keep dependency functions fully annotated.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture</h2>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  C["Client"] --&gt; U["Uvicorn worker (uvloop, httptools)"]
+  U --&gt; SE["ServerErrorMiddleware"]
+  SE --&gt; MW1["User middleware: tracing"]
+  MW1 --&gt; MW2["User middleware: CORS / GZip"]
+  MW2 --&gt; EX["ExceptionMiddleware"]
+  EX --&gt; R["Router: match path"]
+  R --&gt; DEP["solve_dependencies (DI graph)"]
+  DEP --&gt; VAL["Pydantic validation (Rust core)"]
+  VAL --&gt; EP{"Endpoint async def?"}
+  EP --&gt;|yes| LOOP["Await on event loop"]
+  EP --&gt;|no| TP["AnyIO thread pool (40 tokens)"]
+  LOOP --&gt; SER["response_model serialisation"]
+  TP --&gt; SER
+  SER --&gt; U
+</pre>
+  <figcaption>Figure 4.2.1 — FastAPI request pipeline inside one Uvicorn worker process.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> everything left of <code>Router</code> is Starlette (and could be shared with any ASGI framework); everything right of it is FastAPI-specific. The branch at <code>Endpoint async def?</code> is the async-vs-sync decision from §3.10. Compare with Spring MVC: <code>Uvicorn</code> plays Tomcat's connector, middleware plays the servlet filter chain, the router plus dependency solver plays <code>DispatcherServlet</code> plus argument resolvers, and <code>response_model</code> serialisation plays the <code>HttpMessageConverter</code>.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant R as Router
+  participant D as Dependency solver
+  participant S as get_settings (cached)
+  participant DB as get_session (yield)
+  participant A as get_current_user
+  participant E as Endpoint
+  R-&gt;&gt;D: resolve Dependant tree for POST /orders
+  D-&gt;&gt;S: call once per process (lru_cache)
+  D-&gt;&gt;DB: enter generator, open AsyncSession
+  D-&gt;&gt;A: needs token header and get_session
+  A--&gt;&gt;D: User (session reused from cache)
+  D-&gt;&gt;E: call create_order(body, user, session)
+  E--&gt;&gt;D: OrderOut
+  Note over D,DB: response sent to client
+  D-&gt;&gt;DB: resume generator: commit or rollback, close
+</pre>
+  <figcaption>Figure 4.2.2 — Dependency resolution and teardown for a typical authenticated write endpoint (default request scope).</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> <code>get_session</code> is requested by both the auth dependency and the endpoint, but because of per-request caching it runs once; both receive the same session, exactly like a <code>@RequestScope</code> bean. The settings dependency is a process singleton via <code>functools.lru_cache</code>. Teardown runs after the response has gone out in the default scope, so a commit failure there cannot change the HTTP status: commit explicitly in the endpoint or service (or use <code>scope="function"</code>) when the client must learn about commit errors.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+classDiagram
+  class BaseModel {
+    +model_validate(obj)
+    +model_validate_json(data)
+    +model_dump()
+    +model_dump_json()
+    +model_json_schema()
+    +pydantic_validator
+    +pydantic_serializer
+  }
+  class SchemaValidator {
+    &lt;&lt;Rust&gt;&gt;
+    +validate_python()
+    +validate_json()
+  }
+  class SchemaSerializer {
+    &lt;&lt;Rust&gt;&gt;
+    +to_python()
+    +to_json()
+  }
+  class TypeAdapter {
+    +validate_python()
+    +dump_json()
+  }
+  class BaseSettings {
+    +env_prefix
+    +env_file
+    +secrets_dir
+  }
+  BaseModel --&gt; SchemaValidator
+  BaseModel --&gt; SchemaSerializer
+  TypeAdapter --&gt; SchemaValidator
+  BaseSettings --|&gt; BaseModel
+</pre>
+  <figcaption>Figure 4.2.3 — Pydantic v2 split between the Python API and the Rust core.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the Python classes are thin; the heavy lifting lives in two compiled Rust objects per type. <code>BaseSettings</code> (from the separate <code>pydantic-settings</code> package) is a model whose input comes from environment variables, dotenv files and secret directories instead of a request body, which is precisely <code>@ConfigurationProperties</code>.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  subgraph Spring["Spring Boot"]
+    SC["Component scan"] --&gt; BD["BeanDefinitions"] --&gt; CTX["ApplicationContext (singletons)"]
+    CTX --&gt; CTRL["@RestController (constructor injection)"]
+  end
+  subgraph Fast["FastAPI"]
+    LS["lifespan(): create pools, clients"] --&gt; ST["app.state"]
+    ST --&gt; DEPF["Dependency functions"]
+    DEPF --&gt; ENDP["Endpoint parameters (Annotated + Depends)"]
+  end
+</pre>
+  <figcaption>Figure 4.2.4 — Where objects come from: container-managed beans vs explicit lifespan plus dependency functions.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> Spring discovers and wires objects for you; FastAPI asks you to create long-lived objects explicitly in the lifespan function and expose them through small provider functions. The FastAPI model has less magic and fewer startup surprises, but no lifecycle management for arbitrary objects, no AOP proxies, and no <code>@Transactional</code>; transaction boundaries are explicit code (often a dependency or a unit-of-work context manager).</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math: Throughput, Thread-Pool Sizing and Validation Cost</h2>
+  <h3>6.1 Sizing the sync thread pool</h3>
+  <p>For sync endpoints, Little's Law gives the number of threads needed: \( N_{threads} = \lambda \times W_{blocking} \). At 300 req/s and 80 ms of blocking DB time per request, you need \( 300 \times 0.08 = 24 \) busy threads on average; the default 40 leaves headroom. At 1,000 req/s you need 80, which exceeds the default limiter: requests queue invisibly and latency climbs while CPU is low. But also check the downstream: 80 concurrent queries need 80 DB connections per worker process, and with 8 workers per pod and 10 pods that is 6,400 connections, far beyond what PostgreSQL handles well. That is why high-throughput Python services go async with smaller pools, or put PgBouncer in front.</p>
+  <h3>6.2 CPU budget for validation and serialisation</h3>
+  <p>Intuition: validation cost is roughly linear in the number of leaf values. If Rust-core validation costs on the order of tens of nanoseconds per simple field and a Python-level validator costs on the order of a microsecond (interpreter entry and the function body), then a payload with 2,000 fields and 10 custom validators per item over 100 items costs roughly \( 2000 \times 50\,\text{ns} + 1000 \times 1\,\mu\text{s} \approx 1.1 \) ms <span class="tag illus">Illustrative</span>. At 1,000 req/s per process that is 110% of a core: impossible. The lesson is not the exact numbers but the shape: custom Python validators dominate, and big list payloads should be validated once, at the edge, never re-validated internally (use <code>model_construct()</code> for trusted internal data).</p>
+  <h3>6.3 Process count</h3>
+  <p>Workers per pod \( = \lceil \lambda_{pod} \cdot c_{cpu} / u_{target} \rceil \), where \( c_{cpu} \) is CPU-seconds per request and \( u_{target} \) the target utilisation (say 0.6). At 400 req/s per pod and 3 ms CPU per request: \( 400 \times 0.003 / 0.6 = 2 \) workers. Measure \( c_{cpu} \) with a profiler under realistic payloads; JSON serialisation of large responses is often the surprise.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code: A Typed, Validated, Injected API in Three Languages</h2>
+
+  <h3>7.1 DTOs and validation: Bean Validation vs Pydantic vs Go struct tags</h3>
+  <div class="code-tabs">
+  <pre data-lang="Java"><code class="language-java">// Spring Boot 3.x, jakarta.validation
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.*;
+import java.math.BigDecimal;
+import java.util.List;
+
+public record OrderLine(@NotBlank @Pattern(regexp = "^[A-Z0-9-]{3,32}$") String sku,
+                        @Min(1) @Max(1000) int qty,
+                        @DecimalMin("0.01") BigDecimal unitPrice) {}
+
+public record OrderIn(@NotNull @Size(min = 1, max = 100) List&lt;@Valid OrderLine&gt; lines,
+                      @Email String notifyEmail,
+                      @Pattern(regexp = "standard|express") String shipping) {
+    @AssertTrue(message = "express orders limited to 20 lines")
+    boolean isExpressSmall() { return !"express".equals(shipping) || lines.size() &lt;= 20; }
+}</code></pre>
+  <pre data-lang="Python"><code class="language-python"># pip install "pydantic[email]&gt;=2.7"
+from decimal import Decimal
+from typing import Annotated, Literal, Self
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, computed_field, model_validator
+
+Sku = Annotated[str, Field(pattern=r"^[A-Z0-9-]{3,32}$")]
+
+class OrderLine(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")   # immutable, reject unknown fields
+    sku: Sku
+    qty: Annotated[int, Field(ge=1, le=1000)]
+    unit_price: Annotated[Decimal, Field(gt=0, decimal_places=2)]
+
+class OrderIn(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    lines: Annotated[list[OrderLine], Field(min_length=1, max_length=100)]
+    notify_email: EmailStr | None = None
+    shipping: Literal["standard", "express"] = "standard"
+
+    @model_validator(mode="after")
+    def express_is_small(self) -&gt; Self:
+        if self.shipping == "express" and len(self.lines) &gt; 20:
+            raise ValueError("express orders limited to 20 lines")
+        return self
+
+    @computed_field                      # included in model_dump() and JSON schema
+    @property
+    def total(self) -&gt; Decimal:
+        return sum((l.unit_price * l.qty for l in self.lines), Decimal("0"))
+
+raw = b'{"lines":[{"sku":"ABC-1","qty":"2","unit_price":"9.99"}],"shipping":"express"}'
+order = OrderIn.model_validate_json(raw)          # "2" coerced to 2 in lax mode
+print(order.total, order.model_dump_json())</code></pre>
+  <pre data-lang="Go"><code class="language-go">// go get github.com/go-playground/validator/v10
+package orders
+
+import (
+	"errors"
+
+	"github.com/go-playground/validator/v10"
+	"github.com/shopspring/decimal"
+)
+
+type OrderLine struct {
+	SKU       string          `json:"sku" validate:"required,min=3,max=32"`
+	Qty       int             `json:"qty" validate:"min=1,max=1000"`
+	UnitPrice decimal.Decimal `json:"unit_price"`
+}
+
+type OrderIn struct {
+	Lines       []OrderLine `json:"lines" validate:"required,min=1,max=100,dive"`
+	NotifyEmail string      `json:"notify_email,omitempty" validate:"omitempty,email"`
+	Shipping    string      `json:"shipping" validate:"omitempty,oneof=standard express"`
+}
+
+var validate = validator.New()
+
+func (o *OrderIn) Validate() error {
+	if err := validate.Struct(o); err != nil {
+		return err
+	}
+	if o.Shipping == "express" &amp;&amp; len(o.Lines) &gt; 20 { // cross-field rule in plain code
+		return errors.New("express orders limited to 20 lines")
+	}
+	return nil
+}</code></pre>
+  </div>
+  <p>Observations: Pydantic's constraints live in the type (<code>Annotated</code>), so you can reuse <code>Sku</code> anywhere, including as a query parameter. <code>extra="forbid"</code> is the equivalent of Jackson's <code>FAIL_ON_UNKNOWN_PROPERTIES</code> and is a good default for inbound APIs (mass-assignment protection). Go has no coercion: <code>"2"</code> for an int field is a decode error, which is the same as Pydantic strict mode.</p>
+
+  <h3>7.2 Settings: <code>@ConfigurationProperties</code> vs <code>BaseSettings</code></h3>
+  <pre data-file="app/settings.py"><code class="language-python"># pip install pydantic-settings
+from functools import lru_cache
+from pydantic import Field, PostgresDsn, SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="ORDERS_",            # ORDERS_DATABASE_URL, ORDERS_JWT_SECRET ...
+        env_file=".env",                 # local dev only; env vars take precedence
+        secrets_dir="/run/secrets",      # Kubernetes/Docker secrets mounted as files
+        env_nested_delimiter="__",       # ORDERS_RATE__PER_MINUTE=100
+    )
+    database_url: PostgresDsn
+    jwt_secret: SecretStr                # repr shows '**********'; .get_secret_value() to read
+    jwt_audience: str = "orders-api"
+    db_pool_size: int = Field(10, ge=1, le=100)
+    debug: bool = False
+
+@lru_cache                               # process-wide singleton, overridable in tests
+def get_settings() -&gt; Settings:
+    return Settings()                    # fails fast at startup if config is invalid</code></pre>
+  <p>Like Spring Boot's relaxed binding plus <code>@Validated</code> configuration classes, invalid configuration aborts startup with a precise error instead of failing at first use. <code>SecretStr</code> keeps secrets out of logs and tracebacks.</p>
+
+  <h3>7.3 The full FastAPI service</h3>
+  <p>This is a complete, runnable single-file service (split into files in a real project, see Chapter 4.3's project layout). It uses an in-memory repository behind a Protocol so you can run it without a database.</p>
+  <pre data-file="app/main.py"><code class="language-python"># pip install "fastapi&gt;=0.121" "uvicorn[standard]" "pydantic-settings" "pyjwt&gt;=2.8" "pydantic[email]"
+# run: ORDERS_DATABASE_URL=postgresql://x@localhost/db ORDERS_JWT_SECRET=dev uvicorn app.main:app --reload
+
+import time
+import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Annotated, Protocol
+
+import jwt
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.settings import Settings, get_settings
+from app.schemas import OrderIn          # the model from 7.1
+
+# ---------- domain &amp; ports ----------
+class OrderOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)   # read from ORM objects/dataclasses
+    id: uuid.UUID
+    owner: str
+    total: Decimal
+    status: str
+
+@dataclass
+class Order:
+    id: uuid.UUID
+    owner: str
+    total: Decimal
+    status: str = "PENDING"
+
+class OrderRepository(Protocol):
+    async def add(self, order: Order) -&gt; None: ...
+    async def get(self, order_id: uuid.UUID) -&gt; Order | None: ...
+    async def list_for(self, owner: str, limit: int, offset: int) -&gt; list[Order]: ...
+
+class InMemoryOrderRepository:                # satisfies the Protocol structurally
+    def __init__(self) -&gt; None:
+        self._rows: dict[uuid.UUID, Order] = {}
+    async def add(self, order: Order) -&gt; None:
+        self._rows[order.id] = order
+    async def get(self, order_id: uuid.UUID) -&gt; Order | None:
+        return self._rows.get(order_id)
+    async def list_for(self, owner: str, limit: int, offset: int) -&gt; list[Order]:
+        mine = [o for o in self._rows.values() if o.owner == owner]
+        return mine[offset : offset + limit]
+
+class OrderService:
+    def __init__(self, repo: OrderRepository) -&gt; None:
+        self.repo = repo
+    async def place(self, owner: str, cmd: OrderIn) -&gt; Order:
+        order = Order(id=uuid.uuid4(), owner=owner, total=cmd.total)
+        await self.repo.add(order)
+        return order
+
+# ---------- lifespan: the "ApplicationContext" ----------
+@asynccontextmanager
+async def lifespan(app: FastAPI) -&gt; AsyncIterator[None]:
+    settings = get_settings()                       # validate config at startup
+    app.state.repo = InMemoryOrderRepository()      # real app: async engine / pools here
+    yield
+    # shutdown: close pools, flush telemetry
+
+app = FastAPI(title="Orders API", version="1.0.0", lifespan=lifespan)
+
+# ---------- dependencies ----------
+SettingsDep = Annotated[Settings, Depends(get_settings)]
+
+def get_repo(request: Request) -&gt; OrderRepository:
+    return request.app.state.repo
+
+def get_order_service(repo: Annotated[OrderRepository, Depends(get_repo)]) -&gt; OrderService:
+    return OrderService(repo)                        # cheap per-request object, like a prototype bean
+
+bearer = HTTPBearer(auto_error=False)
+
+class Principal(BaseModel):
+    sub: str
+    scopes: frozenset[str] = frozenset()
+
+async def get_principal(
+    settings: SettingsDep,
+    creds: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
+) -&gt; Principal:
+    if creds is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing bearer token",
+                            headers={"WWW-Authenticate": "Bearer"})
+    try:
+        claims = jwt.decode(creds.credentials, settings.jwt_secret.get_secret_value(),
+                            algorithms=["HS256"],            # never accept the alg from the token
+                            audience=settings.jwt_audience,
+                            options={"require": ["exp", "sub", "aud"]})
+    except jwt.PyJWTError as e:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid token") from e
+    return Principal(sub=claims["sub"], scopes=frozenset(claims.get("scope", "").split()))
+
+def require_scope(scope: str):
+    async def checker(p: Annotated[Principal, Depends(get_principal)]) -&gt; Principal:
+        if scope not in p.scopes:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, f"missing scope {scope}")
+        return p
+    return checker
+
+# ---------- middleware: the filter chain ----------
+@app.middleware("http")
+async def request_id_and_timing(request: Request, call_next) -&gt; Response:
+    rid = request.headers.get("x-request-id") or str(uuid.uuid4())
+    t0 = time.perf_counter()
+    response = await call_next(request)
+    response.headers["x-request-id"] = rid
+    response.headers["server-timing"] = f"app;dur={(time.perf_counter() - t0) * 1000:.1f}"
+    return response
+
+# ---------- error mapping: @ControllerAdvice ----------
+class DomainError(Exception):
+    def __init__(self, code: str, detail: str) -&gt; None:
+        self.code, self.detail = code, detail
+
+@app.exception_handler(DomainError)
+async def domain_error_handler(_: Request, exc: DomainError) -&gt; JSONResponse:
+    return JSONResponse(status_code=409,
+                        content={"type": f"https://errors.example.com/{exc.code}",
+                                 "title": exc.detail, "status": 409},
+                        media_type="application/problem+json")   # RFC 9457
+
+# ---------- endpoints ----------
+@app.post("/v1/orders", status_code=status.HTTP_201_CREATED, response_model=OrderOut)
+async def create_order(
+    body: OrderIn,
+    principal: Annotated[Principal, Depends(require_scope("orders:write"))],
+    svc: Annotated[OrderService, Depends(get_order_service)],
+    response: Response,
+) -&gt; Order:
+    order = await svc.place(principal.sub, body)
+    response.headers["Location"] = f"/v1/orders/{order.id}"
+    return order                                     # serialised through OrderOut
+
+@app.get("/v1/orders", response_model=list[OrderOut])
+async def list_orders(
+    principal: Annotated[Principal, Depends(require_scope("orders:read"))],
+    repo: Annotated[OrderRepository, Depends(get_repo)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -&gt; list[Order]:
+    return await repo.list_for(principal.sub, limit, offset)
+
+@app.get("/v1/orders/{order_id}", response_model=OrderOut)
+async def get_order(
+    order_id: uuid.UUID,                              # path param validated as UUID
+    principal: Annotated[Principal, Depends(require_scope("orders:read"))],
+    repo: Annotated[OrderRepository, Depends(get_repo)],
+) -&gt; Order:
+    order = await repo.get(order_id)
+    if order is None or order.owner != principal.sub:  # same 404 for "not yours": no enumeration
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "order not found")
+    return order
+
+@app.get("/healthz", include_in_schema=False)
+async def healthz() -&gt; dict[str, str]:
+    return {"status": "ok"}</code></pre>
+  <p>Equivalent Spring wiring for comparison:</p>
+  <pre data-file="OrderController.java"><code class="language-java">@RestController
+@RequestMapping("/v1/orders")
+class OrderController {
+    private final OrderService svc;                       // constructor injection, singleton
+    OrderController(OrderService svc) { this.svc = svc; }
+
+    @PostMapping
+    @PreAuthorize("hasAuthority('SCOPE_orders:write')")   // Spring Security resource server
+    ResponseEntity&lt;OrderOut&gt; create(@Valid @RequestBody OrderIn body, @AuthenticationPrincipal Jwt jwt) {
+        Order o = svc.place(jwt.getSubject(), body);
+        return ResponseEntity.created(URI.create("/v1/orders/" + o.id())).body(OrderOut.from(o));
+    }
+}</code></pre>
+  <p>Note the differences: in Spring, the JWT filter runs in the security filter chain before the controller and populates the <code>SecurityContext</code>; in FastAPI, authentication is a dependency, so it runs only on routes that declare it and appears in the OpenAPI spec as a security requirement. You can still enforce it globally with <code>APIRouter(dependencies=[Depends(get_principal)])</code>.</p>
+
+  <h3>7.4 Testing with dependency overrides</h3>
+  <pre data-file="tests/test_orders.py"><code class="language-python"># pip install pytest httpx pytest-asyncio
+import uuid
+import pytest
+from httpx import ASGITransport, AsyncClient
+from app.main import Principal, app, get_principal, get_repo, InMemoryOrderRepository
+
+@pytest.fixture
+def repo() -&gt; InMemoryOrderRepository:
+    return InMemoryOrderRepository()
+
+@pytest.fixture
+async def client(repo):
+    app.dependency_overrides[get_repo] = lambda: repo                     # @MockitoBean equivalent
+    app.dependency_overrides[get_principal] = lambda: Principal(
+        sub="alice", scopes=frozenset({"orders:read", "orders:write"}))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        yield c
+    app.dependency_overrides.clear()
+
+@pytest.mark.asyncio
+async def test_create_and_fetch(client: AsyncClient):
+    r = await client.post("/v1/orders", json={"lines": [{"sku": "ABC-1", "qty": 2, "unit_price": "5.00"}]})
+    assert r.status_code == 201
+    oid = r.json()["id"]
+    assert r.headers["location"] == f"/v1/orders/{oid}"
+    r2 = await client.get(f"/v1/orders/{oid}")
+    assert r2.json()["total"] == "10.00"
+
+@pytest.mark.asyncio
+async def test_rejects_unknown_fields(client: AsyncClient):
+    r = await client.post("/v1/orders", json={"lines": [], "is_admin": True})
+    assert r.status_code == 422
+    locs = {tuple(e["loc"]) for e in r.json()["detail"]}
+    assert ("body", "is_admin") in locs and ("body", "lines") in locs</code></pre>
+  <p>Note that <code>ASGITransport</code> does not run the lifespan; that is why the test overrides <code>get_repo</code> rather than relying on <code>app.state</code>. Use <code>asgi-lifespan</code>'s <code>LifespanManager</code> or Starlette's <code>TestClient</code> as a context manager when you need startup to run.</p>
+
+  <h3>7.5 Structured LLM output with Pydantic</h3>
+  <pre data-file="extract.py"><code class="language-python">from typing import Literal
+from pydantic import BaseModel, Field, ValidationError
+
+class Ticket(BaseModel):
+    category: Literal["billing", "bug", "feature", "other"]
+    severity: int = Field(ge=1, le=4, description="1 = critical")
+    summary: str = Field(max_length=200)
+
+schema = Ticket.model_json_schema()      # pass to the LLM provider as the response/tool schema
+
+def parse_llm_reply(raw_json: str) -&gt; Ticket | None:
+    try:
+        return Ticket.model_validate_json(raw_json)   # never trust the model: validate like user input
+    except ValidationError as e:
+        # feed e.errors() back to the model for one repair attempt, then give up
+        print(e.errors(include_url=False))
+        return None
+
+print(parse_llm_reply('{"category":"billing","severity":2,"summary":"double charge"}'))
+print(parse_llm_reply('{"category":"refund","severity":9,"summary":"x"}'))</code></pre>
+  <p>Treat LLM output exactly like untrusted HTTP input. The same model gives you the JSON Schema for the request and the validator for the response.</p>
+
+  <h3>7.6 Streaming responses (Server-Sent Events)</h3>
+  <pre data-file="stream.py"><code class="language-python">import asyncio
+from collections.abc import AsyncIterator
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+
+app = FastAPI()
+
+async def token_stream(prompt: str) -&gt; AsyncIterator[str]:
+    for tok in ["Hello", " ", "from", " ", "the", " ", "model"]:
+        await asyncio.sleep(0.05)                 # an upstream LLM stream in reality
+        yield tok
+
+@app.get("/v1/complete")
+async def complete(prompt: str, request: Request) -&gt; StreamingResponse:
+    async def sse() -&gt; AsyncIterator[bytes]:
+        async for tok in token_stream(prompt):
+            if await request.is_disconnected():   # stop spending tokens on a gone client
+                break
+            yield f"data: {tok}\n\n".encode()
+        yield b"event: done\ndata: {}\n\n"
+    return StreamingResponse(sse(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})</code></pre>
+  <p>Spring equivalent: <code>SseEmitter</code> in MVC or <code>Flux&lt;ServerSentEvent&gt;</code> in WebFlux. In Go you would write to an <code>http.ResponseWriter</code> and call <code>http.Flusher.Flush()</code>.</p>
+
+  <h3>7.7 Go comparison: explicit wiring</h3>
+  <pre data-file="main.go"><code class="language-go">package main
+
+import (
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"os"
+)
+
+type OrderService struct{ repo OrderRepository }
+type OrderRepository interface{ Count() int }
+type memRepo struct{}
+
+func (memRepo) Count() int { return 0 }
+
+type API struct{ svc *OrderService }
+
+func (a *API) listOrders(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]int{"count": a.svc.repo.Count()})
+}
+
+func main() {
+	svc := &amp;OrderService{repo: memRepo{}} // "DI container" = main()
+	api := &amp;API{svc: svc}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/orders", api.listOrders) // Go 1.22+ method patterns
+	slog.Info("listening", "addr", ":8080")
+	if err := http.ListenAndServe(":8080", mux); err != nil {
+		slog.Error("server failed", "err", err)
+		os.Exit(1)
+	}
+}</code></pre>
+  <p>Go makes wiring explicit and compile-time checked; FastAPI makes it declarative per endpoint and resolved at runtime; Spring makes it container-managed and resolved at startup. Chapter 5.3 develops the Go side fully.</p>
+</section>
+
+<section id="applications">
+  <h2>8. Applications: How Teams Use Typing, Pydantic and FastAPI</h2>
+  <h3>8.1 Model-serving and LLM gateway APIs</h3>
+  <p>The most common production use of FastAPI in AI teams is a thin, typed HTTP layer in front of a model or an LLM provider: request models define prompts, parameters and limits; response models define the contract consumed by Java or TypeScript clients; OpenAPI is exported and used to generate clients (OpenAPI Generator for Spring's <code>RestClient</code> or <code>WebClient</code>). Teams often generate the Pydantic models <em>from</em> a shared schema (OpenAPI or JSON Schema with <code>datamodel-code-generator</code>) so Java and Python agree on one source of truth.</p>
+  <h3>8.2 Contract layer for agents and tools</h3>
+  <p>Agent frameworks describe tools as typed Python functions or Pydantic models and derive JSON Schema for the LLM. The official OpenAI and Anthropic Python SDKs use Pydantic-based models for their response types. Pydantic AI and instructor use Pydantic models as output types and re-prompt on validation errors. In each case the model is both the specification sent to the LLM and the validator applied to its reply.</p>
+  <h3>8.3 Internal platforms and back-office tools</h3>
+  <p>Platform teams use FastAPI for internal control planes (feature-flag services, experiment registries, incident tooling) because the automatic interactive docs (<code>/docs</code>) reduce the need for a UI in early versions. Netflix's open-source incident-management tool Dispatch is one public example of a FastAPI backend.</p>
+  <h3>8.4 Typed data pipelines</h3>
+  <p>Pydantic validates records entering pipelines (Kafka consumers, file ingestion), and <code>TypedDict</code>/dataclasses type intermediate stages cheaply. Pandera and Pydantic integrations validate DataFrames. The principle: validate at boundaries with Pydantic, keep internals as typed lightweight structures.</p>
+  <h3>8.5 Configuration as code</h3>
+  <p><code>BaseSettings</code> classes replace ad-hoc <code>os.environ.get</code> calls, giving one typed, validated, documented configuration object per service, the role played by <code>@ConfigurationProperties</code> beans.</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 Dropbox: gradual typing of 4 million lines</h3>
+  <p><span class="tag fact">Verified</span> Dropbox's engineering blog (2019) describes adopting mypy incrementally across roughly 4 million lines of Python. Key lessons from that post that apply to any large migration: make the checker fast (they invested in mypy daemon mode and incremental checking), start with the most widely imported modules, and treat type coverage as a tracked metric. The post also explains why they invested in mypyc to compile typed Python to C extensions for speed.</p>
+  <h3>9.2 Netflix Dispatch</h3>
+  <p><span class="tag fact">Verified</span> Netflix open-sourced Dispatch, its crisis/incident management platform, with a Python backend built on FastAPI and SQLAlchemy (see the repository linked in Further Reading). It is a useful reference for a medium-sized production FastAPI codebase: routers per domain, Pydantic schemas separated from ORM models, and dependency-provided database sessions.</p>
+  <h3>9.3 Pydantic v2's Rust rewrite</h3>
+  <p><span class="tag fact">Verified</span> The Pydantic team rewrote the validation core in Rust (pydantic-core) for v2, released June 2023, and documented a migration guide covering renamed APIs (<code>parse_obj</code> to <code>model_validate</code>, <code>dict()</code> to <code>model_dump()</code>, <code>validator</code> to <code>field_validator</code>, <code>Config</code> class to <code>model_config</code>). The project reported validation speed-ups of roughly 5x to 50x depending on the workload <span class="tag illus">project-reported</span>. The migration was a major ecosystem event: FastAPI supported both v1 and v2 for a transition period. For Java engineers it is comparable to Jackson 1 to 2 or <code>javax</code> to <code>jakarta</code>: mechanical but broad.</p>
+  <h3>9.4 What to learn from them</h3>
+  <ul>
+    <li>Type checking pays off at scale only when it is enforced in CI and fast enough to run locally.</li>
+    <li>Separate API schemas (Pydantic) from persistence models (ORM), as Spring teams separate DTOs from entities.</li>
+    <li>Validation libraries are infrastructure: pin versions, plan migrations.</li>
+  </ul>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages, Limitations and Operational Cost</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Aspect</th><th>FastAPI + Pydantic</th><th>Spring Boot</th><th>Go net/http</th></tr></thead>
+    <tbody>
+      <tr><td>Type safety</td><td>Static (opt-in, strict mode recommended) + runtime validation at boundaries</td><td>Static (compiler) + Bean Validation</td><td>Static (compiler); validation by library</td></tr>
+      <tr><td>Boilerplate</td><td>Very low</td><td>Low with Boot, more for config/security</td><td>Moderate; explicit</td></tr>
+      <tr><td>OpenAPI</td><td>Automatic, accurate</td><td>springdoc, good</td><td>Manual or codegen (oapi-codegen)</td></tr>
+      <tr><td>DI</td><td>Per-endpoint functions; no lifecycle container</td><td>Full IoC container, AOP</td><td>Manual in <code>main()</code> (or Wire/fx)</td></tr>
+      <tr><td>Throughput per core</td><td>Lower; interpreter + serialisation cost</td><td>High after JIT warm-up</td><td>High</td></tr>
+      <tr><td>Startup</td><td>Fast (seconds, slower with ML imports)</td><td>Seconds; milliseconds with native image</td><td>Milliseconds</td></tr>
+      <tr><td>Security ecosystem</td><td>Building blocks (OAuth2 helpers, libraries)</td><td>Spring Security: comprehensive</td><td>Libraries; assemble yourself</td></tr>
+      <tr><td>Maturity/versioning</td><td>FastAPI pre-1.0, frequent releases</td><td>Very mature, LTS-like cadence</td><td>Stdlib stability promise</td></tr>
+    </tbody>
+  </table></div>
+  <p>Operational costs specific to FastAPI: you must size the thread pool and worker count deliberately (§6), monitor the event loop, pin FastAPI/Starlette/Pydantic together, and accept that auth, authorisation and multi-tenancy are your code, not a framework module.</p>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Decision</th><th>Option A</th><th>Option B</th><th>Choose A when</th><th>Choose B when</th></tr></thead>
+    <tbody>
+      <tr><td>Endpoint style</td><td><code>async def</code></td><td><code>def</code></td><td>All I/O in the call path is async-native</td><td>You depend on sync drivers/SDKs; simpler code; moderate load</td></tr>
+      <tr><td>Checker</td><td>pyright</td><td>mypy</td><td>Speed, editor integration, strict inference</td><td>Plugin ecosystem (Django, SQLAlchemy legacy), existing config</td></tr>
+      <tr><td>Data objects</td><td>Pydantic models</td><td>dataclasses / attrs / TypedDict</td><td>Untrusted input, serialisation, schemas</td><td>Internal hot paths; trusted data; no validation needed</td></tr>
+      <tr><td>Validation mode</td><td>Strict</td><td>Lax</td><td>Service-to-service APIs; financial data</td><td>Public form-like inputs; query strings (always strings)</td></tr>
+      <tr><td>Auth placement</td><td>Dependency per router</td><td>ASGI middleware</td><td>Need per-route scopes and OpenAPI security docs</td><td>Blanket checks (mTLS identity, IP allowlist) before routing</td></tr>
+      <tr><td>Framework</td><td>FastAPI</td><td>Django (+ DRF/Ninja) / Litestar</td><td>API-only, async, ML-adjacent</td><td>Admin, ORM, auth batteries (Django); stricter architecture/perf (Litestar)</td></tr>
+    </tbody>
+  </table></div>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A{"Does the handler call any sync-only I/O library?"} --&gt;|yes| B{"Can you replace it with an async client?"}
+  B --&gt;|no| SYNC["Use def endpoint (thread pool), size the limiter"]
+  B --&gt;|yes| ASYNC["Use async def with the async client"]
+  A --&gt;|no| C{"CPU work over ~1 ms per request?"}
+  C --&gt;|yes| OFF["async def + offload to process pool or queue"]
+  C --&gt;|no| ASYNC
+</pre>
+  <figcaption>Figure 4.2.5 — Choosing the endpoint style.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the decision is driven by the least-async thing in the call path. One sync library call inside an <code>async def</code> is enough to stall the worker, so a <code>def</code> endpoint is the safe default until every dependency is async-native.</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes</h2>
+  <ol>
+    <li><strong>Sync I/O inside <code>async def</code></strong> (the number-one FastAPI outage cause). Includes sync SQLAlchemy sessions, <code>boto3</code>, <code>requests</code>, and sync LLM SDK clients.</li>
+    <li><strong>Returning ORM entities without a response model</strong>, leaking internal fields; or lazy-loading relationships during serialisation outside the session (the Python twin of <code>LazyInitializationException</code>).</li>
+    <li><strong>Creating clients per request</strong> (<code>httpx.AsyncClient()</code> inside the endpoint): no connection reuse, TLS handshake per call, file descriptor churn. Create once in lifespan.</li>
+    <li><strong>Mutable default arguments and shared state</strong> in dependencies, e.g. a module-level list used as a cache without locks.</li>
+    <li><strong>Assuming annotations are enforced.</strong> <code>def f(x: int)</code> accepts a string at runtime; only Pydantic/FastAPI boundaries validate.</li>
+    <li><strong>Using <code>Any</code> or <code>dict</code> everywhere</strong>, defeating both the checker and OpenAPI.</li>
+    <li><strong>Accepting the JWT algorithm from the token header</strong> or not checking <code>aud</code>/<code>exp</code>: always pin <code>algorithms</code> and require claims.</li>
+    <li><strong>Committing in yield-dependency teardown</strong> and expecting failures to reach the client (default request scope runs teardown after the response).</li>
+    <li><strong>Route order bugs</strong>: <code>/users/me</code> declared after <code>/users/{user_id}</code> is shadowed (first match wins).</li>
+    <li><strong>Forgetting <code>extra="forbid"</code></strong> on inbound models, allowing clients to send fields like <code>is_admin</code> that later code might trust via <code>**model.model_dump()</code>.</li>
+    <li><strong>Huge validation in the request path</strong> (100k-item lists): put bulk ingestion behind streaming or a queue.</li>
+  </ol>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Security</h3>
+  <ul>
+    <li><strong>AuthN</strong>: verify JWTs against a JWKS endpoint (cache keys, respect <code>kid</code>), pin algorithms, validate <code>iss</code>, <code>aud</code>, <code>exp</code>, <code>nbf</code>. In a Spring estate, reuse the same identity provider and scopes so tokens work across both stacks.</li>
+    <li><strong>AuthZ</strong>: object-level checks in the service layer (the "not yours = 404" pattern), not just scopes.</li>
+    <li><strong>Input limits</strong>: limit request body size at the proxy (FastAPI has no built-in body-size limit), set max lengths in models, bound list sizes.</li>
+    <li><strong>CORS</strong>: explicit origins; never <code>allow_origins=["*"]</code> with credentials.</li>
+    <li><strong>Error hygiene</strong>: in production, do not echo raw validation <code>input</code> values for sensitive fields; customise the <code>RequestValidationError</code> handler.</li>
+    <li><strong>Docs exposure</strong>: disable <code>/docs</code> and <code>/openapi.json</code> on public deployments or protect them.</li>
+  </ul>
+  <h3>13.2 Performance</h3>
+  <ul>
+    <li>Install <code>uvicorn[standard]</code> (uvloop + httptools).</li>
+    <li>Use <code>response_model</code> wisely: serialisation through a model costs CPU; for very large responses, return a pre-serialised <code>Response</code> built with <code>TypeAdapter(...).dump_json()</code> or <code>orjson</code>.</li>
+    <li>Avoid deep dependency trees per request on hot endpoints; each dependency is a function call and possibly a thread hop if sync.</li>
+    <li>Prefer async dependencies for trivial work: a sync dependency costs a thread-pool round trip.</li>
+  </ul>
+  <h3>13.3 Reliability and observability</h3>
+  <ul>
+    <li>Liveness (<code>/healthz</code>, process alive) vs readiness (<code>/readyz</code>, dependencies reachable) exactly as with Spring Actuator probes.</li>
+    <li>OpenTelemetry's FastAPI instrumentation creates server spans per route template; add httpx and SQLAlchemy instrumentation for client spans (Chapter 4.4).</li>
+    <li>Structured JSON logs with request ID from middleware; propagate via <code>contextvars</code>.</li>
+    <li>Graceful shutdown: Uvicorn handles SIGTERM, stops accepting, waits for in-flight requests (configure <code>--timeout-graceful-shutdown</code>), then runs lifespan shutdown.</li>
+  </ul>
+  <h3>13.4 Maintainability</h3>
+  <ul>
+    <li>CI gates: <code>ruff check</code>, <code>ruff format --check</code>, <code>pyright</code> or <code>mypy --strict</code>, tests. Treat type errors as build failures, as <code>javac</code> would.</li>
+    <li>Version your API (<code>/v1</code>), and diff the exported OpenAPI between releases to catch breaking changes (oasdiff or similar).</li>
+    <li>Pin FastAPI, Starlette and Pydantic together with a lockfile (Chapter 4.4).</li>
+  </ul>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundation</p>
+    <p>Write a typed generic <code>Result[T, E]</code> (success or error) using PEP 695 syntax and show that pyright rejects accessing <code>.value</code> without narrowing.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-python">from dataclasses import dataclass
+
+@dataclass(frozen=True, slots=True)
+class Ok[T]:
+    value: T
+
+@dataclass(frozen=True, slots=True)
+class Err[E]:
+    error: E
+
+type Result[T, E] = Ok[T] | Err[E]
+
+def parse_port(s: str) -&gt; Result[int, str]:
+    return Ok(int(s)) if s.isdigit() and 0 &lt; int(s) &lt; 65536 else Err(f"bad port {s!r}")
+
+r = parse_port("8080")
+# r.value  -&gt; error: "value" is not a known attribute of "Err[str]"
+match r:
+    case Ok(value=v):  print(v + 1)          # narrowed to Ok[int]
+    case Err(error=e): print(e.upper())</code></pre>
+    <p>Pattern matching narrows the union like a sealed interface plus <code>switch</code> pattern matching in Java 21.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Model a payment request with a discriminated union: <code>card</code> (PAN last four, expiry), <code>sepa</code> (IBAN), <code>wallet</code> (provider literal). Validate with <code>model_validate_json</code> and produce JSON Schema.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-python">from typing import Annotated, Literal
+from pydantic import BaseModel, Field, TypeAdapter
+
+class Card(BaseModel):
+    type: Literal["card"]
+    last4: Annotated[str, Field(pattern=r"^\d{4}$")]
+    exp: Annotated[str, Field(pattern=r"^(0[1-9]|1[0-2])/\d{2}$")]
+
+class Sepa(BaseModel):
+    type: Literal["sepa"]
+    iban: Annotated[str, Field(min_length=15, max_length=34)]
+
+class Wallet(BaseModel):
+    type: Literal["wallet"]
+    provider: Literal["apple", "google"]
+
+Method = Annotated[Card | Sepa | Wallet, Field(discriminator="type")]
+
+class Payment(BaseModel):
+    amount_cents: Annotated[int, Field(gt=0)]
+    method: Method
+
+p = Payment.model_validate_json(b'{"amount_cents": 500, "method": {"type": "wallet", "provider": "apple"}}')
+print(type(p.method).__name__)          # Wallet
+print(TypeAdapter(Payment).json_schema()["properties"]["method"])   # oneOf + discriminator mapping</code></pre>
+    <p>The discriminator makes validation O(1) in the number of variants and produces clearer errors (only the selected variant's errors are reported), like Jackson's <code>@JsonTypeInfo(use = NAME, property = "type")</code>.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Advanced</p>
+    <p>Implement a tenant-aware dependency: read <code>X-Tenant-ID</code>, verify it matches a <code>tenants</code> claim in the JWT, store it in a <code>ContextVar</code> for logging, and guarantee it is reset after the request. Write a test using overrides.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-python">from contextvars import ContextVar
+from collections.abc import AsyncIterator
+from typing import Annotated
+from fastapi import Depends, Header, HTTPException
+
+current_tenant: ContextVar[str | None] = ContextVar("current_tenant", default=None)
+
+async def tenant_scope(
+    x_tenant_id: Annotated[str, Header()],
+    principal: Annotated["Principal", Depends(get_principal)],
+) -&gt; AsyncIterator[str]:
+    if x_tenant_id not in principal.tenants:
+        raise HTTPException(403, "tenant not allowed")
+    token = current_tenant.set(x_tenant_id)
+    try:
+        yield x_tenant_id
+    finally:
+        current_tenant.reset(token)       # no leakage between requests/tasks</code></pre>
+    <p>Test: override <code>get_principal</code> with a principal whose <code>tenants</code> contains <code>"t1"</code>, call with header <code>t1</code> (200) and <code>t2</code> (403). Because each request runs in its own task with a copied context, <code>ContextVar</code> values do not leak even without the reset, but resetting is correct hygiene for sync paths and nested scopes.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>A <code>def</code> endpoint performs a 50 ms synchronous DB query. Load tests show throughput flat at about 800 req/s per worker regardless of DB capacity. Explain the ceiling and fix it.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>The AnyIO limiter allows 40 concurrent sync calls; by Little's Law the ceiling is \( 40 / 0.05 = 800 \) req/s. Options: raise <code>total_tokens</code> (while sizing the DB pool to match and watching GIL contention), or switch to an async driver and <code>async def</code>, which bounds concurrency by the pool instead of threads. Also consider adding more worker processes if CPU allows.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Expert</p>
+    <p>Design how a Spring Boot service and a FastAPI service share one API contract without drift. Include codegen direction, CI checks and versioning.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Pick one source of truth. Option 1, code-first in FastAPI: export <code>app.openapi()</code> in CI to a versioned artifact, generate the Java client with OpenAPI Generator, and fail CI on breaking changes via an OpenAPI diff tool. Option 2, spec-first: hand-maintained OpenAPI/JSON Schema in a contracts repo, generate Pydantic models (<code>datamodel-code-generator</code>) and Java DTOs from it. Add consumer-driven contract tests (Pact) for critical interactions. Version with URL major versions and additive-only minor changes; deprecate with <code>Sunset</code> headers. For events (Kafka), use a schema registry with compatibility rules (Chapter 4.4).</p></div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Are Python type hints enforced at runtime?</summary><div><p>No. The interpreter stores them (lazily since 3.14) but does not check them. Static checkers verify them before runtime; libraries like Pydantic and FastAPI read them to perform runtime validation at boundaries.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Protocol vs ABC: when do you use which?</summary><div><p>Protocol for structural typing: consumers declare what they need, implementations need not know about it (like Go interfaces), ideal for ports and third-party types. ABC for nominal hierarchies with shared implementation and runtime enforcement of abstract methods at instantiation (like Java abstract classes).</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why is Pydantic v2 much faster than v1?</summary><div><p>Validation and serialisation logic is compiled once per type into a tree of Rust validators/serializers (pydantic-core); JSON can be parsed and validated in one pass without intermediate Python objects. v1 executed Python code per field.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How does FastAPI's DI differ from Spring's, and what do you lose?</summary><div><p>FastAPI resolves a per-endpoint graph of provider functions at request time with per-request caching and generator-based teardown; there is no global container, no component scanning, no AOP, no lifecycle for arbitrary singletons. You gain explicitness and easy overrides; you lose declarative transactions, interceptors on arbitrary beans and auto-configuration. Long-lived objects come from lifespan and <code>app.state</code>.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Where should authentication live in a FastAPI service?</summary><div><p>Token verification as a dependency on routers (so it composes with scopes and appears in OpenAPI), coarse transport checks (mTLS, IP) in middleware or the gateway, and object-level authorisation in the service layer. Keep the identity provider and scope names shared with Spring services.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Write a dependency that provides an async DB session per request and rolls back on error.</summary><div>
+<pre><code class="language-python">async def get_session(request: Request) -&gt; AsyncIterator[AsyncSession]:
+    async with request.app.state.sessionmaker() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise</code></pre>
+  <p>Mention the teardown-timing caveat (default request scope runs after the response) and that many teams commit explicitly in the service instead.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> After adding an async endpoint that calls an internal SDK, all endpoints' p99 jumps. Diagnose.</summary><div><p>The SDK is synchronous and blocks the event loop. Confirm with loop-lag metrics, <code>py-spy dump</code> showing the loop thread inside a socket read, or asyncio debug slow-callback logs. Fix by declaring the endpoint <code>def</code>, wrapping the call in <code>asyncio.to_thread</code>, or using an async SDK.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Your OpenAPI-generated Java client broke after a Python release that "only renamed an internal field". What happened and how do you prevent it?</summary><div><p>The field was part of a response model, so the schema changed. Prevent with response models separated from internal models, explicit aliases for wire names, OpenAPI diff checks in CI, and contract tests.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> How would you introduce strict typing into an untyped 200k-line Python service?</summary><div><p>Baseline the checker with existing errors suppressed per module, enforce strictness on new and touched files, type the most-imported modules first, add stubs for key dependencies, measure coverage over time, and run the checker in CI and pre-commit. Communicate wins (bugs caught) to keep momentum, as Dropbox did.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Python typing is gradual and unchecked at runtime; strict mypy/pyright in CI is your compiler.</li>
+    <li>Protocols give Go-style structural interfaces; ParamSpec keeps decorators typed; Annotated carries metadata for frameworks.</li>
+    <li>Pydantic v2 compiles schemas into Rust validators; use declarative constraints and <code>model_validate_json</code> for speed.</li>
+    <li>FastAPI = Starlette (ASGI, routing, middleware) + Pydantic + per-endpoint DI + OpenAPI.</li>
+    <li><code>async def</code> runs on the loop; <code>def</code> runs in a 40-thread pool by default.</li>
+    <li>Long-lived resources belong in lifespan; per-request resources in yield dependencies; overrides replace them in tests.</li>
+  </ul>
+  <div class="quiz" data-answer="b">
+    <p class="q">A FastAPI endpoint is declared with plain <code>def</code>. Where does it execute?</p>
+    <ol><li data-k="a">On the event loop thread</li><li data-k="b">In a worker thread from AnyIO's thread pool</li><li data-k="c">In a separate process</li><li data-k="d">In a new thread created per request</li></ol>
+    <div class="explain">FastAPI runs sync endpoints and dependencies with <code>run_in_threadpool</code>, bounded by AnyIO's default limiter (40).</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">Two dependencies in the same request both depend on <code>get_session</code>. How many sessions are created?</p>
+    <ol><li data-k="a">Two</li><li data-k="b">One per dependency plus one for the endpoint</li><li data-k="c">Zero until the endpoint uses it</li><li data-k="d">One, cached for the request</li></ol>
+    <div class="explain">FastAPI caches dependency results per request (unless <code>use_cache=False</code>), similar to a request-scoped bean.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">What does <code>ConfigDict(extra="forbid")</code> protect against?</p>
+    <ol><li data-k="a">Clients sending unexpected fields (mass-assignment style bugs)</li><li data-k="b">SQL injection</li><li data-k="c">Missing required fields</li><li data-k="d">Slow validation</li></ol>
+    <div class="explain">Unknown fields cause a validation error instead of being silently ignored.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Which typing construct lets a class satisfy an interface without inheriting from it?</p>
+    <ol><li data-k="a">ABC</li><li data-k="b">TypedDict</li><li data-k="c">Protocol</li><li data-k="d">NewType</li></ol>
+    <div class="explain">Protocol implements structural subtyping, like Go interfaces.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">With the default dependency scope, when does code after <code>yield</code> in a dependency run?</p>
+    <ol><li data-k="a">Before the endpoint</li><li data-k="b">After the response has been sent</li><li data-k="c">Never, unless an exception occurs</li><li data-k="d">On application shutdown</li></ol>
+    <div class="explain">Default <code>scope="request"</code> exits after sending; <code>scope="function"</code> (0.121+) exits before sending.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Why use <code>model_validate_json(raw)</code> instead of <code>model_validate(json.loads(raw))</code>?</p>
+    <ol><li data-k="a">It supports more types</li><li data-k="b">It is the only way to use strict mode</li><li data-k="c">It parses and validates in one Rust pass without intermediate Python objects</li><li data-k="d">It skips validation</li></ol>
+    <div class="explain">Single-pass parsing avoids building and discarding Python dicts and strings.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Docs</span> <a href="https://typing.python.org/">Python typing documentation and specification</a></li>
+    <li><span class="ref-kind">Spec</span> <a href="https://peps.python.org/pep-0695/">PEP 695 — Type Parameter Syntax</a></li>
+    <li><span class="ref-kind">Spec</span> <a href="https://peps.python.org/pep-0544/">PEP 544 — Protocols: Structural subtyping</a></li>
+    <li><span class="ref-kind">Spec</span> <a href="https://peps.python.org/pep-0612/">PEP 612 — Parameter Specification Variables</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.pydantic.dev/latest/">Pydantic documentation</a> (see "Performance" and "Migration Guide")</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.pydantic.dev/latest/concepts/pydantic_settings/">Pydantic Settings</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://fastapi.tiangolo.com/">FastAPI documentation</a> (Advanced User Guide: dependencies, lifespan, testing)</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://www.starlette.io/">Starlette documentation</a></li>
+    <li><span class="ref-kind">Spec</span> <a href="https://asgi.readthedocs.io/en/latest/specs/main.html">ASGI specification</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://microsoft.github.io/pyright/">Pyright documentation</a> and <a href="https://mypy.readthedocs.io/">mypy documentation</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://dropbox.tech/application/our-journey-to-type-checking-4-million-lines-of-python">Dropbox — Our journey to type checking 4 million lines of Python</a></li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/Netflix/dispatch">Netflix Dispatch (FastAPI backend)</a></li>
+    <li><span class="ref-kind">Spec</span> <a href="https://www.rfc-editor.org/rfc/rfc9457">RFC 9457 — Problem Details for HTTP APIs</a></li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

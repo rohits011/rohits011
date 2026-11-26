@@ -1,0 +1,974 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Linux &amp; Networking Fundamentals for Backend Engineers — AI-Era Software Engineering</title>
+<meta name="description" content="Processes, signals, file descriptors, memory, cgroups v2 and namespaces, performance tooling, and the TCP/IP, DNS, HTTP and TLS mechanics every backend engineer needs to debug production systems.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p12-01-linux-networking" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 12 · Chapter 1</p>
+  <h1>Linux &amp; Networking Fundamentals for Backend Engineers</h1>
+  <p class="lede">Every container, every Kubernetes pod and every cloud load balancer is built from a handful of Linux kernel features and a handful of network protocols. This chapter takes you below the JVM and below Spring Boot to the processes, file descriptors, cgroups, sockets and packets that your services actually run on, so that when production misbehaves you can reason from first principles instead of guessing.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Comfortable on a Linux shell; have deployed a Spring Boot service somewhere; basic understanding of HTTP and REST.</li>
+    <li><strong>You will be able to:</strong> explain what happens between <code>kill</code> and a clean JVM shutdown; diagnose OOM kills, file-descriptor and ephemeral-port exhaustion; read <code>vmstat</code>, <code>ss</code>, <code>strace</code>, <code>perf</code> and <code>bpftrace</code> output; trace a request through DNS, TCP, TLS and HTTP/2; and choose between L4 and L7 load balancing.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: The Machine Under Your Framework</h2>
+  <p>For most of your career, Spring Boot has hidden the operating system from you. You wrote <code>@RestController</code>s, the embedded Tomcat accepted connections, HikariCP handed out database connections, and the JVM's garbage collector reclaimed memory. That abstraction is a gift right up to the moment it breaks: a pod is restarted with exit code 137 and nobody can explain why, p99 latency jumps by exactly 200 ms, a batch job fails with <code>Cannot assign requested address</code>, or a deploy causes a burst of 502s at the load balancer. None of those problems can be solved inside the framework. They live in the kernel and on the wire.</p>
+  <p>This chapter is the foundation for the whole of Part 12. Containers (Chapter 2) are nothing more than Linux processes wrapped in <em>namespaces</em> and constrained by <em>cgroups</em>. Kubernetes networking is Linux routing, <code>iptables</code>/<code>nftables</code> or eBPF, and DNS. Cloud networking (Chapter 4) is IP subnetting and NAT done by someone else's hardware. Observability (Chapter 5) begins with understanding what <code>CPU</code>, <code>memory</code> and <code>connections</code> actually mean. And SRE (Chapter 6) depends on fast, systematic diagnosis, which is the USE method you will learn here.</p>
+
+  <h3>1.1 The running example: the Lumen platform</h3>
+  <p>Across the six chapters of Part 12 we will build, deploy, observe and operate one platform, which we call <strong>Lumen</strong> <span class="tag illus">Illustrative</span>. It is a typical AI-era product backend:</p>
+  <ul>
+    <li><strong>edge-gateway</strong> — a Go service that terminates client HTTP/2, authenticates requests (JWT), applies rate limits and routes to backends.</li>
+    <li><strong>orders-service</strong> — a Spring Boot 3.x/4.x service on Java 21 that owns orders, talks to PostgreSQL (Amazon RDS) and publishes events to a queue.</li>
+    <li><strong>assist-service</strong> — a Python (FastAPI + Uvicorn) service that performs retrieval-augmented generation: it embeds queries, searches a vector index and calls an LLM API, streaming tokens back.</li>
+  </ul>
+  <p>In this chapter Lumen runs on plain Linux VMs so we can see the kernel without Kubernetes in the way. In Chapter 2 we containerise it and move it to Kubernetes; in Chapter 3 we build pipelines and Terraform for it; in Chapter 4 it lands on Amazon EKS inside a VPC; in Chapter 5 we instrument it with OpenTelemetry; and in Chapter 6 we define SLOs and run an incident on it.</p>
+
+<div class="bridge">
+  <h4>Bridging from Java &amp; Spring Boot</h4>
+  <dl>
+    <dt>What you already know</dt><dd>You configure <code>server.tomcat.threads.max</code>, <code>spring.datasource.hikari.maximum-pool-size</code>, <code>-Xmx</code> and <code>server.shutdown=graceful</code>. You have read thread dumps with <code>jstack</code>, heap histograms with <code>jmap</code>, and watched <code>/actuator/metrics</code>. You know a JVM has a heap, metaspace, thread stacks and a code cache.</dd>
+    <dt>Why that is not enough</dt><dd>Every one of those settings maps onto a kernel resource that the JVM does not control: Tomcat threads are kernel tasks scheduled by CFS/EEVDF; every HTTP and JDBC connection is a file descriptor and a socket with kernel buffers; the heap is virtual memory that the kernel may refuse to back, and the cgroup memory limit counts native memory the JVM's <code>Runtime.maxMemory()</code> never reports. A graceful shutdown only happens if <code>SIGTERM</code> actually reaches the JVM. Java tools stop at the JVM boundary; production failures do not.</dd>
+    <dt>The modern approach</dt><dd>Treat the kernel as an observable, tunable component. Use the USE method (Utilisation, Saturation, Errors) for every resource; use <code>ss</code>, <code>/proc</code>, cgroup files and eBPF tools to see what the JVM cannot; understand TCP, DNS and TLS well enough to read a packet capture.</dd>
+    <dt>Where Python and Go fit</dt><dd>Go's runtime multiplexes goroutines onto a few OS threads with an <code>epoll</code>-based netpoller, so you see few threads but many sockets. Python's Uvicorn uses one event loop per worker process, so you scale with processes and must watch per-process RSS. Both are affected by the same limits (fd counts, cgroup memory, ephemeral ports), but the symptoms differ from the JVM's.</dd>
+    <dt>In production</dt><dd>Exit code 137 (SIGKILL by the OOM killer), <code>EMFILE</code> (too many open files), thousands of sockets in <code>TIME_WAIT</code>, DNS lookups adding 5-second delays, and 502s during deploys are the five most common kernel- and network-level incidents a backend team meets. Each one is explained and reproduced in this chapter.</dd>
+    <dt>Use it when / avoid it when</dt><dd>Reach for kernel-level tools when application metrics cannot explain a symptom (latency without CPU, restarts without exceptions, errors without logs). Avoid premature kernel tuning: changing <code>sysctl</code>s copied from a blog post without measuring is a classic source of new incidents.</dd>
+  </dl>
+</div>
+
+  <h3>1.2 What problems this knowledge solves</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Symptom you see in Spring Boot</th><th>Kernel/network reality</th><th>Section</th></tr></thead>
+    <tbody>
+      <tr><td>Pod restarted, no exception, exit code 137</td><td>cgroup OOM killer sent SIGKILL</td><td>3.4, 4.4</td></tr>
+      <tr><td><code>java.net.SocketException: Too many open files</code></td><td>RLIMIT_NOFILE reached; fd leak or too-low limit</td><td>3.3</td></tr>
+      <tr><td><code>Cannot assign requested address</code> on outbound calls</td><td>Ephemeral port exhaustion from short-lived connections and TIME_WAIT</td><td>4.3, 6.3</td></tr>
+      <tr><td>p99 latency spikes, CPU at 40%</td><td>CPU throttling by CFS quota, run-queue saturation, or GC + throttling</td><td>3.6, 6.4</td></tr>
+      <tr><td>Random 5 s pauses on outbound HTTP</td><td>DNS timeouts (UDP drop, <code>ndots</code> search-path expansion)</td><td>3.9, 4.5</td></tr>
+      <tr><td>502/503s during every deploy</td><td>Connection draining, keep-alive races between LB and app</td><td>4.6, 12</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="history">
+  <h2>2. History: From Unix Processes to eBPF, from ARPANET to QUIC</h2>
+  <h3>2.1 The operating system side</h3>
+  <p>The process model you use every day — <code>fork()</code>, <code>exec()</code>, file descriptors, signals and "everything is a file" — comes from Unix, developed at Bell Labs from 1969 by Ken Thompson and Dennis Ritchie. Linus Torvalds announced Linux in August 1991 as a free Unix-like kernel, and the GNU userland made it a complete system. For two decades the important story for backend engineers was scalability: the O(1) scheduler (2.6, 2003), the Completely Fair Scheduler (CFS, 2.6.23, 2007), <code>epoll</code> (2.5.44/2.6, 2002) which let one thread watch tens of thousands of sockets and made Nginx, Netty and Go's netpoller possible, and in 2023 the EEVDF scheduler that replaced CFS's core algorithm in Linux 6.6.</p>
+  <p>Containers grew out of two independent kernel features. <strong>Namespaces</strong> started with the mount namespace in 2002 and gained UTS, IPC, PID, network and finally user namespaces (complete around Linux 3.8, 2013). <strong>Control groups (cgroups)</strong> were contributed by Google engineers and merged in Linux 2.6.24 (January 2008) to account for and limit the resources of process groups — the same mechanism Google's Borg used internally. LXC (2008) combined them; Docker (2013) wrapped them in a developer-friendly image format and CLI. The original cgroup design (v1) had one hierarchy per controller and confusing semantics; the <strong>unified cgroup v2</strong> hierarchy was declared stable in Linux 4.5 (2016), and by the early 2020s major distributions (Fedora 31, Ubuntu 21.10, Debian 11, RHEL 9) booted with cgroup v2 by default. Kubernetes declared cgroup v2 support GA in v1.25 (2022) and has since moved cgroup v1 into maintenance mode <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+  <p><strong>systemd</strong> (2010, Lennart Poettering and Kay Sievers) replaced SysV init scripts on most distributions, bringing parallel startup, cgroup-based service tracking and a journal. And <strong>eBPF</strong> — the extended Berkeley Packet Filter, which landed in Linux 3.18 (2014) and grew rapidly after — turned the kernel into a programmable platform: safe, verified programs that run on kernel events. Brendan Gregg's BCC and <code>bpftrace</code> tools, Cilium's networking and Pixie/Parca-style profilers all build on it.</p>
+  <h3>2.2 The network side</h3>
+  <p>TCP/IP was specified by Vint Cerf and Bob Kahn in the 1970s; TCP was standardised as RFC 793 in September 1981, and the ARPANET switched to TCP/IP on 1 January 1983. In 2022 RFC 9293 consolidated four decades of TCP updates into a single specification. Congestion control arrived after the 1986 "congestion collapse" of the early Internet; Van Jacobson's 1988 paper introduced slow start and congestion avoidance. Linux defaulted to CUBIC from 2.6.19 (2006), and Google published <strong>BBR</strong> in 2016 (ACM Queue, "BBR: Congestion-Based Congestion Control").</p>
+  <p>DNS was designed by Paul Mockapetris (RFCs 882/883 in 1983, replaced by RFCs 1034/1035 in 1987). HTTP/1.0 was documented in RFC 1945 (1996), HTTP/1.1 in RFC 2068 (1997) and RFC 2616 (1999), and the modern consolidated HTTP semantics in RFC 9110 (2022). Google's SPDY experiment led to HTTP/2 (RFC 7540, 2015; revised as RFC 9113 in 2022). QUIC, again born at Google, was standardised by the IETF as RFC 9000 in May 2021, and HTTP/3 as RFC 9114 in June 2022. On the security side, SSL 3.0 (1996) gave way to TLS 1.0 (1999), TLS 1.2 (2008) and TLS 1.3 (RFC 8446, August 2018), which cut the full handshake to one round trip.</p>
+  <div class="callout insight"><p class="callout-title">Why this history matters</p><p>Almost every "mysterious" default you meet is a fossil from one of these eras: the 60-second TIME_WAIT dates from the TCP spec's maximum segment lifetime; <code>ndots:5</code> in Kubernetes pods comes from the DNS search-path design of the 1980s; the 200 ms delay you sometimes see is the interaction of Nagle's algorithm (1984) with delayed ACKs. Knowing the origin tells you whether a default is safe to change.</p></div>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals: The Concepts Under Every Production System</h2>
+
+  <h3>3.1 Processes, threads and the scheduler</h3>
+  <p>A <strong>process</strong> is an address space plus a set of resources (open files, credentials, namespaces, cgroup membership) and one or more <strong>threads</strong> of execution. In the Linux kernel, both are represented by a <code>task_struct</code>; a thread is simply a task that shares its address space and file table with its siblings (created by <code>clone()</code> with <code>CLONE_VM | CLONE_FILES | ...</code>). That is why <code>top -H</code> shows every JVM thread as a separate line with its own TID, and why the kernel's scheduler sees a Spring Boot service with 200 Tomcat threads as 200-plus schedulable entities.</p>
+  <p>Each task is in a state: <code>R</code> (running or runnable, waiting in the run queue), <code>S</code> (interruptible sleep — waiting on a socket, a lock, a timer), <code>D</code> (uninterruptible sleep — usually waiting on disk or NFS I/O; cannot be killed until it returns), <code>Z</code> (zombie — exited, but the parent has not yet called <code>wait()</code>), and <code>T</code> (stopped). The <strong>load average</strong> on Linux counts tasks in <code>R</code> <em>and</em> <code>D</code>, which is why a box with an unhealthy disk can show load 40 with idle CPUs.</p>
+  <p>The scheduler (CFS, and since 6.6 EEVDF) gives each runnable task a fair share of CPU weighted by its <em>nice</em> value. Inside a container, CPU limits are enforced by the cgroup CPU controller as a <strong>quota per period</strong> (by default 100 ms): a limit of 2 CPUs means the group may consume 200 ms of CPU time per 100 ms wall-clock period across all its threads. Once the quota is spent, every thread in the group is <em>throttled</em> until the next period starts. A JVM with 50 busy threads (GC workers, JIT compiler threads, Tomcat workers) can burn a 200 ms quota in 4 ms of wall time and then sit frozen for 96 ms. This is the single most common cause of "high p99 with moderate average CPU" in containerised Java.</p>
+
+  <h3>3.2 Signals, exit codes and PID 1</h3>
+  <p>A <strong>signal</strong> is an asynchronous notification delivered to a process. The ones a backend engineer must know:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Signal</th><th>Number</th><th>Default action</th><th>Who sends it in practice</th></tr></thead>
+    <tbody>
+      <tr><td><code>SIGTERM</code></td><td>15</td><td>Terminate</td><td><code>kill</code>, systemd stop, Kubernetes on pod deletion, <code>docker stop</code></td></tr>
+      <tr><td><code>SIGKILL</code></td><td>9</td><td>Terminate, cannot be caught</td><td>OOM killer, kubelet after grace period, <code>kill -9</code></td></tr>
+      <tr><td><code>SIGINT</code></td><td>2</td><td>Terminate</td><td>Ctrl-C in a terminal</td></tr>
+      <tr><td><code>SIGHUP</code></td><td>1</td><td>Terminate</td><td>Terminal closed; by convention "reload config" for daemons such as Nginx</td></tr>
+      <tr><td><code>SIGQUIT</code></td><td>3</td><td>Core dump</td><td>On the JVM: prints a thread dump to stdout and continues</td></tr>
+      <tr><td><code>SIGCHLD</code></td><td>17</td><td>Ignore</td><td>Kernel, when a child exits — the parent must <code>wait()</code> to reap it</td></tr>
+      <tr><td><code>SIGSEGV</code></td><td>11</td><td>Core dump</td><td>Invalid memory access (in Java: JNI or JVM bug, produces <code>hs_err_pid.log</code>)</td></tr>
+    </tbody>
+  </table></div>
+  <p>When a process dies from a signal, shells and container runtimes report exit code <strong>128 + signal number</strong>. So <code>137 = 128 + 9</code> (SIGKILL — usually OOM) and <code>143 = 128 + 15</code> (SIGTERM — a normal stop that the app did not handle by exiting 0). Memorise these two; you will see them in <code>kubectl describe pod</code> constantly.</p>
+  <p><strong>PID 1 is special.</strong> The first process in a PID namespace — <code>systemd</code> on a host, your <code>ENTRYPOINT</code> in a container — has two unusual properties. First, the kernel does <em>not</em> apply default signal actions to it: if PID 1 has not installed a handler for <code>SIGTERM</code>, the signal is simply ignored. The JVM installs handlers, so <code>java -jar</code> as PID 1 works; a shell script that runs <code>java</code> as a child does not forward the signal unless you use <code>exec</code>. Second, PID 1 inherits orphaned processes and must reap zombies. A container whose entrypoint spawns children (a shell, a Python app using <code>subprocess</code>, Chrome for PDF rendering) without reaping them accumulates zombies until the PID limit is hit. Tiny init processes such as <code>tini</code> or <code>dumb-init</code> (or Docker's <code>--init</code>) solve both problems.</p>
+
+  <h3>3.3 File descriptors and resource limits</h3>
+  <p>A <strong>file descriptor</strong> (fd) is a per-process integer that indexes the kernel's open-file table. Regular files, directories, pipes, sockets (TCP, UDP, Unix), <code>epoll</code> instances, <code>eventfd</code>s and timers are all fds. Every inbound HTTP connection to Tomcat, every HikariCP JDBC connection, every outbound connection from <code>RestClient</code> or <code>WebClient</code>, and every JAR on the classpath that the JVM has open consumes one. You can see them under <code>/proc/&lt;pid&gt;/fd</code>.</p>
+  <p>The per-process limit is <code>RLIMIT_NOFILE</code> (<code>ulimit -n</code>), with a soft and a hard value. Historically the soft limit was 1024, which a busy Spring Boot service exceeds easily. Modern systemd sets a soft limit of 1024 but a hard limit of 524288 and the JVM raises its own soft limit to the hard limit at startup on Linux (the <code>-XX:+MaxFDLimit</code> behaviour). Container runtimes typically set both to 1048576 or 65536 depending on configuration. When the limit is hit, <code>accept()</code> and <code>socket()</code> fail with <code>EMFILE</code>, which Java surfaces as <code>SocketException: Too many open files</code>. The system-wide ceiling is <code>fs.file-max</code>.</p>
+  <div class="callout warn"><p class="callout-title">Raising the limit is not the fix</p><p>If fd count grows without bound, you have a leak — usually an unclosed <code>InputStream</code> from an HTTP client response, a <code>Files.lines()</code> stream not used in try-with-resources, or a new <code>HttpClient</code> created per request. Raising the limit only postpones the outage. Graph <code>process_files_open_files</code> (Micrometer) against <code>process_files_max_files</code> and alert on the trend.</p></div>
+
+  <h3>3.4 Virtual memory, RSS and the OOM killer</h3>
+  <p>Every process sees a private <strong>virtual address space</strong>. The kernel maps virtual pages (4 KiB on x86-64 by default) to physical frames lazily: <code>malloc</code> or <code>mmap</code> reserves address space, but physical memory is committed only on first touch (a page fault). That is why <code>-Xms4g</code> does not immediately consume 4 GiB of RAM unless you add <code>-XX:+AlwaysPreTouch</code>.</p>
+  <ul>
+    <li><strong>VSZ</strong> (virtual size) — all reserved address space. Meaningless for capacity; a JVM routinely reserves tens of GiB.</li>
+    <li><strong>RSS</strong> (resident set size) — pages currently in physical memory, including shared libraries.</li>
+    <li><strong>PSS</strong> — RSS with shared pages divided among sharers; useful when many processes share libraries.</li>
+    <li><strong>cgroup memory usage</strong> (<code>memory.current</code>) — what a container is actually charged for: anonymous memory (heap, stacks, native allocations) plus <em>page cache</em> attributed to the group plus kernel memory such as socket buffers.</li>
+  </ul>
+  <p>Linux overcommits memory by default (<code>vm.overcommit_memory=0</code>, a heuristic). When physical memory (or a cgroup's <code>memory.max</code>) is exhausted and reclaim cannot free enough, the <strong>OOM killer</strong> picks a victim based on <code>oom_score</code> (roughly proportional to memory use, adjusted by <code>oom_score_adj</code>) and sends it <code>SIGKILL</code>. No shutdown hook runs, no log line is written by the victim; the evidence is in <code>dmesg</code>/<code>journalctl -k</code> and in the cgroup's <code>memory.events</code> (<code>oom_kill</code> counter). Kubernetes sets <code>oom_score_adj</code> by QoS class so that BestEffort pods die first and Guaranteed pods last.</p>
+  <div class="callout java"><p class="callout-title">Java angle: the heap is not the process</p><p>A JVM's footprint is heap + metaspace + code cache + thread stacks (often 1 MiB reserved per thread) + GC data structures + direct <code>ByteBuffer</code>s (Netty!) + JNI/native libraries + malloc arena fragmentation. With <code>-Xmx</code> equal to the container limit, the process is guaranteed to be OOM-killed eventually. Use <code>-XX:MaxRAMPercentage=70</code> to 75 and enable <code>-XX:NativeMemoryTracking=summary</code> when investigating; <code>jcmd &lt;pid&gt; VM.native_memory summary</code> then shows where the rest goes.</p></div>
+
+  <h3>3.5 The page cache and I/O</h3>
+  <p>Linux uses otherwise-free RAM to cache file contents in the <strong>page cache</strong>. Reads hit memory when pages are cached; writes go to cache pages marked dirty and are flushed to disk later by writeback threads (tuned by <code>vm.dirty_background_ratio</code> and <code>vm.dirty_ratio</code>) or immediately by <code>fsync()</code>. This is why "free" memory on a healthy server is near zero — <code>free -m</code>'s <code>available</code> column is the number to watch. Kafka, PostgreSQL and Elasticsearch deliberately rely on the page cache instead of caching in the heap.</p>
+  <p>Inside a container, page cache generated by the container's file I/O is charged to its cgroup. That is mostly harmless because clean cache is reclaimable before the OOM killer triggers, but it confuses dashboards: a container's <code>memory.current</code> can sit near its limit while its real working set is small. Kubernetes and cAdvisor therefore report <code>container_memory_working_set_bytes</code> (usage minus inactive file cache), and that is what the kubelet compares with limits for eviction decisions.</p>
+
+  <h3>3.6 Namespaces: what a process can see</h3>
+  <p>A <strong>namespace</strong> wraps a global kernel resource so that processes inside it see their own isolated instance. Linux has eight types:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Namespace</th><th>Isolates</th><th>Container consequence</th></tr></thead>
+    <tbody>
+      <tr><td><code>pid</code></td><td>Process IDs</td><td>Your app sees itself as PID 1</td></tr>
+      <tr><td><code>net</code></td><td>Interfaces, routes, iptables, sockets, ports</td><td>Each pod has its own IP and <code>localhost</code>; containers in a pod share one</td></tr>
+      <tr><td><code>mnt</code></td><td>Mount table</td><td>The container's root filesystem is the image</td></tr>
+      <tr><td><code>uts</code></td><td>Hostname, domain name</td><td>Hostname is the pod name</td></tr>
+      <tr><td><code>ipc</code></td><td>System V IPC, POSIX message queues</td><td>Shared memory is not shared across containers by default</td></tr>
+      <tr><td><code>user</code></td><td>UIDs/GIDs and capabilities</td><td>Root in the container can map to an unprivileged host UID</td></tr>
+      <tr><td><code>cgroup</code></td><td>View of the cgroup hierarchy</td><td>The container sees its own cgroup as the root</td></tr>
+      <tr><td><code>time</code></td><td>Monotonic and boot-time clocks</td><td>Rarely used; for checkpoint/restore</td></tr>
+    </tbody>
+  </table></div>
+  <p>Namespaces are created with <code>clone()</code> or <code>unshare()</code> and joined with <code>setns()</code>. <code>nsenter</code> is the CLI wrapper you will use to debug: it lets you run host tools (like <code>ss</code> or <code>tcpdump</code>) inside a container's network namespace even when the image has no shell.</p>
+
+  <h3>3.7 Control groups v2: what a process can use</h3>
+  <p>Where namespaces limit what a process can <em>see</em>, <strong>cgroups</strong> limit and account for what it can <em>use</em>. cgroup v2 is a single tree mounted at <code>/sys/fs/cgroup</code>; each directory is a group; each group has interface files for enabled controllers.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>File</th><th>Meaning</th><th>Kubernetes source</th></tr></thead>
+    <tbody>
+      <tr><td><code>cpu.max</code></td><td><code>"quota period"</code>, e.g. <code>200000 100000</code> = 2 CPUs; <code>max 100000</code> = unlimited</td><td><code>resources.limits.cpu</code></td></tr>
+      <tr><td><code>cpu.weight</code></td><td>Relative share (1–10000) under contention</td><td><code>resources.requests.cpu</code></td></tr>
+      <tr><td><code>cpu.stat</code></td><td><code>nr_periods</code>, <code>nr_throttled</code>, <code>throttled_usec</code></td><td>Source of <code>container_cpu_cfs_throttled_*</code></td></tr>
+      <tr><td><code>memory.max</code></td><td>Hard limit; exceeding it triggers reclaim then OOM kill</td><td><code>resources.limits.memory</code></td></tr>
+      <tr><td><code>memory.high</code></td><td>Soft throttle: reclaim aggressively above this</td><td>Used by the Memory QoS feature</td></tr>
+      <tr><td><code>memory.current</code>, <code>memory.stat</code></td><td>Current usage and breakdown (anon, file, sock, slab)</td><td>cAdvisor metrics</td></tr>
+      <tr><td><code>memory.events</code></td><td>Counters: <code>high</code>, <code>max</code>, <code>oom</code>, <code>oom_kill</code></td><td>Evidence for exit code 137</td></tr>
+      <tr><td><code>pids.max</code></td><td>Maximum tasks (processes + threads)</td><td>kubelet <code>podPidsLimit</code></td></tr>
+      <tr><td><code>io.max</code>, <code>io.weight</code></td><td>Block I/O throttling and weight</td><td>Rarely set by Kubernetes</td></tr>
+      <tr><td><code>cpu.pressure</code>, <code>memory.pressure</code>, <code>io.pressure</code></td><td>Pressure Stall Information: % of time tasks stalled</td><td>Excellent saturation signal</td></tr>
+    </tbody>
+  </table></div>
+  <p>Modern JVMs (JDK 8u191+, 11+, and the cgroup v2 support added in JDK 15 and backported to 11.0.16 and 8u372) read these files to size the heap and the number of GC and compiler threads. <code>Runtime.getRuntime().availableProcessors()</code> returns the CPU limit rounded up (JDK 19+ ignores <code>cpu.weight</code>/shares by default). Go 1.25 and later make <code>GOMAXPROCS</code> cgroup-aware by default <span class="tag version">Version-sensitive · checked Nov 2026</span>; earlier Go versions needed <code>go.uber.org/automaxprocs</code>. Python ignores cgroups entirely: <code>os.cpu_count()</code> returns the host CPU count, so set Uvicorn/Gunicorn worker counts explicitly.</p>
+
+  <h3>3.8 systemd and service management</h3>
+  <p>On VMs and bare metal, <strong>systemd</strong> is PID 1. A <em>unit file</em> declares how to start a service, its dependencies, restart policy, resource limits and security sandboxing; systemd puts every service in its own cgroup (so <code>systemctl status</code> can show all its processes and kill them reliably), captures stdout/stderr into the journal, and supports socket activation and timers (a replacement for cron). Even if you deploy only to Kubernetes, the kubelet and container runtime (containerd) on each node are systemd services, so <code>journalctl -u kubelet</code> is a core debugging command.</p>
+
+  <h3>3.9 IP addressing, subnets and CIDR</h3>
+  <p>An IPv4 address is 32 bits. <strong>CIDR</strong> notation <code>10.20.0.0/16</code> means "the first 16 bits are the network prefix"; the remaining 16 bits number hosts, giving \(2^{16} = 65{,}536\) addresses. A <code>/24</code> has 256 addresses, a <code>/28</code> has 16. Private ranges (RFC 1918) are <code>10.0.0.0/8</code>, <code>172.16.0.0/12</code> and <code>192.168.0.0/16</code>; <code>100.64.0.0/10</code> is carrier-grade NAT space that AWS and Kubernetes setups sometimes borrow for pod networks. A host decides whether to send a packet directly (same subnet, ARP for the MAC) or to its default gateway by AND-ing the destination with its netmask. The <strong>routing table</strong> (<code>ip route</code>) picks the most specific (longest) matching prefix.</p>
+  <p>IPv6 uses 128-bit addresses written in hex groups (<code>2001:db8::1</code>), typically hands out a <code>/64</code> per subnet, and removes the need for NAT for address-scarcity reasons. EKS and most clouds support dual-stack or IPv6-only clusters, which is one practical cure for pod IP exhaustion (Chapter 4).</p>
+
+  <h3>3.10 The layered model: OSI vs TCP/IP</h3>
+  <p>The seven-layer OSI model is a vocabulary more than an implementation. In practice you use the four-layer TCP/IP model and refer to OSI numbers when talking about load balancers:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>OSI layer</th><th>TCP/IP layer</th><th>Unit</th><th>Examples</th><th>Debug tool</th></tr></thead>
+    <tbody>
+      <tr><td>7 Application (5–7)</td><td>Application</td><td>Message</td><td>HTTP, gRPC, DNS, TLS (strictly between 4 and 7)</td><td><code>curl -v</code>, <code>dig</code>, <code>openssl s_client</code></td></tr>
+      <tr><td>4 Transport</td><td>Transport</td><td>Segment / datagram</td><td>TCP, UDP, QUIC (over UDP)</td><td><code>ss</code>, <code>tcpdump</code></td></tr>
+      <tr><td>3 Network</td><td>Internet</td><td>Packet</td><td>IPv4, IPv6, ICMP</td><td><code>ip route</code>, <code>ping</code>, <code>mtr</code></td></tr>
+      <tr><td>2 Data link / 1 Physical</td><td>Link</td><td>Frame</td><td>Ethernet, ARP, VXLAN (overlay)</td><td><code>ip link</code>, <code>ip neigh</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>An "L4 load balancer" forwards TCP/UDP flows by IP and port without understanding the payload; an "L7 load balancer" terminates the connection, parses HTTP and makes per-request decisions. Section 3.15 compares them.</p>
+
+  <h3>3.11 DNS resolution</h3>
+  <p>When your Spring Boot app calls <code>https://api.payments.example.com</code>, the JVM asks the OS resolver (glibc's <code>getaddrinfo</code>, configured by <code>/etc/nsswitch.conf</code> and <code>/etc/resolv.conf</code>). The resolver sends a UDP query to the configured <em>recursive resolver</em> (on EC2 the VPC resolver at the VPC base address +2; in Kubernetes the CoreDNS Service IP), which walks the hierarchy — root servers, the <code>.com</code> TLD servers, then the authoritative servers for <code>example.com</code> — and caches answers for their TTL. Record types you meet daily: <code>A</code>/<code>AAAA</code> (addresses), <code>CNAME</code> (alias to another name), <code>SRV</code> (service host and port), <code>TXT</code> (verification, SPF), <code>NS</code> and <code>SOA</code> (delegation), and on AWS the Route 53 <code>ALIAS</code> pseudo-record.</p>
+  <p>Two resolver settings cause most incidents. <strong><code>search</code> and <code>ndots</code></strong>: if a name has fewer dots than <code>ndots</code>, the resolver first tries appending each search domain. Kubernetes pods get <code>ndots:5</code> and three or more search domains, so a lookup of <code>api.payments.example.com</code> (three dots) first tries <code>api.payments.example.com.default.svc.cluster.local</code>, then <code>.svc.cluster.local</code>, then <code>.cluster.local</code> — each an NXDOMAIN round trip, for both A and AAAA — before the real query. A trailing dot (<code>api.payments.example.com.</code>) makes a name fully qualified and skips the search. <strong>Timeouts</strong>: the default resolver timeout is 5 seconds; a single dropped UDP packet becomes a 5-second stall. The JVM adds its own cache: <code>networkaddress.cache.ttl</code> defaults to 30 seconds when no security manager is installed — fine for most cases, but worth knowing when a DNS-based failover appears not to work.</p>
+
+  <h3>3.12 TCP: reliable streams over unreliable packets</h3>
+  <p>TCP gives you an ordered, reliable byte stream with flow control and congestion control, identified by the <strong>4-tuple</strong> (source IP, source port, destination IP, destination port). The <strong>three-way handshake</strong> (<code>SYN</code>, <code>SYN-ACK</code>, <code>ACK</code>) synchronises initial sequence numbers and negotiates options (MSS, window scaling, SACK, timestamps). It costs one round trip before any data flows. The <strong>four-way close</strong> (<code>FIN</code>/<code>ACK</code> in each direction) leaves the side that closed first in <code>TIME_WAIT</code> for 2 × MSL (60 seconds on Linux, a compile-time constant) so that stray duplicate segments from the old connection cannot corrupt a new connection that reuses the same 4-tuple.</p>
+  <p><strong>Flow control</strong> uses the receive window advertised by the receiver to stop a fast sender from overrunning a slow reader. <strong>Congestion control</strong> keeps a sender-side congestion window (<code>cwnd</code>) to avoid overrunning the network: <em>slow start</em> grows <code>cwnd</code> exponentially from an initial window (10 segments on modern Linux, about 14 KiB) until loss or a threshold, then <em>congestion avoidance</em> grows it more slowly. <strong>CUBIC</strong> (Linux default) is loss-based; <strong>BBR</strong> models bottleneck bandwidth and round-trip time instead and performs much better on lossy long-haul links. The consequence for backend engineers: a <em>new</em> connection is slow — it pays a handshake and starts with a small window — which is the deepest reason connection reuse matters.</p>
+
+  <h3>3.13 UDP</h3>
+  <p>UDP is a thin datagram service: no handshake, no ordering, no retransmission, no congestion control. It is used where the application provides its own reliability or tolerates loss: DNS, NTP, metrics (StatsD), video, VXLAN overlays and, most importantly today, <strong>QUIC</strong>. Because it is connectionless, NAT devices and conntrack tables must guess when a UDP "flow" ends, which is the root of several Kubernetes DNS problems (Section 12).</p>
+
+  <h3>3.14 HTTP/1.1, HTTP/2 and HTTP/3</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th></th><th>HTTP/1.1</th><th>HTTP/2</th><th>HTTP/3</th></tr></thead>
+    <tbody>
+      <tr><td>Transport</td><td>TCP (+TLS)</td><td>TCP + TLS (h2) or cleartext (h2c)</td><td>QUIC over UDP (TLS 1.3 built in)</td></tr>
+      <tr><td>Framing</td><td>Text, one request at a time per connection</td><td>Binary frames, many concurrent streams per connection</td><td>Binary frames, streams are native QUIC streams</td></tr>
+      <tr><td>Head-of-line blocking</td><td>Per connection (pipelining is unusable)</td><td>Removed at HTTP layer, still present at TCP layer: one lost packet stalls all streams</td><td>Removed: loss on one stream does not stall others</td></tr>
+      <tr><td>Header compression</td><td>None</td><td>HPACK</td><td>QPACK</td></tr>
+      <tr><td>Connection setup</td><td>TCP (1 RTT) + TLS 1.3 (1 RTT)</td><td>Same</td><td>1 RTT combined, 0-RTT on resumption</td></tr>
+      <tr><td>Connection migration</td><td>No</td><td>No</td><td>Yes (connection ID survives IP change)</td></tr>
+      <tr><td>Typical use</td><td>Internal REST, legacy clients</td><td>gRPC, browser traffic, service mesh</td><td>Browser and mobile edge traffic via CDN</td></tr>
+    </tbody>
+  </table></div>
+  <p>Inside a data centre, round trips are short and loss is rare, so HTTP/3's advantages shrink; HTTP/1.1 with keep-alive or HTTP/2 remain the norm between services. HTTP/3 pays off at the edge, on mobile networks — which is why CDNs and cloud edge load balancers terminate it and speak HTTP/1.1 or HTTP/2 to your origin.</p>
+
+  <h3>3.15 TLS in one page</h3>
+  <p>TLS provides confidentiality, integrity and server (optionally client) authentication. In a <strong>TLS 1.3</strong> handshake the client sends <code>ClientHello</code> with supported cipher suites, a key share (ephemeral ECDHE public key) and the <strong>SNI</strong> (the hostname, so a single IP can serve many certificates); the server replies with <code>ServerHello</code> and its key share, and both sides can derive the session keys immediately. The server then sends its certificate chain, a <code>CertificateVerify</code> signature and <code>Finished</code>, all encrypted. The client validates the chain to a trusted root, checks the hostname against the certificate's Subject Alternative Names, and sends its own <code>Finished</code>. One round trip, forward secrecy by default, and legacy ciphers removed. <strong>mTLS</strong> adds a client certificate, which is how service meshes authenticate workloads. <strong>ALPN</strong> inside the handshake negotiates <code>h2</code> vs <code>http/1.1</code>.</p>
+
+  <h3>3.16 NAT and connection tracking</h3>
+  <p><strong>Network Address Translation</strong> rewrites addresses in packet headers. <em>SNAT</em> (source NAT, including "masquerade") lets many private hosts share one public IP — this is what an AWS NAT Gateway does for private subnets, and what a Kubernetes node does when a pod talks to the internet. <em>DNAT</em> rewrites the destination — this is exactly how a Kubernetes Service ClusterIP works under kube-proxy's iptables mode. Both rely on the kernel's <strong>conntrack</strong> table, which remembers each flow so reply packets can be translated back. The table has a maximum size (<code>net.netfilter.nf_conntrack_max</code>); when it fills, new connections are silently dropped and <code>dmesg</code> shows <code>nf_conntrack: table full, dropping packet</code>. A NAT device also has a finite number of source ports per destination: AWS documents a limit of 55,000 simultaneous connections per NAT gateway to each unique destination <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+
+  <h3>3.17 Load balancing at L4 and L7</h3>
+  <p>An <strong>L4 load balancer</strong> (AWS NLB, IPVS, a Kubernetes Service, Maglev) chooses a backend per TCP connection (or per UDP flow) using a hash or table, then forwards packets — either by NAT, by tunnelling, or with direct server return. It is fast, protocol-agnostic, and preserves end-to-end TLS. But it balances <em>connections</em>, not requests: a client that holds one long-lived HTTP/2 or gRPC connection pins all its requests to one backend. An <strong>L7 load balancer</strong> (AWS ALB, Envoy, Nginx, HAProxy in HTTP mode, the Lumen Go gateway) terminates the client connection, parses each HTTP request, and picks a backend per request — enabling path/header routing, retries, per-request balancing of HTTP/2 streams, header injection and observability — at the cost of extra latency, TLS termination at the proxy and more CPU.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working: Following One Request Through the Kernel</h2>
+  <p>Let us follow a single request — a mobile client calling <code>POST /orders</code> on Lumen — through the kernel of the VM running <code>orders-service</code>, then look at the failure paths.</p>
+
+  <h3>4.1 Listening: socket, bind, listen and the two queues</h3>
+  <p>At startup, embedded Tomcat (or Netty, or Go's <code>net/http</code>, or Uvicorn) calls <code>socket(AF_INET6, SOCK_STREAM)</code>, <code>bind()</code> to port 8080 and <code>listen(fd, backlog)</code>. The kernel now maintains two queues for that listening socket:</p>
+  <ol>
+    <li>The <strong>SYN queue</strong> (incomplete connections): entries for clients that have sent <code>SYN</code> and received <code>SYN-ACK</code> but not yet sent the final <code>ACK</code>. Bounded by <code>net.ipv4.tcp_max_syn_backlog</code>; under SYN floods, SYN cookies let the kernel avoid storing state.</li>
+    <li>The <strong>accept queue</strong> (completed connections): fully established connections waiting for the application to call <code>accept()</code>. Bounded by <code>min(backlog, net.core.somaxconn)</code>. Tomcat's <code>server.tomcat.accept-count</code> (default 100) is this backlog. <code>somaxconn</code> defaults to 4096 since Linux 5.4.</li>
+  </ol>
+  <p>When the accept queue is full, the kernel by default drops the client's final <code>ACK</code>; the client believes it is connected and sends its request, which is also dropped and retransmitted with exponential backoff. The visible symptom is latency spikes of 1 s, 3 s, 7 s with no server-side log at all. <code>ss -lnt</code> shows <code>Recv-Q</code> (current accept-queue length) against <code>Send-Q</code> (its maximum) for listening sockets, and <code>nstat -az TcpExtListenOverflows</code> counts overflows.</p>
+
+  <h3>4.2 Accepting and reading: epoll and threads</h3>
+  <p>Tomcat's NIO connector has an acceptor thread blocked in <code>accept()</code> and a poller thread that registers each accepted socket with an <code>epoll</code> instance. When bytes arrive, the NIC raises an interrupt (or is polled via NAPI), the driver hands a packet buffer (<code>sk_buff</code>) up the IP and TCP stacks, TCP places the payload in the socket's receive buffer and wakes any <code>epoll</code> waiter. Tomcat's poller sees the socket readable and hands it to a worker thread from its pool (<code>server.tomcat.threads.max</code>, default 200), which calls <code>read()</code>, parses the HTTP request and invokes your controller. On Java 21 with <code>spring.threads.virtual.enabled=true</code>, the worker is a virtual thread mounted on a small carrier pool; blocking I/O inside it parks the virtual thread rather than an OS thread, so thread count stops being the limiting resource — but fds, connection pools and downstream capacity still are.</p>
+  <p>Go's <code>net/http</code> does the same with the runtime netpoller: every goroutine that reads a socket is parked until <code>epoll</code> reports readiness, so 10,000 concurrent connections cost 10,000 goroutines (a few KiB each) and only <code>GOMAXPROCS</code> OS threads. Uvicorn runs an <code>asyncio</code> event loop (uvloop, built on libuv) per worker process with the same <code>epoll</code> core.</p>
+
+  <h3>4.3 Calling downstream: ephemeral ports, pooling and TIME_WAIT</h3>
+  <p>The controller calls PostgreSQL through HikariCP and the payments API through an HTTP client. For each <em>new</em> outbound TCP connection the kernel picks a local <strong>ephemeral port</strong> from <code>net.ipv4.ip_local_port_range</code> (default <code>32768 60999</code>, about 28,000 ports). The 4-tuple must be unique, so a single source IP can hold about 28,000 concurrent connections <em>to one destination IP and port</em>. Connections in <code>TIME_WAIT</code> still occupy their 4-tuple for 60 seconds. A service that opens a new connection per request at 500 requests/second to a single upstream accumulates \(500 \times 60 = 30{,}000\) <code>TIME_WAIT</code> sockets — exceeding the port range — and starts failing with <code>EADDRNOTAVAIL</code> (<em>Cannot assign requested address</em>). The fix is never "lower TIME_WAIT"; it is <strong>connection reuse</strong>: HTTP keep-alive with a bounded pool, HikariCP for JDBC, a single shared <code>http.Client</code> in Go, a shared <code>httpx.AsyncClient</code> in Python. <code>net.ipv4.tcp_tw_reuse=1</code> (allow reuse of TIME_WAIT sockets for <em>outgoing</em> connections when timestamps make it safe) is a reasonable secondary mitigation; the old <code>tcp_tw_recycle</code> broke clients behind NAT and was removed in Linux 4.12.</p>
+  <p>Note who gets the <code>TIME_WAIT</code>: whoever sends the first <code>FIN</code>. If your server closes idle keep-alive connections, the server accumulates them (harmless for a listener — they share the listening port). If clients close, clients accumulate them.</p>
+
+  <h3>4.4 When memory runs out: the OOM path</h3>
+  <p>Suppose a burst of large requests causes <code>orders-service</code> to allocate faster than the GC can free, and the container's anonymous memory grows. When a page fault needs a new page and the cgroup is at <code>memory.max</code>, the kernel first tries reclaim within the cgroup: it evicts clean page cache, writes back dirty pages, and swaps anonymous pages if swap is enabled (it usually is not on Kubernetes nodes). If reclaim fails repeatedly, the kernel invokes the <em>cgroup-local</em> OOM killer, which selects the task with the highest badness score in that cgroup — in a single-process container, your JVM — and sends <code>SIGKILL</code>. The kernel logs <code>Memory cgroup out of memory: Killed process 4242 (java) total-vm:... anon-rss:...</code>, increments <code>memory.events: oom_kill</code>, and the container runtime records exit code 137 and reason <code>OOMKilled</code>.</p>
+  <p>Contrast this with a <em>Java</em> <code>OutOfMemoryError</code>: that is the JVM refusing to grow the heap beyond <code>-Xmx</code>; it is catchable, logged, and with <code>-XX:+HeapDumpOnOutOfMemoryError</code> produces a heap dump. If you see <code>OOMKilled</code> without a Java OOME, the memory outside the heap (or a heap sized too close to the limit) is the problem.</p>
+
+  <h3>4.5 DNS lookup inside the process</h3>
+  <p>For the payments call, the HTTP client first resolves the hostname. On a JVM, <code>InetAddress.getAllByName</code> checks the JVM's positive cache (30 s TTL default), then calls the native resolver. glibc reads <code>/etc/resolv.conf</code>, applies the <code>search</code>/<code>ndots</code> rules, and sends parallel <code>A</code> and <code>AAAA</code> queries over UDP from the <em>same</em> source port. That last detail interacts badly with conntrack: two UDP packets from the same 4-tuple racing through DNAT on a Kubernetes node could historically cause one of them to be dropped, producing the infamous 5-second DNS delays. The mitigations — <code>single-request-reopen</code> in resolv.conf, NodeLocal DNSCache, or fully qualified names — are covered in Chapter 2.</p>
+
+  <h3>4.6 Graceful shutdown: what really happens on deploy</h3>
+  <p>When a new version is deployed, the orchestrator (systemd, ECS, Kubernetes) sends <code>SIGTERM</code> to PID 1 of the old instance. The JVM's signal handler starts its shutdown sequence: shutdown hooks run, and Spring's <code>SmartLifecycle</code> phases stop. With <code>server.shutdown=graceful</code>, the embedded server stops <em>accepting new connections</em> and waits up to <code>spring.lifecycle.timeout-per-shutdown-phase</code> (default 30 s) for in-flight requests to finish. Then connection pools close and the process exits 0.</p>
+  <p>The race: the load balancer does not know instantly that the instance is stopping. For a few seconds after <code>SIGTERM</code>, it may still route new connections or reuse existing keep-alive connections to the instance. If the app closes its listener immediately, those requests receive connection refused or reset — 502s at the LB. The robust sequence is: (1) fail the readiness check / deregister from the LB, (2) keep serving for a short drain delay (Kubernetes users add a <code>preStop</code> sleep of 5–15 s), (3) stop accepting, finish in-flight work, (4) exit before the hard-kill deadline (<code>terminationGracePeriodSeconds</code>, default 30 s, after which <code>SIGKILL</code> arrives).</p>
+  <p>A second race concerns idle keep-alive connections: if the <em>server</em> closes an idle connection at exactly the moment the LB sends a new request on it, the request is lost. The rule is that the upstream's idle timeout must be <strong>longer</strong> than the proxy's: e.g., AWS ALB idle timeout 60 s, so set the app's keep-alive timeout above 60 s (Tomcat <code>server.tomcat.keep-alive-timeout</code>, Go <code>http.Server.IdleTimeout</code>, Uvicorn <code>--timeout-keep-alive</code>).</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: Diagrams of the Request Path</h2>
+
+  <h3>5.1 Connection setup: TCP plus TLS 1.3</h3>
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client (mobile app)
+  participant G as edge-gateway (Go, :443)
+  C->>G: TCP SYN (seq=x, MSS, WScale, SACK)
+  G->>C: TCP SYN-ACK (seq=y, ack=x+1)
+  C->>G: TCP ACK (ack=y+1)
+  Note over C,G: 1 RTT spent, connection ESTABLISHED
+  C->>G: TLS ClientHello (SNI, ALPN h2, key_share)
+  G->>C: ServerHello + key_share, then encrypted Certificate, CertificateVerify, Finished
+  C->>G: Finished (encrypted)
+  Note over C,G: 2nd RTT spent, keys established
+  C->>G: HTTP/2 HEADERS + DATA on stream 1 (POST /orders)
+  G->>C: HTTP/2 HEADERS + DATA on stream 1 (201 Created)
+</pre>
+<figcaption>Figure 12.1 — A new HTTPS connection costs two round trips (TCP + TLS 1.3) before the first byte of the request.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> the first three arrows are the TCP handshake; nothing useful has been sent yet. The TLS 1.3 exchange takes one further round trip because the client speculatively sends its key share in <code>ClientHello</code>. Only then can HTTP/2 frames flow. On a 100 ms mobile RTT, that is 200 ms of pure setup — which is why browsers and clients keep connections open, why TLS session resumption and 0-RTT exist, and why HTTP/3 merges the transport and crypto handshakes into one round trip. Inside the data centre, RTT is around 0.1–0.5 ms, so setup is cheap in latency but still expensive in CPU (asymmetric crypto) and in kernel state.</p>
+
+  <h3>5.2 TCP connection states</h3>
+<figure class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> CLOSED
+  CLOSED --> LISTEN: server listen()
+  CLOSED --> SYN_SENT: client connect()
+  LISTEN --> SYN_RCVD: recv SYN, send SYN-ACK
+  SYN_SENT --> ESTABLISHED: recv SYN-ACK, send ACK
+  SYN_RCVD --> ESTABLISHED: recv ACK
+  ESTABLISHED --> FIN_WAIT_1: active close, send FIN
+  ESTABLISHED --> CLOSE_WAIT: recv FIN (passive close)
+  FIN_WAIT_1 --> FIN_WAIT_2: recv ACK
+  FIN_WAIT_2 --> TIME_WAIT: recv FIN, send ACK
+  CLOSE_WAIT --> LAST_ACK: app calls close(), send FIN
+  LAST_ACK --> CLOSED: recv ACK
+  TIME_WAIT --> CLOSED: after 2 x MSL (60 s)
+</pre>
+<figcaption>Figure 12.2 — The TCP state machine, simplified. The states you will see in <code>ss</code> output are ESTAB, TIME-WAIT, CLOSE-WAIT, SYN-SENT and FIN-WAIT-2.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> the left path is the active closer, which ends in <code>TIME_WAIT</code>. The right path is the passive closer. The diagnostic gold is <code>CLOSE_WAIT</code>: the peer has closed, the kernel has acknowledged, and the kernel is waiting for <em>your application</em> to call <code>close()</code>. Thousands of sockets stuck in <code>CLOSE_WAIT</code> are always an application bug — typically an HTTP response body that was never consumed or closed, so the pooled connection is never released. <code>SYN_SENT</code> piling up means you cannot reach the destination (security group, firewall, dead host).</p>
+
+  <h3>5.3 DNS resolution path for a service on a VM and in a pod</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  APP["orders-service JVM"] -->|"InetAddress cache miss"| LIBC["glibc resolver (resolv.conf)"]
+  LIBC -->|"UDP 53"| REC["Recursive resolver (VPC resolver or CoreDNS)"]
+  REC -->|"cache miss"| ROOT["Root servers"]
+  ROOT -->|"referral"| TLD[".com TLD servers"]
+  TLD -->|"referral"| AUTH["Authoritative NS for example.com"]
+  AUTH -->|"A 203.0.113.10, TTL 60"| REC
+  REC -->|"answer, cached for TTL"| LIBC
+  LIBC --> APP
+</pre>
+<figcaption>Figure 12.3 — Recursive DNS resolution. Every hop is cached for the record's TTL, so most lookups stop at the first or second box.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> your application only ever talks to its configured recursive resolver; the iterative walk from root to authoritative happens there. Caching occurs at three levels for a JVM: the JVM's own cache, any node-local cache, and the recursive resolver. Each layer honours (or overrides) the TTL, which is why changing a DNS record "with TTL 60" can still take minutes to be seen by every client. In Kubernetes, the recursive resolver is CoreDNS, which answers <code>cluster.local</code> names itself from the API and forwards everything else to the VPC resolver.</p>
+
+  <h3>5.4 L4 vs L7 load balancing in Lumen</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  U["Clients (HTTP/2, HTTP/3)"] --> CDN["CDN edge: TLS + HTTP/3 termination"]
+  CDN --> NLB["L4: Network Load Balancer (TCP 443, per-connection hashing)"]
+  NLB --> GW1["edge-gateway pod 1 (L7: TLS, JWT, routing)"]
+  NLB --> GW2["edge-gateway pod 2"]
+  GW1 -->|"HTTP/1.1 keep-alive pool"| ORD["orders-service (Spring Boot)"]
+  GW1 -->|"HTTP/2 streaming"| AST["assist-service (FastAPI)"]
+  GW2 --> ORD
+  GW2 --> AST
+  ORD -->|"HikariCP, TCP 5432"| PG[("PostgreSQL")]
+</pre>
+<figcaption>Figure 12.4 — Lumen's request path mixes L4 and L7: the NLB spreads TCP connections, the Go gateway spreads individual requests.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> the NLB does not see HTTP; it hashes each new TCP connection to a gateway pod and then forwards packets for its lifetime. Because clients keep HTTP/2 connections open for minutes, load across gateways is balanced by <em>connection count</em>, not request rate. The gateway, as an L7 proxy, re-balances per request across <code>orders-service</code> and <code>assist-service</code> replicas and can apply per-route timeouts (short for orders, long for streaming LLM responses). This split — cheap L4 at the edge of the cluster, smart L7 inside — is the dominant pattern and is exactly what Kubernetes Gateway API implementations reproduce in Chapter 2.</p>
+
+  <h3>5.5 Try it: load-balancing algorithms</h3>
+<figure class="diagram">
+<div class="widget" data-widget="load-balancer"></div>
+<figcaption>Figure 12.5 — Interactive: round-robin, weighted, least-connections, random and power-of-two-choices across heterogeneous servers.</figcaption>
+</figure>
+  <p>Set one server to be twice as slow as the others and compare round-robin with least-connections and power-of-two-choices (P2C). Round-robin keeps sending the slow server its full share, so its queue grows; least-connections and P2C route around it. This is the per-request behaviour of an L7 balancer. An L4 balancer with long-lived connections behaves even worse than round-robin here because it cannot react at all once connections are established — the motivation for client-side or L7 balancing of gRPC traffic.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Numbers: Back-of-Envelope Math for Systems and Networks</h2>
+
+  <h3>6.1 CIDR arithmetic</h3>
+  <p>Intuition: every bit you take for the prefix halves the number of hosts. Formally, a prefix of length \(p\) leaves \(2^{32-p}\) addresses. In a cloud VPC some addresses in each subnet are reserved (AWS reserves five: network address, VPC router, DNS, future use, broadcast), so usable hosts are \(2^{32-p} - 5\).</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Prefix</th><th>Addresses</th><th>Usable on AWS</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td>/16</td><td>65,536</td><td>—</td><td>Whole VPC</td></tr>
+      <tr><td>/19</td><td>8,192</td><td>8,187</td><td>Private subnet for EKS pods (VPC CNI gives each pod a VPC IP)</td></tr>
+      <tr><td>/24</td><td>256</td><td>251</td><td>Public subnet for load balancers and NAT</td></tr>
+      <tr><td>/28</td><td>16</td><td>11</td><td>Smallest AWS subnet</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>6.2 Bandwidth-delay product and TCP windows</h3>
+  <p>Intuition: to keep a pipe full, the sender must have a full round trip's worth of data "in flight". The <strong>bandwidth-delay product</strong> is</p>
+  \[ \text{BDP} = \text{bandwidth} \times \text{RTT} \]
+  <p>A 1 Gbit/s cross-region link with 70 ms RTT needs \(10^9/8 \times 0.07 \approx 8.75\) MB in flight. If either the receive window or <code>cwnd</code> is smaller, throughput is capped at \(\text{window} / \text{RTT}\). With a 64 KiB window (no window scaling), throughput is \(65{,}536 / 0.07 \approx 0.94\) MB/s — under 1% of the link. This is why window scaling and auto-tuned buffers (<code>net.ipv4.tcp_rmem</code>/<code>tcp_wmem</code>) matter for cross-region replication, S3 transfers and model downloads, and why a single TCP stream across an ocean is slow even on a fat pipe.</p>
+  <p>Slow start: starting from an initial window of 10 segments (~14.6 KB) and doubling per RTT, reaching an 8.75 MB window takes about \(\log_2(8.75\text{M}/14.6\text{K}) \approx 9.2\) round trips — over 600 ms at 70 ms RTT before the connection reaches full speed. New connections are slow; reused connections are fast.</p>
+
+  <h3>6.3 Ephemeral ports and TIME_WAIT</h3>
+  <p>For connections from one source IP to one destination <code>ip:port</code>, the maximum sustainable <em>new-connection</em> rate without reuse is</p>
+  \[ r_{\max} = \frac{N_{\text{ports}}}{T_{\text{TIME\_WAIT}}} = \frac{28{,}232}{60\ \text{s}} \approx 470\ \text{connections/s} \]
+  <p>(The default range <code>32768–60999</code> holds 28,232 ports.) Above that rate, a client that closes first will run out of ports. With keep-alive and a pool of 50 connections serving 5,000 requests/s, the new-connection rate is near zero. NAT gateways impose the same arithmetic per destination, which is why a fleet of pods calling one third-party API through a single NAT gateway can exhaust its ports even if each pod is fine.</p>
+
+  <h3>6.4 CPU quota and throttling</h3>
+  <p>With a CPU limit \(L\) cores and period \(P\) (100 ms), a container gets quota \(Q = L \times P\) per period. If \(n\) threads are runnable simultaneously, they exhaust it after \(Q/n\) of wall time. For a JVM with \(L = 1\) and a young-GC using 8 parallel threads, the quota is spent in \(100/8 = 12.5\) ms and the whole process stalls for the remaining 87.5 ms. A request that arrives during that window waits up to 87.5 ms extra. Watch the ratio</p>
+  \[ \text{throttle ratio} = \frac{\Delta\,\texttt{nr\_throttled}}{\Delta\,\texttt{nr\_periods}} \]
+  <p>Anything above a few percent for a latency-sensitive service is a red flag. Remedies: raise or remove CPU limits (keep requests), reduce GC/compiler thread counts (<code>-XX:ParallelGCThreads</code>, <code>-XX:CICompilerCount</code>), or use the JVM's container-aware defaults which already base thread counts on the limit.</p>
+
+  <h3>6.5 Little's Law for pools and queues</h3>
+  <p>For any stable system, the average number of items in it equals arrival rate times time in system:</p>
+  \[ L = \lambda \times W \]
+  <p>If <code>orders-service</code> handles \(\lambda = 400\) requests/s and each holds a DB connection for \(W = 15\) ms, it needs on average \(L = 400 \times 0.015 = 6\) connections. A pool of 10–12 gives headroom for bursts; a pool of 100 per pod across 20 pods (2,000 connections) would overwhelm PostgreSQL, which forks a process per connection. The same law sizes Tomcat thread pools, accept backlogs and Go worker pools.</p>
+
+  <h3>6.6 Latency numbers worth memorising</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Operation</th><th>Order of magnitude</th></tr></thead>
+    <tbody>
+      <tr><td>Syscall (e.g., <code>getpid</code>)</td><td>~100 ns</td></tr>
+      <tr><td>Context switch</td><td>1–5 µs</td></tr>
+      <tr><td>Page fault (minor)</td><td>~1 µs</td></tr>
+      <tr><td>Same-AZ network RTT (cloud)</td><td>100–500 µs</td></tr>
+      <tr><td>Cross-AZ RTT in one region</td><td>~0.5–2 ms</td></tr>
+      <tr><td>NVMe SSD random read</td><td>~100 µs</td></tr>
+      <tr><td>Cross-continent RTT</td><td>70–150 ms</td></tr>
+      <tr><td>DNS resolver timeout (default)</td><td>5 s</td></tr>
+    </tbody>
+  </table></div>
+  <p><span class="tag illus">Illustrative</span> These are rounded orders of magnitude for intuition, not benchmarks; measure your own environment.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code and Runnable Sessions</h2>
+
+  <h3>7.1 Graceful shutdown done right in three languages</h3>
+  <p>The goal in every language: on <code>SIGTERM</code>, stop accepting new work, finish in-flight requests within a deadline, close pools, exit 0.</p>
+<div class="code-tabs">
+<pre data-lang="Java" data-file="application.yaml"><code class="language-yaml"># Spring Boot 3.x / 4.x — orders-service
+server:
+  port: 8080
+  shutdown: graceful            # stop accepting, drain in-flight requests
+  tomcat:
+    accept-count: 200           # listen() backlog
+    threads:
+      max: 200
+    keep-alive-timeout: 75s     # MUST exceed the LB idle timeout (e.g. ALB 60s)
+    max-keep-alive-requests: 10000
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 20s   # keep below the orchestrator's grace period
+  threads:
+    virtual:
+      enabled: true             # Java 21+: virtual threads for request handling
+  datasource:
+    hikari:
+      maximum-pool-size: 12     # Little's Law, not "as many as possible"
+      connection-timeout: 2000  # fail fast instead of queueing forever
+      max-lifetime: 1740000     # below any LB/DB idle cut-off (29 min)
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true           # /actuator/health/liveness and /readiness</code></pre>
+<pre data-lang="Python" data-file="main.py"><code class="language-python"># assist-service — FastAPI with explicit lifespan management (Python 3.12)
+# Run: uvicorn main:app --host 0.0.0.0 --port 8000 --timeout-keep-alive 75 \
+#        --timeout-graceful-shutdown 20 --workers 2
+from contextlib import asynccontextmanager
+
+import httpx
+from fastapi import FastAPI
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # One shared client = one connection pool per worker process.
+    app.state.http = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=1.0, read=30.0, write=5.0, pool=1.0),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20,
+                            keepalive_expiry=30.0),
+        http2=True,  # requires: pip install "httpx[http2]"
+    )
+    yield
+    # Uvicorn handles SIGTERM: it stops accepting, waits for in-flight requests
+    # (bounded by --timeout-graceful-shutdown), then runs this shutdown code.
+    await app.state.http.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/healthz")
+async def healthz() -&gt; dict:
+    return {"status": "ok"}</code></pre>
+<pre data-lang="Go" data-file="main.go"><code class="language-go">// edge-gateway — graceful shutdown with net/http (Go 1.22+)
+package main
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	srv := &amp;http.Server{
+		Addr:              ":8443",
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,  // slowloris protection
+		IdleTimeout:       75 * time.Second, // longer than the NLB/ALB idle timeout
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil &amp;&amp; !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("listen failed", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	&lt;-ctx.Done() // SIGTERM received
+	slog.Info("shutting down: draining connections")
+	time.Sleep(5 * time.Second) // let the load balancer notice readiness failure
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil { // closes listeners, waits for active requests
+		slog.Error("forced shutdown", "err", err)
+	}
+}</code></pre>
+</div>
+  <p>Note how each runtime exposes the same three knobs — keep-alive/idle timeout, drain deadline, and pool limits — under different names. The Go version shows the drain delay explicitly; in Kubernetes you would usually put that delay in a <code>preStop</code> hook instead (Chapter 2).</p>
+
+  <h3>7.2 Running Java correctly as PID 1</h3>
+<pre data-file="entrypoint.sh"><code class="language-bash">#!/bin/sh
+# WRONG: "java ..." without exec makes /bin/sh PID 1; sh ignores SIGTERM,
+# the JVM never sees it, and the orchestrator SIGKILLs after the grace period.
+#   java $JAVA_OPTS -jar /app/app.jar
+
+# RIGHT: exec replaces the shell, so the JVM becomes PID 1 and receives SIGTERM.
+set -eu
+exec java ${JAVA_OPTS:-} -XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError -jar /app/app.jar "$@"</code></pre>
+  <p><code>-XX:+ExitOnOutOfMemoryError</code> makes a heap OOME fatal so the orchestrator restarts a clean process instead of leaving a half-broken JVM running. If your container also spawns child processes, run under <code>tini</code> (<code>ENTRYPOINT ["/sbin/tini", "--", "/entrypoint.sh"]</code>) to reap zombies.</p>
+
+  <h3>7.3 Troubleshooting session: "the pod keeps restarting with 137"</h3>
+<pre data-file="session-oom.txt"><code class="language-bash"># 1. Confirm it was the kernel OOM killer, not the app
+$ journalctl -k --since "1 hour ago" | grep -i -E "out of memory|oom-kill"
+kernel: Memory cgroup out of memory: Killed process 48211 (java) total-vm:9123456kB, anon-rss:1987340kB ...
+
+# 2. Inspect the cgroup's limit and OOM counters (cgroup v2)
+$ CG=/sys/fs/cgroup/system.slice/orders.service    # or the pod's cgroup path
+$ cat $CG/memory.max $CG/memory.current
+2147483648
+2139095040
+$ cat $CG/memory.events
+low 0
+high 0
+max 1832
+oom 3
+oom_kill 3
+
+# 3. Where does memory go? (NMT must be enabled: -XX:NativeMemoryTracking=summary)
+$ jcmd $(pgrep -f orders) VM.native_memory summary | head -30
+Total: reserved=3.1GB, committed=2.0GB
+-  Java Heap (reserved=1.5GB, committed=1.5GB)
+-  Class (reserved=1.0GB, committed=82MB)
+-  Thread (reserved=210MB, committed=210MB)      # ~205 threads x ~1MB stacks
+-  Code (reserved=240MB, committed=60MB)
+-  GC (reserved=95MB, committed=95MB)
+-  Other (reserved=120MB, committed=120MB)       # direct ByteBuffers (Netty)
+
+# 4. Diagnosis: heap (1.5G) + ~500MB native &gt; 2G limit. Fix: MaxRAMPercentage=70,
+#    cap direct memory (-XX:MaxDirectMemorySize=128m), or raise the limit.</code></pre>
+  <p><span class="tag illus">Illustrative</span> output, trimmed; field names match real <code>memory.events</code> and NMT output.</p>
+
+  <h3>7.4 Troubleshooting session: sockets and connections with <code>ss</code></h3>
+<pre data-file="session-ss.txt"><code class="language-bash"># Summary of all sockets by state
+$ ss -s
+Total: 31842
+TCP:   31410 (estab 412, closed 30871, orphaned 0, timewait 30870)
+
+# Who is in TIME-WAIT, grouped by remote peer?
+$ ss -Htan state time-wait | awk '{print $4}' | sort | uniq -c | sort -rn | head
+  29811 10.20.4.17:443          # payments API: a new connection per request!
+
+# Listening sockets: Recv-Q = current accept queue, Send-Q = backlog limit
+$ ss -lnt 'sport = :8080'
+State   Recv-Q  Send-Q  Local Address:Port
+LISTEN  0       200     *:8080
+
+# Connections stuck in CLOSE-WAIT (application never closed them) with owning process
+$ ss -tanp state close-wait
+CLOSE-WAIT 0 0 10.20.1.5:51234 10.20.4.17:443 users:(("java",pid=48211,fd=187))
+
+# Per-connection TCP internals: RTT, cwnd, retransmits
+$ ss -ti dst 10.20.4.17
+   cubic wscale:7,7 rto:204 rtt:1.2/0.4 mss:1448 cwnd:10 retrans:0/3 ...
+
+# Kernel counters for overflows and retransmits
+$ nstat -az | grep -E "ListenOverflows|ListenDrops|TCPRetransSegs|TCPTimeouts"</code></pre>
+
+  <h3>7.5 Troubleshooting session: DNS and HTTP with <code>dig</code> and <code>curl</code></h3>
+<pre data-file="session-dns-http.txt"><code class="language-bash"># What does the resolver config look like? (inside a pod you will see ndots:5)
+$ cat /etc/resolv.conf
+search lumen.svc.cluster.local svc.cluster.local cluster.local ec2.internal
+nameserver 172.20.0.10
+options ndots:5
+
+# Query a specific record type, show TTL, and trace the delegation chain
+$ dig +noall +answer api.payments.example.com A
+$ dig +trace api.payments.example.com
+
+# Compare lookup time with and without search expansion (note the trailing dot)
+$ time getent ahosts api.payments.example.com
+$ time getent ahosts api.payments.example.com.
+
+# Break an HTTPS request into phases: DNS, TCP connect, TLS, first byte, total
+$ curl -so /dev/null -w 'dns=%{time_namelookup} tcp=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total} http=%{http_version}\n' \
+    https://api.lumen.example.com/healthz
+dns=0.004 tcp=0.012 tls=0.031 ttfb=0.058 total=0.058 http=2
+
+# Inspect the TLS handshake and certificate chain
+$ openssl s_client -connect api.lumen.example.com:443 -servername api.lumen.example.com -alpn h2 &lt;/dev/null 2&gt;/dev/null \
+    | grep -E "Protocol|Cipher|ALPN|subject=|issuer=|Verify return"</code></pre>
+
+  <h3>7.6 Troubleshooting session: packets with <code>tcpdump</code></h3>
+<pre data-file="session-tcpdump.txt"><code class="language-bash"># Capture SYNs and RSTs to/from the app port (cheap filter, safe on busy hosts)
+$ sudo tcpdump -ni any 'tcp port 8080 and (tcp[tcpflags] &amp; (tcp-syn|tcp-rst) != 0)' -c 50
+
+# Capture DNS traffic to see search-domain expansion and timeouts
+$ sudo tcpdump -ni any udp port 53 -c 40
+
+# Write a bounded capture to analyse in Wireshark later (ring buffer, 5 x 100 MB)
+$ sudo tcpdump -ni eth0 -s 128 -C 100 -W 5 -w /var/tmp/cap.pcap host 10.20.4.17
+
+# Capture inside a container's network namespace using host tools
+$ PID=$(docker inspect -f '{{.State.Pid}}' orders)   # or crictl inspect on K8s nodes
+$ sudo nsenter -t "$PID" -n tcpdump -ni eth0 port 5432 -c 20</code></pre>
+
+  <h3>7.7 Performance tools: the first 60 seconds</h3>
+<pre data-file="session-perf.txt"><code class="language-bash">uptime                      # load averages: rising or falling?
+dmesg -T | tail             # OOM kills, conntrack full, disk errors
+vmstat 1 5                  # r = run queue (CPU saturation), si/so = swapping, wa = I/O wait
+mpstat -P ALL 1 3           # per-CPU usage: one hot CPU = single-threaded bottleneck
+pidstat 1 3                 # per-process CPU
+iostat -xz 1 3              # %util, await, aqu-sz per device
+free -m                     # use 'available', not 'free'
+sar -n DEV 1 3              # network throughput per interface
+sar -n TCP,ETCP 1 3         # active/passive opens per second, retransmits
+top -H -p $(pgrep -f orders)  # per-thread CPU inside the JVM; map TID (hex) to jstack nid
+
+# Pressure Stall Information: are tasks actually waiting on CPU/memory/IO?
+cat /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io
+cat /sys/fs/cgroup/&lt;group&gt;/cpu.stat   # nr_throttled, throttled_usec</code></pre>
+  <p>This list is adapted in spirit from the Netflix Performance Engineering checklist (see case studies). Each command answers a USE question for one resource.</p>
+
+  <h3>7.8 Tracing system calls and profiling</h3>
+<pre data-file="session-trace.txt"><code class="language-bash"># Summarise syscalls of a running process for 10 s (strace is SLOW: use briefly, never in hot loops)
+$ sudo timeout 10 strace -f -c -p $(pgrep -f assist)
+
+# See which files/sockets a slow startup touches
+$ strace -f -e trace=openat,connect -o /tmp/start.trace python -m uvicorn main:app
+
+# CPU flame graph of a JVM with perf (needs -XX:+PreserveFramePointer or async-profiler)
+$ sudo perf record -F 99 -g -p $(pgrep -f orders) -- sleep 30
+$ sudo perf report --stdio | head -50
+# For Java, async-profiler gives better symbol resolution:
+$ asprof -d 30 -e cpu -f /tmp/flame.html $(pgrep -f orders)
+
+# eBPF one-liners with bpftrace (kernel 5.x+, run as root)
+# Count new TCP connections by process name
+$ bpftrace -e 'kprobe:tcp_connect { @[comm] = count(); }'
+# Histogram of read() latency for the JVM
+$ bpftrace -e 'tracepoint:syscalls:sys_enter_read /comm == "java"/ { @s[tid] = nsecs; }
+  tracepoint:syscalls:sys_exit_read /@s[tid]/ { @us = hist((nsecs - @s[tid]) / 1000); delete(@s[tid]); }'
+# BCC tools (packaged as e.g. bpfcc-tools): who opens TCP connections, with latency
+$ tcpconnect-bpfcc -t
+$ tcplife-bpfcc            # lifespan and bytes of each TCP session
+$ runqlat-bpfcc 10 1       # run-queue latency histogram: CPU saturation proof</code></pre>
+  <div class="callout tip"><p class="callout-title">strace vs eBPF</p><p><code>strace</code> uses <code>ptrace</code> and stops the target on every syscall, slowing it by orders of magnitude — fine on a dev box, dangerous on a production hot path. eBPF tools run verified programs in the kernel and aggregate in-kernel, so their overhead is usually small enough for production use. Prefer BCC/bpftrace in production.</p></div>
+
+  <h3>7.9 A systemd unit for a Spring Boot service (VM deployments)</h3>
+<pre data-file="/etc/systemd/system/orders.service"><code class="language-properties">[Unit]
+Description=Lumen orders-service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=orders
+Group=orders
+Environment=JAVA_OPTS=-XX:MaxRAMPercentage=70 -XX:+ExitOnOutOfMemoryError
+ExecStart=/usr/bin/java $JAVA_OPTS -jar /opt/orders/app.jar
+SuccessExitStatus=143          # JVM exits 143 on SIGTERM: treat as clean stop
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30              # SIGKILL after 30 s
+LimitNOFILE=65536
+MemoryMax=2G                   # cgroup v2 memory.max
+CPUQuota=200%                  # cgroup v2 cpu.max = 200000 100000
+TasksMax=1024                  # pids.max
+# Sandboxing
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/orders
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+  <p>This unit expresses in systemd terms exactly what a Kubernetes pod spec expresses later: user, environment, resource limits (which become the same cgroup files), restart policy and stop timeout. Seeing them side by side demystifies containers: they are this, plus namespaces and an image.</p>
+
+  <h3>7.10 Building a "container" by hand</h3>
+<pre data-file="session-unshare.txt"><code class="language-bash"># Create new PID, mount, UTS, IPC and network namespaces; become PID 1 inside
+$ sudo unshare --pid --fork --mount-proc --uts --ipc --net bash
+# hostname lumen-sandbox
+# ps -ef            # only bash (PID 1) and ps are visible
+# ip link           # only a down loopback interface: no network until you add a veth pair
+
+# In another terminal: create a cgroup v2 group, limit it, and move the shell into it
+$ sudo mkdir /sys/fs/cgroup/sandbox
+$ echo "50000 100000" | sudo tee /sys/fs/cgroup/sandbox/cpu.max     # 0.5 CPU
+$ echo 256M          | sudo tee /sys/fs/cgroup/sandbox/memory.max
+$ echo &lt;PID-of-that-bash-on-host&gt; | sudo tee /sys/fs/cgroup/sandbox/cgroup.procs</code></pre>
+  <p>Add a root filesystem (via <code>pivot_root</code> into an unpacked image), drop capabilities and apply a seccomp profile, and you have rebuilt what <code>runc</code> does for every container.</p>
+</section>
+
+<section id="applications">
+  <h2>8. Applications: How Teams Use This Day to Day</h2>
+  <h3>8.1 Right-sizing JVM containers</h3>
+  <p>Teams running Spring Boot in containers converge on a standard recipe: set the container memory limit from observed working set plus headroom; size the heap with <code>MaxRAMPercentage</code> (60–75%) instead of a fixed <code>-Xmx</code>; cap direct memory and metaspace when native usage is volatile; alert on <code>memory.events oom_kill</code> increments and on working set as a fraction of limit; and treat CPU <em>requests</em> as the scheduling guarantee and CPU <em>limits</em> as optional, measuring throttling before deciding. In Lumen, <code>orders-service</code> runs with a 1.5 GiB limit, 70% heap, and no CPU limit but a 500m request <span class="tag opinion">Opinion</span>.</p>
+  <h3>8.2 Connection management as a reliability practice</h3>
+  <p>Production-grade services have explicit, reviewed settings for every pool: inbound (server threads, backlog, keep-alive timeout), database (HikariCP size, lifetime), and outbound HTTP (max connections per route, connect/read timeouts, idle eviction). Platform teams publish "golden" client configurations so that every service gets timeouts shorter than the caller's, keep-alive longer than the load balancer's idle timeout, and bounded pools. Missing timeouts are among the top causes of cascading failure (see Part 2's circuit breaker chapter).</p>
+  <h3>8.3 Debug containers and node-level tooling</h3>
+  <p>Production images are minimal (distroless or Alpine) and lack <code>ss</code>, <code>dig</code> or <code>tcpdump</code>. Teams instead use ephemeral debug containers (<code>kubectl debug</code>, Chapter 2) or <code>nsenter</code> from the node to bring tools into the target's namespaces. Platform teams also deploy eBPF-based agents (Cilium Hubble for flows, Parca or Pyroscope-style continuous profilers, Inspektor Gadget) that capture kernel-level evidence continuously so that incidents can be investigated after the fact.</p>
+  <h3>8.4 Network troubleshooting playbooks</h3>
+  <p>Mature on-call teams have runbooks that encode the layered approach: is the name resolving (<code>dig</code>)? Is the port reachable (<code>nc -vz</code>, <code>curl -v</code>)? Does TLS negotiate (<code>openssl s_client</code>)? Is the HTTP response correct (<code>curl -i</code>)? Are we dropping packets (<code>nstat</code>, <code>tcpdump</code>)? Moving strictly bottom-up or top-down avoids the common failure of staring at application logs for a problem that is a security-group rule.</p>
+  <h3>8.5 AI workloads change the profile</h3>
+  <p><code>assist-service</code> illustrates how AI services stress different resources than CRUD services: responses are long-lived streams (server-sent events or HTTP/2 streams lasting tens of seconds), so idle and read timeouts must be generous on that route only; outbound calls to LLM APIs cross the internet through NAT with high RTT and benefit from HTTP/2 multiplexing and connection reuse; and embedding models loaded in-process consume large, mostly read-only memory (often memory-mapped), which interacts with the page cache and cgroup accounting.</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 Netflix: Linux performance analysis in 60 seconds</h3>
+  <p><span class="tag fact">Verified</span> In 2015 Netflix's performance engineering team (Brendan Gregg and colleagues) published a checklist of ten standard Linux commands — <code>uptime</code>, <code>dmesg | tail</code>, <code>vmstat 1</code>, <code>mpstat -P ALL 1</code>, <code>pidstat 1</code>, <code>iostat -xz 1</code>, <code>free -m</code>, <code>sar -n DEV 1</code>, <code>sar -n TCP,ETCP 1</code> and <code>top</code> — to run in the first minute of investigating a performance issue on a Linux instance. The lesson for backend teams is methodological: a fixed, resource-oriented checklist finds saturation and errors faster than ad hoc exploration. Source: <a href="https://netflixtechblog.com/linux-performance-analysis-in-60-000-milliseconds-accc10403c55">Netflix Tech Blog, "Linux Performance Analysis in 60,000 Milliseconds"</a>.</p>
+  <h3>9.2 Cloudflare: SYN and accept queues in the wild</h3>
+  <p><span class="tag fact">Verified</span> Cloudflare's engineering blog explained in detail how Linux handles the SYN queue and accept queue, how SYN cookies work, and how to observe queue overflows with <code>ss</code> and <code>nstat</code> on their edge servers. It is the best public explanation of why a slow <code>accept()</code> loop shows up as client-side latency with no server log. Source: <a href="https://blog.cloudflare.com/syn-packet-handling-in-the-wild/">Cloudflare Blog, "SYN packet handling in the wild"</a> (2018).</p>
+  <h3>9.3 Google: BBR congestion control</h3>
+  <p><span class="tag fact">Verified</span> Google developed BBR, deployed it for Google.com and YouTube traffic, contributed it to the Linux kernel, and in 2017 enabled it for Google Cloud services and load balancing. Google reported that on YouTube BBR reduced round-trip times and rebuffering compared with CUBIC. The engineering lesson: congestion control is a deployable, measurable lever for long-haul traffic, and it is a sender-side change — you can turn it on for your servers (<code>net.ipv4.tcp_congestion_control=bbr</code> with the <code>fq</code> qdisc) without touching clients. Sources: <a href="https://cloud.google.com/blog/products/networking/tcp-bbr-congestion-control-comes-to-gcp-your-internet-just-got-faster">Google Cloud Blog (2017)</a>; <a href="https://queue.acm.org/detail.cfm?id=3022184">Cardwell et al., "BBR: Congestion-Based Congestion Control", ACM Queue (2016)</a>.</p>
+  <h3>9.4 Buffer: CPU limits and throttling on Kubernetes</h3>
+  <p><span class="tag fact">Verified</span> Buffer's engineering team found that containers were being CPU-throttled even while their average usage was below the configured limits. They removed CPU limits for latency-critical services (isolating them on dedicated nodes) and reported large latency improvements on their landing page; the post was later updated to note that a kernel CFS bug (fixed in Linux 4.19-era kernels) contributed and to recommend kernel upgrades. The lesson: CPU limits are a latency hazard to measure, not a free safety net. Source: <a href="https://erickhun.com/posts/kubernetes-faster-services-no-cpu-limits/">Eric Khun, "Kubernetes: Make your services faster by removing CPU limits"</a>. For the counter-argument, see the Kubernetes blog's <a href="https://kubernetes.io/blog/2023/11/16/the-case-for-kubernetes-resource-limits/">"The Case for Kubernetes Resource Limits"</a> (2023).</p>
+  <h3>9.5 Kubernetes DNS: the conntrack race and NodeLocal DNSCache</h3>
+  <p><span class="tag fact">Verified</span> The Kubernetes project documents NodeLocal DNSCache as a way to avoid DNS latency problems, explicitly citing conntrack races that cause 5-second DNS timeouts when parallel A and AAAA UDP queries traverse DNAT, and conntrack table exhaustion for UDP. Running a caching agent on each node and connecting to it without DNAT (and upgrading upstream connections to TCP) removes the race. Source: <a href="https://kubernetes.io/docs/tasks/administer-cluster/nodelocaldns/">Kubernetes docs, "Using NodeLocal DNSCache in Kubernetes Clusters"</a>.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Strengths, Limits and Operational Cost</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Mechanism</th><th>Strength</th><th>Limitation</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>cgroup CPU limits (CFS quota)</td><td>Hard isolation of noisy neighbours, predictable billing</td><td>Throttling stalls latency-sensitive multithreaded runtimes</td><td>Must monitor <code>nr_throttled</code>; tuning per service</td></tr>
+      <tr><td>cgroup memory limits</td><td>Protects node from runaway processes</td><td>Death by SIGKILL, no graceful path; counts page cache and native memory</td><td>Requires understanding JVM native memory</td></tr>
+      <tr><td>Overcommit</td><td>High memory utilisation</td><td>OOM killer chooses victims at the worst time</td><td>OOM alerts and capacity margins</td></tr>
+      <tr><td>Page cache</td><td>Free, automatic I/O acceleration</td><td>Confuses memory dashboards; competes with app memory</td><td>Need working-set metrics</td></tr>
+      <tr><td>Keep-alive + pooling</td><td>Removes handshake latency and port churn</td><td>Stale connections, LB idle races, uneven L4 balancing</td><td>Timeouts must be coordinated across tiers</td></tr>
+      <tr><td>L4 load balancing</td><td>Very fast, any protocol, end-to-end TLS</td><td>Balances connections not requests; no HTTP awareness</td><td>Low</td></tr>
+      <tr><td>L7 load balancing</td><td>Per-request routing, retries, observability</td><td>Extra hop, TLS termination, CPU</td><td>Proxy fleet to run and tune</td></tr>
+      <tr><td>HTTP/2</td><td>Multiplexing, header compression, one connection</td><td>TCP head-of-line blocking; long-lived connections skew L4 balancing</td><td>Need L7 or client-side balancing</td></tr>
+      <tr><td>HTTP/3/QUIC</td><td>No HOL blocking, 1-RTT setup, connection migration</td><td>UDP often rate-limited/blocked; userspace stack costs CPU</td><td>Typically outsourced to CDN/edge</td></tr>
+      <tr><td>eBPF tooling</td><td>Deep, low-overhead visibility in production</td><td>Requires recent kernels, privileges; steep learning curve</td><td>Agent deployment and security review</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs and Decisions</h2>
+  <h3>11.1 Decision table</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Decision</th><th>Choose A when…</th><th>Choose B when…</th></tr></thead>
+    <tbody>
+      <tr><td>CPU limit vs request-only</td><td><strong>Limit</strong>: multi-tenant cluster, batch jobs, cost chargeback, untrusted workloads</td><td><strong>Request only</strong>: latency-sensitive services on well-managed nodes; monitor node saturation instead</td></tr>
+      <tr><td>L4 (NLB) vs L7 (ALB/Envoy) at the edge</td><td><strong>L4</strong>: non-HTTP protocols, need static IPs, end-to-end TLS, extreme throughput</td><td><strong>L7</strong>: path routing, WAF, auth offload, per-request balancing, HTTP observability</td></tr>
+      <tr><td>HTTP/1.1 vs HTTP/2 between services</td><td><strong>HTTP/1.1</strong>: simple REST, L4 balancing, easy debugging</td><td><strong>HTTP/2</strong>: gRPC, many concurrent requests per peer, streaming</td></tr>
+      <tr><td>Fixed <code>-Xmx</code> vs <code>MaxRAMPercentage</code></td><td><strong>Fixed</strong>: VMs, precise tuning for large heaps</td><td><strong>Percentage</strong>: containers whose limits change between environments</td></tr>
+      <tr><td>CUBIC vs BBR</td><td><strong>CUBIC</strong>: intra-datacentre, default safety</td><td><strong>BBR</strong>: serving long-haul/lossy clients, large transfers across regions</td></tr>
+    </tbody>
+  </table></div>
+  <h3>11.2 Flowchart: diagnosing a latency regression</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A["p99 latency up"] --> B{"CPU utilisation high?"}
+  B -->|yes| C["Profile: perf / async-profiler flame graph"]
+  B -->|no| D{"cpu.stat nr_throttled rising?"}
+  D -->|yes| E["CFS throttling: raise or remove limit, cut GC threads"]
+  D -->|no| F{"Time spent before request reaches app?"}
+  F -->|"yes: ListenOverflows, SYN retrans"| G["Accept queue / backlog / thread pool saturation"]
+  F -->|no| H{"curl -w shows slow DNS or connect?"}
+  H -->|"slow DNS"| I["ndots, resolver timeouts, conntrack race"]
+  H -->|"slow connect/TLS"| J["No connection reuse, NAT port exhaustion, cross-AZ"]
+  H -->|"slow TTFB"| K["Downstream: DB pool wait, upstream API, GC pauses"]
+</pre>
+<figcaption>Figure 12.6 — A USE-driven path from "it is slow" to a specific kernel or network cause.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> start with utilisation and saturation of the CPU, because it is cheap to check, then move outward along the request path: queues before the application (backlog), name resolution, connection setup, and finally time inside the application and its dependencies. Each leaf names the tool that confirms the hypothesis. The order matters: teams often jump to "the database is slow" when the real cause is a throttled client.</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Production Failures</h2>
+  <ol>
+    <li><strong>Shell-form entrypoints that swallow SIGTERM.</strong> <code>CMD java -jar app.jar</code> (shell form) runs under <code>/bin/sh -c</code>; the JVM never receives SIGTERM, every deploy waits for the grace period and ends in SIGKILL, in-flight requests are lost. Use exec form or <code>exec</code> in scripts.</li>
+    <li><strong><code>-Xmx</code> equal to the container limit.</strong> Guarantees an eventual OOM kill because native memory has nowhere to go.</li>
+    <li><strong>Creating an HTTP client per request.</strong> New pool per call means no reuse, a new TCP and TLS handshake every time, TIME_WAIT explosions and port exhaustion. Same for <code>new RestTemplate()</code> with a default request factory, <code>http.Client{}</code> created inside handlers in Go, or <code>requests.get()</code> without a <code>Session</code> in Python.</li>
+    <li><strong>Missing or infinite timeouts.</strong> Java's <code>HttpURLConnection</code> and many clients default to infinite read timeouts. One slow dependency then holds threads and connections forever.</li>
+    <li><strong>App keep-alive shorter than the LB's idle timeout.</strong> Produces sporadic 502s under low traffic that disappear under load — maddening to reproduce.</li>
+    <li><strong>"Fixing" TIME_WAIT with <code>tcp_tw_recycle</code> or tiny <code>tcp_fin_timeout</code>.</strong> The former was removed for breaking NAT clients; the latter does not affect TIME_WAIT at all (it controls FIN_WAIT_2).</li>
+    <li><strong>Ignoring CLOSE_WAIT growth.</strong> It is always an application-level leak of unread or unclosed responses.</li>
+    <li><strong>Reading <code>free</code> instead of <code>available</code></strong> and concluding a server "has no memory", or adding RAM to fix what is actually page cache doing its job.</li>
+    <li><strong>Using <code>os.cpu_count()</code> or default worker counts in Python containers.</strong> Gunicorn's common <code>2 * cores + 1</code> formula computed from 64 host cores spawns 129 workers in a 1-CPU container, each holding model weights in memory.</li>
+    <li><strong>Debugging DNS by pinging.</strong> <code>ping</code> uses the system resolver but hides timing and search expansion; use <code>dig</code> and <code>getent</code> with and without a trailing dot.</li>
+    <li><strong>Running <code>strace</code> on a production hot process</strong> and causing the outage you were investigating. Prefer eBPF tools.</li>
+    <li><strong>Hard-coding IPs or caching DNS forever</strong> (old JVMs with a security manager cached positive lookups forever), which breaks failover of RDS, ElastiCache and load balancers whose IPs change.</li>
+  </ol>
+  <div class="callout danger"><p class="callout-title">Production failure pattern: the conntrack cliff</p><p>A node handling many short-lived UDP (DNS) or TCP flows fills <code>nf_conntrack</code>. New flows are dropped silently; existing ones keep working. Symptoms: random connection timeouts on a subset of nodes, no application errors beyond timeouts. Evidence: <code>dmesg</code> message, <code>conntrack -S</code> showing <code>drop</code> or <code>insert_failed</code>. Fix: raise <code>nf_conntrack_max</code> as a stopgap, reduce flow churn (connection reuse, NodeLocal DNSCache), and alert on conntrack utilisation.</p></div>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Performance</h3>
+  <p>Apply the <strong>USE method</strong> (Brendan Gregg) systematically: for each resource — CPUs, memory, network interfaces, storage devices, and software resources such as thread pools, connection pools and file descriptors — check <em>Utilisation</em> (busy time or fraction used), <em>Saturation</em> (queued work: run queue, PSI, accept queue, pool wait time) and <em>Errors</em> (OOM kills, retransmits, <code>EMFILE</code>, pool timeouts). Saturation metrics are the most predictive and the most often missing.</p>
+  <h3>13.2 Security</h3>
+  <ul>
+    <li>Run services as a non-root user; drop Linux capabilities; set <code>NoNewPrivileges</code> (systemd) or <code>allowPrivilegeEscalation: false</code> (Kubernetes).</li>
+    <li>Apply seccomp profiles (the container runtime's default profile blocks dozens of rarely needed syscalls).</li>
+    <li>Use TLS 1.2+ (prefer 1.3) everywhere, including inside the VPC for sensitive data; manage certificates with automation (ACM, cert-manager) and alert on expiry.</li>
+    <li>Treat eBPF and <code>CAP_SYS_ADMIN</code>/<code>CAP_BPF</code> as highly privileged; restrict who can run them in production.</li>
+    <li>Defend listeners: <code>ReadHeaderTimeout</code> in Go, request size limits, and SYN cookies (on by default) for SYN floods.</li>
+  </ul>
+  <h3>13.3 Scalability</h3>
+  <p>Kernel limits that bound scale and should be part of capacity reviews: fd limits, ephemeral port ranges per destination, conntrack table size, <code>somaxconn</code>, NAT gateway connection limits per destination, and PID limits per container. Scale the number of instances horizontally rather than raising every limit on one huge instance — the blast radius of a single misbehaving host stays smaller.</p>
+  <h3>13.4 Monitoring</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Signal</th><th>Metric (Prometheus naming)</th><th>Alert idea</th></tr></thead>
+    <tbody>
+      <tr><td>CPU throttling</td><td><code>container_cpu_cfs_throttled_periods_total / container_cpu_cfs_periods_total</code></td><td>&gt; 10% for 15 min on latency-critical services</td></tr>
+      <tr><td>Memory headroom</td><td><code>container_memory_working_set_bytes / limit</code></td><td>&gt; 90% for 10 min</td></tr>
+      <tr><td>OOM kills</td><td><code>kube_pod_container_status_last_terminated_reason{reason="OOMKilled"}</code></td><td>Any increase</td></tr>
+      <tr><td>FD usage</td><td><code>process_files_open_files / process_files_max_files</code></td><td>&gt; 80%</td></tr>
+      <tr><td>TCP retransmits</td><td><code>node_netstat_Tcp_RetransSegs</code> rate</td><td>Sudden step change</td></tr>
+      <tr><td>Conntrack</td><td><code>node_nf_conntrack_entries / node_nf_conntrack_entries_limit</code></td><td>&gt; 75%</td></tr>
+      <tr><td>Pool saturation</td><td><code>hikaricp_connections_pending</code></td><td>&gt; 0 sustained</td></tr>
+    </tbody>
+  </table></div>
+  <h3>13.5 Reliability and maintainability</h3>
+  <p>Encode kernel and network settings as code — systemd units, container specs, sysctl via node images or DaemonSets — never as hand edits on hosts. Document every non-default sysctl with the measurement that justified it. Keep debug tooling (BCC, bpftrace, tcpdump) available on node images or as a debug container image, so the first minutes of an incident are not spent installing packages.</p>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundation</p>
+    <p>A pod's last termination shows <code>Exit Code: 143</code>, and another pod shows <code>Exit Code: 137, Reason: OOMKilled</code>. Explain what happened in each case and which one indicates a configuration problem.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>143 = 128 + 15: the process was terminated by SIGTERM and did not exit with 0 itself — a normal stop (deploy, scale-down) where the JVM's default handler ran shutdown hooks and exited with 143. It is not a problem (systemd units often declare <code>SuccessExitStatus=143</code>). 137 = 128 + 9: SIGKILL, and the reason <code>OOMKilled</code> confirms the cgroup OOM killer. That indicates the container's memory limit is too low for heap + native memory, or a leak; check <code>memory.events</code>, NMT and the <code>MaxRAMPercentage</code> setting.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Your batch job calls an internal pricing API 800 times per second using <code>new RestTemplate()</code> created inside the loop, and after about 40 seconds starts failing with <code>Cannot assign requested address</code>. Explain the failure numerically and give two fixes, in order of preference.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Each call opens a new connection that the client closes, leaving the socket in TIME_WAIT for 60 s. Available ephemeral ports ≈ 28,232. At 800 new connections/s, the range is consumed in 28,232 / 800 ≈ 35 s — matching the observed ~40 s. Fix 1 (correct): reuse connections — a single shared <code>RestClient</code>/<code>RestTemplate</code> backed by a pooled client (Apache HttpClient 5 <code>PoolingHttpClientConnectionManager</code> or JDK <code>HttpClient</code>) with keep-alive, sized by Little's Law. Fix 2 (mitigation): enable <code>net.ipv4.tcp_tw_reuse=1</code> and widen <code>ip_local_port_range</code>; also consider whether the server side should close connections instead. Never use <code>tcp_tw_recycle</code>.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>Inside a Kubernetes pod with the default <code>resolv.conf</code> (search list of four domains, <code>ndots:5</code>), how many DNS queries does a single lookup of <code>api.openai.example.com</code> generate in the worst case before succeeding, assuming the resolver sends A and AAAA queries in parallel? Propose two changes that reduce this.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>The name has three dots (&lt; 5), so the resolver tries the four search suffixes first (each fails with NXDOMAIN), then the absolute name. That is 5 attempts × 2 record types = 10 queries, with 8 wasted. Fixes: use the fully qualified name with a trailing dot (<code>api.openai.example.com.</code>) in configuration; or set <code>dnsConfig.options: [{name: ndots, value: "2"}]</code> on the pod; additionally deploy NodeLocal DNSCache so the wasted queries are answered locally and cheaply.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>A Spring Boot service with a CPU limit of 1 core shows average CPU usage of 35% but p99 latency of 120 ms versus a p50 of 8 ms. <code>cpu.stat</code> shows <code>nr_throttled</code> increasing in 22% of periods. The JVM runs G1 on a 16-core node. Explain the mechanism and propose a measured remediation plan.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Average usage hides bursts. When a request burst or a young GC runs many threads in parallel, the 100 ms quota is exhausted in a few milliseconds and all threads are throttled until the next period, adding up to ~90 ms to any request in flight — matching the p99. Check JVM ergonomics: with a 1-CPU limit, modern JVMs pick a small number of GC threads, but older JVMs or explicit flags may use 13+. Plan: (1) confirm with <code>jcmd VM.flags</code> and <code>container_cpu_cfs_throttled_periods_total</code>; (2) reduce parallelism (<code>-XX:ParallelGCThreads=2 -XX:ConcGCThreads=1</code>, smaller Tomcat pool or virtual threads with bounded downstream concurrency); (3) raise the limit to 2 or remove it while keeping the request at 1, after checking node headroom; (4) re-measure throttle ratio and p99. Document the decision.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>During every deploy of <code>orders-service</code> behind an AWS ALB (idle timeout 60 s), about 0.3% of requests receive 502. The app uses Tomcat defaults (keep-alive timeout 20 s, connection timeout as configured) and <code>server.shutdown=graceful</code>. Identify two independent causes and the fix for each.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Cause 1 — keep-alive race: Tomcat closes idle connections after 20 s, shorter than the ALB's 60 s, so the ALB sometimes sends a request on a connection the backend is closing → 502. Fix: set <code>server.tomcat.keep-alive-timeout</code> (and <code>connection-timeout</code> if used as the idle default) above 60 s, e.g. 75 s. Cause 2 — deregistration race: on SIGTERM the app stops accepting immediately while the ALB still routes to it until the target is deregistered and draining begins. Fix: fail readiness first and delay shutdown (preStop sleep or a drain delay), set the target group deregistration delay appropriately, and keep the graceful shutdown phase below the termination grace period.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is the difference between a namespace and a cgroup?</summary><div><p>A namespace controls what a process can <em>see</em> (its own PID numbering, network stack, mounts, hostname, users). A cgroup controls what it can <em>use</em> and accounts for it (CPU time, memory, I/O, number of tasks). A container is a process with both applied, plus a root filesystem from an image, dropped capabilities and a seccomp profile.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why does a socket end up in TIME_WAIT and why is it needed?</summary><div><p>The side that sends the first FIN ends in TIME_WAIT for 2×MSL (60 s on Linux). It ensures the final ACK can be retransmitted if lost and that delayed duplicates from the old connection expire before the same 4-tuple can be reused. It only becomes a problem when a client opens and closes many connections to the same destination, exhausting ephemeral ports — solved by connection reuse.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain HTTP/2 head-of-line blocking and how HTTP/3 removes it.</summary><div><p>HTTP/2 multiplexes streams over one TCP connection; TCP delivers bytes in order, so one lost segment blocks delivery of all subsequent bytes, including those belonging to other streams, until retransmission. HTTP/3 runs over QUIC, which implements streams in the transport itself on top of UDP; loss only blocks the stream whose data was lost.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> When would you put an NLB in front of your services rather than an ALB?</summary><div><p>NLB for non-HTTP protocols (gRPC can go either way), when you need static IPs or PrivateLink, extreme connection rates, minimal latency, or end-to-end TLS/mTLS to the pod. ALB when you need HTTP routing by host/path/header, WAF, OIDC auth, per-request balancing and HTTP-level metrics. Many platforms use NLB → in-cluster L7 proxy (Envoy/Gateway) to get both.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> A Java service in Kubernetes restarts every few hours with OOMKilled, but heap usage never exceeds 60% of -Xmx. How do you investigate?</summary><div><p>Confirm the kernel OOM in <code>memory.events</code>/node logs. Compare the container limit with <code>-Xmx</code> or <code>MaxRAMPercentage</code>. Enable Native Memory Tracking and take periodic <code>VM.native_memory summary.diff</code> snapshots to find growth: thread count (stacks), direct buffers (Netty), metaspace (class loading leak), or malloc arenas (glibc; try <code>MALLOC_ARENA_MAX=2</code> or jemalloc). Check page cache / tmpfs writes charged to the cgroup. Then fix the leak or adjust heap percentage and limits.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Users report intermittent 5-second delays on calls from your pods to an external API. Where do you look?</summary><div><p>Five seconds is the default resolver timeout — suspect DNS. Use <code>curl -w</code> to confirm <code>time_namelookup</code>. Check <code>ndots</code> expansion, CoreDNS errors and latency, conntrack insert failures on nodes, and UDP drops. Mitigate with FQDNs, lower <code>ndots</code>, NodeLocal DNSCache, and <code>single-request-reopen</code> where applicable.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Write a one-liner to find which remote peers hold the most ESTABLISHED connections from this host.</summary><div><pre><code class="language-bash">ss -Htn state established | awk '{print $4}' | cut -d: -f1 | sort | uniq -c | sort -rn | head</code></pre><p>(For IPv6 addresses, use <code>rev | cut -d: -f2- | rev</code> to strip only the port.)</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What does the USE method say and how would you apply it to a HikariCP pool?</summary><div><p>For each resource check Utilisation, Saturation and Errors. For HikariCP: utilisation = active / max connections (<code>hikaricp_connections_active</code>); saturation = threads waiting for a connection (<code>hikaricp_connections_pending</code>, acquisition time); errors = connection timeouts (<code>hikaricp_connections_timeout_total</code>). Saturation is the early warning.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Why should the backend's keep-alive timeout exceed the load balancer's idle timeout?</summary><div><p>Whoever closes an idle connection does so unilaterally; if the backend closes while the LB simultaneously sends a new request on that connection, the request fails and the LB returns 502. If the LB always times out first, it never reuses a connection the backend is about to close.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> Tell me about a time you diagnosed a problem below the application layer.</summary><div><p>A strong answer follows STAR and shows method: the symptom (e.g., latency without CPU), the hypotheses ruled out with evidence (<code>cpu.stat</code>, <code>ss</code>, <code>tcpdump</code>), the root cause (e.g., CFS throttling or DNS search expansion), the fix, how it was verified with metrics, and what was changed systemically (dashboards, golden configs, runbooks) so it does not recur.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Containers are processes: namespaces limit what they see; cgroups v2 limit what they use. The JVM, Go and Python each read cgroup limits differently.</li>
+    <li>Exit 137 = SIGKILL (usually OOM), exit 143 = SIGTERM. PID 1 must handle SIGTERM and reap children.</li>
+    <li>Container memory = heap + native memory + charged page cache. Size the heap as a percentage, leave headroom.</li>
+    <li>CPU limits are enforced per 100 ms period; multithreaded bursts cause throttling that shows up as tail latency.</li>
+    <li>New connections are expensive (handshakes, slow start, ports, TIME_WAIT); reuse them with bounded pools and coordinated timeouts.</li>
+    <li>DNS in Kubernetes multiplies queries through <code>ndots</code>/search; 5-second delays mean resolver timeouts.</li>
+    <li>L4 balances connections, L7 balances requests; long-lived HTTP/2 connections need L7 or client-side balancing.</li>
+    <li>Use the USE method and prefer eBPF tools over strace in production.</li>
+  </ul>
+  <div class="quiz" data-answer="c">
+    <p class="q">A container's main process exits with code 137 and no Java exception is logged. What is the most likely cause?</p>
+    <ol>
+      <li data-k="a">The JVM threw OutOfMemoryError: Java heap space</li>
+      <li data-k="b">The process received SIGTERM during a deploy</li>
+      <li data-k="c">The kernel sent SIGKILL, typically the cgroup OOM killer</li>
+      <li data-k="d">The application called System.exit(137)</li>
+    </ol>
+    <div class="explain">137 = 128 + 9 (SIGKILL), which cannot be caught, so nothing is logged by the app. A heap OOME is a Java exception (logged), and SIGTERM gives 143.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">Thousands of sockets in CLOSE_WAIT on your service indicate:</p>
+    <ol>
+      <li data-k="a">The peer has not acknowledged your FIN</li>
+      <li data-k="b">The peer closed, and your application has not closed its side (a leak)</li>
+      <li data-k="c">Normal behaviour after an active close</li>
+      <li data-k="d">A SYN flood attack</li>
+    </ol>
+    <div class="explain">CLOSE_WAIT means the kernel received FIN and is waiting for the application to call close(). Active closers end in TIME_WAIT, not CLOSE_WAIT.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">Which cgroup v2 file tells you whether CPU throttling is happening?</p>
+    <ol>
+      <li data-k="a">cpu.weight</li>
+      <li data-k="b">memory.events</li>
+      <li data-k="c">pids.max</li>
+      <li data-k="d">cpu.stat (nr_throttled, throttled_usec)</li>
+    </ol>
+    <div class="explain">cpu.stat exposes nr_periods, nr_throttled and throttled_usec. cpu.weight is the relative share; memory.events counts OOM events.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">Why does an L4 load balancer often distribute gRPC traffic unevenly?</p>
+    <ol>
+      <li data-k="a">It balances TCP connections, and gRPC multiplexes many requests over a few long-lived HTTP/2 connections</li>
+      <li data-k="b">It cannot forward UDP</li>
+      <li data-k="c">It terminates TLS and re-encrypts traffic</li>
+      <li data-k="d">It uses DNS round-robin internally</li>
+    </ol>
+    <div class="explain">Per-connection balancing pins all streams on a connection to one backend. L7 proxies or client-side balancing distribute per request.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">At what new-connection rate to a single destination will a client with the default ephemeral port range start to exhaust ports, if it always closes first?</p>
+    <ol>
+      <li data-k="a">About 28,000 per second</li>
+      <li data-k="b">About 4,700 per second</li>
+      <li data-k="c">About 470 per second</li>
+      <li data-k="d">About 47 per second</li>
+    </ol>
+    <div class="explain">≈28,232 ports / 60 s TIME_WAIT ≈ 470 connections per second.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">In TLS 1.3, what lets one IP address serve certificates for many hostnames?</p>
+    <ol>
+      <li data-k="a">ALPN</li>
+      <li data-k="b">SNI in the ClientHello</li>
+      <li data-k="c">OCSP stapling</li>
+      <li data-k="d">Session tickets</li>
+    </ol>
+    <div class="explain">Server Name Indication carries the requested hostname so the server can choose the certificate. ALPN negotiates the application protocol (h2 vs http/1.1).</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Brendan Gregg, <em>Systems Performance: Enterprise and the Cloud</em>, 2nd ed., Addison-Wesley, 2020 — the definitive guide to the USE method and Linux performance tools.</li>
+    <li><span class="ref-kind">Book</span> Brendan Gregg, <em>BPF Performance Tools</em>, Addison-Wesley, 2019.</li>
+    <li><span class="ref-kind">Book</span> Michael Kerrisk, <em>The Linux Programming Interface</em>, No Starch Press, 2010 — processes, signals, file descriptors, sockets.</li>
+    <li><span class="ref-kind">Book</span> Ilya Grigorik, <em>High Performance Browser Networking</em>, O'Reilly, 2013 — <a href="https://hpbn.co/">free online edition</a>; TCP, TLS, HTTP/2 performance.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://www.brendangregg.com/usemethod.html">Brendan Gregg, "The USE Method"</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.kernel.org/admin-guide/cgroup-v2.html">Linux kernel documentation: Control Group v2</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://man7.org/linux/man-pages/man7/namespaces.7.html">namespaces(7) man page</a> and <a href="https://man7.org/linux/man-pages/man7/signal.7.html">signal(7)</a></li>
+    <li><span class="ref-kind">Spec</span> <a href="https://www.rfc-editor.org/rfc/rfc9293">RFC 9293 — Transmission Control Protocol</a>; <a href="https://www.rfc-editor.org/rfc/rfc8446">RFC 8446 — TLS 1.3</a>; <a href="https://www.rfc-editor.org/rfc/rfc9000">RFC 9000 — QUIC</a>; <a href="https://www.rfc-editor.org/rfc/rfc9114">RFC 9114 — HTTP/3</a>; <a href="https://www.rfc-editor.org/rfc/rfc9113">RFC 9113 — HTTP/2</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://queue.acm.org/detail.cfm?id=3022184">Cardwell et al., "BBR: Congestion-Based Congestion Control", ACM Queue, 2016</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://netflixtechblog.com/linux-performance-analysis-in-60-000-milliseconds-accc10403c55">Netflix Tech Blog, "Linux Performance Analysis in 60,000 Milliseconds"</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://blog.cloudflare.com/syn-packet-handling-in-the-wild/">Cloudflare, "SYN packet handling in the wild"</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.spring.io/spring-boot/reference/web/graceful-shutdown.html">Spring Boot reference: Graceful Shutdown</a></li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/bpftrace/bpftrace">bpftrace</a> and <a href="https://github.com/iovisor/bcc">BCC tools</a></li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

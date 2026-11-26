@@ -1,0 +1,1345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Linked Lists, Stacks &amp; Queues — AI-Era Software Engineering</title>
+<meta name="description" content="Singly and doubly linked lists, fast/slow pointers, reversal, LRU caches, stacks, queues, deques, ArrayDeque internals, monotonic stacks and queues, and expression evaluation, with problem ladders.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p3-02-linked-lists-stacks-queues" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 3 · Chapter 2</p>
+  <h1>Linked Lists, Stacks, Queues &amp; Monotonic Structures</h1>
+  <p class="lede">Linked lists teach pointer manipulation under invariants; stacks and queues encode <em>order of processing</em> — last-in-first-out and first-in-first-out — which is the hidden skeleton of recursion, BFS, schedulers and parsers. Monotonic stacks and queues turn a whole family of "next greater / window maximum" problems from quadratic to linear. Along the way we open up <code>LinkedList</code>, <code>ArrayDeque</code>, <code>LinkedHashMap</code> and Python's <code>deque</code>, and build an LRU cache the way interviewers expect.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Chapter 3.1 (complexity, amortized analysis, arrays).</li>
+    <li><strong>You will be able to:</strong> manipulate lists with sentinels and fast/slow pointers without bugs, prove Floyd's cycle detection, implement an O(1) LRU cache two ways, explain ArrayDeque and work-stealing deques, recognise monotonic-stack problems, and evaluate arithmetic expressions with operator precedence.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: Order of Processing as a Design Tool</h2>
+  <p>The previous chapter was about <em>where</em> data lives. This chapter is about <em>in what order</em> you process it. Four structures cover most needs:</p>
+  <ul>
+    <li><strong>Linked lists</strong> — sequences of nodes connected by references. They give O(1) insertion and deletion <em>at a known node</em>, which is exactly what you need to keep recency order in an LRU cache or to splice lists without copying. In interviews they test whether you can maintain invariants while rewiring pointers.</li>
+    <li><strong>Stacks</strong> (LIFO) — the most recent unfinished thing is handled first: function calls, undo, matching brackets, depth-first search, parsing.</li>
+    <li><strong>Queues</strong> (FIFO) — fairness and arrival order: breadth-first search, request buffers, job queues, rate-limited pipelines.</li>
+    <li><strong>Deques</strong> — both ends; they generalise both and power sliding-window maxima, 0-1 BFS and work-stealing schedulers.</li>
+  </ul>
+  <p>The <strong>monotonic</strong> variants maintain elements in sorted order by discarding those that can never be an answer again. That single idea — "pop what is dominated" — gives Θ(n) solutions to next-greater-element, stock span, largest rectangle in a histogram and sliding-window maximum.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd><code>LinkedList</code>, <code>ArrayDeque</code>, <code>Queue.offer/poll</code>, <code>BlockingQueue</code> in executors, the call stack in stack traces, maybe <code>LinkedHashMap</code> for ordered JSON. Spring's <code>ThreadPoolTaskExecutor</code> is a queue in front of workers; <code>@Cacheable</code> with Caffeine is an eviction-ordered structure.</dd>
+      <dt>Why that is not enough</dt><dd>Interviews ask you to build these from nodes and arrays: reverse a list in k-groups, detect a cycle in O(1) space, design an LRU cache with O(1) operations, compute window maxima in Θ(n). You also need to know why <code>LinkedList</code> is almost never the right production choice and why <code>Stack</code> is legacy.</dd>
+      <dt>The modern approach</dt><dd>Prefer array-backed structures (<code>ArrayDeque</code>, ring buffers) for cache locality; use linked structures only when you need O(1) splicing at arbitrary known positions (LRU recency lists, intrusive lists). Use sentinel nodes to remove edge cases. Think in invariants ("everything before <code>prev</code> is already reversed").</dd>
+      <dt>Where Python and Go fit</dt><dd>Python: <code>list</code> is a fine stack; <code>collections.deque</code> is the queue/deque (never <code>list.pop(0)</code>); <code>OrderedDict.move_to_end</code> and <code>functools.lru_cache</code> give LRU. Go: slices as stacks, <code>container/list</code> for doubly linked lists, buffered channels as bounded FIFO queues.</dd>
+      <dt>In production</dt><dd>Bounded queues for backpressure in executors and Kafka consumers, ring buffers in logging (Log4j 2 async loggers use the LMAX Disruptor), work-stealing deques in <code>ForkJoinPool</code> and virtual-thread schedulers, LRU-like caches everywhere.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use linked lists when you hold node references and need O(1) unlink/move; avoid them for indexed access, iteration-heavy workloads or memory-sensitive data. Use unbounded queues only when producers are naturally bounded; otherwise bound them and decide what happens when full.</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="history">
+  <h2>2. History</h2>
+  <ul>
+    <li><strong>1946 — Stacks for subroutines.</strong> Alan Turing's ACE report described "burying" and "unburying" return addresses — a stack for subroutine calls.</li>
+    <li><strong>1955–1956 — Linked lists.</strong> Allen Newell, Cliff Shaw and Herbert Simon created linked lists for the Information Processing Language (IPL) used in their Logic Theorist program at RAND.</li>
+    <li><strong>1957–1960 — Stack-based evaluation.</strong> Friedrich Bauer and Klaus Samelson patented the "stack principle" for evaluating expressions (1957); the Burroughs B5000 (1961) was a stack machine; Dijkstra's shunting-yard algorithm (1961) converted infix expressions to postfix for ALGOL 60 compilers.</li>
+    <li><strong>1958–1960 — LISP</strong> (John McCarthy) made the cons-cell singly linked list a language primitive.</li>
+    <li><strong>1967 — Floyd's cycle-finding</strong> ("tortoise and hare") is attributed to Robert Floyd; Knuth credits him in TAOCP vol. 2 (1969). Richard Brent published an improved variant in 1980.</li>
+    <li><strong>1996 — Lock-free queue.</strong> Maged Michael and Michael Scott's non-blocking concurrent queue (PODC '96) later became <code>java.util.concurrent.ConcurrentLinkedQueue</code> (Java 5, 2004).</li>
+    <li><strong>2000 — Work stealing in Java.</strong> Doug Lea's "A Java Fork/Join Framework" described per-worker deques with stealing; it shipped as <code>ForkJoinPool</code> in Java 7 (2011).</li>
+    <li><strong>2006 — ArrayDeque</strong> arrived in Java 6, and its Javadoc recommends it over both <code>Stack</code> and <code>LinkedList</code>.</li>
+    <li><strong>2011 — LMAX Disruptor</strong> was open-sourced, popularising pre-allocated ring buffers with sequence counters for low-latency messaging.</li>
+  </ul>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 Singly linked lists</h3>
+  <p>A node holds a value and a <code>next</code> reference; the list is a reference to the head (and often a tail). Operations: insert at head Θ(1); insert after a known node Θ(1); delete the node <em>after</em> a known node Θ(1); find by value or index Θ(n); delete a given node Θ(n) because you need its predecessor (unless you use the "copy the next node's value" trick, which fails for the tail). Memory: one object per element, each with an object header — on HotSpot a node with a value reference and a next reference is about 16–24 bytes plus the value.</p>
+  <p><strong>Sentinel (dummy) nodes</strong> remove special cases. With a dummy head, "insert before the first node" and "delete the first node" are the same code path as for any other position. Most interview list bugs disappear with <code>var dummy = new Node(0, head)</code> and returning <code>dummy.next</code>.</p>
+
+  <h3>3.2 Doubly linked lists</h3>
+  <p>Nodes also hold <code>prev</code>, so deleting a node you hold a reference to is Θ(1): <code>node.prev.next = node.next; node.next.prev = node.prev</code>. With <em>two</em> sentinels (head and tail) there are no null checks at all. This is the recency list in an LRU cache and the structure behind <code>LinkedHashMap</code>, <code>java.util.LinkedList</code>, Go's <code>container/list</code> (a circular list with one sentinel) and the Linux kernel's intrusive <code>list_head</code>.</p>
+  <p><strong>Intrusive vs external lists.</strong> In an external list (<code>LinkedList&lt;Order&gt;</code>), nodes wrap your objects. In an intrusive list, the object itself carries <code>prev/next</code> fields, so one object can be unlinked in O(1) given only the object, without a map from object to node. Caches and kernels prefer intrusive designs; Java collections are external, which is why an LRU needs a map from key to node.</p>
+
+  <h3>3.3 Fast and slow pointers</h3>
+  <p>Two references moving at different speeds over a sequence. Uses: <strong>middle of a list</strong> (slow moves 1, fast moves 2; when fast reaches the end, slow is at the middle), <strong>cycle detection</strong> (if there is a cycle, fast eventually laps slow), <strong>cycle entry</strong> (after they meet, restart one pointer from the head and move both one step; they meet at the entry), <strong>k-th from the end</strong> (advance one pointer k steps first, then move both). The technique works on any sequence defined by a function x → f(x), which is why "Find the Duplicate Number" (array values as next pointers) and "Happy Number" are cycle-detection problems in disguise.</p>
+
+  <h3>3.4 Reversal</h3>
+  <p>Iterative reversal keeps three references: <code>prev</code> (head of the already-reversed part), <code>cur</code> (the node to process), <code>next</code> (saved before we overwrite <code>cur.next</code>). Invariant: the nodes before <code>cur</code> form a reversed list headed by <code>prev</code>. Θ(n) time, Θ(1) space. The recursive version is elegant but uses Θ(n) stack — on a 10⁵-node list it can overflow a default thread stack. Sub-list reversal (between positions l and r, or in groups of k) is the same loop with careful reconnection of the boundaries.</p>
+
+  <h3>3.5 Stacks</h3>
+  <p>A stack supports push, pop and peek at one end. Array-backed: push/pop amortized O(1), excellent locality. Linked: O(1) worst case, a node per element. The <strong>call stack</strong> is the canonical example: each call pushes a frame (locals, return address); recursion depth is stack depth. Any recursive algorithm can be made iterative with an explicit stack — essential when depth can reach 10⁵+. Stacks also <em>match</em> things: brackets, tags, the most recent unmatched open item.</p>
+
+  <h3>3.6 Queues and circular buffers</h3>
+  <p>A queue supports enqueue at the tail and dequeue at the head. An array with a moving head wastes the front; the fix is a <strong>circular buffer</strong>: indices wrap modulo capacity, <code>tail = (tail + 1) % cap</code>. If capacity is a power of two, wrap with a mask: <code>(i + 1) &amp; (cap − 1)</code>. Distinguish full from empty by keeping a size counter (or by leaving one slot empty). A queue can also be built from <strong>two stacks</strong>: push onto <code>in</code>; to pop, if <code>out</code> is empty, move everything from <code>in</code> to <code>out</code> (reversing order), then pop <code>out</code>. Each element is moved at most once, so dequeue is amortized O(1) — a favourite amortized-analysis question, and the basis of purely functional queues.</p>
+
+  <h3>3.7 Deques</h3>
+  <p>A deque (double-ended queue) supports add/remove at both ends in O(1). A circular buffer with head and tail indices that can both move in either direction implements it. Deques are the most general of the three: use <code>push/pop</code> on one end for a stack and <code>offerLast/pollFirst</code> for a queue.</p>
+
+  <h3>3.8 Priority queues (preview)</h3>
+  <p>A priority queue dequeues the minimum (or maximum) rather than the oldest. It is a heap, not a list, and is covered in Chapter 4. Mentioned here because <code>Queue</code> in Java includes <code>PriorityQueue</code>, and confusing the two orders is a classic bug.</p>
+
+  <h3>3.9 Monotonic stacks</h3>
+  <p>A stack whose contents are kept increasing (or decreasing) from bottom to top. When a new element x arrives, pop every element that x "dominates" (e.g. smaller than x, for a decreasing stack). Each popped element has just found its <em>next greater element</em>: x. Each element is pushed once and popped at most once, so the total is Θ(n) even though there is a while loop inside the for loop. Variants answer: previous/next greater/smaller element, span ("how many consecutive days before today were ≤ today?"), the largest rectangle under a histogram (each bar's maximal extent is bounded by the previous and next smaller bars), trapping rain water, and contributions of each element as the minimum of subarrays.</p>
+
+  <h3>3.10 Monotonic queues (deques)</h3>
+  <p>For the maximum of every window of size k, keep a deque of <em>indices</em> whose values are decreasing from front to back. On each new index i: pop from the back while the back's value ≤ a[i] (they can never be a maximum again while i is in the window); push i; pop from the front if it has left the window (index ≤ i − k); the front is the window maximum. Θ(n) total. The same deque optimises some dynamic programs ("max of dp over the last k positions") — a technique you will meet again in Chapter 7.</p>
+
+  <h3>3.11 Expression evaluation</h3>
+  <p>Postfix (Reverse Polish) notation needs no parentheses or precedence: scan tokens; push numbers; on an operator pop two operands, apply, push the result. Infix needs precedence and associativity. <strong>Dijkstra's shunting-yard</strong> uses an operator stack: output numbers immediately; for an operator, pop to the output any operators of higher precedence (or equal precedence if left-associative), then push; "(" is pushed; ")" pops until "(". The output is postfix, which you evaluate with the first algorithm (or evaluate on the fly with two stacks). <strong>Recursive descent</strong> mirrors the grammar — <code>expr := term (('+'|'-') term)*</code>, <code>term := factor (('*'|'/') factor)*</code>, <code>factor := number | '(' expr ')' | '-' factor</code> — using the call stack as the operator stack. Both are Θ(n). Real-world descendants: Spring Expression Language (SpEL) parser, query planners, and every config/templating language.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working</h2>
+
+  <h3>4.1 Reversal, traced</h3>
+<pre class="ascii">
+start:  prev=null   cur=1 -&gt; 2 -&gt; 3 -&gt; null
+
+step 1: next=2;  1.next=null;  prev=1;  cur=2       reversed: 1 -&gt; null        rest: 2 -&gt; 3
+step 2: next=3;  2.next=1;     prev=2;  cur=3       reversed: 2 -&gt; 1 -&gt; null   rest: 3
+step 3: next=null; 3.next=2;   prev=3;  cur=null    reversed: 3 -&gt; 2 -&gt; 1 -&gt; null
+return prev (3)
+</pre>
+  <p>The order of the four assignments matters: save <code>next</code> before overwriting <code>cur.next</code>, otherwise the rest of the list is lost. That is the single most common bug in list problems.</p>
+
+  <h3>4.2 Floyd's cycle detection, traced</h3>
+<pre class="ascii">
+list: 1 -&gt; 2 -&gt; 3 -&gt; 4 -&gt; 5 -&gt; 6
+                     ^              |
+                     +--------------+     (6.next = 3, entry = 3, tail length mu = 2, cycle length lambda = 4)
+
+t  slow fast
+0   1    1
+1   2    3
+2   3    5
+3   4    3
+4   5    5   &lt;-- meet at 5
+phase 2: p=head(1), q=meet(5); step both by 1
+     1,5 -&gt; 2,6 -&gt; 3,3   meet at 3 = cycle entry
+</pre>
+  <p>Why phase 2 works is proven in §6.2. Brent's variant moves one pointer in powers of two and typically makes fewer function evaluations; both are O(μ + λ) time, O(1) space.</p>
+
+  <h3>4.3 java.util.LinkedList</h3>
+  <p>A doubly linked list with <code>first</code> and <code>last</code> fields (no sentinel) and inner <code>Node&lt;E&gt;{item, next, prev}</code>. It implements both <code>List</code> and <code>Deque</code>. <code>get(i)</code> walks from whichever end is closer (<code>i &lt; size &gt;&gt; 1</code>), so it is Θ(min(i, n−i)) — and a <code>for (int i…) list.get(i)</code> loop is Θ(n²). Its only real advantage is O(1) removal through a <code>ListIterator</code> you already hold; Joshua Bloch, who wrote it, has remarked publicly that he does not use it. <span class="tag opinion">Opinion</span> In practice <code>ArrayList</code> or <code>ArrayDeque</code> wins almost every benchmark because of locality and lower per-element memory (~24 bytes of node overhead per element in <code>LinkedList</code>).</p>
+
+  <h3>4.4 ArrayDeque</h3>
+  <p><code>ArrayDeque</code> is a circular buffer over <code>Object[] elements</code> with <code>head</code> (index of the first element) and <code>tail</code> (index where the next <code>addLast</code> goes). <code>addFirst</code> decrements <code>head</code> modulo the length; <code>addLast</code> writes at <code>tail</code> and increments it. When the buffer becomes full it grows: in JDK 9+ the growth is roughly doubling for small arrays (under 64) and +50% for larger ones, and the capacity is no longer required to be a power of two (JDK 6–8 used power-of-two capacities and masks). The elements wrapped past the end are moved so that the contents stay contiguous modulo the new length. Nulls are prohibited (null is used to mark empty slots, and <code>poll</code> returns null for "empty"). It is not thread-safe. <span class="tag version">Version-sensitive · checked Nov 2026</span></p>
+<pre class="ascii">
+capacity 8, after addLast(a,b,c) and addFirst(z,y):
+
+ index:  0   1   2   3   4   5   6   7
+        [a] [b] [c] [ ] [ ] [ ] [y] [z]
+                     ^tail       ^head          logical order: y z a b c
+
+pollFirst -&gt; y (head moves to 7);  pollLast -&gt; c (tail moves to 2)
+</pre>
+  <p><code>java.util.Stack</code> extends <code>Vector</code>: every method is <code>synchronized</code>, and it exposes index-based methods that break the stack abstraction. Use <code>Deque&lt;Integer&gt; st = new ArrayDeque&lt;&gt;()</code> with <code>push/pop/peek</code>. Beware that <code>ArrayDeque</code> iterates a stack from top to bottom, whereas <code>Stack</code> iterates bottom to top.</p>
+
+  <h3>4.5 LinkedHashMap as an LRU</h3>
+  <p><code>LinkedHashMap</code> extends <code>HashMap</code>; its entries add <code>before</code>/<code>after</code> links forming a doubly linked list through all entries. With the constructor flag <code>accessOrder = true</code>, every <code>get</code> or <code>put</code> of an existing key moves the entry to the tail (<code>afterNodeAccess</code>). After each insertion it calls <code>removeEldestEntry(eldest)</code>; override it to return <code>size() &gt; capacity</code> and you have an LRU cache in a few lines. It is not thread-safe — and note that in access-order mode even <code>get</code> is a structural modification, so concurrent readers corrupt it. Java 21's <code>SequencedMap</code> adds <code>putFirst/putLast/pollFirstEntry</code>.</p>
+
+  <h3>4.6 Python deque and OrderedDict</h3>
+  <p>CPython's <code>collections.deque</code> is a doubly linked list of fixed-size <em>blocks</em> (64 slots each). Appends and pops at either end are O(1) and touch one block; indexing the middle is O(n/64) — fine near the ends, linear in the middle. A <code>maxlen</code> deque discards from the opposite end, giving a ready-made bounded ring buffer. <code>OrderedDict</code> keeps a doubly linked list of keys alongside the dict, so <code>move_to_end(key)</code> and <code>popitem(last=False)</code> are O(1) — an LRU in a few lines. <code>functools.lru_cache</code> is implemented in C with a circular doubly linked list plus a dict.</p>
+
+  <h3>4.7 Concurrent queues in java.util.concurrent</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Class</th><th>Structure</th><th>Concurrency</th><th>Bound</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td><code>ArrayBlockingQueue</code></td><td>circular array</td><td>one <code>ReentrantLock</code>, two conditions</td><td>bounded</td><td>backpressure between stages</td></tr>
+      <tr><td><code>LinkedBlockingQueue</code></td><td>singly linked list</td><td>two locks (put lock, take lock)</td><td>optional (default <code>Integer.MAX_VALUE</code>)</td><td><code>Executors.newFixedThreadPool</code> (unbounded!)</td></tr>
+      <tr><td><code>ConcurrentLinkedQueue</code></td><td>Michael–Scott linked queue</td><td>lock-free CAS</td><td>unbounded</td><td>non-blocking handoff</td></tr>
+      <tr><td><code>ConcurrentLinkedDeque</code></td><td>doubly linked</td><td>lock-free</td><td>unbounded</td><td>lock-free deque</td></tr>
+      <tr><td><code>LinkedTransferQueue</code></td><td>dual queue</td><td>lock-free</td><td>unbounded</td><td>producers can wait for consumers</td></tr>
+      <tr><td><code>SynchronousQueue</code></td><td>no storage</td><td>handoff</td><td>0</td><td><code>newCachedThreadPool</code></td></tr>
+      <tr><td><code>PriorityBlockingQueue</code> / <code>DelayQueue</code></td><td>binary heap</td><td>one lock</td><td>unbounded</td><td>scheduling</td></tr>
+    </tbody>
+  </table></div>
+  <p>The two-lock design of <code>LinkedBlockingQueue</code> works because producers touch only the tail and consumers only the head; a linked structure makes those two ends independent memory locations, something a single array cannot offer as cleanly.</p>
+
+  <h3>4.8 Monotonic stack, traced (next greater element)</h3>
+<pre class="ascii">
+a = [2, 1, 2, 4, 3]       stack holds indices, values decreasing bottom-&gt;top
+i=0 (2): stack []        push 0          stack [0:2]
+i=1 (1): 1 &lt; 2           push 1          stack [0:2, 1:1]
+i=2 (2): pop 1 (1&lt;2) -&gt; nge[1]=2;  2 !&lt; 2 stop; push 2     stack [0:2, 2:2]
+i=3 (4): pop 2 -&gt; nge[2]=4; pop 0 -&gt; nge[0]=4; push 3      stack [3:4]
+i=4 (3): push 4                                           stack [3:4, 4:3]
+end: remaining indices have no next greater -&gt; -1
+nge = [4, 2, 4, -1, -1]       pushes = 5, pops = 3  =&gt; Theta(n)
+</pre>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: The Structures in Pictures</h2>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph LRU["LRU cache = HashMap + doubly linked list"]
+    direction LR
+    H["head sentinel"] --- A["key 7 (LRU)"] --- B["key 3"] --- C["key 9 (MRU)"] --- T["tail sentinel"]
+  end
+  M["HashMap key to node"] -.-> A
+  M -.-> B
+  M -.-> C
+</pre>
+    <figcaption>Figure 3.5 — An LRU cache: the map gives O(1) access to a node; the list gives O(1) reordering and eviction.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> a <code>get(3)</code> finds node 3 through the map, unlinks it (two pointer writes) and relinks it before the tail sentinel, making it most recently used. A <code>put</code> that overflows capacity removes <code>head.next</code> (key 7) from both the list and the map — which is why each node stores its key. Neither structure alone suffices: the map has no order, the list has no O(1) lookup.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant W1 as Worker 1 deque
+  participant W2 as Worker 2 deque (empty)
+  Note over W1: owner pushes and pops at the TOP (LIFO)
+  W1->>W1: push(task A), push(task B), push(task C)
+  W1->>W1: pop() returns C (most recent, cache-hot)
+  W2->>W1: steal() takes A from the BOTTOM (oldest, likely largest)
+  Note over W1,W2: owner and thief touch opposite ends, so contention is rare
+</pre>
+    <figcaption>Figure 3.6 — Work stealing in ForkJoinPool: each worker owns a deque.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the owner treats its deque as a stack, which keeps recently split subtasks (and their data) hot in cache. Idle workers steal from the opposite end, taking the oldest task — in divide-and-conquer workloads that is the biggest remaining chunk, so one steal transfers a lot of work. Only when the deque has one element do owner and thief race, resolved with a CAS. This is the scheduler behind parallel streams, <code>CompletableFuture</code>'s default async pool, and the carrier threads of virtual threads.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> Empty
+  Empty --> Partial: offer
+  Partial --> Partial: offer or poll
+  Partial --> Full: offer reaches capacity
+  Full --> Partial: poll
+  Partial --> Empty: poll last element
+  Full --> Full: offer blocks, times out, or is rejected
+</pre>
+    <figcaption>Figure 3.7 — Lifecycle of a bounded queue; the Full state is where backpressure policy lives.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> what happens in <em>Full</em> is a design decision, not an implementation detail: <code>put</code> blocks the producer (backpressure), <code>offer</code> with a timeout fails after waiting, and a <code>ThreadPoolExecutor</code> invokes its <code>RejectedExecutionHandler</code> (abort, caller-runs, discard, discard-oldest). Unbounded queues have no Full state — they convert overload into memory growth and latency instead.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math: Costs, Proofs and Amortization</h2>
+
+  <h3>6.1 Operation costs</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Operation</th><th>Singly linked</th><th>Doubly linked</th><th>Dynamic array</th><th>Circular deque</th></tr></thead>
+    <tbody>
+      <tr><td>Access k-th</td><td>Θ(k)</td><td>Θ(min(k, n−k))</td><td>Θ(1)</td><td>Θ(1)</td></tr>
+      <tr><td>Insert/delete at front</td><td>Θ(1)</td><td>Θ(1)</td><td>Θ(n)</td><td>Θ(1) amortized</td></tr>
+      <tr><td>Insert/delete at back</td><td>Θ(1) insert with tail; Θ(n) delete</td><td>Θ(1)</td><td>Θ(1) amortized</td><td>Θ(1) amortized</td></tr>
+      <tr><td>Delete a held node</td><td>Θ(n) (need predecessor)</td><td>Θ(1)</td><td>Θ(n)</td><td>Θ(n)</td></tr>
+      <tr><td>Extra memory per element</td><td>1 ref + header</td><td>2 refs + header</td><td>≤ (r−1)× slack</td><td>≤ slack</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>6.2 Proof of Floyd's algorithm</h3>
+  <p>Intuition: once both pointers are inside the cycle, the gap between them shrinks by one each step (fast gains one node per step), so they must meet within λ steps. Formally, let μ be the number of nodes before the cycle entry and λ the cycle length. After t steps, slow is at position t and fast at 2t (positions counted along the sequence). They coincide inside the cycle when t ≥ μ and 2t − t = t ≡ 0 (mod λ), i.e. at the first multiple of λ that is ≥ μ — so t ≤ μ + λ.</p>
+  <p>For the entry: at the meeting time t, t is a multiple of λ. Pointer p starts at the head and q at the meeting point (position t). After μ more steps p is at position μ (the entry) and q is at position t + μ ≡ μ (mod λ) inside the cycle — also the entry, because t ≡ 0. So they meet exactly at the entry. Cycle length: from the meeting point, walk until you return, λ steps. Total Θ(μ + λ) time, Θ(1) space — versus Θ(n) space for a <code>HashSet</code> of visited nodes.</p>
+
+  <h3>6.3 Two-stack queue: potential argument</h3>
+  <p>Let Φ = 2 × |in|. Enqueue: actual 1, ΔΦ = 2, amortized 3. Dequeue with <code>out</code> non-empty: actual 1, ΔΦ = 0. Dequeue with <code>out</code> empty and |in| = k: actual 2k + 1 (k pops, k pushes, 1 pop), ΔΦ = −2k, amortized 1. So every operation is amortized O(1), and the worst single dequeue is Θ(n). (Real-time queues from Okasaki's work remove the spike by transferring incrementally.)</p>
+
+  <h3>6.4 Monotonic stack: aggregate argument</h3>
+  <p>Each index is pushed exactly once and popped at most once. The work of the inner <code>while</code> loop summed over the whole run is at most n pops, so total time is Θ(n) + Θ(n) = Θ(n). The same argument bounds the monotonic deque (each index enters and leaves at most once from either end).</p>
+
+  <h3>6.5 Largest rectangle in a histogram: why the stack finds every candidate</h3>
+  <p>The optimal rectangle has height equal to some bar h[i] (otherwise raise it to the shortest bar it covers). For that bar, the rectangle extends left to just after the previous strictly smaller bar L(i) and right to just before the next smaller bar R(i): area = h[i] × (R(i) − L(i) − 1). An increasing stack computes R(i) at the moment i is popped (the popping index) and L(i) as the new top below it. All n candidates are evaluated in Θ(n).</p>
+
+  <h3>6.6 Little's law for queues</h3>
+  <p>Back-of-envelope for production queues: L = λ × W — the average number of items in a stable system equals arrival rate times average time in system. <span class="tag illus">Illustrative</span> A queue receiving 2,000 jobs/s where each job spends 50 ms waiting plus being processed holds about 100 jobs on average. If the queue suddenly holds 20,000 jobs, either λ rose or W did (slow downstream) — and every new job now waits ≈ 10 s. A bound of a few hundred items and a rejection policy keeps W predictable.</p>
+
+  <h3>6.7 Ring buffer index arithmetic</h3>
+  <p>For capacity C = 2ᵏ, <code>i mod C = i &amp; (C − 1)</code> for non-negative i. The Disruptor uses ever-increasing 64-bit sequence numbers and masks them to slot indices, so "full" is simply <code>producerSeq − consumerSeq == C</code> — no wrap-around ambiguity. At 10⁹ events/s a 64-bit counter overflows after about 292 years.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code</h2>
+  <p>Complete Java 21 programs with self-checking <code>main</code> methods, plus Python equivalents.</p>
+
+  <h3>7.1 Linked list toolkit</h3>
+  <div class="code-tabs">
+<pre data-lang="Java" data-file="ListToolkit.java"><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+public final class ListToolkit {
+    static final class Node {
+        int val; Node next;
+        Node(int val, Node next) { this.val = val; this.next = next; }
+    }
+
+    static Node of(int... vals) {
+        Node dummy = new Node(0, null), t = dummy;
+        for (int v : vals) t = t.next = new Node(v, null);
+        return dummy.next;
+    }
+
+    static List&lt;Integer&gt; toList(Node h) {
+        List&lt;Integer&gt; out = new ArrayList&lt;&gt;();
+        for (; h != null; h = h.next) out.add(h.val);
+        return out;
+    }
+
+    /** Iterative reversal: Theta(n) time, Theta(1) space. */
+    static Node reverse(Node head) {
+        Node prev = null, cur = head;
+        while (cur != null) {
+            Node next = cur.next;   // 1. save
+            cur.next = prev;        // 2. rewire
+            prev = cur;             // 3. advance prev
+            cur = next;             // 4. advance cur
+        }
+        return prev;
+    }
+
+    /** Recursive reversal: elegant, but Theta(n) stack. */
+    static Node reverseRec(Node head) {
+        if (head == null || head.next == null) return head;
+        Node newHead = reverseRec(head.next);
+        head.next.next = head;      // the node after head now points back
+        head.next = null;
+        return newHead;
+    }
+
+    /** Second middle for even lengths (1,2,3,4 -&gt; 3). */
+    static Node middle(Node head) {
+        Node slow = head, fast = head;
+        while (fast != null &amp;&amp; fast.next != null) { slow = slow.next; fast = fast.next.next; }
+        return slow;
+    }
+
+    /** Floyd: returns the cycle entry, or null if acyclic. */
+    static Node cycleEntry(Node head) {
+        Node slow = head, fast = head;
+        while (fast != null &amp;&amp; fast.next != null) {
+            slow = slow.next; fast = fast.next.next;
+            if (slow == fast) {                     // phase 2
+                Node p = head;
+                while (p != slow) { p = p.next; slow = slow.next; }
+                return p;
+            }
+        }
+        return null;
+    }
+
+    /** Merge two sorted lists with a dummy head: Theta(n + m), stable. */
+    static Node merge(Node a, Node b) {
+        Node dummy = new Node(0, null), t = dummy;
+        while (a != null &amp;&amp; b != null) {
+            if (a.val &lt;= b.val) { t.next = a; a = a.next; } else { t.next = b; b = b.next; }
+            t = t.next;
+        }
+        t.next = (a != null) ? a : b;
+        return dummy.next;
+    }
+
+    /** Remove the n-th node from the end in one pass (gap of n between pointers). */
+    static Node removeNthFromEnd(Node head, int n) {
+        Node dummy = new Node(0, head), lead = dummy, lag = dummy;
+        for (int i = 0; i &lt;= n; i++) lead = lead.next;
+        while (lead != null) { lead = lead.next; lag = lag.next; }
+        lag.next = lag.next.next;
+        return dummy.next;
+    }
+
+    /** Merge sort on a linked list: Theta(n log n), O(log n) stack, no random access needed. */
+    static Node sort(Node head) {
+        if (head == null || head.next == null) return head;
+        Node slow = head, fast = head.next;            // first middle so halves shrink
+        while (fast != null &amp;&amp; fast.next != null) { slow = slow.next; fast = fast.next.next; }
+        Node second = slow.next;
+        slow.next = null;
+        return merge(sort(head), sort(second));
+    }
+
+    public static void main(String[] args) {
+        check(toList(reverse(of(1, 2, 3, 4))), List.of(4, 3, 2, 1));
+        check(toList(reverseRec(of(1, 2, 3))), List.of(3, 2, 1));
+        if (middle(of(1, 2, 3, 4)).val != 3 || middle(of(1, 2, 3)).val != 2) throw new AssertionError();
+        Node c = of(1, 2, 3, 4, 5, 6), entry = c.next.next, tail = c;
+        while (tail.next != null) tail = tail.next;
+        tail.next = entry;
+        if (cycleEntry(c) != entry || cycleEntry(of(1, 2)) != null) throw new AssertionError();
+        check(toList(merge(of(1, 3, 5), of(2, 3, 6))), List.of(1, 2, 3, 3, 5, 6));
+        check(toList(removeNthFromEnd(of(1, 2, 3, 4, 5), 2)), List.of(1, 2, 3, 5));
+        check(toList(removeNthFromEnd(of(1), 1)), List.of());
+        check(toList(sort(of(4, 2, 1, 3, 2))), List.of(1, 2, 2, 3, 4));
+        System.out.println("list toolkit ok");
+    }
+    static void check(Object got, Object want) { if (!got.equals(want)) throw new AssertionError(got + " != " + want); }
+}</code></pre>
+<pre data-lang="Python"><code class="language-python">from __future__ import annotations
+from dataclasses import dataclass
+
+@dataclass
+class Node:
+    val: int
+    next: Node | None = None
+
+def build(*vals):
+    dummy = tail = Node(0)
+    for v in vals:
+        tail.next = Node(v)
+        tail = tail.next
+    return dummy.next
+
+def to_list(h):
+    out = []
+    while h:
+        out.append(h.val)
+        h = h.next
+    return out
+
+def reverse(head):
+    prev = None
+    while head:
+        head.next, prev, head = prev, head, head.next   # RHS evaluated first: safe
+    return prev
+
+def cycle_entry(head):
+    slow = fast = head
+    while fast and fast.next:
+        slow, fast = slow.next, fast.next.next
+        if slow is fast:
+            p = head
+            while p is not slow:
+                p, slow = p.next, slow.next
+            return p
+    return None
+
+def merge(a, b):
+    dummy = t = Node(0)
+    while a and b:
+        if a.val &lt;= b.val:
+            t.next, a = a, a.next
+        else:
+            t.next, b = b, b.next
+        t = t.next
+    t.next = a or b
+    return dummy.next
+
+assert to_list(reverse(build(1, 2, 3))) == [3, 2, 1]
+assert to_list(merge(build(1, 3), build(2, 4))) == [1, 2, 3, 4]</code></pre>
+  </div>
+  <p>Python's tuple assignment <code>head.next, prev, head = prev, head, head.next</code> is safe because the right side is evaluated completely first; the left targets are then assigned left to right. Reordering the targets (e.g. assigning <code>head</code> before <code>head.next</code>) silently breaks it — a well-known gotcha.</p>
+
+  <h3>7.2 LRU cache: from scratch and with LinkedHashMap</h3>
+  <div class="code-tabs">
+<pre data-lang="Java" data-file="LruCache.java"><code class="language-java">import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+/** O(1) get/put LRU cache: HashMap for lookup, doubly linked list with two sentinels for recency. */
+public final class LruCache&lt;K, V&gt; {
+    private final class Node {
+        K key; V val; Node prev, next;
+        Node(K k, V v) { key = k; val = v; }
+    }
+
+    private final int capacity;
+    private final Map&lt;K, Node&gt; index = new HashMap&lt;&gt;();
+    private final Node head = new Node(null, null);   // head.next = least recently used
+    private final Node tail = new Node(null, null);   // tail.prev = most recently used
+
+    public LruCache(int capacity) {
+        if (capacity &lt;= 0) throw new IllegalArgumentException("capacity");
+        this.capacity = capacity;
+        head.next = tail; tail.prev = head;
+    }
+
+    public V get(K key) {
+        Node n = index.get(key);
+        if (n == null) return null;
+        unlink(n); linkLast(n);                       // mark as most recently used
+        return n.val;
+    }
+
+    public void put(K key, V val) {
+        Node n = index.get(key);
+        if (n != null) { n.val = val; unlink(n); linkLast(n); return; }
+        if (index.size() == capacity) {               // evict LRU
+            Node lru = head.next;
+            unlink(lru);
+            index.remove(lru.key);                    // why each node stores its key
+        }
+        n = new Node(key, val);
+        index.put(key, n);
+        linkLast(n);
+    }
+
+    private void unlink(Node n) { n.prev.next = n.next; n.next.prev = n.prev; }
+    private void linkLast(Node n) { n.prev = tail.prev; n.next = tail; tail.prev.next = n; tail.prev = n; }
+
+    /** The library version: access-ordered LinkedHashMap + removeEldestEntry. */
+    static &lt;K, V&gt; Map&lt;K, V&gt; linkedHashMapLru(int capacity) {
+        return new LinkedHashMap&lt;&gt;(16, 0.75f, true) {
+            @Override protected boolean removeEldestEntry(Map.Entry&lt;K, V&gt; eldest) { return size() &gt; capacity; }
+        };
+    }
+
+    public static void main(String[] args) {
+        var c = new LruCache&lt;Integer, String&gt;(2);
+        c.put(1, "a"); c.put(2, "b");
+        c.get(1);                 // 1 becomes MRU
+        c.put(3, "c");            // evicts 2
+        if (c.get(2) != null || !"a".equals(c.get(1)) || !"c".equals(c.get(3))) throw new AssertionError();
+        var m = LruCache.&lt;Integer, String&gt;linkedHashMapLru(2);
+        m.put(1, "a"); m.put(2, "b"); m.get(1); m.put(3, "c");
+        if (m.containsKey(2) || !m.containsKey(1)) throw new AssertionError(m);
+        System.out.println("lru ok " + m.keySet());
+    }
+}</code></pre>
+<pre data-lang="Python"><code class="language-python">from collections import OrderedDict
+
+class LRUCache:
+    def __init__(self, capacity: int):
+        self.cap = capacity
+        self.data: OrderedDict = OrderedDict()
+
+    def get(self, key, default=None):
+        if key not in self.data:
+            return default
+        self.data.move_to_end(key)           # O(1): doubly linked list underneath
+        return self.data[key]
+
+    def put(self, key, value):
+        if key in self.data:
+            self.data.move_to_end(key)
+        self.data[key] = value
+        if len(self.data) &gt; self.cap:
+            self.data.popitem(last=False)    # evict least recently used
+
+c = LRUCache(2)
+c.put(1, "a"); c.put(2, "b"); c.get(1); c.put(3, "c")
+assert c.get(2) is None and c.get(1) == "a"
+
+# For memoizing pure functions, the standard library already has it:
+from functools import lru_cache
+
+@lru_cache(maxsize=1024)
+def fib(n: int) -&gt; int:
+    return n if n &lt; 2 else fib(n - 1) + fib(n - 2)
+
+assert fib(90) == 2880067194370816120</code></pre>
+  </div>
+  <p>Thread safety: neither version is safe for concurrent use. Wrapping in <code>Collections.synchronizedMap</code> works but serialises every read. Production caches (Caffeine) avoid a global lock by recording accesses in striped ring buffers and replaying them onto the policy asynchronously.</p>
+
+  <h3>7.3 Ring buffer queue, two-stack queue and min-stack</h3>
+  <div class="code-tabs">
+<pre data-lang="Java" data-file="Queues.java"><code class="language-java">import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.NoSuchElementException;
+
+public final class Queues {
+
+    /** Bounded FIFO ring buffer; power-of-two capacity so wrap is a mask. Not thread-safe. */
+    static final class RingBuffer&lt;E&gt; {
+        private final Object[] buf;
+        private final int mask;
+        private long head, tail;              // monotonically increasing sequence numbers
+
+        RingBuffer(int capacityPow2) {
+            if (Integer.bitCount(capacityPow2) != 1) throw new IllegalArgumentException("power of two");
+            buf = new Object[capacityPow2];
+            mask = capacityPow2 - 1;
+        }
+        boolean offer(E e) {
+            if (tail - head == buf.length) return false;       // full: caller decides policy
+            buf[(int) (tail++ &amp; mask)] = e;
+            return true;
+        }
+        @SuppressWarnings("unchecked")
+        E poll() {
+            if (head == tail) return null;
+            int i = (int) (head++ &amp; mask);
+            E e = (E) buf[i];
+            buf[i] = null;
+            return e;
+        }
+        int size() { return (int) (tail - head); }
+    }
+
+    /** Queue from two stacks: amortized O(1) per operation. */
+    static final class TwoStackQueue&lt;E&gt; {
+        private final Deque&lt;E&gt; in = new ArrayDeque&lt;&gt;(), out = new ArrayDeque&lt;&gt;();
+        void enqueue(E e) { in.push(e); }
+        E dequeue() {
+            if (out.isEmpty()) while (!in.isEmpty()) out.push(in.pop());   // each element moves once
+            if (out.isEmpty()) throw new NoSuchElementException();
+            return out.pop();
+        }
+    }
+
+    /** Stack with O(1) getMin: store (value, min-so-far) pairs. */
+    static final class MinStack {
+        private record Entry(int val, int min) {}
+        private final Deque&lt;Entry&gt; st = new ArrayDeque&lt;&gt;();
+        void push(int x) { st.push(new Entry(x, st.isEmpty() ? x : Math.min(x, st.peek().min()))); }
+        int pop() { return st.pop().val(); }
+        int top() { return st.peek().val(); }
+        int getMin() { return st.peek().min(); }
+    }
+
+    public static void main(String[] args) {
+        var rb = new RingBuffer&lt;Integer&gt;(4);
+        for (int i = 0; i &lt; 4; i++) if (!rb.offer(i)) throw new AssertionError();
+        if (rb.offer(99)) throw new AssertionError("should be full");
+        if (rb.poll() != 0 || !rb.offer(4) || rb.size() != 4) throw new AssertionError();
+        var q = new TwoStackQueue&lt;String&gt;();
+        q.enqueue("a"); q.enqueue("b"); String x = q.dequeue(); q.enqueue("c");
+        if (!x.equals("a") || !q.dequeue().equals("b") || !q.dequeue().equals("c")) throw new AssertionError();
+        var ms = new MinStack();
+        ms.push(5); ms.push(2); ms.push(7); ms.push(1);
+        if (ms.getMin() != 1) throw new AssertionError();
+        ms.pop();
+        if (ms.getMin() != 2 || ms.top() != 7) throw new AssertionError();
+        System.out.println("queues ok");
+    }
+}</code></pre>
+<pre data-lang="Python"><code class="language-python">from collections import deque
+
+q = deque(maxlen=3)            # bounded ring buffer: drops from the opposite end when full
+for i in range(5):
+    q.append(i)
+assert list(q) == [2, 3, 4]
+
+stack = []                     # list is the idiomatic stack
+stack.append(1); stack.append(2)
+assert stack.pop() == 2
+
+class MinStack:
+    def __init__(self):
+        self._s: list[tuple[int, int]] = []
+    def push(self, x: int):
+        self._s.append((x, min(x, self._s[-1][1]) if self._s else x))
+    def pop(self) -&gt; int:
+        return self._s.pop()[0]
+    def get_min(self) -&gt; int:
+        return self._s[-1][1]
+
+ms = MinStack(); ms.push(3); ms.push(1); ms.push(2)
+assert ms.get_min() == 1</code></pre>
+  </div>
+
+  <h3>7.4 Monotonic stack and monotonic deque</h3>
+  <div class="code-tabs">
+<pre data-lang="Java" data-file="Monotonic.java"><code class="language-java">import java.util.ArrayDeque;
+import java.util.Arrays;
+import java.util.Deque;
+
+public final class Monotonic {
+
+    /** nge[i] = first value to the right greater than a[i], or -1. Theta(n). */
+    static int[] nextGreater(int[] a) {
+        int[] nge = new int[a.length];
+        Arrays.fill(nge, -1);
+        Deque&lt;Integer&gt; st = new ArrayDeque&lt;&gt;();                 // indices, values decreasing
+        for (int i = 0; i &lt; a.length; i++) {
+            while (!st.isEmpty() &amp;&amp; a[st.peek()] &lt; a[i]) nge[st.pop()] = a[i];
+            st.push(i);
+        }
+        return nge;
+    }
+
+    /** Max of each window of size k. Deque of indices with decreasing values. Theta(n). */
+    static int[] windowMax(int[] a, int k) {
+        int[] out = new int[a.length - k + 1];
+        Deque&lt;Integer&gt; dq = new ArrayDeque&lt;&gt;();
+        for (int i = 0; i &lt; a.length; i++) {
+            while (!dq.isEmpty() &amp;&amp; a[dq.peekLast()] &lt;= a[i]) dq.pollLast(); // dominated
+            dq.offerLast(i);
+            if (dq.peekFirst() &lt;= i - k) dq.pollFirst();                     // expired
+            if (i &gt;= k - 1) out[i - k + 1] = a[dq.peekFirst()];
+        }
+        return out;
+    }
+
+    /** Largest rectangle in a histogram: increasing stack, sentinel bar of height 0 at the end. */
+    static long largestRectangle(int[] h) {
+        Deque&lt;Integer&gt; st = new ArrayDeque&lt;&gt;();
+        long best = 0;
+        for (int i = 0; i &lt;= h.length; i++) {
+            int cur = (i == h.length) ? 0 : h[i];
+            while (!st.isEmpty() &amp;&amp; h[st.peek()] &gt;= cur) {
+                int height = h[st.pop()];
+                int left = st.isEmpty() ? -1 : st.peek();      // previous smaller bar
+                best = Math.max(best, (long) height * (i - left - 1));  // i is the next smaller bar
+            }
+            st.push(i);
+        }
+        return best;
+    }
+
+    public static void main(String[] args) {
+        if (!Arrays.equals(nextGreater(new int[]{2, 1, 2, 4, 3}), new int[]{4, 2, 4, -1, -1})) throw new AssertionError();
+        if (!Arrays.equals(windowMax(new int[]{1, 3, -1, -3, 5, 3, 6, 7}, 3), new int[]{3, 3, 5, 5, 6, 7})) throw new AssertionError();
+        if (largestRectangle(new int[]{2, 1, 5, 6, 2, 3}) != 10) throw new AssertionError();
+        System.out.println("monotonic ok");
+    }
+}</code></pre>
+<pre data-lang="Python"><code class="language-python">from collections import deque
+
+def next_greater(a):
+    nge, st = [-1] * len(a), []
+    for i, x in enumerate(a):
+        while st and a[st[-1]] &lt; x:
+            nge[st.pop()] = x
+        st.append(i)
+    return nge
+
+def window_max(a, k):
+    dq, out = deque(), []
+    for i, x in enumerate(a):
+        while dq and a[dq[-1]] &lt;= x:
+            dq.pop()
+        dq.append(i)
+        if dq[0] &lt;= i - k:
+            dq.popleft()
+        if i &gt;= k - 1:
+            out.append(a[dq[0]])
+    return out
+
+assert next_greater([2, 1, 2, 4, 3]) == [4, 2, 4, -1, -1]
+assert window_max([1, 3, -1, -3, 5, 3, 6, 7], 3) == [3, 3, 5, 5, 6, 7]</code></pre>
+  </div>
+
+  <h3>7.5 Expression evaluation: shunting-yard and recursive descent</h3>
+  <div class="code-tabs">
+<pre data-lang="Java" data-file="Calculator.java"><code class="language-java">import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.Map;
+
+/** Integer calculator supporting + - * / parentheses and unary minus. */
+public final class Calculator {
+    private static final Map&lt;Character, Integer&gt; PREC = Map.of('+', 1, '-', 1, '*', 2, '/', 2, '~', 3);
+
+    /** Shunting-yard with two stacks, evaluating as operators are popped. '~' = unary minus. */
+    static long evalShunting(String s) {
+        Deque&lt;Long&gt; nums = new ArrayDeque&lt;&gt;();
+        Deque&lt;Character&gt; ops = new ArrayDeque&lt;&gt;();
+        boolean expectOperand = true;
+        for (int i = 0; i &lt; s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == ' ') continue;
+            if (Character.isDigit(c)) {
+                long v = 0;
+                while (i &lt; s.length() &amp;&amp; Character.isDigit(s.charAt(i))) v = v * 10 + (s.charAt(i++) - '0');
+                i--;
+                nums.push(v);
+                expectOperand = false;
+            } else if (c == '(') { ops.push(c); expectOperand = true; }
+            else if (c == ')') {
+                while (ops.peek() != '(') apply(nums, ops.pop());
+                ops.pop();
+                expectOperand = false;
+            } else {
+                char op = (c == '-' &amp;&amp; expectOperand) ? '~' : c;
+                // left-associative binary ops pop equal precedence; unary (right-assoc) does not
+                while (!ops.isEmpty() &amp;&amp; ops.peek() != '(' &amp;&amp; op != '~'
+                        &amp;&amp; PREC.get(ops.peek()) &gt;= PREC.get(op)) apply(nums, ops.pop());
+                ops.push(op);
+                expectOperand = true;
+            }
+        }
+        while (!ops.isEmpty()) apply(nums, ops.pop());
+        return nums.pop();
+    }
+
+    private static void apply(Deque&lt;Long&gt; nums, char op) {
+        if (op == '~') { nums.push(-nums.pop()); return; }
+        long b = nums.pop(), a = nums.pop();
+        nums.push(switch (op) {
+            case '+' -&gt; a + b;
+            case '-' -&gt; a - b;
+            case '*' -&gt; a * b;
+            case '/' -&gt; a / b;                 // truncates toward zero like Java
+            default -&gt; throw new IllegalStateException("op " + op);
+        });
+    }
+
+    /** Recursive descent: the grammar is the code. */
+    static final class Parser {
+        private final String s; private int pos;
+        Parser(String s) { this.s = s.replace(" ", ""); }
+        long parse() { long v = expr(); if (pos != s.length()) throw new IllegalArgumentException("junk at " + pos); return v; }
+        private long expr() {                     // expr := term (('+'|'-') term)*
+            long v = term();
+            while (pos &lt; s.length() &amp;&amp; (s.charAt(pos) == '+' || s.charAt(pos) == '-'))
+                v = s.charAt(pos++) == '+' ? v + term() : v - term();
+            return v;
+        }
+        private long term() {                     // term := factor (('*'|'/') factor)*
+            long v = factor();
+            while (pos &lt; s.length() &amp;&amp; (s.charAt(pos) == '*' || s.charAt(pos) == '/'))
+                v = s.charAt(pos++) == '*' ? v * factor() : v / factor();
+            return v;
+        }
+        private long factor() {                   // factor := '-' factor | '(' expr ')' | number
+            char c = s.charAt(pos);
+            if (c == '-') { pos++; return -factor(); }
+            if (c == '(') { pos++; long v = expr(); pos++; return v; }
+            long v = 0;
+            while (pos &lt; s.length() &amp;&amp; Character.isDigit(s.charAt(pos))) v = v * 10 + (s.charAt(pos++) - '0');
+            return v;
+        }
+    }
+
+    public static void main(String[] args) {
+        String[] cases = {"1 + 2 * 3", "(1+(4+5+2)-3)+(6+8)", "2*(3+4)-10/3", "-(2+3)*4", "14-3-2", "-2*-3"};
+        long[] want = {7, 23, 11, -20, 9, 6};
+        for (int i = 0; i &lt; cases.length; i++) {
+            long a = evalShunting(cases[i]), b = new Parser(cases[i]).parse();
+            if (a != want[i] || b != want[i]) throw new AssertionError(cases[i] + " -&gt; " + a + ", " + b);
+        }
+        System.out.println("calculator ok");
+    }
+}</code></pre>
+<pre data-lang="Python"><code class="language-python">def eval_rpn(tokens: list[str]) -&gt; int:
+    st: list[int] = []
+    for t in tokens:
+        if t in {"+", "-", "*", "/"}:
+            b, a = st.pop(), st.pop()
+            st.append({"+": a + b, "-": a - b, "*": a * b,
+                       "/": int(a / b)}[t])      # truncate toward zero, not floor
+        else:
+            st.append(int(t))
+    return st.pop()
+
+assert eval_rpn(["2", "1", "+", "3", "*"]) == 9
+assert eval_rpn(["4", "13", "5", "/", "+"]) == 6
+assert eval_rpn(["7", "-2", "/"]) == -3          # floor division would give -4</code></pre>
+  </div>
+  <p>Never evaluate untrusted expressions with <code>eval</code> (Python) or a scripting engine; a tiny parser like this is safer and bounded. For SpEL in Spring, use <code>SimpleEvaluationContext</code> for untrusted input to disable type references and bean access.</p>
+</section>
+
+<section id="applications">
+  <h2>8. Applications in Backend Engineering</h2>
+  <ul>
+    <li><strong>Caches.</strong> LRU/LFU and their hybrids order entries by recency or frequency with linked lists (or approximations). Every API gateway, ORM second-level cache and HTTP client connection pool has one.</li>
+    <li><strong>Executors and backpressure.</strong> <code>ThreadPoolExecutor</code> = a <code>BlockingQueue</code> + workers. Choosing <code>ArrayBlockingQueue(500)</code> with <code>CallerRunsPolicy</code> instead of the default unbounded <code>LinkedBlockingQueue</code> is the difference between graceful degradation and an OOM. Spring's <code>ThreadPoolTaskExecutor</code> exposes <code>queueCapacity</code> for this reason.</li>
+    <li><strong>Work stealing.</strong> <code>ForkJoinPool</code> (parallel streams, <code>CompletableFuture.supplyAsync</code> default pool, virtual thread carriers) and Go's runtime scheduler (per-P local run queues with stealing) both use per-worker deques/queues.</li>
+    <li><strong>Async logging and messaging.</strong> Log4j 2's async loggers use the LMAX Disruptor ring buffer; Aeron and Chronicle Queue use ring buffers and append-only memory-mapped logs. Kafka partitions are append-only logs — a queue whose consumers keep their own read offsets.</li>
+    <li><strong>Graph traversal.</strong> BFS uses a FIFO queue (shortest paths in unweighted graphs, e.g. degrees of separation, dependency layers); DFS uses a stack, explicit or the call stack (Chapter 5). 0-1 BFS uses a deque.</li>
+    <li><strong>Parsing and validation.</strong> Bracket matching in config validators, HTML/XML tag balancing, expression languages (SpEL, JSONPath, feature-flag rule engines), and SQL parsers are stack machines.</li>
+    <li><strong>Undo/redo and navigation.</strong> Two stacks: edits push onto undo; undo pops to redo; a new edit clears redo. Browser back/forward is the same.</li>
+    <li><strong>Rate limiting.</strong> A sliding-window-log limiter keeps a deque of request timestamps per client, popping expired ones from the front.</li>
+    <li><strong>Streaming analytics.</strong> Rolling max/min over the last N samples (e.g. peak latency over the last minute) uses a monotonic deque instead of rescanning the window.</li>
+    <li><strong>Operating systems.</strong> Run queues, wait queues and the free page lists of kernels are intrusive linked lists; Redis lists are "quicklists" — a doubly linked list of compact listpack arrays, a hybrid that balances locality and O(1) end operations.</li>
+  </ul>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+
+  <h3>9.1 Redis: approximated LRU instead of a linked list <span class="tag fact">Verified</span></h3>
+  <p>A textbook LRU needs two pointers per key and list manipulation on every read. Redis instead stores a 24-bit LRU clock in each object and, when it must evict, <em>samples</em> a few keys (<code>maxmemory-samples</code>, default 5) and evicts the best candidate from a small pool. The Redis documentation shows that with 10 samples the approximation is very close to true LRU, while saving memory on every key. It also offers LFU modes using a probabilistic logarithmic counter. Lesson for interviews: the HashMap + DLL design is the exact answer; production systems often trade exactness for memory and concurrency.</p>
+
+  <h3>9.2 Caffeine and W-TinyLFU <span class="tag fact">Verified</span></h3>
+  <p>Caffeine (the default cache provider in Spring Boot when on the classpath) uses W-TinyLFU: a small LRU "window" admits new entries, a frequency sketch (count-min, 4-bit counters, periodically halved) decides whether a candidate deserves to displace the main region's victim, and the main region is segmented LRU (probation + protected lists). Reads are recorded into striped lossy ring buffers and drained under a try-lock, so the linked-list reorderings do not serialise readers. Ben Manes's wiki reports hit rates close to optimal across database, search and web traces.</p>
+
+  <h3>9.3 LMAX Disruptor <span class="tag fact">Verified</span></h3>
+  <p>LMAX built a retail exchange processing millions of orders per second on a single business-logic thread. Their technical paper explains why queues were the bottleneck: linked queues allocate nodes (GC pressure) and contend on head/tail; array queues contend on a shared size. The Disruptor pre-allocates a ring of event objects, uses sequence counters padded to separate cache lines (avoiding false sharing), and lets consumers form a dependency graph. It is the ring buffer of §7.3, engineered for mechanical sympathy.</p>
+
+  <h3>9.4 Michael–Scott queue in the JDK <span class="tag fact">Verified</span></h3>
+  <p>The Javadoc of <code>ConcurrentLinkedQueue</code> states that it is based on the algorithm in Michael and Scott's 1996 paper "Simple, Fast, and Practical Non-Blocking and Blocking Concurrent Queue Algorithms". The algorithm keeps a dummy node and uses CAS on <code>tail.next</code> then on <code>tail</code>, allowing other threads to "help" swing a lagging tail — the sentinel idea from §3.1 doing real concurrent work.</p>
+
+  <h3>9.5 Fork/Join work stealing <span class="tag fact">Verified</span></h3>
+  <p>Doug Lea's 2000 paper describes per-worker double-ended queues where owners push/pop LIFO and thieves steal FIFO, following Cilk's work-stealing design. The JDK's <code>ForkJoinPool</code> implements this and is the default scheduler for virtual threads (JDK 21, JEP 444).</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Strengths and Limits</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Structure</th><th>Strengths</th><th>Limits</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>Singly linked list</td><td>O(1) push-front, cheap splicing, persistent/immutable sharing of tails</td><td>no random access; deleting needs predecessor</td><td>node allocation per element; poor locality</td></tr>
+      <tr><td>Doubly linked list</td><td>O(1) delete/move of a held node; both ends</td><td>2 refs per node; easy to corrupt invariants</td><td>more memory; GC churn</td></tr>
+      <tr><td><code>ArrayDeque</code></td><td>fast stack/queue/deque, cache-friendly</td><td>no nulls; resize copies; not thread-safe</td><td>amortized resize spikes</td></tr>
+      <tr><td>Ring buffer (bounded)</td><td>no allocation in steady state; natural backpressure</td><td>fixed capacity; must choose full policy</td><td>sizing decisions</td></tr>
+      <tr><td>Blocking queues</td><td>thread handoff, backpressure</td><td>lock contention; unbounded variants hide overload</td><td>queue depth must be monitored</td></tr>
+      <tr><td>Monotonic stack/deque</td><td>Θ(n) for range-dominance problems</td><td>only for "dominated elements are useless" problems</td><td>—</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+  <h3>11.1 Choosing a sequence structure</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A["Need a sequence"] --> B{"Access pattern?"}
+  B -- "random index" --> AL["ArrayList / array"]
+  B -- "LIFO" --> AD1["ArrayDeque as stack"]
+  B -- "FIFO, single thread" --> AD2["ArrayDeque as queue"]
+  B -- "FIFO across threads" --> C{"Bounded?"}
+  C -- yes --> ABQ["ArrayBlockingQueue or ring buffer"]
+  C -- "no, non-blocking" --> CLQ["ConcurrentLinkedQueue"]
+  B -- "move or delete held elements in O(1)" --> DLL["Doubly linked list (often intrusive) + map"]
+  B -- "min or max first" --> PQ["PriorityQueue (Chapter 4)"]
+</pre>
+    <figcaption>Figure 3.8 — Picking a sequence structure by access pattern.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the linked list appears only on the branch where you already hold the element and need O(1) relocation. Everything else is array-backed, which is the main practical lesson of this chapter.</p>
+
+  <h3>11.2 Exact vs approximate recency</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Approach</th><th>Hit ratio</th><th>Memory/key</th><th>Concurrency</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td>HashMap + DLL (exact LRU)</td><td>LRU</td><td>+2 refs + node</td><td>global lock or buffered</td><td>interviews, small caches</td></tr>
+      <tr><td>Sampled LRU (Redis)</td><td>≈ LRU</td><td>24-bit clock</td><td>single-threaded server</td><td>huge keyspaces</td></tr>
+      <tr><td>CLOCK / second chance</td><td>≈ LRU</td><td>1 bit</td><td>good</td><td>OS page caches, buffer pools</td></tr>
+      <tr><td>W-TinyLFU (Caffeine)</td><td>often better than LRU</td><td>sketch + lists</td><td>excellent (buffered)</td><td>JVM application caches</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>11.3 Recursion vs explicit stack</h3>
+  <p>Recursion is clearer; an explicit stack is safer for deep inputs (default JVM thread stacks are typically 512 KB–1 MB, enough for roughly 10⁴–10⁵ simple frames) and lets you pause/resume traversal (iterators over trees). Python's default recursion limit is 1,000 — raise it cautiously (<code>sys.setrecursionlimit</code>) or convert to iteration.</p>
+
+  <h3>11.4 Shunting-yard vs recursive descent vs parser generators</h3>
+  <p>Shunting-yard is compact for operator-precedence grammars; recursive descent scales to real grammars (statements, function calls) and gives better error messages; parser generators (ANTLR) are worth it for full languages with many rules. <span class="tag opinion">Opinion</span> For a rule engine or filter DSL in a backend, hand-written recursive descent is usually the most maintainable choice.</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes</h2>
+  <ul>
+    <li><strong>Losing the rest of the list</strong>: overwriting <code>cur.next</code> before saving it.</li>
+    <li><strong>Null-pointer on fast pointers</strong>: the loop guard must be <code>fast != null &amp;&amp; fast.next != null</code>, in that order.</li>
+    <li><strong>Skipping the dummy node</strong> and writing special cases for the head — which then contain the bug.</li>
+    <li><strong>Forgetting to remove evicted keys from the map</strong> in an LRU (map grows forever while the list is bounded) — or storing nodes without their key, making that removal impossible.</li>
+    <li><strong>Using <code>java.util.Stack</code></strong> or <code>LinkedList</code> as a queue in hot code; use <code>ArrayDeque</code>.</li>
+    <li><strong>Mixing Deque method families</strong>: <code>push</code> adds to the <em>front</em>, <code>offer/add</code> to the <em>back</em>. Using <code>push</code> and <code>poll</code> together gives LIFO; <code>offer</code> and <code>poll</code> give FIFO. Read the Javadoc table.</li>
+    <li><strong>Comparing <code>Integer</code> stack tops with <code>==</code></strong> (<code>st.peek() == a[i]</code>) — identity, not value, beyond the cache range.</li>
+    <li><strong>Storing values instead of indices in a monotonic deque</strong> — you then cannot tell when the front has left the window.</li>
+    <li><strong>Strict vs non-strict comparisons in monotonic stacks</strong>: with duplicates, counting problems (e.g. sum of subarray minimums) need one side strict and the other non-strict to avoid double counting.</li>
+    <li><strong>Python <code>list.pop(0)</code> as a queue</strong> — Θ(n) per pop, Θ(n²) BFS.</li>
+    <li><strong>Unbounded executor queues</strong> (<code>Executors.newFixedThreadPool</code>) that accumulate millions of tasks during an outage.</li>
+    <li><strong>Iterating a <code>LinkedList</code> with <code>get(i)</code></strong> — Θ(n²).</li>
+    <li><strong>Integer division semantics</strong>: Java and C truncate toward zero; Python's <code>//</code> floors. RPN problems specify truncation.</li>
+    <li><strong>Recursive list algorithms on long lists</strong> — <code>StackOverflowError</code> in production for inputs that never appeared in tests.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <ul>
+    <li><strong>Bound every queue that crosses a trust or rate boundary.</strong> Expose queue depth and wait time as metrics (Micrometer's <code>ExecutorServiceMetrics</code> binds executor queue sizes); alert on sustained growth, which by Little's law is latency growth.</li>
+    <li><strong>Choose a rejection policy deliberately.</strong> <code>CallerRunsPolicy</code> slows producers (natural backpressure for HTTP threads) but can block event loops; <code>AbortPolicy</code> fails fast and should map to HTTP 429/503 with retry hints.</li>
+    <li><strong>Avoid false sharing</strong> in hand-rolled concurrent ring buffers: pad producer and consumer counters onto different cache lines (the JDK has <code>@jdk.internal.vm.annotation.Contended</code> internally; libraries pad manually).</li>
+    <li><strong>Memory</strong>: a <code>LinkedList&lt;Long&gt;</code> of 10⁷ elements costs roughly 10⁷ × (24 node + 16 Long) ≈ 400 MB; a <code>long[]</code> costs 80 MB. Caches holding millions of entries should account for per-entry overhead in sizing (Caffeine can bound by weight).</li>
+    <li><strong>Thread safety of LRU structures</strong>: access-ordered <code>LinkedHashMap</code> mutates on <code>get</code>; never share it unsynchronised. Prefer Caffeine.</li>
+    <li><strong>Security</strong>: expression evaluators must not expose reflection or bean access to untrusted input (SpEL injection has produced real CVEs); deep nesting in input (JSON, expressions) can exhaust recursive parsers' stacks — enforce depth limits.</li>
+    <li><strong>Testing</strong>: property-based tests (jqwik in Java, Hypothesis in Python) comparing your structure against <code>ArrayDeque</code> or <code>LinkedHashMap</code> as a reference model catch pointer bugs quickly.</li>
+  </ul>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises: Problem Ladders</h2>
+  <p>Problems are paraphrased; well-known names are given for lookup. Each solution is a complete Java class with a self-check.</p>
+
+  <h3>14.1 Ladder A — Linked-list pointer manipulation</h3>
+  <div class="callout insight"><p class="callout-title">How to recognise linked-list patterns</p>
+  <ul>
+    <li>"Do it in O(1) extra space" on a list → in-place rewiring, often reverse half the list.</li>
+    <li>"Middle", "k-th from the end", "cycle", "meeting point" → fast/slow pointers.</li>
+    <li>Head may change (deletion, insertion at front, reversal) → dummy node.</li>
+    <li>Sublist operations (reverse between, groups of k, reorder) → find boundaries, detach, transform, reconnect; draw the four boundary references before coding.</li>
+    <li>Extra pointers (random, child) → interleave copies or a map from old to new node.</li>
+  </ul></div>
+
+  <div class="exercise">
+    <p class="exercise-title">A1 · Easy — "Remove Duplicates from Sorted List"</p>
+    <p>Given a sorted singly linked list, delete nodes so that each value appears once.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> because duplicates are adjacent, skip <code>cur.next</code> while it equals <code>cur</code>. Θ(n) time, Θ(1) space. Do not advance <code>cur</code> after a deletion — there may be several duplicates in a row.</p>
+<pre data-file="LA1DedupSorted.java"><code class="language-java">class LA1DedupSorted {
+    static final class Node { int val; Node next; Node(int v, Node n) { val = v; next = n; } }
+    static Node dedup(Node head) {
+        for (Node cur = head; cur != null &amp;&amp; cur.next != null; ) {
+            if (cur.next.val == cur.val) cur.next = cur.next.next;   // stay on cur
+            else cur = cur.next;
+        }
+        return head;
+    }
+    public static void main(String[] args) {
+        Node h = dedup(new Node(1, new Node(1, new Node(1, new Node(2, new Node(3, new Node(3, null)))))));
+        StringBuilder sb = new StringBuilder();
+        for (; h != null; h = h.next) sb.append(h.val);
+        if (!sb.toString().equals("123")) throw new AssertionError(sb);
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">A2 · Easy — "Intersection of Two Linked Lists"</p>
+    <p>Two singly linked lists may merge at some node (sharing all later nodes). Return the first shared node or null, in O(1) extra space.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> walk pointer p over A then B, and q over B then A. Both travel a + c + b steps (a, b = private lengths, c = shared tail), so they arrive at the intersection simultaneously, or both reach null together. Θ(a + b) time, Θ(1) space. Compare references, not values.</p>
+<pre data-file="LA2Intersection.java"><code class="language-java">class LA2Intersection {
+    static final class Node { int val; Node next; Node(int v, Node n) { val = v; next = n; } }
+    static Node intersect(Node a, Node b) {
+        Node p = a, q = b;
+        while (p != q) {
+            p = (p == null) ? b : p.next;
+            q = (q == null) ? a : q.next;
+        }
+        return p;
+    }
+    public static void main(String[] args) {
+        Node shared = new Node(8, new Node(4, null));
+        Node a = new Node(4, new Node(1, shared)), b = new Node(5, new Node(6, new Node(1, shared)));
+        if (intersect(a, b) != shared || intersect(new Node(1, null), new Node(2, null)) != null) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">A3 · Easy/Medium — "Palindrome Linked List" in O(1) space</p>
+    <p>Decide whether a singly linked list reads the same forwards and backwards without copying it to an array.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> find the middle with fast/slow, reverse the second half, compare, then (good manners in production) reverse it back. Θ(n) time, Θ(1) space. Mention that this temporarily mutates shared data — not acceptable if other threads read the list.</p>
+<pre data-file="LA3PalindromeList.java"><code class="language-java">class LA3PalindromeList {
+    static final class Node { int val; Node next; Node(int v, Node n) { val = v; next = n; } }
+    static Node reverse(Node h) { Node p = null; while (h != null) { Node n = h.next; h.next = p; p = h; h = n; } return p; }
+    static boolean isPalindrome(Node head) {
+        Node slow = head, fast = head;
+        while (fast != null &amp;&amp; fast.next != null) { slow = slow.next; fast = fast.next.next; }
+        Node second = reverse(slow), p = head, q = second;
+        boolean ok = true;
+        while (q != null) { if (p.val != q.val) { ok = false; break; } p = p.next; q = q.next; }
+        reverse(second);                                   // restore the input
+        return ok;
+    }
+    static Node of(int... v) { Node h = null; for (int i = v.length - 1; i &gt;= 0; i--) h = new Node(v[i], h); return h; }
+    public static void main(String[] args) {
+        if (!isPalindrome(of(1, 2, 2, 1)) || !isPalindrome(of(1, 2, 3, 2, 1)) || isPalindrome(of(1, 2))) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">A4 · Medium — "Reorder List"</p>
+    <p>Rearrange L0 → L1 → … → Ln into L0 → Ln → L1 → Ln−1 → … in place.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> three classic moves composed: split at the middle (fast/slow), reverse the second half, interleave the halves. Θ(n), Θ(1). Interviewers use this to see whether you can decompose a problem into known primitives.</p>
+<pre data-file="LA4ReorderList.java"><code class="language-java">class LA4ReorderList {
+    static final class Node { int val; Node next; Node(int v, Node n) { val = v; next = n; } }
+    static void reorder(Node head) {
+        if (head == null) return;
+        Node slow = head, fast = head;
+        while (fast.next != null &amp;&amp; fast.next.next != null) { slow = slow.next; fast = fast.next.next; }
+        Node second = null, cur = slow.next;
+        slow.next = null;                                    // split
+        while (cur != null) { Node n = cur.next; cur.next = second; second = cur; cur = n; }  // reverse
+        for (Node first = head; second != null; ) {          // interleave
+            Node n1 = first.next, n2 = second.next;
+            first.next = second; second.next = n1;
+            first = n1; second = n2;
+        }
+    }
+    public static void main(String[] args) {
+        Node h = null; for (int i = 5; i &gt;= 1; i--) h = new Node(i, h);
+        reorder(h);
+        StringBuilder sb = new StringBuilder(); for (Node p = h; p != null; p = p.next) sb.append(p.val);
+        if (!sb.toString().equals("15243")) throw new AssertionError(sb);
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">A5 · Medium — "Add Two Numbers"</p>
+    <p>Two non-negative integers are stored as lists of digits, least significant first. Return their sum as a list.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> schoolbook addition with a carry and a dummy head; continue while either list or the carry remains. Θ(max(m, n)). Follow-up (most significant digit first): push digits onto two stacks, or reverse both lists.</p>
+<pre data-file="LA5AddTwoNumbers.java"><code class="language-java">class LA5AddTwoNumbers {
+    static final class Node { int val; Node next; Node(int v, Node n) { val = v; next = n; } }
+    static Node add(Node a, Node b) {
+        Node dummy = new Node(0, null), t = dummy;
+        int carry = 0;
+        while (a != null || b != null || carry != 0) {
+            int s = carry + (a != null ? a.val : 0) + (b != null ? b.val : 0);
+            t = t.next = new Node(s % 10, null);
+            carry = s / 10;
+            if (a != null) a = a.next;
+            if (b != null) b = b.next;
+        }
+        return dummy.next;
+    }
+    public static void main(String[] args) {
+        Node a = new Node(2, new Node(4, new Node(3, null))), b = new Node(5, new Node(6, new Node(4, null)));
+        StringBuilder sb = new StringBuilder(); for (Node p = add(a, b); p != null; p = p.next) sb.append(p.val);
+        if (!sb.toString().equals("708")) throw new AssertionError(sb);        // 342 + 465 = 807
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">A6 · Medium — "Copy List with Random Pointer"</p>
+    <p>Each node has <code>next</code> and an arbitrary <code>random</code> reference (possibly null). Produce a deep copy.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach 1:</strong> a <code>Map&lt;Node, Node&gt;</code> old → copy, two passes; Θ(n) space. <strong>Approach 2 (O(1) extra):</strong> interleave copies (A → A' → B → B'…), set <code>copy.random = orig.random.next</code>, then unweave. The interleaving makes the "map" implicit in the structure itself.</p>
+<pre data-file="LA6CopyRandomList.java"><code class="language-java">class LA6CopyRandomList {
+    static final class Node { int val; Node next, random; Node(int v) { val = v; } }
+    static Node copy(Node head) {
+        for (Node p = head; p != null; p = p.next.next) {          // 1. interleave
+            Node c = new Node(p.val); c.next = p.next; p.next = c;
+        }
+        for (Node p = head; p != null; p = p.next.next)             // 2. random links
+            p.next.random = (p.random == null) ? null : p.random.next;
+        Node dummy = new Node(0), t = dummy;
+        for (Node p = head; p != null; p = p.next) {                 // 3. unweave
+            t = t.next = p.next;
+            p.next = p.next.next;
+        }
+        return dummy.next;
+    }
+    public static void main(String[] args) {
+        Node a = new Node(7), b = new Node(13), c = new Node(11);
+        a.next = b; b.next = c; b.random = a; c.random = c;
+        Node x = copy(a);
+        if (x == a || x.next.random != x || x.next.next.random != x.next.next || x.random != null) throw new AssertionError();
+        if (a.next != b || b.next != c) throw new AssertionError("original not restored");
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">A7 · Hard — "Reverse Nodes in k-Group"</p>
+    <p>Reverse the list in consecutive groups of k; a final group shorter than k stays as is. O(1) extra space.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> keep <code>groupPrev</code> (node before the group). Check that k nodes exist; reverse them with the standard loop, using the node after the group as the initial <code>prev</code> so the reversed group is already attached to the rest; then link <code>groupPrev.next</code> to the new group head and move <code>groupPrev</code> to the old group head (now the group's tail). Θ(n) time, Θ(1) space.</p>
+<pre data-file="LA7ReverseKGroup.java"><code class="language-java">class LA7ReverseKGroup {
+    static final class Node { int val; Node next; Node(int v, Node n) { val = v; next = n; } }
+    static Node reverseKGroup(Node head, int k) {
+        Node dummy = new Node(0, head), groupPrev = dummy;
+        while (true) {
+            Node kth = groupPrev;
+            for (int i = 0; i &lt; k &amp;&amp; kth != null; i++) kth = kth.next;
+            if (kth == null) break;                             // fewer than k left
+            Node groupNext = kth.next, prev = groupNext, cur = groupPrev.next;
+            while (cur != groupNext) { Node n = cur.next; cur.next = prev; prev = cur; cur = n; }
+            Node oldHead = groupPrev.next;
+            groupPrev.next = kth;                               // kth is the new group head
+            groupPrev = oldHead;                                // old head is now the tail
+        }
+        return dummy.next;
+    }
+    public static void main(String[] args) {
+        Node h = null; for (int i = 5; i &gt;= 1; i--) h = new Node(i, h);
+        StringBuilder sb = new StringBuilder(); for (Node p = reverseKGroup(h, 2); p != null; p = p.next) sb.append(p.val);
+        if (!sb.toString().equals("21435")) throw new AssertionError(sb);
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <h3>14.2 Ladder B — Stacks and queues</h3>
+  <div class="callout insight"><p class="callout-title">How to recognise a stack problem</p>
+  <ul>
+    <li>Nested structure: brackets, tags, encoded strings like <code>3[ab]</code>, directories with <code>..</code>.</li>
+    <li>"The most recent unmatched / unresolved item" decides what happens next.</li>
+    <li>Collisions or cancellations between neighbours (asteroids, adjacent duplicates removal).</li>
+    <li>Recursion you must make iterative, or depth that could overflow.</li>
+    <li>Expressions with precedence.</li>
+  </ul></div>
+
+  <div class="exercise">
+    <p class="exercise-title">B1 · Easy — "Valid Parentheses"</p>
+    <p>Decide whether a string of <code>()[]{}</code> is properly nested.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> push the <em>expected closer</em> for each opener; on a closer, the stack top must match. Valid iff the stack ends empty. Θ(n). Early exit if the length is odd.</p>
+<pre data-file="SB1ValidParens.java"><code class="language-java">import java.util.*;
+
+class SB1ValidParens {
+    static boolean valid(String s) {
+        if (s.length() % 2 == 1) return false;
+        Deque&lt;Character&gt; st = new ArrayDeque&lt;&gt;();
+        for (char c : s.toCharArray()) {
+            switch (c) {
+                case '(' -&gt; st.push(')');
+                case '[' -&gt; st.push(']');
+                case '{' -&gt; st.push('}');
+                default -&gt; { if (st.isEmpty() || st.pop() != c) return false; }
+            }
+        }
+        return st.isEmpty();
+    }
+    public static void main(String[] args) {
+        if (!valid("([]{})") || valid("(]") || valid("((") || !valid("")) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">B2 · Medium — "Simplify Path"</p>
+    <p>Canonicalise a Unix absolute path: collapse repeated slashes, resolve <code>.</code> and <code>..</code>.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> split on "/", push names, pop on "..", ignore "" and ".". Use a deque so you can join from the bottom. Θ(n). Security tie-in: this is path normalisation, the defence against path traversal (<code>../../etc/passwd</code>) — in Java use <code>Path.normalize()</code> and then verify the result <code>startsWith</code> the allowed base directory.</p>
+<pre data-file="SB2SimplifyPath.java"><code class="language-java">import java.util.*;
+
+class SB2SimplifyPath {
+    static String simplify(String path) {
+        Deque&lt;String&gt; st = new ArrayDeque&lt;&gt;();
+        for (String part : path.split("/")) {
+            if (part.isEmpty() || part.equals(".")) continue;
+            if (part.equals("..")) { if (!st.isEmpty()) st.pollLast(); }
+            else st.offerLast(part);
+        }
+        return "/" + String.join("/", st);
+    }
+    public static void main(String[] args) {
+        if (!simplify("/a/./b/../../c/").equals("/c") || !simplify("/../").equals("/") || !simplify("/home//foo/").equals("/home/foo")) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">B3 · Medium — "Asteroid Collision"</p>
+    <p>Integers represent asteroids moving right (positive) or left (negative) with size |x|. When two meet, the smaller explodes; equal sizes both explode. Return the survivors.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> a stack of survivors. A left-mover collides only with right-movers on top of the stack; resolve collisions in a loop. Each asteroid is pushed and popped at most once: Θ(n).</p>
+<pre data-file="SB3Asteroids.java"><code class="language-java">import java.util.*;
+
+class SB3Asteroids {
+    static int[] collide(int[] a) {
+        Deque&lt;Integer&gt; st = new ArrayDeque&lt;&gt;();
+        for (int x : a) {
+            boolean alive = true;
+            while (alive &amp;&amp; x &lt; 0 &amp;&amp; !st.isEmpty() &amp;&amp; st.peek() &gt; 0) {
+                int top = st.peek();
+                if (top &lt; -x) st.pop();                 // top explodes, keep checking
+                else { alive = false; if (top == -x) st.pop(); }
+            }
+            if (alive) st.push(x);
+        }
+        int[] out = new int[st.size()];
+        for (int i = out.length - 1; i &gt;= 0; i--) out[i] = st.pop();
+        return out;
+    }
+    public static void main(String[] args) {
+        if (!Arrays.equals(collide(new int[]{5, 10, -5}), new int[]{5, 10})) throw new AssertionError();
+        if (!Arrays.equals(collide(new int[]{8, -8}), new int[]{})) throw new AssertionError();
+        if (!Arrays.equals(collide(new int[]{10, 2, -5}), new int[]{10})) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">B4 · Medium — "Decode String"</p>
+    <p>Expand encodings of the form <code>k[...]</code>, which may nest, e.g. <code>3[a2[c]]</code> → <code>accaccacc</code>.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> two stacks — counts and partially built strings. On "[", push the current count and builder and start fresh; on "]", pop and append the current builder k times to the outer one. Θ(output length).</p>
+<pre data-file="SB4DecodeString.java"><code class="language-java">import java.util.*;
+
+class SB4DecodeString {
+    static String decode(String s) {
+        Deque&lt;Integer&gt; counts = new ArrayDeque&lt;&gt;();
+        Deque&lt;StringBuilder&gt; outer = new ArrayDeque&lt;&gt;();
+        StringBuilder cur = new StringBuilder();
+        int k = 0;
+        for (char c : s.toCharArray()) {
+            if (Character.isDigit(c)) k = k * 10 + (c - '0');
+            else if (c == '[') { counts.push(k); outer.push(cur); cur = new StringBuilder(); k = 0; }
+            else if (c == ']') { StringBuilder up = outer.pop(); up.append(cur.toString().repeat(counts.pop())); cur = up; }
+            else cur.append(c);
+        }
+        return cur.toString();
+    }
+    public static void main(String[] args) {
+        if (!decode("3[a2[c]]").equals("accaccacc") || !decode("2[abc]3[cd]ef").equals("abcabccdcdcdef")) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">B5 · Medium — "Basic Calculator II" (no parentheses)</p>
+    <p>Evaluate an expression with non-negative integers and <code>+ - * /</code> (integer division truncating), without parentheses, in Θ(n) and without a full parser.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> keep the last operator. For + and −, push ±num; for * and /, pop, combine and push. The answer is the stack sum. Can be reduced to Θ(1) space by keeping only the "last term" instead of a stack. For parentheses and unary minus, see §7.5.</p>
+<pre data-file="SB5CalculatorII.java"><code class="language-java">class SB5CalculatorII {
+    static int calc(String s) {
+        int result = 0, last = 0, num = 0;
+        char op = '+';
+        for (int i = 0; i &lt;= s.length(); i++) {
+            char c = i &lt; s.length() ? s.charAt(i) : '+';      // sentinel flushes the last number
+            if (c == ' ') continue;
+            if (Character.isDigit(c)) { num = num * 10 + (c - '0'); continue; }
+            switch (op) {
+                case '+' -&gt; { result += last; last = num; }
+                case '-' -&gt; { result += last; last = -num; }
+                case '*' -&gt; last *= num;
+                case '/' -&gt; last /= num;
+                default -&gt; throw new IllegalStateException();
+            }
+            op = c; num = 0;
+        }
+        return result + last;
+    }
+    public static void main(String[] args) {
+        if (calc("3+2*2") != 7 || calc(" 3/2 ") != 1 || calc(" 3+5 / 2 ") != 5 || calc("14-3*2") != 8) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">B6 · Hard — "Longest Valid Parentheses"</p>
+    <p>Given a string of '(' and ')', return the length of the longest well-formed substring.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><strong>Approach:</strong> stack of indices seeded with −1 as the "base" before the current valid run. Push '(' indices. On ')', pop; if the stack becomes empty, push the current index as the new base; else the valid length is i − peek(). Θ(n). (A two-pass counter solution achieves Θ(1) space.)</p>
+<pre data-file="SB6LongestValidParens.java"><code class="language-java">import java.util.*;
+
+class SB6LongestValidParens {
+    static int longest(String s) {
+        Deque&lt;Integer&gt; st = new ArrayDeque&lt;&gt;();
+        st.push(-1);
+        int best = 0;
+        for (int i = 0; i &lt; s.length(); i++) {
+            if (s.charAt(i) == '(') st.push(i);
+            else {
+                st.pop();
+                if (st.isEmpty()) st.push(i);               // unmatched ')' becomes the new base
+                else best = Math.max(best, i - st.peek());
+            }
+        }
+        return best;
+    }
+    public static void main(String[] args) {
+        if (longest("(()") != 2 || longest(")()())") != 4 || longest("()(())") != 6 || longest("") != 0) throw new AssertionError();
+        System.out.println("ok");
+    }
+}</code></pre>
+    </div></details>
+  </div>

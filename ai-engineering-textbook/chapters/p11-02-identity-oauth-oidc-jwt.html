@@ -1,0 +1,1181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authentication, Authorization, OAuth 2.0, OIDC, JWT &amp; Sessions — AI-Era Software Engineering</title>
+<meta name="description" content="Password storage, MFA and passkeys, session security, OAuth 2.0 grants and RFC 9700 best practice, OpenID Connect, JWT validation and pitfalls, RBAC/ABAC/ReBAC, with Spring Security resource server and Spring Authorization Server code plus Go and Python validation.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p11-02-identity-oauth-oidc-jwt" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 11 · Chapter 2</p>
+  <h1>Authentication, Authorization, OAuth 2.0, OIDC, JWT &amp; Sessions</h1>
+  <p class="lede">Identity is where most backend engineers meet security every day — and where copy-pasted configuration hides the deepest misunderstandings. This chapter rebuilds the whole stack from first principles: how passwords and passkeys actually work, what a session cookie must look like, what each OAuth 2.0 grant is for and which ones are now forbidden, what OpenID Connect adds, how to validate a JWT correctly, and how to model authorization beyond roles. Every concept ends in working Spring Security, Spring Authorization Server, Python and Go code.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Chapter 11.1; you have used <code>spring-boot-starter-oauth2-resource-server</code> or <code>oauth2Login()</code> at least once.</li>
+    <li><strong>You will be able to:</strong> choose and configure password hashing; design MFA/passkey rollout; harden cookie sessions; pick the correct OAuth 2.0 grant for any client; explain RFC 9700's recommendations; validate JWTs safely in Java, Python and Go; choose between JWT and opaque tokens; design RBAC, ABAC and ReBAC authorization; run a Spring Authorization Server.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: Two Questions, Many Protocols</h2>
+  <p>Every protected request answers two questions. <strong>Authentication</strong>: who is making this request, and how sure are we? <strong>Authorization</strong>: is this principal allowed to do this specific thing to this specific resource right now? The protocols in this chapter — OAuth 2.0, OpenID Connect, JWT, WebAuthn — exist because answering those questions gets hard once there are many applications, many APIs, many devices and third parties involved.</p>
+  <p>OAuth 2.0 is the most misunderstood of them. It is a <em>delegated authorization</em> framework: it lets a user grant a client application limited access to an API on their behalf, without giving the client their password. It is not, by itself, an authentication protocol — an access token tells an API what the bearer may do, not who logged in to the client. OpenID Connect (OIDC) adds authentication on top by defining the ID token. JWT is merely a token <em>format</em> that both may use. Keeping these layers separate in your head prevents most identity design errors.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>You have configured <code>spring.security.oauth2.resourceserver.jwt.issuer-uri</code>, used <code>@AuthenticationPrincipal Jwt</code>, mapped scopes to <code>SCOPE_</code> authorities, written <code>@PreAuthorize("hasRole('ADMIN')")</code>, used <code>BCryptPasswordEncoder</code> or <code>PasswordEncoderFactories.createDelegatingPasswordEncoder()</code>, and perhaps set up <code>oauth2Login()</code> against Keycloak or Okta. Spring Session with Redis may be how your sessions survive pod restarts.</dd>
+      <dt>Why that is not enough</dt><dd>Defaults hide decisions. Does your resource server check the <code>aud</code> claim? (Spring Boot only does if you set <code>audiences</code>.) Does your SPA use the implicit grant from a 2017 tutorial? Are refresh tokens rotated? What happens when a user is disabled but holds a valid one-hour JWT? Does a role check stop one tenant's admin from administering another tenant? These are design questions the starter cannot answer.</dd>
+      <dt>The modern approach</dt><dd>Authorization code + PKCE for every user-facing client (RFC 9700, OAuth 2.1 draft); no implicit or password grant; short-lived, audience-restricted access tokens; sender-constrained tokens (DPoP or mTLS) where theft matters; backend-for-frontend (BFF) for browser apps so tokens never reach JavaScript; passkeys for phishing-resistant login; and fine-grained authorization (ABAC/ReBAC) in the service or a policy engine, not just roles in the token.</dd>
+      <dt>Where Python and Go fit</dt><dd>Python (PyJWT, Authlib) and Go (<code>golang-jwt/jwt/v5</code>, <code>coreos/go-oidc</code>) services often validate tokens issued for the Spring estate. The validation checklist is identical; the defaults are weaker, so you must pin algorithms, require <code>exp</code>, and check <code>iss</code>/<code>aud</code> explicitly.</dd>
+      <dt>In production</dt><dd>One identity provider (Keycloak, Okta/Auth0, Entra ID, Cognito, Ping, or Spring Authorization Server for bespoke needs), standard OIDC everywhere, JWKS caching and key rotation, central session/token revocation hooks, and authorization decisions logged.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use OAuth/OIDC whenever more than one application or API shares users, or third parties need delegated access. Avoid building your own authorization server unless you have a strong reason (unusual token formats, embedded product); a managed or established IdP is cheaper and safer. Avoid JWTs as browser session storage.</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="history">
+  <h2>2. History: From /etc/passwd to Passkeys</h2>
+  <h3>2.1 Passwords and their storage</h3>
+  <p>Early Unix stored password hashes in a world-readable <code>/etc/passwd</code>. Robert Morris and Ken Thompson's 1979 paper "Password Security: A Case History" introduced salting and deliberately slow hashing (crypt based on DES iterated 25 times) — the two ideas behind every modern password hash. bcrypt followed in 1999 (Provos and Mazières, USENIX), scrypt in 2009 (Colin Percival), and Argon2 won the Password Hashing Competition in 2015 and was standardised as RFC 9106 in 2021. PBKDF2 (RFC 2898, 2000; updated in RFC 8018) remains the FIPS-approved option.</p>
+  <h3>2.2 Federated identity</h3>
+  <p>Kerberos (MIT, 1980s; v5 as RFC 1510 in 1993, later RFC 4120) introduced tickets issued by a trusted third party. In the enterprise web, SAML 2.0 (OASIS, 2005) became the standard for browser single sign-on using signed XML assertions — and still dominates B2B SSO. OAuth 1.0 emerged in 2007 from Twitter and others to stop users giving their passwords to third-party apps; it was published as RFC 5849 in 2010. OAuth 2.0 (RFC 6749, with bearer tokens in RFC 6750) followed in October 2012, simplifying OAuth 1.0 by relying on TLS instead of per-request signatures.</p>
+  <h3>2.3 Tokens and OpenID Connect</h3>
+  <p>The JOSE specifications — JWS (RFC 7515), JWE (RFC 7516), JWK (RFC 7517), JWA (RFC 7518) — and JWT (RFC 7519) were published in May 2015. OpenID Connect Core 1.0 was finalised by the OpenID Foundation in February 2014, built on OAuth 2.0 with JWT-format ID tokens. PKCE (RFC 7636, September 2015) was designed for mobile apps to protect the authorization code from interception. In 2015, a widely-read analysis by Tim McLean showed several JWT libraries accepting <code>alg: none</code> or confusing RSA and HMAC keys — leading to the JWT Best Current Practices (RFC 8725, February 2020).</p>
+  <h3>2.4 Hardening OAuth</h3>
+  <p>The Device Authorization Grant (RFC 8628, 2019) handled TVs and CLIs. Token introspection (RFC 7662, 2015) and revocation (RFC 7009, 2013) standardised token lifecycle. Mutual-TLS client authentication and certificate-bound tokens came in RFC 8705 (2020); DPoP (Demonstrating Proof of Possession, RFC 9449) in September 2023. The OAuth 2.0 Security Best Current Practice was published as <strong>RFC 9700 in January 2025</strong>, formally deprecating the implicit grant and the resource owner password credentials grant and requiring PKCE broadly. OAuth 2.1 consolidates these into a single document; <span class="tag version">Version-sensitive · checked Nov 2026</span> it is still an IETF Internet-Draft (draft-ietf-oauth-v2-1, revisions continuing through 2026), not yet an RFC.</p>
+  <h3>2.5 Phishing-resistant authentication</h3>
+  <p>The FIDO Alliance (founded 2012) produced U2F security keys; FIDO2, combining W3C Web Authentication (WebAuthn Level 1, a W3C Recommendation in March 2019) and CTAP, generalised it. In 2022 Apple, Google and Microsoft announced support for synced, multi-device FIDO credentials — "passkeys". NIST SP 800-63B Revision 4, finalised in July 2025, incorporates syncable authenticators and continues to favour phishing-resistant options.</p>
+  <h3>2.6 Authorization at scale</h3>
+  <p>Role-based access control was formalised by Ferraiolo and Kuhn at NIST (1992) and standardised as ANSI INCITS 359 (2004). XACML (OASIS, 2003) attempted standard attribute-based policies. Google's Zanzibar paper (USENIX ATC 2019) described a global relationship-based authorization system for Drive, YouTube and others, inspiring open-source ReBAC systems such as SpiceDB and OpenFGA. Open Policy Agent (2016, CNCF graduated 2021) and AWS's Cedar language (2023) popularised policy-as-code.</p>
+  <h3>2.7 In the Spring world</h3>
+  <p>Spring Security OAuth (the old <code>spring-security-oauth2</code> project with <code>@EnableAuthorizationServer</code>) was deprecated around 2019–2020 in favour of first-class OAuth2 client and resource-server support in Spring Security 5. Spring Authorization Server started in 2020 as a community-driven project, reached 1.0 in November 2022, and — as announced in September 2025 — has moved into Spring Security itself as of Spring Security 7.0 (same artifact ID, versioned with Spring Security). <span class="tag version">Version-sensitive · checked Nov 2026</span></p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 Authentication vs authorization, precisely</h3>
+  <p>Authentication verifies a claim of identity using one or more <em>factors</em>: something you know (password, PIN), something you have (phone, security key, private key on a device), something you are (biometric, normally used only to unlock a local key). The output is a <strong>principal</strong> plus metadata about <em>how</em> it was authenticated (method, time, assurance level — in OIDC, the <code>amr</code>, <code>acr</code> and <code>auth_time</code> claims). Authorization consumes that principal and decides on an action. A clean architecture keeps them separate: the identity provider authenticates; your services authorize. Mixing them — e.g. encoding every permission for every resource in the token — makes tokens huge and stale.</p>
+
+  <h3>3.2 Password storage</h3>
+  <p>If you store passwords at all (prefer delegating to an IdP), the requirements are: never store plaintext or reversibly encrypted passwords; hash with a <em>salted, slow, memory-hard (ideally) password hashing function</em>; make the work factor configurable and upgradeable.</p>
+  <ul>
+    <li><strong>Why not SHA-256?</strong> General-purpose hashes are designed to be fast. GPUs compute billions of SHA-256 hashes per second, so a leaked table of unsalted or even salted SHA-256 hashes yields most human-chosen passwords quickly.</li>
+    <li><strong>Salt</strong>: a unique random value per password stored alongside the hash. It defeats precomputed (rainbow) tables and ensures identical passwords have different hashes. Salt is not secret.</li>
+    <li><strong>Pepper</strong>: an optional secret key (stored outside the database, e.g. in a KMS/HSM) mixed in via HMAC before hashing. It helps if only the database leaks. Rotation is awkward; treat as defense in depth.</li>
+    <li><strong>Work factor</strong>: tune so a single hash takes roughly a few hundred milliseconds or less on your login hardware, and revisit as hardware improves.</li>
+  </ul>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Algorithm</th><th>Memory-hard</th><th>Parameters</th><th>Notes</th><th>Spring encoder</th></tr></thead>
+    <tbody>
+      <tr><td>Argon2id</td><td>Yes</td><td>memory (m), iterations (t), parallelism (p)</td><td>OWASP's first recommendation; RFC 9106</td><td><code>Argon2PasswordEncoder</code> (needs Bouncy Castle)</td></tr>
+      <tr><td>scrypt</td><td>Yes</td><td>N (CPU/memory cost), r, p</td><td>Good alternative</td><td><code>SCryptPasswordEncoder</code></td></tr>
+      <tr><td>bcrypt</td><td>No (4 KB)</td><td>cost (log2 rounds)</td><td>Widely deployed; truncates input at 72 bytes</td><td><code>BCryptPasswordEncoder</code></td></tr>
+      <tr><td>PBKDF2-HMAC-SHA256</td><td>No</td><td>iterations</td><td>Use when FIPS-140 compliance is required; needs very high iteration counts</td><td><code>Pbkdf2PasswordEncoder</code></td></tr>
+    </tbody>
+  </table></div>
+  <p><span class="tag version">Version-sensitive · checked Nov 2026</span> OWASP's Password Storage Cheat Sheet currently suggests minimums such as Argon2id with 19 MiB memory, 2 iterations, parallelism 1; scrypt N=2^17, r=8, p=1; bcrypt cost ≥ 10; PBKDF2-HMAC-SHA256 with 600,000 iterations. Check the current sheet before adopting numbers.</p>
+  <p>Spring's <code>DelegatingPasswordEncoder</code> stores hashes with a prefix such as <code>{bcrypt}$2a$10$...</code> or <code>{argon2}...</code>, so you can change the default algorithm without invalidating existing hashes, and <code>upgradeEncoding()</code> lets you re-hash on next successful login.</p>
+  <p>Password policy (NIST SP 800-63B): minimum length (at least 8, and 15 for single-factor passwords in Rev. 4), allow long passphrases (at least 64 characters), check against lists of breached/common passwords, do <em>not</em> impose composition rules or periodic forced rotation, and rate-limit attempts.</p>
+
+  <h3>3.3 Multi-factor authentication</h3>
+  <p>MFA combines factors from different categories. Not all second factors are equal:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Factor</th><th>Phishing-resistant?</th><th>Main weaknesses</th></tr></thead>
+    <tbody>
+      <tr><td>SMS / voice OTP</td><td>No</td><td>SIM swap, SS7 interception, real-time phishing relay; NIST classes it as "restricted"</td></tr>
+      <tr><td>TOTP app (RFC 6238)</td><td>No</td><td>Real-time phishing proxies relay the code; seed theft</td></tr>
+      <tr><td>Push approval</td><td>No</td><td>"MFA fatigue" bombing; mitigated by number matching</td></tr>
+      <tr><td>FIDO2 / WebAuthn (security key, platform authenticator, passkey)</td><td>Yes</td><td>Account recovery flows become the weak point; device loss</td></tr>
+      <tr><td>Client certificate (smart card, mTLS)</td><td>Yes</td><td>Provisioning and lifecycle cost</td></tr>
+    </tbody>
+  </table></div>
+  <p>The defining property of phishing resistance is <strong>origin binding</strong>: the authenticator itself checks which website is asking and will not produce a valid response for a look-alike domain. OTP codes are just numbers a user can type into the wrong site.</p>
+
+  <h3>3.4 Passkeys and WebAuthn</h3>
+  <p>WebAuthn is public-key authentication in the browser. At <em>registration</em>, the authenticator generates a new key pair scoped to the relying party ID (your domain), keeps the private key (in secure hardware or a synced credential manager), and returns the public key and a credential ID, which the server stores. At <em>authentication</em>, the server sends a random challenge; the authenticator, after local user verification (biometric or PIN), signs a structure containing the challenge, the origin and the RP ID hash; the server verifies the signature with the stored public key. Nothing reusable is ever sent to the server — there is no shared secret to phish or leak in a database breach.</p>
+  <p><strong>Passkeys</strong> is the industry name for discoverable FIDO credentials, typically synced across a user's devices by their platform (iCloud Keychain, Google Password Manager, Windows/Microsoft, or third-party managers). Synced passkeys trade some assurance (the key is no longer bound to one device) for recoverability. Device-bound passkeys (on hardware security keys) offer higher assurance for administrators. <span class="tag version">Version-sensitive · checked Nov 2026</span> Spring Security 6.4+ includes WebAuthn/passkey support (<code>http.webAuthn(...)</code>), built on the WebAuthn4J library.</p>
+
+  <h3>3.5 Sessions and cookies</h3>
+  <p>A server-side session maps a random identifier (the cookie) to state stored on the server (memory, Redis via Spring Session, JDBC). Security requirements:</p>
+  <ul>
+    <li><strong>Identifier entropy</strong>: at least 64 bits from a CSPRNG (servlet containers use far more).</li>
+    <li><strong>Cookie flags</strong>: <code>Secure</code> (HTTPS only), <code>HttpOnly</code> (not readable by JavaScript, limiting XSS theft), <code>SameSite=Lax</code> or <code>Strict</code> (limits cross-site sending, a CSRF defence), narrow <code>Path</code>, and no <code>Domain</code> attribute unless you need subdomains (host-only cookies are safer). The <code>__Host-</code> name prefix enforces Secure, no Domain and Path=/.</li>
+    <li><strong>Session fixation</strong>: an attacker plants a known session ID in the victim's browser before login; if the ID survives authentication, the attacker shares the authenticated session. Defence: issue a new session ID on login (and on privilege change). Spring Security does this by default (<code>changeSessionId</code> strategy via <code>sessionFixation()</code>).</li>
+    <li><strong>Timeouts</strong>: idle timeout (e.g. 15–30 minutes for sensitive apps) and absolute timeout (e.g. 8–12 hours), plus re-authentication for sensitive operations.</li>
+    <li><strong>Logout</strong> must invalidate server-side state, not merely delete the cookie.</li>
+    <li><strong>Concurrent session control</strong>: optionally cap sessions per user (<code>maximumSessions(1)</code>) — requires a <code>SessionRegistry</code>; with Spring Session use <code>SpringSessionBackedSessionRegistry</code>.</li>
+  </ul>
+  <p>Spring Session externalises the <code>HttpSession</code> to Redis/JDBC/Hazelcast so sessions survive restarts and scale horizontally; it also offers <code>FindByIndexNameSessionRepository</code> to find and invalidate all sessions for a user (e.g. after a password change).</p>
+
+  <h3>3.6 OAuth 2.0 roles</h3>
+  <ul>
+    <li><strong>Resource owner</strong> — usually the end user, who owns the data.</li>
+    <li><strong>Client</strong> — the application requesting access (SPA, mobile app, server-side web app, CLI, another service). <em>Confidential</em> clients can keep a secret (server-side); <em>public</em> clients cannot (SPAs, mobile, desktop, CLI).</li>
+    <li><strong>Authorization server (AS)</strong> — authenticates the resource owner, obtains consent, issues tokens (Keycloak, Okta, Entra ID, Spring Authorization Server).</li>
+    <li><strong>Resource server (RS)</strong> — the API that accepts access tokens (your Spring Boot service with <code>oauth2ResourceServer()</code>).</li>
+  </ul>
+
+  <h3>3.7 Grant types</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Grant</th><th>Use for</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>Authorization code + PKCE</td><td>Any client acting for a user: web apps, SPAs (ideally via BFF), mobile, desktop</td><td>Recommended; PKCE required for public clients and recommended for confidential clients (RFC 9700)</td></tr>
+      <tr><td>Client credentials</td><td>Service-to-service with no user (batch jobs, backend integrations)</td><td>Recommended</td></tr>
+      <tr><td>Device authorization (RFC 8628)</td><td>Input-constrained devices and CLIs: TV, IoT, <code>gh auth login</code>-style flows</td><td>Recommended for those clients</td></tr>
+      <tr><td>Refresh token</td><td>Obtaining new access tokens without user interaction</td><td>Recommended with rotation or sender-constraint for public clients</td></tr>
+      <tr><td>Token exchange (RFC 8693)</td><td>A service exchanging an incoming token for one scoped to a downstream API (delegation/impersonation)</td><td>Recommended for multi-hop calls</td></tr>
+      <tr><td>JWT bearer / client assertion (RFC 7523)</td><td>Client authentication with a signed JWT instead of a shared secret (<code>private_key_jwt</code>)</td><td>Recommended over shared secrets</td></tr>
+      <tr><td>Implicit</td><td>Formerly SPAs; tokens returned in URL fragment</td><td><strong>Deprecated</strong> (RFC 9700); omitted from OAuth 2.1</td></tr>
+      <tr><td>Resource owner password credentials</td><td>Client collects the user's password and sends it to the AS</td><td><strong>Must not be used</strong> (RFC 9700); omitted from OAuth 2.1; removed from Spring Security 7</td></tr>
+    </tbody>
+  </table></div>
+  <p>Why the deprecations? <em>Implicit</em> puts access tokens in the browser URL fragment, where they leak via history, referrers and browser extensions, and cannot be sender-constrained or refreshed safely. <em>Password</em> trains users to type credentials into third-party apps, prevents MFA and phishing-resistant authentication, and gives the client the user's full credentials.</p>
+
+  <h3>3.8 Token types</h3>
+  <ul>
+    <li><strong>Access token</strong> — presented to resource servers. Either <em>self-contained</em> (JWT, validated locally by signature) or <em>opaque/reference</em> (random string, validated by calling the AS introspection endpoint). Short-lived: minutes, not days.</li>
+    <li><strong>Refresh token</strong> — presented only to the AS to get new access tokens. Long-lived, high value; must be stored securely and, for public clients, rotated on each use (reuse detection revokes the family) or sender-constrained.</li>
+    <li><strong>ID token</strong> (OIDC) — a JWT for the <em>client</em>, asserting who authenticated. Never send it to APIs as an access token.</li>
+    <li><strong>Bearer vs sender-constrained</strong>: a bearer token works for anyone who holds it (like cash). A sender-constrained token is bound to a key the client must prove possession of — via mTLS (RFC 8705, <code>cnf.x5t#S256</code> claim) or DPoP (RFC 9449, <code>cnf.jkt</code>). A stolen sender-constrained token is useless without the private key.</li>
+  </ul>
+
+  <h3>3.9 Scopes, audiences and claims</h3>
+  <p><strong>Scopes</strong> are coarse permissions the <em>client</em> asks for and the user consents to (<code>orders.read</code>, <code>openid</code>, <code>profile</code>). They limit what the client can do on the user's behalf — they are not a replacement for per-user authorization in the API. <strong>Audience</strong> (<code>aud</code>) states which resource server a token is for; an API must reject tokens whose <code>aud</code> is not itself, otherwise a token issued for a low-trust API can be replayed against a high-trust one. RFC 8707 (Resource Indicators) lets clients request audience-specific tokens. <strong>Claims</strong> are statements about the subject (<code>sub</code>, <code>email</code>, <code>roles</code>, <code>tenant</code>); keep access-token claims minimal and stable.</p>
+
+  <h3>3.10 RFC 9700 — the OAuth 2.0 Security Best Current Practice</h3>
+  <p>The key recommendations, summarised (read the RFC for exact normative language):</p>
+  <ul>
+    <li>Use authorization code with PKCE; PKCE required for public clients, recommended for confidential ones; use <code>S256</code>, not <code>plain</code>.</li>
+    <li>Do not use the implicit grant or other response types that return access tokens in the authorization response.</li>
+    <li>Do not use the resource owner password credentials grant.</li>
+    <li>Exact string matching of redirect URIs (no wildcards, no open redirectors on the client or AS).</li>
+    <li>Protect against CSRF on the redirect (PKCE, or <code>state</code>, or OIDC <code>nonce</code>).</li>
+    <li>Sender-constrain refresh tokens for public clients, or use refresh-token rotation; sender-constrain access tokens where feasible (mTLS or DPoP).</li>
+    <li>Restrict access-token privileges: audience restriction and minimal scope.</li>
+    <li>Defend against mix-up attacks when clients use multiple authorization servers (the <code>iss</code> authorization response parameter, RFC 9207).</li>
+    <li>Authenticate confidential clients with asymmetric methods (<code>private_key_jwt</code>, mTLS) where possible.</li>
+  </ul>
+
+  <h3>3.11 OpenID Connect</h3>
+  <p>OIDC adds: the <code>openid</code> scope; the <strong>ID token</strong> (a signed JWT with <code>iss</code>, <code>sub</code>, <code>aud</code> = the client ID, <code>exp</code>, <code>iat</code>, <code>auth_time</code>, <code>nonce</code>, optional <code>acr</code>/<code>amr</code>); the <strong>UserInfo endpoint</strong> returning claims for an access token; <strong>Discovery</strong> at <code>/.well-known/openid-configuration</code> (issuer, endpoints, <code>jwks_uri</code>, supported algorithms); <strong>dynamic client registration</strong>; and session management/logout specs (RP-initiated, front-channel, back-channel logout). The stable user identifier is the pair (<code>iss</code>, <code>sub</code>) — never the email, which can change or be reassigned.</p>
+
+  <h3>3.12 JWT structure</h3>
+  <p>A JWS-signed JWT is three base64url-encoded parts joined by dots: <code>header.payload.signature</code>. The header names the algorithm (<code>alg</code>), the key ID (<code>kid</code>) and type (<code>typ</code>, e.g. <code>at+jwt</code> for access tokens per RFC 9068). The payload holds claims. The signature covers <code>base64url(header) + "." + base64url(payload)</code>. A JWT is <em>signed, not encrypted</em>: anyone can read the payload. Do not put secrets or sensitive PII in it. (JWE provides encryption but is rarely needed for access tokens.)</p>
+  <pre class="ascii">eyJhbGciOiJSUzI1NiIsImtpZCI6IjIwMjYtMTEiLCJ0eXAiOiJhdCtqd3QifQ   &lt;- header  {"alg":"RS256","kid":"2026-11","typ":"at+jwt"}
+.eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlLmNvbSIsInN1YiI6IjI0OCIs...  &lt;- payload {"iss":"https://idp.example.com","sub":"248",
+                                                                              "aud":"orders-api","exp":1795000000,"scope":"orders.read"}
+.Qm9ndXMtc2lnbmF0dXJlLWZvci1pbGx1c3RyYXRpb24tb25seQ               &lt;- signature (illustrative)</pre>
+
+  <h3>3.13 Signing algorithms</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>alg</th><th>Type</th><th>Key</th><th>When</th></tr></thead>
+    <tbody>
+      <tr><td>RS256 / PS256</td><td>RSA PKCS#1 v1.5 / RSA-PSS with SHA-256</td><td>RSA 2048+ (3072 for longer horizons)</td><td>Most common across IdPs; PS256 preferred where supported</td></tr>
+      <tr><td>ES256</td><td>ECDSA P-256</td><td>EC</td><td>Smaller signatures; requires good randomness or deterministic nonces</td></tr>
+      <tr><td>EdDSA (Ed25519)</td><td>Edwards curve</td><td>OKP</td><td>Fast, robust; library support improving</td></tr>
+      <tr><td>HS256</td><td>HMAC-SHA256</td><td>Shared secret</td><td>Only when issuer and verifier are the same party; every verifier can also forge</td></tr>
+      <tr><td>none</td><td>Unsigned</td><td>—</td><td>Never accept</td></tr>
+    </tbody>
+  </table></div>
+  <p>Asymmetric algorithms let many resource servers verify tokens with a public key from the JWKS while only the AS holds the private key. With HS256, every service that verifies can also mint tokens — so a compromise of any one service compromises all.</p>
+
+  <h3>3.14 Authorization models</h3>
+  <ul>
+    <li><strong>ACL</strong> — per-object lists of who may do what. Simple, but hard to manage at scale.</li>
+    <li><strong>RBAC</strong> — permissions attach to roles, users get roles. Great for coarse function-level access (<code>ADMIN</code>, <code>SUPPORT</code>). Fails at object level ("support agents may only see tickets of their region") and suffers role explosion when you encode context into role names (<code>EU_SUPPORT_READONLY</code>).</li>
+    <li><strong>ABAC</strong> — decisions from attributes of subject, resource, action and environment ("allow if user.department == doc.department and time within business hours and device managed"). Expressive; harder to audit; policies need testing. Implemented with policy engines (OPA/Rego, Cedar, XACML) or in code.</li>
+    <li><strong>ReBAC</strong> — decisions from relationships in a graph ("user is editor of folder; folder is parent of doc; editors of a parent are viewers of children"). The Zanzibar model: tuples <code>object#relation@subject</code>, plus a namespace config defining how relations compose. Ideal for sharing/collaboration products and hierarchical multi-tenant data. Implementations: SpiceDB, OpenFGA, Permify, Ory Keto.</li>
+    <li><strong>Policy-as-code engines</strong> — OPA (Rego) evaluates JSON input against policies, often as a sidecar or library; Cedar (AWS, open source, also behind Amazon Verified Permissions) is a typed policy language designed for analysability.</li>
+  </ul>
+  <p>Most real systems combine them: RBAC for admin functions, ownership/ReBAC for data, ABAC conditions for context (tenant, region, risk).</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working</h2>
+
+  <h3>4.1 Authorization code flow with PKCE, step by step</h3>
+  <ol>
+    <li>The client generates a <code>code_verifier</code>: 43–128 characters of high-entropy randomness. It computes <code>code_challenge = BASE64URL(SHA256(code_verifier))</code>. It also generates <code>state</code> (and, for OIDC, <code>nonce</code>) and stores all three in the user's session (for a BFF) or secure storage (native apps).</li>
+    <li>The client redirects the browser to the AS's authorization endpoint with <code>response_type=code</code>, <code>client_id</code>, <code>redirect_uri</code>, <code>scope</code>, <code>state</code>, <code>nonce</code>, <code>code_challenge</code>, <code>code_challenge_method=S256</code>.</li>
+    <li>The AS authenticates the user (password + MFA, passkey, upstream federation), checks the client and the redirect URI by exact match, and obtains consent if needed.</li>
+    <li>The AS redirects back to <code>redirect_uri?code=...&amp;state=...&amp;iss=...</code>. The code is short-lived (often around a minute or less) and single-use; the AS remembers the challenge associated with it.</li>
+    <li>The client checks <code>state</code> (and <code>iss</code>) match what it stored, then POSTs to the token endpoint: <code>grant_type=authorization_code</code>, <code>code</code>, <code>redirect_uri</code>, <code>code_verifier</code>, plus client authentication if confidential.</li>
+    <li>The AS recomputes <code>SHA256(code_verifier)</code> and compares with the stored challenge. An attacker who intercepted the code (malicious app on the same device, log leakage, referrer) does not have the verifier and cannot redeem it.</li>
+    <li>The AS returns <code>access_token</code>, <code>token_type</code>, <code>expires_in</code>, optional <code>refresh_token</code>, and with <code>openid</code> an <code>id_token</code>. The client validates the ID token (signature, <code>iss</code>, <code>aud</code> = its client ID, <code>exp</code>, <code>nonce</code>).</li>
+  </ol>
+  <p>Why PKCE even for confidential clients? It also defends against <em>authorization code injection</em>, where an attacker injects a stolen code into their own session with the legitimate client; the client's stored verifier will not match the code's challenge.</p>
+
+  <h3>4.2 How Spring's resource server validates a JWT</h3>
+  <p>For a request with <code>Authorization: Bearer ...</code>:</p>
+  <ol>
+    <li><code>BearerTokenAuthenticationFilter</code> extracts the token via <code>BearerTokenResolver</code> (header only by default; query-parameter and form-body tokens are disabled by default — keep it that way, since URLs are logged).</li>
+    <li>It delegates to the <code>AuthenticationManager</code>, which routes to <code>JwtAuthenticationProvider</code>.</li>
+    <li><code>NimbusJwtDecoder</code> parses the JWT, finds the key by <code>kid</code> in the JWKS (fetched from <code>jwks_uri</code> discovered via <code>issuer-uri</code>, cached, refreshed when an unknown <code>kid</code> appears), and verifies the signature using only the algorithms it is configured for (RS256 by default, or those advertised by the issuer).</li>
+    <li>An <code>OAuth2TokenValidator&lt;Jwt&gt;</code> chain runs: by default timestamps (<code>exp</code>/<code>nbf</code> with 60 seconds clock skew) and issuer (when configured via issuer URI). Audience is validated only if you configure <code>audiences</code> or add a validator. <span class="tag version">Version-sensitive · checked Nov 2026</span> Spring Security 7 adds a <code>typ</code> header validator to the defaults.</li>
+    <li><code>JwtAuthenticationConverter</code> turns claims into a <code>JwtAuthenticationToken</code> with authorities (by default <code>SCOPE_</code>-prefixed entries from <code>scope</code>/<code>scp</code>).</li>
+    <li>The token is placed in the <code>SecurityContext</code>; <code>AuthorizationFilter</code> and method security then evaluate rules. On failure, <code>BearerTokenAuthenticationEntryPoint</code> returns 401 with a <code>WWW-Authenticate: Bearer error="invalid_token"</code> header.</li>
+  </ol>
+
+  <h3>4.3 The JWT validation checklist</h3>
+  <p>Whatever the language, a resource server must:</p>
+  <ol>
+    <li><strong>Pin the algorithm(s)</strong> server-side. Never trust the token's <code>alg</code> to choose the verification method. Reject <code>none</code>.</li>
+    <li><strong>Select keys only from a trusted source</strong>: the configured issuer's JWKS. Ignore <code>jku</code>, <code>x5u</code> and embedded <code>jwk</code> header parameters (they let the token point to an attacker's key). Treat <code>kid</code> as an opaque lookup key, never as a file path or SQL fragment.</li>
+    <li><strong>Verify the signature</strong> before trusting any claim.</li>
+    <li><strong>Check <code>iss</code></strong> equals the expected issuer exactly.</li>
+    <li><strong>Check <code>aud</code></strong> contains this API's identifier.</li>
+    <li><strong>Check <code>exp</code></strong> (required) and <code>nbf</code>/<code>iat</code> with small clock skew.</li>
+    <li><strong>Check <code>typ</code></strong> (<code>at+jwt</code> for access tokens per RFC 9068) to prevent an ID token or other JWT being used as an access token ("token confusion").</li>
+    <li><strong>Check sender constraint</strong> if present (<code>cnf</code> against DPoP proof or mTLS certificate).</li>
+    <li><strong>Then authorize</strong> using scopes/claims plus your own data.</li>
+  </ol>
+
+  <h3>4.4 Algorithm confusion and other classic JWT bugs</h3>
+  <p><strong>RS256→HS256 confusion.</strong> A naive library function like <code>verify(token, key)</code> picks the algorithm from the token header. If the server passes its RSA <em>public</em> key (which is public!) and the attacker sets <code>alg: HS256</code>, the library computes an HMAC using the public key bytes as the secret — which the attacker can also do. The attacker can therefore forge arbitrary tokens. Fix: algorithm pinned per key; keys typed (an RSA key object cannot be used as an HMAC secret).</p>
+  <p><strong><code>alg: none</code>.</strong> Some early libraries accepted unsigned tokens. Fix: reject <code>none</code>; modern libraries do by default when given a key.</p>
+  <p><strong>Weak HMAC secrets.</strong> HS256 with a short or dictionary secret can be brute-forced offline from any captured token. Fix: 256-bit random secrets, or asymmetric algorithms.</p>
+  <p><strong>Missing audience check.</strong> A token for the low-privilege <code>newsletter-api</code> works on <code>payments-api</code> because both trust the same issuer. Fix: validate <code>aud</code>.</p>
+  <p><strong>Cross-issuer acceptance.</strong> Multi-tenant resource servers that accept tokens from several issuers must map each issuer to its own JWKS; never accept "any signature from any key we know" (the Storm-0558 case study in §9 shows a variant of this at hyperscale).</p>
+
+  <h3>4.5 Revocation strategies</h3>
+  <p>A self-contained JWT is valid until <code>exp</code>; the resource server does not consult the AS. If a user is disabled, a token stolen, or permissions changed, what then?</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Strategy</th><th>How</th><th>Trade-off</th></tr></thead>
+    <tbody>
+      <tr><td>Short lifetimes</td><td>5–15 minute access tokens; revoke the refresh token</td><td>Exposure window = token lifetime; more token-endpoint traffic</td></tr>
+      <tr><td>Deny-list by <code>jti</code></td><td>Push revoked token IDs to a shared cache checked per request</td><td>Reintroduces state and a lookup; list is small because entries expire at <code>exp</code></td></tr>
+      <tr><td>Deny-list by subject + "not before"</td><td>Store <code>revokedBefore[sub] = now</code>; reject tokens with <code>iat</code> earlier</td><td>Revokes all of a user's tokens with one entry</td></tr>
+      <tr><td>Introspection (opaque tokens)</td><td>RS calls AS (RFC 7662) per request, with short caching</td><td>Immediate revocation; latency and AS availability dependency</td></tr>
+      <tr><td>Event-driven</td><td>AS emits revocation events (e.g. Shared Signals / CAEP); services update local deny-lists</td><td>Near-real-time; more moving parts</td></tr>
+      <tr><td>Sender-constrained tokens</td><td>DPoP/mTLS</td><td>Does not revoke, but makes theft far less useful</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>4.6 JWT vs opaque tokens</h3>
+  <p>JWTs: no per-request call to the AS, good for high-throughput microservices and cross-domain; but content is readable by any holder (privacy), revocation is delayed, and tokens grow with claims. Opaque tokens: immediately revocable, carry no data to leak, small; but every RS must introspect (latency, AS load, availability). A common hybrid is the <strong>phantom token</strong> pattern: clients receive opaque tokens; the API gateway introspects once and forwards a short-lived JWT to internal services. Spring supports both: <code>.jwt()</code> and <code>.opaqueToken()</code> on <code>oauth2ResourceServer</code>, and an <code>AuthenticationManagerResolver</code> to support both at once.</p>
+
+  <h3>4.7 Refresh token rotation and reuse detection</h3>
+  <p>With rotation, each refresh returns a <em>new</em> refresh token and invalidates the old one. If an old refresh token is presented again, the AS knows that either the client or an attacker holds a stolen copy, and revokes the whole token family, forcing re-authentication. Spring Authorization Server exposes <code>TokenSettings.reuseRefreshTokens(false)</code> to issue a new refresh token on every use.</p>
+
+  <h3>4.8 DPoP in brief</h3>
+  <p>The client generates a key pair. On each token request and each API call, it sends a <code>DPoP</code> header containing a short JWT signed with its private key, including its public key (<code>jwk</code> header), the HTTP method (<code>htm</code>), URI (<code>htu</code>), a unique <code>jti</code>, <code>iat</code>, and for API calls a hash of the access token (<code>ath</code>). The AS binds the access token to the key thumbprint (<code>cnf.jkt</code>). The resource server verifies the proof signature, that the key thumbprint matches <code>cnf.jkt</code>, that method and URI match, freshness, and <code>jti</code> uniqueness. A stolen access token without the private key is useless. <span class="tag version">Version-sensitive · checked Nov 2026</span> Spring Security added DPoP support for resource servers in the 6.5 line; check your IdP's DPoP support before planning a rollout.</p>
+
+  <h3>4.9 Where browser apps should keep tokens: the BFF pattern</h3>
+  <p>Any token accessible to JavaScript (localStorage, sessionStorage, in-memory in the SPA) can be exfiltrated by an XSS bug or a malicious dependency. The IETF draft "OAuth 2.0 for Browser-Based Applications" recommends, in order of preference, a <strong>backend-for-frontend</strong>: a server-side component (Spring Boot with <code>oauth2Login()</code>, or Spring Cloud Gateway with <code>TokenRelay</code>) that is the confidential OAuth client, holds tokens server-side, and gives the browser only an <code>HttpOnly</code>, <code>Secure</code>, <code>SameSite</code> session cookie. API calls go through the BFF, which attaches the access token. The trade-off is that the cookie reintroduces CSRF concerns (handled by SameSite plus CSRF tokens) and a stateful component.</p>
+
+  <h3>4.10 Session fixation protection, internally</h3>
+  <p>On successful authentication, Spring Security's <code>SessionManagementFilter</code>/<code>AbstractAuthenticationProcessingFilter</code> invoke the configured <code>SessionAuthenticationStrategy</code>. The default <code>ChangeSessionIdAuthenticationStrategy</code> calls <code>HttpServletRequest.changeSessionId()</code> (Servlet 3.1+), keeping attributes but issuing a new ID. The pre-login ID the attacker planted becomes worthless. Alternatives: <code>newSession()</code> (fresh session, attributes dropped) and <code>migrateSession()</code>.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: The Flows as Sequence Diagrams</h2>
+
+  <h3>5.1 Authorization code + PKCE through a BFF</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant B as Browser
+  participant F as BFF (Spring Boot, confidential client)
+  participant A as Authorization Server
+  participant R as Orders API (resource server)
+  B->>F: GET /app (no session)
+  F->>F: create state, nonce, code_verifier; store in server session
+  F-->>B: 302 to A /authorize with code_challenge = S256(verifier), state, nonce
+  B->>A: GET /authorize ...
+  A->>B: login page (passkey / password + MFA)
+  B->>A: credentials
+  A-->>B: 302 to F callback with code, state, iss
+  B->>F: GET callback with code, state
+  F->>F: verify state and iss
+  F->>A: POST /token (code, code_verifier, client auth)
+  A-->>F: access_token, refresh_token, id_token
+  F->>F: validate id_token (sig, iss, aud, nonce); store tokens server-side
+  F-->>B: Set-Cookie SESSION (HttpOnly, Secure, SameSite=Lax)
+  B->>F: GET /api/orders (cookie + CSRF token for writes)
+  F->>R: GET /orders (Authorization: Bearer access_token)
+  R->>R: validate JWT (alg, sig, iss, aud, exp, typ); authorize
+  R-->>F: 200 orders
+  F-->>B: 200 orders
+</pre>
+  <figcaption>Figure 1 — Authorization code with PKCE via a backend-for-frontend. Tokens never reach the browser.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> steps 2–3 create the PKCE pair and anti-CSRF values server-side. Steps 5–7 happen entirely between browser and AS; the BFF never sees the password. Step 11 is the back-channel code redemption: the verifier proves the redeemer is the same party that started the flow. Step 13 is where many implementations are sloppy — the ID token must be validated, including <code>nonce</code>. From step 14 the browser holds only an opaque session cookie; XSS can still make requests while the user is on the page, but it cannot steal a long-lived token to use elsewhere. Steps 17–18 are the resource server's independent validation; it trusts nothing about the BFF except the token.</p>
+
+  <h3>5.2 Client credentials for service-to-service</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant J as Billing job (client)
+  participant A as Authorization Server
+  participant R as Ledger API
+  J->>A: POST /token grant_type=client_credentials, scope=ledger.write, client_assertion (private_key_jwt)
+  A->>A: verify assertion signature with client's registered public key
+  A-->>J: access_token (aud=ledger-api, exp=5 min)
+  J->>R: POST /entries (Bearer token)
+  R->>R: validate token, check scope ledger.write and client_id allow-list
+  R-->>J: 201
+  Note over J,A: Cache the token until shortly before expiry, then request a new one
+</pre>
+  <figcaption>Figure 2 — Client credentials with asymmetric client authentication.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> there is no user, so the token's subject is the client itself. Using <code>private_key_jwt</code> instead of a shared client secret means the AS stores only a public key, and the private key can live in a KMS or be replaced by workload identity (Chapter 11.4). The resource server should authorize on both scope and client identity: a scope alone does not say <em>which</em> service is calling.</p>
+
+  <h3>5.3 Device authorization grant</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as CLI tool
+  participant A as Authorization Server
+  participant U as User on phone/laptop
+  C->>A: POST /device_authorization client_id, scope
+  A-->>C: device_code, user_code=WDJB-MJHT, verification_uri, interval=5
+  C->>U: "Visit verification_uri and enter WDJB-MJHT"
+  U->>A: open URI, sign in, enter code, approve
+  loop every interval seconds
+    C->>A: POST /token grant_type=device_code, device_code
+    A-->>C: authorization_pending (until approved)
+  end
+  A-->>C: access_token, refresh_token
+</pre>
+  <figcaption>Figure 3 — Device authorization grant (RFC 8628) for a CLI.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the device never handles the user's credentials. The user authenticates on a full browser where passkeys and MFA work. The main risk is social engineering ("enter this code to claim your prize"), so the AS should display the requesting client clearly on the approval screen, and user codes should expire quickly. Respect <code>slow_down</code> responses when polling.</p>
+
+  <h3>5.4 Token exchange for multi-hop calls</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant F as BFF
+  participant O as Orders API
+  participant A as Authorization Server
+  participant P as Payments API
+  F->>O: Bearer T1 (aud=orders-api, sub=alice)
+  O->>A: token exchange: subject_token=T1, audience=payments-api, scope=payments.charge
+  A->>A: policy: may orders-api act for alice on payments-api?
+  A-->>O: T2 (aud=payments-api, sub=alice, act.sub=orders-api, exp=2 min)
+  O->>P: Bearer T2
+  P->>P: validate aud, see actor chain, authorize
+</pre>
+  <figcaption>Figure 4 — RFC 8693 token exchange instead of forwarding the user's token.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> forwarding T1 to Payments would require Payments to accept tokens whose audience is Orders — breaking audience restriction — and would give Orders the ability to do anything Alice's token allows anywhere. With exchange, T2 is narrow (one audience, one scope, short lifetime) and records the actor (<code>act</code> claim), so Payments' audit log shows "Orders acting for Alice". This is the same "no token passthrough" principle that the MCP specification enforces for AI tool servers (Chapter 11.5).</p>
+
+  <h3>5.5 A ReBAC authorization check</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  U["user:alice"] -- "member" --> T["team:eng"]
+  T -- "editor" --> F["folder:roadmap"]
+  F -- "parent" --> D["doc:q3-plan"]
+  Q{"check: is alice a viewer of doc q3-plan?"}
+  D -.-> Q
+  Q -- "viewer includes editor of parent; editor includes team members" --> Y["ALLOW"]
+</pre>
+  <figcaption>Figure 5 — Relationship graph evaluated by a Zanzibar-style engine.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> no tuple directly says Alice may view the document. The engine walks relations defined in the schema: <code>doc.viewer</code> includes <code>parent.editor</code>; <code>folder.editor</code> includes <code>team.member</code>. Because relationships are data, sharing a folder with a team is one tuple write, and the check stays fast via graph caching. Zanzibar's paper also addresses consistency ("new enemy" problem) using snapshot tokens called zookies.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math: Hash Cost, Entropy, Token Exposure</h2>
+  <h3>6.1 Password cracking economics</h3>
+  <p>Intuition: an attacker with a stolen hash table tries candidate passwords; your only lever is the cost of each guess. If one guess costs \( c \) seconds of attacker hardware and the attacker needs on average half the candidate space \( N \), time to crack one password is</p>
+  \[ T \approx \frac{N}{2} \cdot \frac{c}{k} \]
+  <p>with \( k \) parallel units. <span class="tag illus">Illustrative</span> For a password drawn uniformly from \( N = 10^{10} \) candidates: with a fast hash (\( c = 10^{-10} \) s per guess on a GPU), \( T \approx 0.5 \) s. With bcrypt at a cost where a guess takes \( 10^{-4} \) s on the same GPU (bcrypt resists GPU acceleration), \( T \approx 5\times10^{5} \) s ≈ 6 days — per password, per GPU. Salt multiplies this by the number of users, since each must be attacked separately. Memory-hard functions further raise \( c \) on GPUs/ASICs by requiring large RAM per guess.</p>
+  <h3>6.2 bcrypt cost is exponential</h3>
+  <p>bcrypt cost \( w \) performs \( 2^{w} \) key-expansion rounds, so each +1 doubles time: cost 10 → 12 is 4× slower. Benchmark on production hardware; a login endpoint that takes 250 ms of CPU per attempt also needs rate limiting, or attackers can use it for CPU exhaustion.</p>
+  <h3>6.3 Entropy of secrets</h3>
+  <p>Entropy in bits for a uniformly random string of length \( L \) from alphabet size \( A \): \( H = L \log_2 A \). A 43-character base64url PKCE verifier: \( 43 \times 6 = 258 \) bits. A 6-digit OTP: \( \log_2 10^6 \approx 19.9 \) bits — safe only because of short lifetime and attempt limits. Human passwords do not have uniform entropy; that is why breached-password checks matter more than composition rules.</p>
+  <h3>6.4 Token lifetime vs exposure</h3>
+  <p>If tokens are stolen at rate \( \lambda \) per day and each remains usable for lifetime \( L \) after theft (no revocation), expected attacker-usable token-time per day is \( \lambda L \). Halving lifetime halves exposure but doubles refresh traffic: refresh requests per second ≈ active sessions ÷ \( L \). <span class="tag illus">Illustrative</span> 200,000 concurrent sessions with 5-minute tokens ⇒ ≈ 667 refreshes/s at the AS; with 15-minute tokens ≈ 222/s. Pick \( L \) as a capacity and risk decision.</p>
+  <h3>6.5 JWKS caching and validation latency</h3>
+  <p>RSA-2048 signature verification costs on the order of tens of microseconds on modern CPUs; ES256 verification is somewhat slower than RSA verification but signing is much faster. JWKS fetches happen once per key rotation (cache with refresh on unknown <code>kid</code>, rate-limited to avoid being turned into a DoS amplifier by tokens with random <code>kid</code>s). Introspection adds a network round trip (typically 1–10 ms in-region) per request unless cached.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code: Authorization Server, Resource Server, BFF, Passwords, and Go/Python Validation</h2>
+  <p><span class="tag version">Version-sensitive · checked Nov 2026</span> Code targets Spring Boot 3.5 with Spring Security 6.5 / Spring Authorization Server 1.5, and is source-compatible in the essentials with Spring Boot 4 / Spring Security 7, where the authorization server lives in Spring Security itself (same artifact ID <code>org.springframework.security:spring-security-oauth2-authorization-server</code>) and some Boot starters were renamed — check the Boot 4 migration guide for starter names.</p>
+
+  <h3>7.1 A minimal Spring Authorization Server</h3>
+  <pre data-file="AuthServerConfig.java"><code class="language-java">package com.example.idp;
+
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.interfaces.RSAPrivateKey;
+import java.security.interfaces.RSAPublicKey;
+import java.time.Duration;
+import java.util.UUID;
+
+import com.nimbusds.jose.jwk.JWKSet;
+import com.nimbusds.jose.jwk.RSAKey;
+import com.nimbusds.jose.jwk.source.ImmutableJWKSet;
+import com.nimbusds.jose.jwk.source.JWKSource;
+import com.nimbusds.jose.proc.SecurityContext;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.annotation.Order;
+import org.springframework.http.MediaType;
+import org.springframework.security.config.Customizer;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.core.userdetails.User;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.crypto.factory.PasswordEncoderFactories;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.oauth2.core.AuthorizationGrantType;
+import org.springframework.security.oauth2.core.ClientAuthenticationMethod;
+import org.springframework.security.oauth2.core.oidc.OidcScopes;
+import org.springframework.security.oauth2.server.authorization.client.InMemoryRegisteredClientRepository;
+import org.springframework.security.oauth2.server.authorization.client.RegisteredClient;
+import org.springframework.security.oauth2.server.authorization.client.RegisteredClientRepository;
+import org.springframework.security.oauth2.server.authorization.config.annotation.web.configurers.OAuth2AuthorizationServerConfigurer;
+import org.springframework.security.oauth2.server.authorization.settings.AuthorizationServerSettings;
+import org.springframework.security.oauth2.server.authorization.settings.ClientSettings;
+import org.springframework.security.oauth2.server.authorization.settings.TokenSettings;
+import org.springframework.security.provisioning.InMemoryUserDetailsManager;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.LoginUrlAuthenticationEntryPoint;
+import org.springframework.security.web.util.matcher.MediaTypeRequestMatcher;
+
+@Configuration
+public class AuthServerConfig {
+
+    @Bean @Order(1)
+    SecurityFilterChain authorizationServer(HttpSecurity http) throws Exception {
+        OAuth2AuthorizationServerConfigurer as = OAuth2AuthorizationServerConfigurer.authorizationServer();
+        http.securityMatcher(as.getEndpointsMatcher())
+            .with(as, cfg -&gt; cfg.oidc(Customizer.withDefaults()))      // discovery, userinfo, ID tokens
+            .authorizeHttpRequests(a -&gt; a.anyRequest().authenticated())
+            .exceptionHandling(e -&gt; e.defaultAuthenticationEntryPointFor(
+                    new LoginUrlAuthenticationEntryPoint("/login"),
+                    new MediaTypeRequestMatcher(MediaType.TEXT_HTML)));
+        return http.build();
+    }
+
+    @Bean @Order(2)
+    SecurityFilterChain login(HttpSecurity http) throws Exception {
+        http.authorizeHttpRequests(a -&gt; a.anyRequest().authenticated())
+            .formLogin(Customizer.withDefaults());                       // add .webAuthn(...) for passkeys
+        return http.build();
+    }
+
+    @Bean
+    RegisteredClientRepository clients(PasswordEncoder encoder) {
+        RegisteredClient bff = RegisteredClient.withId(UUID.randomUUID().toString())
+            .clientId("shop-bff")
+            .clientSecret(encoder.encode(System.getenv("SHOP_BFF_SECRET")))  // from a secret store, never literal
+            .clientAuthenticationMethod(ClientAuthenticationMethod.CLIENT_SECRET_BASIC)
+            .authorizationGrantType(AuthorizationGrantType.AUTHORIZATION_CODE)
+            .authorizationGrantType(AuthorizationGrantType.REFRESH_TOKEN)
+            .redirectUri("https://shop.example.com/login/oauth2/code/shop")  // exact match only
+            .scope(OidcScopes.OPENID).scope(OidcScopes.PROFILE).scope("orders.read").scope("orders.write")
+            .clientSettings(ClientSettings.builder().requireProofKey(true).requireAuthorizationConsent(false).build())
+            .tokenSettings(TokenSettings.builder()
+                .accessTokenTimeToLive(Duration.ofMinutes(5))
+                .refreshTokenTimeToLive(Duration.ofHours(8))
+                .reuseRefreshTokens(false)                                 // rotation
+                .build())
+            .build();
+
+        RegisteredClient billing = RegisteredClient.withId(UUID.randomUUID().toString())
+            .clientId("billing-job")
+            .clientAuthenticationMethod(ClientAuthenticationMethod.PRIVATE_KEY_JWT)
+            .authorizationGrantType(AuthorizationGrantType.CLIENT_CREDENTIALS)
+            .scope("ledger.write")
+            .clientSettings(ClientSettings.builder()
+                .jwkSetUrl("https://billing.internal.example.com/.well-known/jwks.json").build())
+            .tokenSettings(TokenSettings.builder().accessTokenTimeToLive(Duration.ofMinutes(5)).build())
+            .build();
+        // Production: JdbcRegisteredClientRepository + JdbcOAuth2AuthorizationService.
+        return new InMemoryRegisteredClientRepository(bff, billing);
+    }
+
+    @Bean
+    JWKSource&lt;SecurityContext&gt; jwkSource() throws Exception {
+        // Demo only: an ephemeral key. Production: load from KMS/HSM or a keystore, publish old+new keys during rotation.
+        KeyPairGenerator g = KeyPairGenerator.getInstance("RSA");
+        g.initialize(3072);
+        KeyPair kp = g.generateKeyPair();
+        RSAKey rsa = new RSAKey.Builder((RSAPublicKey) kp.getPublic())
+                .privateKey((RSAPrivateKey) kp.getPrivate())
+                .keyID(UUID.randomUUID().toString()).build();
+        return new ImmutableJWKSet&lt;&gt;(new JWKSet(rsa));
+    }
+
+    @Bean
+    AuthorizationServerSettings settings() {
+        return AuthorizationServerSettings.builder().issuer("https://idp.example.com").build();
+    }
+
+    @Bean
+    PasswordEncoder passwordEncoder() {
+        return PasswordEncoderFactories.createDelegatingPasswordEncoder();   // {bcrypt} default, upgradeable
+    }
+
+    @Bean
+    UserDetailsService users(PasswordEncoder encoder) {
+        // Demo only. Production: a JDBC/LDAP-backed store or federation to an upstream IdP.
+        return new InMemoryUserDetailsManager(
+            User.withUsername("alice").password(encoder.encode("correct horse battery staple")).roles("USER").build());
+    }
+}</code></pre>
+  <p>Points to notice: PKCE is required for the BFF even though it is confidential; refresh tokens rotate; the batch client authenticates with <code>private_key_jwt</code> so the AS stores no shared secret; issuer is explicit; the demo signing key is ephemeral (every restart invalidates all tokens — fine for a demo, wrong for production).</p>
+  <p>To put an audience and token type into access tokens, add an <code>OAuth2TokenCustomizer&lt;JwtEncodingContext&gt;</code>:</p>
+  <pre><code class="language-java">@Bean
+OAuth2TokenCustomizer&lt;JwtEncodingContext&gt; accessTokenCustomizer() {
+    return ctx -&gt; {
+        if (OAuth2TokenType.ACCESS_TOKEN.equals(ctx.getTokenType())) {
+            ctx.getJwsHeader().type("at+jwt");                                   // RFC 9068
+            ctx.getClaims().audience(java.util.List.of("orders-api"));          // or derive from requested resource
+        }
+    };
+}</code></pre>
+
+  <h3>7.2 Resource server with strict validation</h3>
+  <pre data-file="ResourceServerConfig.java"><code class="language-java">package com.example.orders.security;
+
+import java.util.List;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.oauth2.core.DelegatingOAuth2TokenValidator;
+import org.springframework.security.oauth2.core.OAuth2Error;
+import org.springframework.security.oauth2.core.OAuth2TokenValidator;
+import org.springframework.security.oauth2.core.OAuth2TokenValidatorResult;
+import org.springframework.security.oauth2.jose.jws.SignatureAlgorithm;
+import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.security.oauth2.jwt.JwtClaimNames;
+import org.springframework.security.oauth2.jwt.JwtClaimValidator;
+import org.springframework.security.oauth2.jwt.JwtDecoder;
+import org.springframework.security.oauth2.jwt.JwtValidators;
+import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
+import org.springframework.security.web.SecurityFilterChain;
+
+@Configuration
+@EnableMethodSecurity
+public class ResourceServerConfig {
+
+    @Bean
+    SecurityFilterChain api(HttpSecurity http) throws Exception {
+        http.authorizeHttpRequests(a -&gt; a
+                .requestMatchers("/api/orders/**").hasAuthority("SCOPE_orders.read")
+                .anyRequest().denyAll())
+            .oauth2ResourceServer(rs -&gt; rs.jwt(j -&gt; {}))
+            .sessionManagement(s -&gt; s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .csrf(c -&gt; c.disable());                    // bearer tokens only, no cookies
+        return http.build();
+    }
+
+    @Bean
+    JwtDecoder jwtDecoder(@Value("${app.jwt.issuer}") String issuer) {
+        NimbusJwtDecoder decoder = NimbusJwtDecoder.withIssuerLocation(issuer)
+                .jwsAlgorithm(SignatureAlgorithm.RS256)          // pinned; add PS256/ES256 only if your IdP uses them
+                .build();
+        OAuth2TokenValidator&lt;Jwt&gt; audience = new JwtClaimValidator&lt;List&lt;String&gt;&gt;(
+                JwtClaimNames.AUD, aud -&gt; aud != null &amp;&amp; aud.contains("orders-api"));
+        OAuth2TokenValidator&lt;Jwt&gt; type = jwt -&gt; "at+jwt".equalsIgnoreCase(String.valueOf(jwt.getHeaders().get("typ")))
+                ? OAuth2TokenValidatorResult.success()
+                : OAuth2TokenValidatorResult.failure(new OAuth2Error("invalid_token", "wrong typ", null));
+        decoder.setJwtValidator(new DelegatingOAuth2TokenValidator&lt;&gt;(
+                JwtValidators.createDefaultWithIssuer(issuer), audience, type));
+        return decoder;
+    }
+}</code></pre>
+  <p>If your IdP does not set <code>typ: at+jwt</code> (many do not), drop the type validator and rely on audience — ID tokens carry the client ID as audience, so the audience check already prevents most ID-token-as-access-token confusion.</p>
+
+  <h3>7.3 Fine-grained authorization: ownership and relationships</h3>
+  <pre data-file="DocumentAccess.java"><code class="language-java">package com.example.docs.security;
+
+import java.util.UUID;
+import org.springframework.security.core.Authentication;
+import org.springframework.stereotype.Component;
+
+/** Referenced from SpEL as @docAccess. Delegates to a ReBAC engine (e.g. OpenFGA/SpiceDB) or local tables. */
+@Component("docAccess")
+public class DocumentAccess {
+    private final RelationshipClient rebac;   // thin client over your ReBAC engine, with timeouts
+
+    public DocumentAccess(RelationshipClient rebac) { this.rebac = rebac; }
+
+    public boolean canView(Authentication auth, UUID docId) {
+        try {
+            return rebac.check("doc:" + docId, "viewer", "user:" + auth.getName());
+        } catch (RelationshipClient.Unavailable e) {
+            return false;                     // fail closed
+        }
+    }
+}
+
+// Usage in a service:
+// @PreAuthorize("hasAuthority('SCOPE_docs.read') and @docAccess.canView(authentication, #docId)")
+// public Document get(UUID docId) { ... }</code></pre>
+  <p>For list endpoints, do not call <code>check</code> per row after loading everything; either push the filter into the query (ownership/tenant columns) or use the engine's "list objects" API to obtain allowed IDs first.</p>
+
+  <h3>7.4 BFF: Spring Boot as OAuth client with secure session cookies</h3>
+  <pre data-file="application.yml"><code class="language-yaml">spring:
+  security:
+    oauth2:
+      client:
+        registration:
+          shop:
+            provider: shop-idp
+            client-id: shop-bff
+            client-secret: ${SHOP_BFF_SECRET}
+            authorization-grant-type: authorization_code
+            scope: openid,profile,orders.read,orders.write
+            redirect-uri: "{baseUrl}/login/oauth2/code/{registrationId}"
+        provider:
+          shop-idp:
+            issuer-uri: https://idp.example.com
+  session:
+    timeout: 30m                 # idle timeout (Spring Session)
+server:
+  servlet:
+    session:
+      cookie:
+        name: __Host-SESSION
+        secure: true
+        http-only: true
+        same-site: lax
+        path: /</code></pre>
+  <pre data-file="BffSecurityConfig.java"><code class="language-java">package com.example.bff;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.Customizer;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.oauth2.client.registration.ClientRegistrationRepository;
+import org.springframework.security.oauth2.client.web.DefaultOAuth2AuthorizationRequestResolver;
+import org.springframework.security.oauth2.client.web.OAuth2AuthorizationRequestCustomizers;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.csrf.CookieCsrfTokenRepository;
+
+@Configuration
+public class BffSecurityConfig {
+    @Bean
+    SecurityFilterChain bff(HttpSecurity http, ClientRegistrationRepository repo) throws Exception {
+        var resolver = new DefaultOAuth2AuthorizationRequestResolver(repo, "/oauth2/authorization");
+        resolver.setAuthorizationRequestCustomizer(OAuth2AuthorizationRequestCustomizers.withPkce()); // PKCE for confidential client
+        http.authorizeHttpRequests(a -&gt; a
+                .requestMatchers("/", "/assets/**").permitAll()
+                .anyRequest().authenticated())
+            .oauth2Login(o -&gt; o.authorizationEndpoint(ae -&gt; ae.authorizationRequestResolver(resolver)))
+            .logout(l -&gt; l.logoutSuccessUrl("/"))          // add OidcClientInitiatedLogoutSuccessHandler for RP-initiated logout
+            .csrf(c -&gt; c.csrfTokenRepository(CookieCsrfTokenRepository.withHttpOnlyFalse())) // SPA reads XSRF-TOKEN
+            .sessionManagement(s -&gt; s.sessionFixation(f -&gt; f.changeSessionId()));             // default, shown explicitly
+        return http.build();
+    }
+}</code></pre>
+  <p>The SPA sends the <code>X-XSRF-TOKEN</code> header on state-changing requests; Spring Security 6 uses a deferred, BREACH-masked CSRF token by default, and SPAs need the <code>SpaCsrfTokenRequestHandler</code> approach described in the Spring reference (Chapter 11.3 covers CSRF in depth). Calls to the API can be proxied by Spring Cloud Gateway with the <code>TokenRelay</code> filter, or made with a <code>RestClient</code> configured with <code>OAuth2ClientHttpRequestInterceptor</code> (Spring Security 6.4+).</p>
+
+  <h3>7.5 Password hashing with Argon2 and upgrade-on-login</h3>
+  <pre data-file="PasswordConfig.java"><code class="language-java">package com.example.idp;
+
+import java.util.Map;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.crypto.argon2.Argon2PasswordEncoder;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.DelegatingPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+
+@Configuration
+public class PasswordConfig {
+    @Bean
+    PasswordEncoder passwordEncoder() {
+        // saltLength=16, hashLength=32, parallelism=1, memory=19456 KiB (19 MiB), iterations=2 -- OWASP minimum profile
+        Argon2PasswordEncoder argon2 = new Argon2PasswordEncoder(16, 32, 1, 19456, 2);
+        Map&lt;String, PasswordEncoder&gt; encoders = Map.of(
+            "argon2", argon2,
+            "bcrypt", new BCryptPasswordEncoder(12));
+        // New hashes use argon2; old {bcrypt} hashes still verify and are flagged for upgrade.
+        return new DelegatingPasswordEncoder("argon2", encoders);
+    }
+}
+// With DaoAuthenticationProvider and a UserDetailsPasswordService bean, Spring re-hashes on successful
+// login whenever passwordEncoder.upgradeEncoding(storedHash) returns true.</code></pre>
+  <p>Argon2 requires <code>org.bouncycastle:bcprov-jdk18on</code> on the classpath.</p>
+
+  <h3>7.6 Validating access tokens in Python and Go</h3>
+  <div class="code-tabs">
+  <pre data-lang="Python"><code class="language-python"># token_validation.py — pip install "pyjwt[crypto]==2.9.*" "fastapi==0.115.*"
+import time
+import jwt
+from jwt import PyJWKClient, InvalidTokenError
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+ISSUER = "https://idp.example.com"
+AUDIENCE = "orders-api"
+ALLOWED_ALGS = ["RS256"]                      # pinned; never read from the token
+# Discover jwks_uri from /.well-known/openid-configuration once at startup in real code.
+jwk_client = PyJWKClient(f"{ISSUER}/oauth2/jwks", cache_keys=True, lifespan=300)
+
+def validate(raw: str) -&gt; dict:
+    header = jwt.get_unverified_header(raw)
+    if header.get("alg") not in ALLOWED_ALGS:
+        raise InvalidTokenError("algorithm not allowed")
+    if any(h in header for h in ("jku", "x5u", "jwk")):
+        raise InvalidTokenError("untrusted key reference")
+    signing_key = jwk_client.get_signing_key_from_jwt(raw)   # looks up by kid in the trusted JWKS only
+    claims = jwt.decode(
+        raw, signing_key.key, algorithms=ALLOWED_ALGS,
+        issuer=ISSUER, audience=AUDIENCE, leeway=30,
+        options={"require": ["exp", "iat", "iss", "aud", "sub"]},
+    )
+    return claims
+
+app = FastAPI()
+bearer = HTTPBearer()
+
+def principal(creds: HTTPAuthorizationCredentials = Depends(bearer)) -&gt; dict:
+    try:
+        return validate(creds.credentials)
+    except InvalidTokenError:
+        raise HTTPException(401, headers={"WWW-Authenticate": 'Bearer error="invalid_token"'})
+
+@app.get("/api/orders")
+def orders(p: dict = Depends(principal)):
+    if "orders.read" not in p.get("scope", "").split():
+        raise HTTPException(403)
+    return {"customer": p["sub"], "orders": []}</code></pre>
+  <pre data-lang="Go"><code class="language-go">// validate.go — go get github.com/golang-jwt/jwt/v5 github.com/MicahParks/keyfunc/v3
+package main
+
+import (
+	"context"
+	"errors"
+	"log"
+	"net/http"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/MicahParks/keyfunc/v3"
+	"github.com/golang-jwt/jwt/v5"
+)
+
+const (
+	issuer   = "https://idp.example.com"
+	audience = "orders-api"
+)
+
+type Claims struct {
+	Scope string `json:"scope"`
+	jwt.RegisteredClaims
+}
+
+type Validator struct {
+	kf     keyfunc.Keyfunc
+	parser *jwt.Parser
+}
+
+func NewValidator(ctx context.Context) (*Validator, error) {
+	// Background refresh of the JWKS; unknown kid triggers a rate-limited refresh.
+	kf, err := keyfunc.NewDefaultCtx(ctx, []string{issuer + "/oauth2/jwks"})
+	if err != nil {
+		return nil, err
+	}
+	p := jwt.NewParser(
+		jwt.WithValidMethods([]string{"RS256"}), // pinned algorithm
+		jwt.WithIssuer(issuer),
+		jwt.WithAudience(audience),
+		jwt.WithExpirationRequired(),
+		jwt.WithIssuedAt(),
+		jwt.WithLeeway(30*time.Second),
+	)
+	return &amp;Validator{kf: kf, parser: p}, nil
+}
+
+func (v *Validator) Validate(raw string) (*Claims, error) {
+	c := &amp;Claims{}
+	tok, err := v.parser.ParseWithClaims(raw, c, v.kf.Keyfunc)
+	if err != nil || !tok.Valid {
+		return nil, errors.Join(errors.New("invalid token"), err)
+	}
+	return c, nil
+}
+
+func (v *Validator) Require(scope string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		raw, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !ok {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		c, err := v.Validate(raw)
+		if err != nil {
+			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if !slices.Contains(strings.Fields(c.Scope), scope) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func main() {
+	v, err := NewValidator(context.Background())
+	if err != nil {
+		log.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/orders", v.Require("orders.read", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"orders":[]}`))
+	}))
+	srv := &amp;http.Server{Addr: ":8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	log.Fatal(srv.ListenAndServe()) // terminate TLS at the mesh/ingress or use ListenAndServeTLS
+}</code></pre>
+  </div>
+  <p>Both implementations pin algorithms, use only the trusted JWKS, require <code>exp</code>, and check issuer and audience. PyJWT's <code>jwt.decode</code> rejects tokens whose algorithm is not in <code>algorithms</code>; <code>golang-jwt</code>'s <code>WithValidMethods</code> does the same. Ignoring <code>jku</code>/<code>x5u</code> is automatic in both because neither fetches keys from token headers — the explicit check in Python is belt-and-braces. Both libraries' key functions return typed keys, so an RSA public key cannot be misused as an HMAC secret.</p>
+
+  <h3>7.7 Testing identity rules</h3>
+  <pre data-file="TokenValidationTest.java"><code class="language-java">@SpringBootTest
+@AutoConfigureMockMvc
+class TokenValidationTest {
+    @Autowired MockMvc mvc;
+
+    @Test
+    void rejectsMissingScope() throws Exception {
+        mvc.perform(get("/api/orders").with(jwt().jwt(j -&gt; j.claim("scope", "profile"))))
+           .andExpect(status().isForbidden());
+    }
+
+    @Test
+    void acceptsCorrectScope() throws Exception {
+        mvc.perform(get("/api/orders").with(jwt().authorities(new SimpleGrantedAuthority("SCOPE_orders.read"))))
+           .andExpect(status().isOk());
+    }
+}
+// The jwt() post-processor bypasses the decoder. Add a separate test that feeds real signed tokens
+// (e.g. created with Nimbus and a test JWKS served by MockWebServer) to prove audience/issuer/alg checks.</code></pre>
+</section>
+
+<section id="applications">
+  <h2>8. Applications: Identity Architectures Teams Actually Run</h2>
+  <h3>8.1 B2C web + mobile</h3>
+  <p>One OIDC provider; web via BFF (Spring Boot or a gateway); mobile apps as public clients using authorization code + PKCE through the system browser (AppAuth libraries — never embedded web views, which let the app capture credentials); short access tokens with rotating refresh tokens; passkeys offered at sign-up and promoted at login; risk-based step-up (re-authentication or stronger factor) for payments and profile changes.</p>
+  <h3>8.2 B2B SaaS with enterprise SSO</h3>
+  <p>Customers bring their own IdP (Entra ID, Okta, Google Workspace) via OIDC or SAML; your IdP brokers federation (Keycloak identity brokering, Auth0 enterprise connections). Tokens carry a tenant/organisation claim derived from the federation connection — never from user input. SCIM (RFC 7644) provisions and deprovisions users so leavers lose access promptly. Authorization is per-tenant RBAC plus ownership/ReBAC inside the tenant.</p>
+  <h3>8.3 Microservices</h3>
+  <p>Edge validates user tokens; internal calls use either token exchange (user context preserved, narrow audience) or service identity (mTLS via a service mesh with SPIFFE IDs, or client credentials). Every service re-validates and authorizes; none trusts identity headers unless they are cryptographically bound (e.g. a signed internal JWT). The anti-pattern is a gateway that strips the token and forwards <code>X-User-Id</code>, so any internal caller can impersonate anyone.</p>
+  <h3>8.4 Machine identities and CLIs</h3>
+  <p>CI pipelines use OIDC workload identity federation (GitHub Actions OIDC tokens exchanged for cloud credentials) instead of long-lived keys. Developer CLIs use the device grant or a loopback-redirect authorization code flow with PKCE (RFC 8252 for native apps).</p>
+  <h3>8.5 Admin access</h3>
+  <p>Administrators authenticate with device-bound phishing-resistant credentials (hardware security keys), hold no standing admin rights (just-in-time elevation through an approval workflow), and their actions are audited separately. Break-glass accounts exist, are vaulted, and alert when used.</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 Storm-0558 (2023): a stolen signing key and a validation gap <span class="tag fact">Verified</span></h3>
+  <p>In July 2023 Microsoft disclosed that a threat actor it tracked as Storm-0558 had used an acquired Microsoft account (MSA) <em>consumer</em> signing key to forge authentication tokens and access Outlook Web Access in Exchange Online and Outlook.com for about 25 organisations, including US government agencies. Microsoft reported that a token-validation issue allowed tokens signed with the consumer key to be accepted for enterprise (Azure AD) accounts. Its follow-up investigation concluded that the key most likely leaked into a crash dump in 2021 that later reached a debugging environment on the corporate network. The US Cyber Safety Review Board's 2024 report was sharply critical of Microsoft's security culture. Lessons for your systems: keys belong in HSM/KMS where they cannot be dumped; key scoping must be enforced by validators (which issuer, which key, which audience); and key rotation plus monitoring of token anomalies limits damage. Sources: <a href="https://msrc.microsoft.com/blog/2023/07/microsoft-mitigates-china-based-threat-actor-storm-0558-targeting-of-customer-email/">MSRC, July 2023</a>; <a href="https://msrc.microsoft.com/blog/2023/09/results-of-major-technical-investigations-for-storm-0558-key-acquisition/">MSRC, results of key-acquisition investigation</a>.</p>
+  <h3>9.2 JWT library vulnerabilities (2015) <span class="tag fact">Verified</span></h3>
+  <p>Tim McLean's 2015 write-up showed that several popular JWT libraries would accept tokens with <code>alg: none</code> and could be tricked into verifying an HS256 token using an RSA public key as the HMAC secret. Libraries were fixed, and the episode drove the "pin the algorithm, type the key" guidance later codified in RFC 8725. The lesson generalises: a security protocol whose message tells the verifier how to verify it is inviting attack. Source: <a href="https://auth0.com/blog/critical-vulnerabilities-in-json-web-token-libraries/">Auth0 blog, "Critical vulnerabilities in JSON Web Token libraries"</a>.</p>
+  <h3>9.3 Google Zanzibar (2019) <span class="tag fact">Verified</span></h3>
+  <p>Google's Zanzibar paper describes a single authorization system serving many products (Calendar, Drive, Maps, Photos, YouTube) with relation tuples, a namespace configuration language, and snapshot-consistent checks. The paper reports trillions of stored tuples and millions of authorization checks per second at low latency. It shows why ReBAC is attractive for sharing-heavy products and why consistency (avoiding the "new enemy" problem when permissions are revoked and content changes) needs explicit design. Source: <a href="https://research.google/pubs/zanzibar-googles-consistent-global-authorization-system/">Pang et al., "Zanzibar: Google's Consistent, Global Authorization System", USENIX ATC 2019</a>.</p>
+  <h3>9.4 Airbnb Himeji (2021) <span class="tag fact">Verified</span></h3>
+  <p>Airbnb described moving permission checks from duplicated logic in presentation services into a centralised, Zanzibar-inspired authorization service called from the data layer. Their write-up explains the motivations (consistency, duplicated checks, maintainability) and the operational effort required. Source: <a href="https://medium.com/airbnb-engineering/himeji-a-scalable-centralized-system-for-authorization-at-airbnb-341664924574">Airbnb Engineering, "Himeji: A Scalable Centralized System for Authorization at Airbnb"</a>.</p>
+  <h3>9.5 Spring Security removes the password grant <span class="tag fact">Verified</span></h3>
+  <p>Following RFC 9700's prohibition, Spring Security 7.0 removed client support for the resource owner password credentials grant. Teams that used it for "simple" mobile logins must migrate to authorization code + PKCE with the system browser. Source: <a href="https://docs.spring.io/spring-security/reference/whats-new.html">Spring Security "What's New"</a>.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages and Limits</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Mechanism</th><th>Advantages</th><th>Limits / costs</th></tr></thead>
+    <tbody>
+      <tr><td>Server-side sessions (Spring Session)</td><td>Instant revocation; small cookie; nothing sensitive in the browser</td><td>State store to operate (Redis HA); CSRF defences needed; cross-domain awkward</td></tr>
+      <tr><td>JWT access tokens</td><td>Local validation, no AS call; scales; works across domains</td><td>Delayed revocation; readable payload; size; key management</td></tr>
+      <tr><td>Opaque tokens + introspection</td><td>Immediate revocation; private</td><td>AS on hot path; latency; caching weakens revocation</td></tr>
+      <tr><td>DPoP / mTLS-bound tokens</td><td>Stolen tokens useless</td><td>Client complexity; DPoP nonce/jti stores; IdP support varies</td></tr>
+      <tr><td>Passkeys</td><td>Phishing-resistant; no server secrets; good UX</td><td>Recovery flows; cross-ecosystem sync; enterprise attestation needs</td></tr>
+      <tr><td>TOTP</td><td>Cheap, offline</td><td>Phishable; seed management</td></tr>
+      <tr><td>RBAC</td><td>Simple, auditable</td><td>No object-level context; role explosion</td></tr>
+      <tr><td>ABAC / policy engine</td><td>Expressive, centralised, testable policy</td><td>Latency; policy sprawl; needs attribute sources</td></tr>
+      <tr><td>ReBAC (Zanzibar-style)</td><td>Natural for sharing/hierarchies; fast checks at scale</td><td>Another stateful system; dual writes between app DB and tuple store</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs: Choosing Flows, Tokens and Models</h2>
+  <h3>11.1 Which grant?</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A{"Is a user involved?"} -- no --> CC["Client credentials (private_key_jwt or mTLS); or workload identity"]
+  A -- yes --> B{"Can the device show a browser and accept input?"}
+  B -- no --> DC["Device authorization grant"]
+  B -- yes --> C{"Browser-based SPA?"}
+  C -- yes --> BFF["Auth code + PKCE via BFF (cookie session)"]
+  C -- no --> D{"Native/mobile/desktop app?"}
+  D -- yes --> NA["Auth code + PKCE, system browser, rotating or sender-constrained refresh tokens"]
+  D -- no --> SW["Server-side web app: auth code + PKCE, confidential client"]
+</pre>
+  <figcaption>Figure 6 — Selecting an OAuth 2.0 grant. Implicit and password grants never appear.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> every user-facing path ends in authorization code + PKCE; the variations are where tokens live (BFF server, native secure storage, server session). Machine paths prefer asymmetric client authentication or, better, platform workload identity so there is no secret at all.</p>
+  <h3>11.2 Sessions vs tokens for your own web app</h3>
+  <p><span class="tag opinion">Opinion</span> For a first-party web application served from your domain, server-side sessions (or a BFF holding tokens) are simpler and safer than storing JWTs in the browser. Use bearer JWTs for API-to-API and for third-party/native clients. "Stateless JWT sessions" in localStorage optimise a non-problem (session lookups in Redis are cheap) while creating real ones (XSS token theft, no revocation).</p>
+  <h3>11.3 Token lifetime</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Token</th><th>Typical lifetime</th><th>Reasoning</th></tr></thead>
+    <tbody>
+      <tr><td>Authorization code</td><td>≤ 1 minute, single use</td><td>Only bridges redirect to token request</td></tr>
+      <tr><td>Access token (bearer)</td><td>5–15 minutes</td><td>Bounded theft window; refresh is cheap</td></tr>
+      <tr><td>Access token (sender-constrained)</td><td>15–60 minutes</td><td>Theft less useful</td></tr>
+      <tr><td>Refresh token (public client)</td><td>Hours to days, rotated, idle timeout</td><td>Reuse detection limits theft</td></tr>
+      <tr><td>Session (sensitive app)</td><td>Idle 15–30 min, absolute 8–12 h</td><td>Balance usability and exposure</td></tr>
+    </tbody>
+  </table></div>
+  <p><span class="tag opinion">Opinion</span> Values are common starting points, not standards; regulated domains (banking, health) often mandate shorter.</p>
+  <h3>11.4 Build vs buy the authorization server</h3>
+  <p>Buy (or run Keycloak) when you need standard OIDC, social/enterprise federation, MFA/passkeys, admin UI and compliance certifications. Build on Spring Authorization Server when you need custom grant types, embedded deployment in a product, unusual token contents, or full control — and accept owning key management, user storage, MFA, account recovery, abuse protection and audits.</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes</h2>
+  <ul>
+    <li><strong>Using the ID token as an API access token.</strong> Its audience is the client; APIs should reject it.</li>
+    <li><strong>Not validating <code>aud</code></strong> in resource servers — Spring Boot only checks it if configured.</li>
+    <li><strong>Letting the token choose the algorithm</strong>, or verifying with a key fetched from <code>jku</code>.</li>
+    <li><strong>Storing tokens in <code>localStorage</code></strong> in SPAs.</li>
+    <li><strong>Using email as the user key.</strong> Use (<code>iss</code>, <code>sub</code>); emails change and can be recycled, and unverified emails enable account takeover through federation.</li>
+    <li><strong>Wildcard redirect URIs</strong> (<code>https://*.example.com/*</code>) or open redirects on the client, enabling code theft.</li>
+    <li><strong>Long-lived bearer access tokens</strong> (24 h+) "to avoid refresh complexity".</li>
+    <li><strong>Encoding all permissions in the JWT</strong>, making tokens huge and permissions stale until expiry.</li>
+    <li><strong>Treating scopes as user permissions.</strong> <code>orders.write</code> means the client may write orders on behalf of the user — not that the user may write <em>this</em> order.</li>
+    <li><strong>Different error messages for "unknown user" vs "wrong password"</strong>, enabling enumeration; also timing differences when unknown users skip hashing (Spring's <code>DaoAuthenticationProvider</code> mitigates this by hashing a dummy password).</li>
+    <li><strong>Forgetting to invalidate sessions on password change, MFA reset or account disable.</strong></li>
+    <li><strong>Account recovery weaker than login</strong>: passkeys everywhere, but recovery by SMS code — attackers take the easiest path.</li>
+    <li><strong>HS256 shared across services</strong>, so any service can mint tokens for all.</li>
+    <li><strong>Trusting <code>X-Forwarded-User</code></strong> or similar headers that external clients can set.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Key management and rotation</h3>
+  <p>Sign tokens with keys held in an HSM or KMS (or at minimum a protected keystore). Rotate on a schedule: publish the new public key in JWKS first, wait for caches to pick it up (longer than the maximum JWKS cache time), switch signing to the new key, keep the old public key published until all tokens signed with it have expired, then remove it. Have an emergency rotation runbook for key compromise, which also requires revoking refresh tokens.</p>
+  <h3>13.2 Availability</h3>
+  <p>The authorization server is a tier-0 dependency: when it is down, nobody logs in or refreshes. Run it highly available, monitor token endpoint latency and error rates, and size it for refresh traffic (§6.4). Resource servers with cached JWKS keep working through brief AS outages; introspection-based ones do not, unless you cache — and caching trades revocation speed for availability.</p>
+  <h3>13.3 Abuse protection</h3>
+  <p>Rate-limit login, MFA verification, password reset and token endpoints by account and by source; detect credential stuffing (many usernames per IP, high failure rates, known-breached credentials); use bot mitigation on public login; lock or step-up rather than hard-lock accounts (hard locks become a DoS tool).</p>
+  <h3>13.4 Monitoring</h3>
+  <p>Metrics: login success/failure rates, MFA challenge rates, refresh-token reuse detections (each one is a likely theft), token validation failures by reason (expired vs bad signature vs wrong audience — a spike in bad signatures is an attack or a botched rotation), session counts. Logs: authentication events with method (<code>amr</code>), client ID, IP, user agent; never tokens.</p>
+  <h3>13.5 Performance</h3>
+  <p>JWT validation with cached keys is cheap; the expensive parts are password hashing on login (CPU-bound — run login on dedicated capacity or rate-limit it), introspection round trips, and fine-grained authorization calls. For ReBAC, batch checks and cache negative and positive decisions briefly; for policy engines, run them as a sidecar or embedded library to avoid network hops.</p>
+  <h3>13.6 Compliance</h3>
+  <p>Map controls to the frameworks you are audited against: NIST SP 800-63 assurance levels, PCI DSS v4 MFA requirements for access to cardholder data environments, SOC 2 access-review evidence, and GDPR data minimisation (keep PII out of tokens).</p>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundation</p>
+    <p>For each client, name the grant and where tokens are stored: (a) a React SPA on <code>app.example.com</code>; (b) a nightly reconciliation job; (c) an Android app; (d) a CLI used by developers over SSH on a remote box; (e) a partner's server integrating on behalf of shared customers.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>(a) Authorization code + PKCE through a BFF; tokens server-side, browser holds an HttpOnly session cookie. (b) Client credentials with <code>private_key_jwt</code> or workload identity; tokens in memory. (c) Authorization code + PKCE via the system browser (AppAuth); refresh token in Android Keystore-backed storage, rotated. (d) Device authorization grant; tokens in the OS keychain or a 0600 file. (e) Authorization code + PKCE as a confidential client (user consent per customer), refresh tokens stored encrypted server-side; or, for B2B with no user, client credentials scoped per tenant.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Write a Spring <code>OAuth2TokenValidator&lt;Jwt&gt;</code> that rejects tokens issued before the user's "revoked-before" timestamp, stored in Redis under <code>revoked:{sub}</code>. Consider performance and failure behaviour.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-java">public class RevokedBeforeValidator implements OAuth2TokenValidator&lt;Jwt&gt; {
+    private final StringRedisTemplate redis;
+    private final Cache&lt;String, Optional&lt;Instant&gt;&gt; local =
+        Caffeine.newBuilder().expireAfterWrite(Duration.ofSeconds(10)).maximumSize(100_000).build();
+
+    public RevokedBeforeValidator(StringRedisTemplate redis) { this.redis = redis; }
+
+    @Override
+    public OAuth2TokenValidatorResult validate(Jwt jwt) {
+        Instant iat = jwt.getIssuedAt();
+        if (iat == null) return fail("missing iat");
+        Optional&lt;Instant&gt; revokedBefore;
+        try {
+            revokedBefore = local.get(jwt.getSubject(), sub -&gt;
+                Optional.ofNullable(redis.opsForValue().get("revoked:" + sub)).map(Instant::parse));
+        } catch (RuntimeException e) {
+            return fail("revocation store unavailable");      // fail closed (or open, as an explicit, documented risk decision)
+        }
+        return revokedBefore.filter(iat::isBefore).isPresent() ? fail("token revoked") : OAuth2TokenValidatorResult.success();
+    }
+
+    private static OAuth2TokenValidatorResult fail(String msg) {
+        return OAuth2TokenValidatorResult.failure(new OAuth2Error("invalid_token", msg, null));
+    }
+}</code></pre>
+      <p>Add it to the <code>DelegatingOAuth2TokenValidator</code>. The 10-second local cache bounds Redis load and adds at most 10 s to revocation latency. Set a Redis TTL on each key equal to the maximum access-token lifetime, since older tokens expire anyway. Failing closed means a Redis outage blocks all API traffic — many teams choose fail-open here with an alert because tokens are short-lived; whichever you choose, make it explicit.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>Decode (without verifying) a JWT from your local Keycloak or Spring Authorization Server and list every claim. Which would you remove from access tokens, and why? Which validation steps from §4.3 does your current production service actually perform?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Typical candidates for removal: email, name, phone (PII readable by any holder and logged by proxies), group lists that change often (stale until expiry), and large role arrays. Keep <code>iss</code>, <code>sub</code>, <code>aud</code>, <code>exp</code>, <code>iat</code>, <code>jti</code>, <code>scope</code>, <code>client_id</code>, and a stable tenant ID if needed for routing. For the audit, check config for <code>audiences</code> or a custom audience validator, the configured <code>jwsAlgorithms</code>, and whether tokens are accepted from query parameters.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>Design authorization for a multi-tenant document platform: tenants have admins and members; documents live in folders; folders can be shared with users or groups in the same tenant; support agents can view any document in a tenant only during an approved support ticket. Choose models, sketch the ReBAC schema, and say where each check runs.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-plaintext">model (OpenFGA-style DSL, illustrative)
+type user
+type group
+  relations
+    define member: [user]
+type tenant
+  relations
+    define admin: [user]
+    define member: [user] or admin
+type folder
+  relations
+    define tenant: [tenant]
+    define owner: [user]
+    define editor: [user, group#member] or owner or admin from tenant
+    define viewer: [user, group#member] or editor
+type doc
+  relations
+    define parent: [folder]
+    define viewer: viewer from parent
+    define editor: editor from parent</code></pre>
+      <p>Tenant membership and sharing are ReBAC tuples. The support-agent rule is contextual (time-bound, ticket-bound): implement as ABAC — a policy that grants <code>viewer</code> if a support grant record exists for (agent, tenant) with <code>expiresAt &gt; now</code> (OpenFGA supports conditional tuples; otherwise check in the service). Checks: the gateway validates the token; the document service checks <code>doc#viewer</code> per request and filters list queries by tenant in SQL first; admin endpoints use RBAC scopes. All support-agent accesses are audited and visible to the tenant.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced (local lab)</p>
+    <p>Run Keycloak locally (<code>docker run -p 127.0.0.1:8081:8080 -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=change-me quay.io/keycloak/keycloak:26.0 start-dev</code>), create a realm, a confidential client with PKCE required, and wire up the BFF from §7.4 and the resource server from §7.2. Then verify: a token for another client's audience is rejected; an expired token is rejected; logout invalidates the session.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>In Keycloak, add an "Audience" protocol mapper to include <code>orders-api</code> in access tokens for the BFF client only; create a second client without it and confirm its tokens get 401 from the resource server with <code>invalid_token</code>. Set access-token lifespan to 1 minute and confirm expiry handling (the BFF should transparently refresh using the refresh token). For logout, configure <code>OidcClientInitiatedLogoutSuccessHandler</code> so the IdP session ends too; otherwise the next login is silent. Environment variable names for the admin bootstrap differ across Keycloak versions — check the version's docs.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Is OAuth 2.0 an authentication protocol?</summary><div><p>No. It is a delegated authorization framework: access tokens tell resource servers what the bearer may do. Using an access token to infer "the user logged in to my app" is unsafe (a token obtained by another client could be substituted). OpenID Connect adds authentication with the ID token, whose audience is the client and which carries <code>nonce</code>, <code>auth_time</code> and authentication context.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What problem does PKCE solve, and why is it now recommended for confidential clients too?</summary><div><p>It binds the authorization code to the client instance that started the flow: only the holder of the <code>code_verifier</code> can redeem the code. Originally for public clients (code interception on mobile); for confidential clients it also prevents authorization code injection, where an attacker injects a stolen code into a legitimate client session. RFC 9700 recommends it for all clients.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why are the implicit and password grants deprecated?</summary><div><p>Implicit returns tokens in the URL fragment where they leak (history, referrer, extensions) and cannot be sender-constrained; PKCE + code works in browsers now via CORS. Password exposes user credentials to the client, blocks MFA/passkeys/federation, and trains phishing-prone behaviour. RFC 9700 deprecates implicit and forbids password; OAuth 2.1 omits both.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> List what your resource server checks on every JWT.</summary><div><p>Algorithm in a server-pinned allow-list; key from the trusted issuer's JWKS by <code>kid</code>; signature; <code>iss</code> exact match; <code>aud</code> contains this API; <code>exp</code>/<code>nbf</code> with small skew; <code>typ</code> where used; sender constraint if <code>cnf</code> present; then scopes and business authorization. In Spring: <code>NimbusJwtDecoder</code> with <code>jwsAlgorithm</code>, <code>JwtValidators.createDefaultWithIssuer</code>, plus an audience validator.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain the RS256/HS256 algorithm confusion attack and its fix.</summary><div><p>If a verifier picks the algorithm from the token header and passes the RSA public key as "the key", an attacker sets <code>alg=HS256</code> and signs with HMAC using the public key bytes as the secret; the verifier computes the same HMAC and accepts. Fix: pin allowed algorithms server-side and use typed key objects so an RSA key cannot be used for HMAC.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How do you revoke access for a fired employee within one minute in a JWT-based microservice estate?</summary><div><p>Disable the account in the IdP and revoke refresh tokens/sessions; emit a revocation event; services hold a small revoked-before map keyed by <code>sub</code> (Redis or pushed in-memory) and reject tokens issued earlier; keep access-token lifetime short (≤ 5 min) so the deny-list stays small and the worst case is bounded. Also kill active server-side sessions via Spring Session's index by principal name. For the highest-risk APIs, use introspection.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> RBAC, ABAC or ReBAC for a Google-Docs-like product?</summary><div><p>ReBAC for sharing and inheritance (folders, groups), RBAC for administrative functions, ABAC conditions for context (time-limited links, IP restrictions, data residency). Pure RBAC cannot express "people this doc was shared with" without per-document roles; pure ABAC needs relationship attributes anyway. A Zanzibar-style engine with conditional tuples covers most of it.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Your SPA stores JWTs in localStorage and the pen test found an XSS. What do you change?</summary><div><p>Fix the XSS (encoding, CSP — Chapter 11.3), then move to a BFF: confidential client, tokens server-side, HttpOnly/Secure/SameSite cookie to the browser, CSRF tokens for writes. Revoke existing refresh tokens; shorten access-token lifetime; consider DPoP for any remaining public clients. Explain that HttpOnly does not stop XSS from making requests during the session, but it prevents token exfiltration and long-term reuse.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Login latency spikes to 3 s under a credential-stuffing attack. What happened and what do you do?</summary><div><p>Each attempt runs a deliberately slow password hash, so the attack is also CPU exhaustion. Rate-limit by IP, account and ASN; add bot detection/challenge on suspicious traffic; check against breached-credential lists; isolate login onto separate capacity; push users to passkeys (no hashing per attempt). Do not lower the hash cost.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is session fixation and how does Spring Security prevent it?</summary><div><p>An attacker sets a known session ID in the victim's browser; after the victim logs in, the attacker uses the same ID. Spring Security changes the session ID on authentication by default (<code>ChangeSessionIdAuthenticationStrategy</code>), so the pre-login ID is useless.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Authentication establishes a principal; authorization decides per action and resource. OAuth is delegated authorization; OIDC adds authentication.</li>
+    <li>Hash passwords with Argon2id/scrypt/bcrypt via <code>DelegatingPasswordEncoder</code>; follow NIST 800-63B: length, breached-password checks, no forced rotation.</li>
+    <li>Passkeys/WebAuthn are phishing-resistant because the authenticator binds responses to the origin; recovery is the new weak point.</li>
+    <li>Use authorization code + PKCE for every user-facing client, client credentials for machines, device grant for constrained devices; never implicit or password (RFC 9700).</li>
+    <li>Validate JWTs with pinned algorithms, trusted JWKS, issuer, audience, expiry and type; never let the token choose how it is verified.</li>
+    <li>Short access tokens + rotating refresh tokens + targeted deny-lists handle revocation; sender-constraining (DPoP/mTLS) makes theft less useful.</li>
+    <li>Combine RBAC (functions), ReBAC/ownership (data) and ABAC (context); fail closed when a policy engine is unavailable.</li>
+  </ul>
+  <div class="quiz" data-answer="b">
+    <p class="q">A public SPA client needs to call your API for a logged-in user. Which approach aligns with current best practice?</p>
+    <ol>
+      <li data-k="a">Implicit grant, token in localStorage</li>
+      <li data-k="b">Authorization code + PKCE via a backend-for-frontend holding the tokens</li>
+      <li data-k="c">Password grant from a custom login form</li>
+      <li data-k="d">Client credentials embedded in the JavaScript bundle</li>
+    </ol>
+    <div class="explain">RFC 9700 deprecates implicit and forbids password; a public client cannot hold secrets; the BFF keeps tokens out of the browser.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">Which JWT check does Spring Boot's resource-server auto-configuration NOT perform unless you configure it?</p>
+    <ol>
+      <li data-k="a">Signature verification</li>
+      <li data-k="b">Expiry (<code>exp</code>)</li>
+      <li data-k="c">Issuer when <code>issuer-uri</code> is set</li>
+      <li data-k="d">Audience (<code>aud</code>)</li>
+    </ol>
+    <div class="explain">Audience validation requires the <code>audiences</code> property or a custom validator.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">What makes WebAuthn/passkeys phishing-resistant whereas TOTP is not?</p>
+    <ol>
+      <li data-k="a">The authenticator binds the signed response to the requesting origin/RP ID</li>
+      <li data-k="b">Passkeys are longer than six digits</li>
+      <li data-k="c">Passkeys are stored on the server</li>
+      <li data-k="d">TOTP uses SHA-1</li>
+    </ol>
+    <div class="explain">A look-alike site gets no valid assertion because the RP ID/origin differs; a TOTP code is just a number the user can be tricked into typing anywhere.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">An old refresh token is presented after it was already rotated. What should the authorization server do?</p>
+    <ol>
+      <li data-k="a">Issue a new access token; it might be a network retry</li>
+      <li data-k="b">Ignore it silently</li>
+      <li data-k="c">Treat it as possible theft and revoke the entire token family</li>
+      <li data-k="d">Extend its lifetime</li>
+    </ol>
+    <div class="explain">Reuse detection is the point of rotation: either the legitimate client or an attacker has a copy, so the whole family is revoked and the user re-authenticates.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">Orders API needs to call Payments API on behalf of the user. What is the best practice?</p>
+    <ol>
+      <li data-k="a">Forward the user's access token unchanged</li>
+      <li data-k="b">Use token exchange to obtain a token with audience payments-api and narrow scope</li>
+      <li data-k="c">Use an HS256 token shared by both services</li>
+      <li data-k="d">Send the user ID in an X-User-Id header</li>
+    </ol>
+    <div class="explain">Token exchange preserves user context with correct audience, minimal scope and an actor claim; passthrough breaks audience restriction; headers are spoofable.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Which statement about password hashing is correct?</p>
+    <ol>
+      <li data-k="a">SHA-256 with a salt is sufficient for passwords</li>
+      <li data-k="b">The salt must be kept secret</li>
+      <li data-k="c">Increasing bcrypt cost by 1 doubles the work per hash</li>
+      <li data-k="d">Passwords should be encrypted with AES so they can be recovered</li>
+    </ol>
+    <div class="explain">bcrypt's cost is log2 of rounds. Fast hashes are crackable; salt is not secret; reversible encryption is forbidden.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Spec</span> <a href="https://www.rfc-editor.org/rfc/rfc9700">RFC 9700 — Best Current Practice for OAuth 2.0 Security</a> (Jan 2025).</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://datatracker.ietf.org/doc/draft-ietf-oauth-v2-1/">The OAuth 2.1 Authorization Framework (Internet-Draft)</a>.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://www.rfc-editor.org/rfc/rfc7636">RFC 7636 — PKCE</a>; <a href="https://www.rfc-editor.org/rfc/rfc9449">RFC 9449 — DPoP</a>; <a href="https://www.rfc-editor.org/rfc/rfc8628">RFC 8628 — Device Authorization Grant</a>; <a href="https://www.rfc-editor.org/rfc/rfc8693">RFC 8693 — Token Exchange</a>.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://www.rfc-editor.org/rfc/rfc7519">RFC 7519 — JWT</a>; <a href="https://www.rfc-editor.org/rfc/rfc8725">RFC 8725 — JWT Best Current Practices</a>; <a href="https://www.rfc-editor.org/rfc/rfc9068">RFC 9068 — JWT Profile for Access Tokens</a>.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://openid.net/specs/openid-connect-core-1_0.html">OpenID Connect Core 1.0</a>.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://www.w3.org/TR/webauthn-3/">W3C Web Authentication</a>; <a href="https://fidoalliance.org/passkeys/">FIDO Alliance passkeys</a>.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://pages.nist.gov/800-63-4/sp800-63b.html">NIST SP 800-63B-4 Authentication and Authenticator Management</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html">OWASP Password Storage</a>, <a href="https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html">Session Management</a> and <a href="https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_for_Java_Cheat_Sheet.html">JWT for Java</a> cheat sheets.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.spring.io/spring-security/reference/servlet/oauth2/index.html">Spring Security OAuth2 reference</a> (client, resource server, authorization server).</li>
+    <li><span class="ref-kind">Paper</span> <a href="https://research.google/pubs/zanzibar-googles-consistent-global-authorization-system/">Zanzibar: Google's Consistent, Global Authorization System</a> (USENIX ATC 2019).</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://openfga.dev/docs">OpenFGA documentation</a>; <a href="https://www.openpolicyagent.org/docs/latest/">Open Policy Agent documentation</a>; <a href="https://www.cedarpolicy.com/">Cedar policy language</a>.</li>
+    <li><span class="ref-kind">Book</span> Justin Richer &amp; Antonio Sanso, <em>OAuth 2 in Action</em>, Manning, 2017.</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

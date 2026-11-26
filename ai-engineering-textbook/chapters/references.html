@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reference Library &amp; Research Policy — AI-Era Software Engineering</title>
+<meta name="description" content="The books, documentation, papers and engineering publications this textbook is built on, and how claims in it are verified and labelled.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="references" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Start here</p>
+  <h1>Reference Library &amp; Research Policy</h1>
+  <p class="lede">The established works each part of this book draws on, the official documentation it defers to, and the rules used to keep facts, examples and opinions apart.</p>
+</header>
+
+<section id="policy">
+  <h2>Research and writing policy</h2>
+  <h3>What the book is built from</h3>
+  <p>Each part was planned against four kinds of source, in this order of authority:</p>
+  <ol>
+    <li><strong>Official specifications and documentation</strong> (RFCs, language specs, project docs such as Kafka, PostgreSQL, Kubernetes and Spring). Behaviour and defaults are taken from here.</li>
+    <li><strong>Peer-reviewed and widely cited papers</strong> (Dynamo, Raft, Spanner, “Attention Is All You Need”, LoRA, HNSW and similar). Algorithms and their guarantees are taken from here.</li>
+    <li><strong>Established textbooks</strong> (listed below). They shaped the <em>structure and teaching order</em> of each part. No text, figures or exercises are reproduced from them.</li>
+    <li><strong>First-party engineering publications</strong>: company engineering blogs, conference talks and public postmortems. Case studies are taken from here and always linked to the original.</li>
+  </ol>
+  <h3>How claims are labelled</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Label</th><th>Meaning</th><th>How to treat it</th></tr></thead>
+    <tbody>
+      <tr><td><span class="tag fact">Verified</span></td><td>Supported by the linked or cited source.</td><td>Safe to rely on; still check the source for nuance.</td></tr>
+      <tr><td><span class="tag illus">Illustrative</span></td><td>Numbers, companies or scenarios invented to teach a point, e.g. capacity estimates.</td><td>Never quote as fact. Re-derive with your own inputs.</td></tr>
+      <tr><td><span class="tag opinion">Opinion</span></td><td>Engineering judgement or a recommendation.</td><td>Weigh it against your context. Reasonable experts disagree.</td></tr>
+      <tr><td><span class="tag version">Version-sensitive</span></td><td>Product versions, defaults, limits, prices and model names.</td><td>True at the date shown. Check current docs before relying on it.</td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout warn"><p class="callout-title">Fast-moving areas</p><p>LLM model names, context sizes, prices, agent frameworks and the MCP specification change month to month. Chapters in Part 8 were checked in November 2026. Treat every number there as a snapshot, and prefer the provider's documentation.</p></div>
+  <h3>Copyright</h3>
+  <p>All explanations, diagrams, code and exercises are original. Reference books are cited as further reading. Where a case study summarises a company's published engineering post, the summary is in our own words and the post is linked so you can read the original.</p>
+</section>
+
+<section id="books">
+  <h2>Core reference books by part</h2>
+
+  <h3>Parts 1–2: Engineering practice, architecture and distributed systems</h3>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, O'Reilly, 2017. A second edition with Chris Riccomini has been in progress; check the publisher for its status <span class="tag version">Version-sensitive · checked Nov 2026</span>.</li>
+    <li><span class="ref-kind">Book</span> Alex Xu, <em>System Design Interview – An Insider's Guide</em>, Vol. 1 (2020) and Vol. 2 (with Sahn Lam, 2022), ByteByteGo.</li>
+    <li><span class="ref-kind">Book</span> Mark Richards &amp; Neal Ford, <em>Fundamentals of Software Architecture</em>, O'Reilly (1st ed. 2020; 2nd ed. 2025).</li>
+    <li><span class="ref-kind">Book</span> Chris Richardson, <em>Microservices Patterns</em>, Manning, 2018.</li>
+    <li><span class="ref-kind">Book</span> Sam Newman, <em>Building Microservices</em>, 2nd ed., O'Reilly, 2021.</li>
+    <li><span class="ref-kind">Book</span> Michael T. Nygard, <em>Release It!</em>, 2nd ed., Pragmatic Bookshelf, 2018.</li>
+    <li><span class="ref-kind">Book</span> Betsy Beyer et al. (eds.), <a href="https://sre.google/books/"><em>Site Reliability Engineering</em> and <em>The Site Reliability Workbook</em></a>, O'Reilly / Google (free online).</li>
+    <li><span class="ref-kind">Book</span> Nicole Forsgren, Jez Humble &amp; Gene Kim, <em>Accelerate</em>, IT Revolution, 2018.</li>
+  </ul>
+
+  <h3>Part 3: Data structures and algorithms</h3>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Cormen, Leiserson, Rivest &amp; Stein, <em>Introduction to Algorithms</em>, 4th ed., MIT Press, 2022.</li>
+    <li><span class="ref-kind">Book</span> Robert Sedgewick &amp; Kevin Wayne, <em>Algorithms</em>, 4th ed., Addison-Wesley, 2011 (<a href="https://algs4.cs.princeton.edu/">companion site with Java code</a>).</li>
+    <li><span class="ref-kind">Book</span> Aditya Bhargava, <em>Grokking Algorithms</em>, 2nd ed., Manning, 2024.</li>
+    <li><span class="ref-kind">Book</span> Steven Skiena, <em>The Algorithm Design Manual</em>, 3rd ed., Springer, 2020.</li>
+    <li><span class="ref-kind">Book</span> Gayle Laakmann McDowell, <em>Cracking the Coding Interview</em>, 6th ed., CareerCup, 2015.</li>
+  </ul>
+
+  <h3>Parts 4–5: Python and Go</h3>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Luciano Ramalho, <em>Fluent Python</em>, 2nd ed., O'Reilly, 2022.</li>
+    <li><span class="ref-kind">Book</span> Brett Slatkin, <em>Effective Python</em>, 3rd ed., Addison-Wesley.</li>
+    <li><span class="ref-kind">Book</span> Micha Gorelick &amp; Ian Ozsvald, <em>High Performance Python</em>, 2nd ed., O'Reilly, 2020.</li>
+    <li><span class="ref-kind">Book</span> Alan A. A. Donovan &amp; Brian W. Kernighan, <em>The Go Programming Language</em>, Addison-Wesley, 2015.</li>
+    <li><span class="ref-kind">Book</span> Katherine Cox-Buday, <em>Concurrency in Go</em>, O'Reilly, 2017.</li>
+    <li><span class="ref-kind">Book</span> Teiva Harsanyi, <em>100 Go Mistakes and How to Avoid Them</em>, Manning, 2022.</li>
+  </ul>
+
+  <h3>Parts 6–7: Machine learning and deep learning</h3>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Aurélien Géron, <em>Hands-On Machine Learning with Scikit-Learn, Keras &amp; TensorFlow</em>, 3rd ed., O'Reilly, 2022. A PyTorch edition has also been published; check the publisher <span class="tag version">Version-sensitive · checked Nov 2026</span>.</li>
+    <li><span class="ref-kind">Book</span> Gareth James, Daniela Witten, Trevor Hastie, Robert Tibshirani (&amp; Jonathan Taylor), <a href="https://www.statlearning.com/"><em>An Introduction to Statistical Learning</em></a> (free PDF; R and Python editions).</li>
+    <li><span class="ref-kind">Book</span> Marc Peter Deisenroth, A. Aldo Faisal &amp; Cheng Soon Ong, <a href="https://mml-book.github.io/"><em>Mathematics for Machine Learning</em></a>, Cambridge University Press, 2020 (free PDF).</li>
+    <li><span class="ref-kind">Book</span> Ian Goodfellow, Yoshua Bengio &amp; Aaron Courville, <a href="https://www.deeplearningbook.org/"><em>Deep Learning</em></a>, MIT Press, 2016 (free online).</li>
+    <li><span class="ref-kind">Book</span> Aston Zhang, Zachary Lipton, Mu Li &amp; Alexander Smola, <a href="https://d2l.ai/"><em>Dive into Deep Learning</em></a> (free online, runnable notebooks).</li>
+    <li><span class="ref-kind">Book</span> Simon J. D. Prince, <a href="https://udlbook.github.io/udlbook/"><em>Understanding Deep Learning</em></a>, MIT Press, 2023 (free PDF).</li>
+  </ul>
+
+  <h3>Part 8: Generative AI and LLM engineering</h3>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Chip Huyen, <em>AI Engineering: Building Applications with Foundation Models</em>, O'Reilly, 2025.</li>
+    <li><span class="ref-kind">Book</span> Jay Alammar &amp; Maarten Grootendorst, <em>Hands-On Large Language Models</em>, O'Reilly, 2024.</li>
+    <li><span class="ref-kind">Book</span> Sebastian Raschka, <em>Build a Large Language Model (From Scratch)</em>, Manning, 2024.</li>
+    <li><span class="ref-kind">Book</span> Lewis Tunstall, Leandro von Werra &amp; Thomas Wolf, <em>Natural Language Processing with Transformers</em>, revised ed., O'Reilly, 2022.</li>
+  </ul>
+
+  <h3>Parts 9–10: Data engineering, data science and MLOps</h3>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Joe Reis &amp; Matt Housley, <em>Fundamentals of Data Engineering</em>, O'Reilly, 2022.</li>
+    <li><span class="ref-kind">Book</span> Chip Huyen, <em>Designing Machine Learning Systems</em>, O'Reilly, 2022.</li>
+    <li><span class="ref-kind">Book</span> Andriy Burkov, <a href="http://www.mlebook.com/"><em>Machine Learning Engineering</em></a>, True Positive, 2020.</li>
+    <li><span class="ref-kind">Book</span> Ralph Kimball &amp; Margy Ross, <em>The Data Warehouse Toolkit</em>, 3rd ed., Wiley, 2013.</li>
+    <li><span class="ref-kind">Book</span> Wes McKinney, <a href="https://wesmckinney.com/book/"><em>Python for Data Analysis</em></a>, 3rd ed., O'Reilly, 2022 (free online).</li>
+    <li><span class="ref-kind">Book</span> Bill Chambers &amp; Matei Zaharia, <em>Spark: The Definitive Guide</em>, O'Reilly, 2018.</li>
+  </ul>
+
+  <h3>Part 11: Security</h3>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Ross Anderson, <a href="https://www.cl.cam.ac.uk/~rja14/book.html"><em>Security Engineering</em></a>, 3rd ed., Wiley, 2020 (chapters free online).</li>
+    <li><span class="ref-kind">Book</span> Adam Shostack, <em>Threat Modeling: Designing for Security</em>, Wiley, 2014.</li>
+    <li><span class="ref-kind">Book</span> Neil Madden, <em>API Security in Action</em>, Manning, 2020.</li>
+    <li><span class="ref-kind">Book</span> Justin Richer &amp; Antonio Sanso, <em>OAuth 2 in Action</em>, Manning, 2017.</li>
+    <li><span class="ref-kind">Book</span> Jean-Philippe Aumasson, <em>Serious Cryptography</em>, 2nd ed., No Starch Press, 2024.</li>
+  </ul>
+
+  <h3>Part 12: Cloud-native, networking and DevOps</h3>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> James Kurose &amp; Keith Ross, <em>Computer Networking: A Top-Down Approach</em>, 8th ed., Pearson, 2021.</li>
+    <li><span class="ref-kind">Book</span> Randal Bryant &amp; David O'Hallaron, <em>Computer Systems: A Programmer's Perspective</em>, 3rd ed., Pearson, 2015.</li>
+    <li><span class="ref-kind">Book</span> Brendan Gregg, <em>Systems Performance</em>, 2nd ed., Addison-Wesley, 2020.</li>
+    <li><span class="ref-kind">Book</span> Brendan Burns, Joe Beda, Kelsey Hightower &amp; Lachlan Evenson, <em>Kubernetes: Up and Running</em>, 3rd ed., O'Reilly, 2022.</li>
+    <li><span class="ref-kind">Book</span> Yevgeniy Brikman, <em>Terraform: Up &amp; Running</em>, 3rd ed., O'Reilly, 2022.</li>
+    <li><span class="ref-kind">Book</span> Charity Majors, Liz Fong-Jones &amp; George Miranda, <em>Observability Engineering</em>, O'Reilly, 2022.</li>
+  </ul>
+</section>
+
+<section id="docs">
+  <h2>Primary documentation</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Area</th><th>Documentation</th></tr></thead>
+    <tbody>
+      <tr><td>Java &amp; Spring</td><td><a href="https://docs.spring.io/spring-boot/">Spring Boot</a> · <a href="https://docs.spring.io/spring-framework/reference/">Spring Framework</a> · <a href="https://docs.spring.io/spring-security/reference/">Spring Security</a> · <a href="https://docs.spring.io/spring-kafka/reference/">Spring for Apache Kafka</a> · <a href="https://docs.spring.io/spring-ai/reference/">Spring AI</a> · <a href="https://resilience4j.readme.io/">Resilience4j</a></td></tr>
+      <tr><td>Python</td><td><a href="https://docs.python.org/3/">Python</a> · <a href="https://fastapi.tiangolo.com/">FastAPI</a> · <a href="https://docs.pydantic.dev/">Pydantic</a> · <a href="https://docs.sqlalchemy.org/">SQLAlchemy</a> · <a href="https://docs.celeryq.dev/">Celery</a> · <a href="https://docs.astral.sh/uv/">uv</a></td></tr>
+      <tr><td>Go</td><td><a href="https://go.dev/doc/">Go documentation</a> · <a href="https://go.dev/ref/spec">Language spec</a> · <a href="https://go.dev/ref/mem">Memory model</a> · <a href="https://go.dev/doc/gc-guide">GC guide</a> · <a href="https://grpc.io/docs/languages/go/">gRPC-Go</a></td></tr>
+      <tr><td>Data stores &amp; messaging</td><td><a href="https://www.postgresql.org/docs/current/">PostgreSQL</a> · <a href="https://redis.io/docs/latest/">Redis</a> · <a href="https://kafka.apache.org/documentation/">Apache Kafka</a> · <a href="https://debezium.io/documentation/">Debezium</a> · <a href="https://www.rabbitmq.com/docs">RabbitMQ</a></td></tr>
+      <tr><td>ML &amp; AI</td><td><a href="https://scikit-learn.org/stable/">scikit-learn</a> · <a href="https://pytorch.org/docs/stable/">PyTorch</a> · <a href="https://huggingface.co/docs">Hugging Face</a> · <a href="https://docs.vllm.ai/">vLLM</a> · <a href="https://mlflow.org/docs/latest/">MLflow</a> · <a href="https://modelcontextprotocol.io/">Model Context Protocol</a> · <a href="https://docs.anthropic.com/">Anthropic API</a></td></tr>
+      <tr><td>Data engineering</td><td><a href="https://spark.apache.org/docs/latest/">Apache Spark</a> · <a href="https://nightlies.apache.org/flink/flink-docs-stable/">Apache Flink</a> · <a href="https://iceberg.apache.org/docs/latest/">Apache Iceberg</a> · <a href="https://airflow.apache.org/docs/">Apache Airflow</a> · <a href="https://docs.getdbt.com/">dbt</a> · <a href="https://duckdb.org/docs/">DuckDB</a></td></tr>
+      <tr><td>Cloud-native</td><td><a href="https://kubernetes.io/docs/home/">Kubernetes</a> · <a href="https://helm.sh/docs/">Helm</a> · <a href="https://developer.hashicorp.com/terraform/docs">Terraform</a> · <a href="https://argo-cd.readthedocs.io/">Argo CD</a> · <a href="https://prometheus.io/docs/">Prometheus</a> · <a href="https://opentelemetry.io/docs/">OpenTelemetry</a> · <a href="https://docs.aws.amazon.com/">AWS</a></td></tr>
+      <tr><td>Security</td><td><a href="https://owasp.org/www-project-top-ten/">OWASP Top 10</a> · <a href="https://owasp.org/API-Security/">OWASP API Security</a> · <a href="https://genai.owasp.org/">OWASP GenAI Security Project</a> · <a href="https://cheatsheetseries.owasp.org/">OWASP Cheat Sheets</a> · <a href="https://www.rfc-editor.org/rfc/rfc9700">RFC 9700 (OAuth 2.0 Security BCP)</a> · <a href="https://slsa.dev/">SLSA</a></td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="papers">
+  <h2>Foundational papers</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Paper</th><th>Why it matters</th><th>Used in</th></tr></thead>
+    <tbody>
+      <tr><td>Lamport, <a href="https://lamport.azurewebsites.net/pubs/time-clocks.pdf">“Time, Clocks, and the Ordering of Events in a Distributed System”</a> (1978)</td><td>Happens-before and logical clocks</td><td>P2</td></tr>
+      <tr><td>DeCandia et al., <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">“Dynamo: Amazon's Highly Available Key-value Store”</a> (SOSP 2007)</td><td>Leaderless replication, consistent hashing, quorums</td><td>P2</td></tr>
+      <tr><td>Ongaro &amp; Ousterhout, <a href="https://raft.github.io/raft.pdf">“In Search of an Understandable Consensus Algorithm (Raft)”</a> (USENIX ATC 2014)</td><td>Consensus as used by etcd and Kafka KRaft</td><td>P2</td></tr>
+      <tr><td>Corbett et al., “Spanner: Google's Globally-Distributed Database” (OSDI 2012)</td><td>External consistency with TrueTime</td><td>P2</td></tr>
+      <tr><td>Garcia-Molina &amp; Salem, “Sagas” (SIGMOD 1987)</td><td>Origin of the saga pattern</td><td>P2</td></tr>
+      <tr><td>Kreps, Narkhede &amp; Rao, “Kafka: a Distributed Messaging System for Log Processing” (NetDB 2011)</td><td>The log-centric design behind Kafka</td><td>P2, P9</td></tr>
+      <tr><td>Dean &amp; Ghemawat, “MapReduce” (OSDI 2004); Zaharia et al., <a href="https://www.usenix.org/conference/nsdi12/technical-sessions/presentation/zaharia">“Resilient Distributed Datasets”</a> (NSDI 2012)</td><td>Batch processing lineage leading to Spark</td><td>P9</td></tr>
+      <tr><td>Akidau et al., “The Dataflow Model” (VLDB 2015)</td><td>Event time, windows, watermarks</td><td>P9</td></tr>
+      <tr><td>Sculley et al., <a href="https://papers.nips.cc/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html">“Hidden Technical Debt in Machine Learning Systems”</a> (NeurIPS 2015)</td><td>Why ML systems are mostly not ML code</td><td>P10</td></tr>
+      <tr><td>Chen &amp; Guestrin, <a href="https://arxiv.org/abs/1603.02754">“XGBoost”</a> (KDD 2016)</td><td>Regularised gradient boosting</td><td>P6</td></tr>
+      <tr><td>Kingma &amp; Ba, <a href="https://arxiv.org/abs/1412.6980">“Adam”</a> (2014); He et al., <a href="https://arxiv.org/abs/1512.03385">“Deep Residual Learning”</a> (2015)</td><td>Optimisation and residual networks</td><td>P7</td></tr>
+      <tr><td>Vaswani et al., <a href="https://arxiv.org/abs/1706.03762">“Attention Is All You Need”</a> (2017)</td><td>The transformer</td><td>P7, P8</td></tr>
+      <tr><td>Kaplan et al., <a href="https://arxiv.org/abs/2001.08361">“Scaling Laws for Neural Language Models”</a> (2020); Hoffmann et al., <a href="https://arxiv.org/abs/2203.15556">“Training Compute-Optimal LLMs”</a> (2022)</td><td>How capability scales with data and compute</td><td>P8</td></tr>
+      <tr><td>Ouyang et al., <a href="https://arxiv.org/abs/2203.02155">“Training language models to follow instructions with human feedback”</a> (2022); Rafailov et al., <a href="https://arxiv.org/abs/2305.18290">“Direct Preference Optimization”</a> (2023)</td><td>Alignment and preference tuning</td><td>P8</td></tr>
+      <tr><td>Lewis et al., <a href="https://arxiv.org/abs/2005.11401">“Retrieval-Augmented Generation”</a> (2020); Malkov &amp; Yashunin, <a href="https://arxiv.org/abs/1603.09320">“HNSW”</a> (2016)</td><td>RAG and approximate nearest-neighbour search</td><td>P8</td></tr>
+      <tr><td>Hu et al., <a href="https://arxiv.org/abs/2106.09685">“LoRA”</a> (2021); Dettmers et al., <a href="https://arxiv.org/abs/2305.14314">“QLoRA”</a> (2023)</td><td>Parameter-efficient fine-tuning</td><td>P8</td></tr>
+      <tr><td>Kwon et al., <a href="https://arxiv.org/abs/2309.06180">“Efficient Memory Management for LLM Serving with PagedAttention”</a> (SOSP 2023)</td><td>vLLM and KV-cache paging</td><td>P8, P10</td></tr>
+      <tr><td>Greshake et al., <a href="https://arxiv.org/abs/2302.12173">“Not what you've signed up for: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection”</a> (2023)</td><td>Indirect prompt injection</td><td>P8, P11</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="engineering-blogs">
+  <h2>Engineering publications worth following</h2>
+  <p>These are first-party sources for the case studies in this book. Follow a handful of them regularly: they show how real teams make trade-offs.</p>
+  <ul class="refs">
+    <li><span class="ref-kind">Blog</span> <a href="https://netflixtechblog.com/">Netflix Technology Blog</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://www.uber.com/blog/engineering/">Uber Engineering</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://discord.com/category/engineering">Discord Engineering</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://stripe.com/blog/engineering">Stripe Engineering</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://shopify.engineering/">Shopify Engineering</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://www.linkedin.com/blog/engineering">LinkedIn Engineering</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://careersatdoordash.com/engineering-blog/">DoorDash Engineering</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://github.blog/engineering/">GitHub Engineering</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://blog.cloudflare.com/">Cloudflare Blog</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://aws.amazon.com/builders-library/">The Amazon Builders' Library</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://www.allthingsdistributed.com/">All Things Distributed (Werner Vogels)</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://www.anthropic.com/engineering">Anthropic Engineering</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://huyenchip.com/blog/">Chip Huyen's blog</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://martin.kleppmann.com/">Martin Kleppmann's blog</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://www.brendangregg.com/blog/">Brendan Gregg's blog</a></li>
+  </ul>
+</section>
+
+<section id="courses">
+  <h2>Courses that pair well with this book</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Course</span> <a href="https://pdos.csail.mit.edu/6.824/">MIT 6.5840 (formerly 6.824) Distributed Systems</a>: labs implement Raft and a sharded key-value store.</li>
+    <li><span class="ref-kind">Course</span> <a href="https://15445.courses.cs.cmu.edu/">CMU 15-445/645 Database Systems</a>: storage engines, indexing, query execution.</li>
+    <li><span class="ref-kind">Course</span> <a href="https://cs229.stanford.edu/">Stanford CS229 Machine Learning</a></li>
+    <li><span class="ref-kind">Course</span> <a href="https://cs231n.stanford.edu/">Stanford CS231n Deep Learning for Computer Vision</a></li>
+    <li><span class="ref-kind">Course</span> <a href="https://web.stanford.edu/class/cs224n/">Stanford CS224N NLP with Deep Learning</a></li>
+    <li><span class="ref-kind">Course</span> <a href="https://karpathy.ai/zero-to-hero.html">Andrej Karpathy — Neural Networks: Zero to Hero</a></li>
+    <li><span class="ref-kind">Course</span> <a href="https://huggingface.co/learn">Hugging Face courses</a> (LLM, agents, MCP)</li>
+    <li><span class="ref-kind">Course</span> <a href="https://www.deeplearning.ai/short-courses/">DeepLearning.AI short courses</a> on LLM application engineering</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

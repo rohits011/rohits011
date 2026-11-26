@@ -1,0 +1,1127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Data Science Lifecycle, EDA, Statistics, Pandas &amp; NumPy — AI-Era Software Engineering</title>
+<meta name="description" content="The data science lifecycle from CRISP-DM to modern variants, data cleaning, EDA, applied statistics and A/B testing, visualization, pandas/NumPy/Polars internals, Jupyter in production, and how data roles hand work to each other.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p9-01-data-science-lifecycle" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 9 · Chapter 1</p>
+  <h1>The Data Science Lifecycle, EDA, Statistics, Pandas &amp; NumPy</h1>
+  <p class="lede">Backend engineers are increasingly asked to build the systems that data scientists depend on, review their notebooks, and ship their models. This chapter gives you the working vocabulary and the mechanics underneath: how a data science project actually moves from question to decision, the statistics that keep A/B tests honest, and why a vectorized pandas expression is a hundred times faster than the loop you would have written in Java.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Comfortable Python; familiarity with SQL aggregates; you have run or read an A/B test result at least once.</li>
+    <li><strong>You will be able to:</strong> run a disciplined EDA on a real dataset (NYC TLC trips), choose and interpret a hypothesis test, spot the classic A/B testing mistakes, explain NumPy strides and pandas Copy-on-Write, decide between pandas, Polars and DuckDB, take a notebook to a scheduled production job, and explain how data engineers, data scientists, analytics engineers and ML engineers divide the work.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: From a Business Question to a Defensible Answer</h2>
+  <p>A data science project starts with a question someone is willing to act on: <em>Should we raise the surge cap in Manhattan? Do tipping prompts on the payment screen increase average tip? Which merchants will churn next quarter?</em> It ends, if it ends well, with a decision that is backed by evidence and a mechanism that keeps that evidence fresh. Everything between those two points is the <strong>data science lifecycle</strong>: understanding the business problem, collecting and understanding data, cleaning it, exploring it, modelling or testing it, evaluating the result against the original question, and deploying either a model, a dashboard, or simply a recommendation.</p>
+  <p>If you come from backend engineering, the most disorienting thing about this lifecycle is that <strong>the primary artifact is not code, it is a belief about the world</strong>. A Spring Boot service is correct if it satisfies its contract. A churn analysis is "correct" only if its conclusions survive contact with reality: different samples, different weeks, a skeptical finance team. That changes what rigor means. In services, rigor is tests, types and code review. In data science, rigor is also sampling design, controlling for confounders, quantifying uncertainty, and refusing to over-interpret a p-value.</p>
+  <p>This chapter is the first of four on the data side of the house. It covers the lifecycle itself, the statistics that underpin evidence, the dataframe libraries that are the "JVM" of the data world (NumPy, pandas, Polars, and Arrow underneath them), and Jupyter, the environment where most of this work happens. It closes the loop by explaining who does what: the boundaries between <strong>data engineering</strong>, <strong>data science</strong>, <strong>analytics engineering</strong> and <strong>ML engineering</strong>, a theme that Chapter 9.4 revisits once you have seen pipelines and orchestration.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>You have written reporting endpoints that run <code>GROUP BY</code> queries against Postgres, built Spring Batch jobs that read CSV, transform rows with an <code>ItemProcessor</code> and write results, and debugged production by reading Micrometer histograms in Grafana. You know that a p99 latency is not an average and that one bad deploy can shift a whole distribution.</dd>
+      <dt>Why that is not enough</dt><dd>Row-at-a-time processing (a <code>for</code> loop over <code>List&lt;Trip&gt;</code>, or an <code>ItemProcessor</code>) is the wrong mental model for analytical work: dataframe libraries are column-oriented and vectorized, and idiomatic code avoids per-row Python entirely. More importantly, an OLTP mindset asks "is this row correct?" whereas analysis asks "is this <em>conclusion</em> correct, given noise, bias and missing data?" That requires statistics, not just SQL.</dd>
+      <dt>The modern approach</dt><dd>Explore interactively in Jupyter with pandas or Polars over Arrow-backed columnar data (often Parquet read straight from object storage, or DuckDB for SQL over files), make every claim carry an uncertainty estimate, design experiments with power analysis before launching them, and promote exploratory notebooks into parameterized, versioned, scheduled jobs.</dd>
+      <dt>Where Python and Go fit</dt><dd>Python owns exploratory analysis and statistics (NumPy, pandas, Polars, SciPy, statsmodels, matplotlib/seaborn/plotly). Go rarely appears in analysis but is common in the ingestion and serving tier that produces the data (event collectors, CDC relays). Java remains relevant in the JVM data ecosystem (Spark, Flink, Kafka) and in the services you instrument to produce clean events in the first place.</dd>
+      <dt>In production</dt><dd>Notebooks are run by schedulers via papermill or converted to modules, experiments are analyzed by an experimentation platform rather than ad-hoc scripts, and metrics are defined once in a semantic layer so that "active riders" means the same thing in every dashboard.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use the full lifecycle when a decision has real cost and uncertainty. Avoid heavyweight process for a one-off lookup that a single SQL query answers; avoid notebooks as the long-term home for logic that other systems depend on.</dd>
+    </dl>
+  </div>
+
+  <div class="callout insight"><p class="callout-title">The one-sentence version</p><p>Data science is the discipline of turning messy, biased, incomplete observations into decisions you can defend; the code is the easy part, and the statistics and data hygiene are what make the answer trustworthy.</p></div>
+</section>
+
+<section id="history">
+  <h2>2. History: From Exploratory Data Analysis to Lakehouse Notebooks</h2>
+  <h3>2.1 Statistics meets computing (1960s–1990s)</h3>
+  <p>John Tukey argued in his 1962 paper <em>The Future of Data Analysis</em> that analysing data was a science in its own right, separate from mathematical statistics. His 1977 book <em>Exploratory Data Analysis</em> introduced the box plot and the stem-and-leaf display, and above all an attitude: look at the data before you test hypotheses about it. That attitude is the ancestor of every <code>df.describe()</code> you will run. The S language at Bell Labs (from 1976) and its open-source descendant R (first released publicly in the mid-1990s, version 1.0 in 2000) made that kind of interactive, plot-heavy analysis routine for statisticians.</p>
+  <h3>2.2 Process models: KDD and CRISP-DM (1996–2000)</h3>
+  <p>As companies began mining their transactional databases, practitioners needed a shared process. Fayyad, Piatetsky-Shapiro and Smyth described the <strong>KDD process</strong> (Knowledge Discovery in Databases) in 1996: selection, preprocessing, transformation, data mining, interpretation. In parallel, a consortium including Daimler-Benz, SPSS and NCR developed <strong>CRISP-DM</strong> (Cross-Industry Standard Process for Data Mining), starting in 1996 and publishing version 1.0 in 2000. Its six phases (business understanding, data understanding, data preparation, modelling, evaluation, deployment) are still the most widely cited lifecycle, mainly because they put <em>business understanding</em> first and draw the loops back explicitly.</p>
+  <h3>2.3 The Python scientific stack (2001–2015)</h3>
+  <p>Fernando Pérez started IPython in 2001 as a better interactive shell. NumPy unified the earlier Numeric and Numarray array packages in 2006 under Travis Oliphant. Wes McKinney began pandas at AQR Capital in 2008 to bring R-style data frames to Python, and it was open-sourced in 2009. matplotlib (John Hunter, 2003) supplied plotting, scikit-learn (2007 onward) supplied classical ML. In 2014 the language-agnostic parts of IPython's notebook were spun out as <strong>Project Jupyter</strong> (Julia, Python, R). By the mid-2010s, "Python + pandas + Jupyter" had become the default environment for analysis in industry.</p>
+  <h3>2.4 The job title and the role split (2008–2020)</h3>
+  <p>The title "data scientist" is commonly credited to DJ Patil and Jeff Hammerbacher around 2008 at LinkedIn and Facebook; a 2012 <em>Harvard Business Review</em> article by Thomas Davenport and Patil famously called it "the sexiest job of the 21st century". Within a decade, the generalist role fractured. Companies discovered that most data science time went to plumbing, so <strong>data engineering</strong> became its own discipline; the rise of cloud warehouses and dbt (2016 onward) created <strong>analytics engineering</strong>; and the difficulty of keeping models alive in production created <strong>ML engineering</strong> and MLOps.</p>
+  <h3>2.5 Columnar memory and the dataframe renaissance (2016–2026)</h3>
+  <p>Apache Arrow (2016) defined a language-independent columnar in-memory format so that Python, R, Java, Rust and query engines could share data without serialization. pandas 2.0 (April 2023) made Arrow an optional backend for any column. Polars, a Rust dataframe library started by Ritchie Vink in 2020, built a query optimizer and multithreaded execution on top of Arrow and became the main alternative to pandas. DuckDB (first released 2019) brought an embedded columnar SQL engine into the notebook. pandas 3.0 (released January 2026) made Copy-on-Write the only behaviour and a dedicated string dtype the default, backed by PyArrow when installed <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+  <div class="callout note"><p class="callout-title">Why the history matters</p><p>Each step removed a bottleneck: Tukey removed "test before you look", CRISP-DM removed "model before you understand the business", the Python stack removed licensing and language barriers, and Arrow removed serialization between tools. The current bottleneck is reproducibility and hand-offs between roles, which is why so much of this part of the book is about pipelines, contracts and orchestration.</p></div>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals: The Lifecycle, the Data, the Statistics and the Roles</h2>
+
+  <h3>3.1 CRISP-DM, phase by phase</h3>
+  <p>CRISP-DM is less a methodology than a checklist of the questions you must answer before anyone trusts your output. The phases are iterative: arrows go back from evaluation to business understanding as often as they go forward to deployment.</p>
+  <ol>
+    <li><strong>Business understanding.</strong> Translate a fuzzy goal ("reduce churn") into a measurable objective ("identify the 5% of merchants most likely to cancel in the next 30 days so account managers can intervene"), a success criterion ("intervention list has at least 3x the base churn rate"), and the cost of being wrong. This is where you decide whether the problem even needs a model; a rule or a dashboard is often enough.</li>
+    <li><strong>Data understanding.</strong> Inventory sources, owners, grain (one row per what?), freshness, known quality issues, and legal constraints. Profile the data: row counts, null rates, cardinalities, ranges, distributions.</li>
+    <li><strong>Data preparation.</strong> Clean, join, filter and engineer features. Practitioners routinely report this as the majority of project time; the exact fraction varies by survey and is not worth quoting, but no experienced practitioner disputes that it dominates.</li>
+    <li><strong>Modelling.</strong> Choose techniques (a statistical test, a regression, a gradient-boosted tree), tune them, and record assumptions.</li>
+    <li><strong>Evaluation.</strong> Evaluate against the <em>business</em> success criterion, not just a metric like AUC. Review the process: were there leaks, biased samples, or untested assumptions?</li>
+    <li><strong>Deployment.</strong> Anything from a slide deck, to a scheduled report, to a model behind an API. CRISP-DM is famously thin on what happens after deployment, which is the gap MLOps fills (Part 10).</li>
+  </ol>
+
+  <h3>3.2 Modern variants: TDSP, OSEMN and the product lifecycle</h3>
+  <p><strong>Microsoft's Team Data Science Process (TDSP)</strong> keeps the CRISP-DM shape but adds explicit roles, a standard project folder structure, and version control for everything. <strong>OSEMN</strong> (Obtain, Scrub, Explore, Model, iNterpret) is a mnemonic popular in teaching. In product companies the lifecycle is usually framed around <strong>decisions and experiments</strong>: hypothesis, metric definition, experiment design, launch, analysis, ship/no-ship, then monitoring of the shipped change. When a model is the output, the lifecycle extends into the ML lifecycle covered in Chapter 10.1: training pipelines, registries, serving, monitoring and retraining.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Framework</th><th>Origin</th><th>Strength</th><th>Weakness</th></tr></thead>
+    <tbody>
+      <tr><td>CRISP-DM</td><td>Industry consortium, 1996–2000</td><td>Business understanding first; explicit iteration</td><td>Little on operations, roles, or versioning</td></tr>
+      <tr><td>KDD</td><td>Fayyad et al., 1996</td><td>Precise about transformation steps</td><td>Academic; assumes the question is known</td></tr>
+      <tr><td>TDSP</td><td>Microsoft</td><td>Roles, repo templates, version control</td><td>Process-heavy for small teams</td></tr>
+      <tr><td>Experiment lifecycle</td><td>Product analytics practice</td><td>Ties analysis to ship decisions</td><td>Not all questions are experimentable</td></tr>
+      <tr><td>ML lifecycle / MLOps</td><td>2015 onward</td><td>Covers deployment, monitoring, retraining</td><td>Overkill when the output is a one-off insight</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>3.3 Data collection: where the bias gets in</h3>
+  <p>Data arrives from four broad sources: <strong>operational databases</strong> (your Postgres OLTP tables, extracted via batch dumps or CDC), <strong>event streams</strong> (clickstream, app telemetry, Kafka topics), <strong>third-party data</strong> (vendors, public datasets, APIs), and <strong>purpose-built collection</strong> (surveys, labelling, experiments). The engineering problems (formats, throughput, schemas) are covered in later chapters; the analytical problem is <em>bias</em>:</p>
+  <ul>
+    <li><strong>Selection bias.</strong> The data only contains units that made it into the system. Analysing "time to complete checkout" only over completed checkouts ignores everyone who abandoned. Survivorship bias is the special case where failures are invisible.</li>
+    <li><strong>Measurement bias.</strong> The instrument distorts the value. In the NYC TLC data, <code>tip_amount</code> is only reliable for card payments; cash tips are not recorded, so "average tip" is biased downwards unless you filter to card trips.</li>
+    <li><strong>Logging changes.</strong> A client release starts emitting an event twice, or a field's units change from seconds to milliseconds. These look like real behaviour changes. Treat every step change in a time series as a suspected logging change until proven otherwise.</li>
+    <li><strong>Sampling.</strong> When full data is too large, sample deliberately: uniform random sampling for overall estimates, <em>stratified</em> sampling to guarantee enough rows from small groups, and sampling by <em>entity</em> (all events for 1% of users) rather than by event when you need per-user behaviour. Sampling events uniformly breaks sessions apart.</li>
+  </ul>
+
+  <h3>3.4 Data cleaning: missingness, outliers, duplicates, types</h3>
+  <p>Cleaning is where analysis is won or lost, and it is full of judgement calls that must be written down.</p>
+  <p><strong>Missing data</strong> has three classical mechanisms. <em>MCAR</em> (missing completely at random): the probability of missingness is unrelated to anything; dropping rows loses power but not correctness. <em>MAR</em> (missing at random): missingness depends on <em>observed</em> variables, for example older app versions do not send <code>device_model</code>; you can model or impute it conditional on app version. <em>MNAR</em> (missing not at random): missingness depends on the missing value itself, for example high earners skip the income question; no amount of imputation from observed columns fixes this, and you must say so. Practical tools: drop, impute with a constant or median (fast, distorts variance), impute conditionally (group median, model-based), or add an explicit <code>is_missing</code> indicator so a model can learn from the missingness itself.</p>
+  <p><strong>Outliers</strong> are either errors or the most interesting rows you have. A taxi trip with a negative fare or a 300-mile distance in 2 minutes is an error. A $400 airport trip with a 12-hour wait might be real. Use domain rules first (fares cannot be negative, speed cannot exceed some physical bound), then statistical rules (IQR fences, z-scores on log-transformed values, or robust median absolute deviation) to flag rather than silently drop. Always count how many rows each rule removes.</p>
+  <p><strong>Duplicates</strong> come from at-least-once delivery, retries, and joins with unexpected fan-out. Before deduplicating, define the natural key. After every join, assert the row count is what you expected; a many-to-many join silently multiplying revenue is the single most common analytical bug.</p>
+  <p><strong>Types and units.</strong> Parse timestamps with explicit time zones (TLC timestamps are local New York time with no zone marker), convert currency and units once, and use categorical types for low-cardinality strings. Normalize free-text categories (<code>"NY"</code>, <code>"New York"</code>, <code>"ny "</code>).</p>
+  <div class="callout java"><p class="callout-title">Java angle</p><p>In a Spring Batch job, invalid rows throw in the <code>ItemProcessor</code> and go to a skip policy with a skip limit. Use the same idea in analysis: every cleaning rule produces a count of affected rows, and the job fails if a rule suddenly removes far more than usual. Silent filtering is the analytical equivalent of swallowing exceptions.</p></div>
+
+  <h3>3.5 Exploratory data analysis (EDA)</h3>
+  <p>EDA is structured curiosity. A disciplined pass covers:</p>
+  <ol>
+    <li><strong>Shape and grain.</strong> How many rows and columns? What does one row represent? Is the key unique?</li>
+    <li><strong>Univariate profiles.</strong> For each numeric column: count, nulls, min/max, quantiles, a histogram (often on a log scale; most real-world quantities like fares, durations and order values are right-skewed). For each categorical column: cardinality and top values.</li>
+    <li><strong>Time.</strong> Plot row counts per day. Gaps, spikes, and step changes reveal pipeline incidents and logging changes. Check seasonality (hour-of-day, day-of-week).</li>
+    <li><strong>Bivariate relationships.</strong> Scatter plots (with transparency or hexbins for large data), correlation matrices, grouped box plots. Look for non-linear relationships that a correlation coefficient would miss.</li>
+    <li><strong>Segments.</strong> Break every headline number down by the major dimensions (borough, payment type, platform). Simpson's paradox lives here: an aggregate trend can reverse within every subgroup when group sizes differ.</li>
+    <li><strong>Hypotheses list.</strong> EDA ends with written hypotheses and data-quality issues, not with a model.</li>
+  </ol>
+
+  <h3>3.6 Descriptive statistics and robustness</h3>
+  <p>The <strong>mean</strong> is sensitive to outliers; the <strong>median</strong> is not. The <strong>standard deviation</strong> summarizes spread for roughly symmetric data; for skewed data report <strong>quantiles</strong> (p50, p90, p99) exactly as you do for latency. The <strong>interquartile range</strong> (p75 minus p25) is a robust spread measure. You already know this from SRE work: average latency hides the tail, and so does average fare. When a distribution is multiplicative (prices, durations), the <strong>geometric mean</strong> or analysis on the log scale is often more meaningful.</p>
+
+  <h3>3.7 Distributions you will meet</h3>
+  <ul>
+    <li><strong>Normal</strong>: sums of many small independent effects; the reason sample means are approximately normal (Central Limit Theorem) even when raw data is not.</li>
+    <li><strong>Log-normal</strong>: products of many small effects; trip durations, order values, file sizes.</li>
+    <li><strong>Binomial / Bernoulli</strong>: conversion events (did the user buy, yes/no).</li>
+    <li><strong>Poisson</strong>: counts of events per interval at a constant rate (requests per second, trips per minute in a zone). Variance equals mean; real data is usually <em>overdispersed</em> (variance larger), which motivates the negative binomial.</li>
+    <li><strong>Exponential</strong>: time between Poisson events; memoryless.</li>
+    <li><strong>Power law / Zipf</strong>: popularity of items, hot keys in caches, revenue per customer. Means can be dominated by a handful of entities; analyses must be robust to whales.</li>
+  </ul>
+
+  <h3>3.8 Correlation versus causation</h3>
+  <p>Correlation measures how two variables move together; it says nothing about why. Three classic traps: <strong>confounding</strong> (a third variable drives both; ice cream sales and drownings both rise in summer), <strong>reverse causation</strong> (users who contact support churn more, but frustrated users both contact support and churn), and <strong>selection</strong> (conditioning on a collider; among hospitalized patients, two unrelated diseases can appear negatively correlated). Pearson correlation captures linear association; Spearman rank correlation captures monotonic association and is robust to outliers. Neither detects a U-shaped relationship.</p>
+  <p>The gold standard for causal claims is a <strong>randomized controlled experiment</strong> (an A/B test): randomization makes treatment independent of every confounder, observed or not. When experiments are impossible, observational causal methods (difference-in-differences, regression discontinuity, instrumental variables, propensity matching, synthetic control) make explicit assumptions that substitute for randomization. They are powerful and fragile; label their conclusions with their assumptions.</p>
+
+  <h3>3.9 Hypothesis testing in one page</h3>
+  <p>A hypothesis test asks: <em>if there were no real effect (the null hypothesis H0), how surprising would data at least this extreme be?</em> That probability is the <strong>p-value</strong>. If it is below a pre-chosen threshold α (often 0.05), we reject H0. Key definitions:</p>
+  <ul>
+    <li><strong>Type I error (false positive)</strong>: rejecting a true H0. Its rate is α.</li>
+    <li><strong>Type II error (false negative)</strong>: failing to reject a false H0. Its rate is β; <strong>power</strong> is 1 − β, typically targeted at 0.8.</li>
+    <li><strong>Minimum detectable effect (MDE)</strong>: the smallest true effect you have adequate power to detect with your sample size.</li>
+    <li><strong>Confidence interval</strong>: a range constructed so that, across repeated experiments, 95% of such intervals contain the true value. Report intervals, not just p-values: "+1.2% (95% CI −0.3% to +2.7%)" is far more informative than "p = 0.11".</li>
+  </ul>
+  <p>What a p-value is <em>not</em>: the probability that H0 is true, the probability the result is a fluke, or a measure of effect size. A tiny, useless effect is highly significant with enough data; a large, important effect can be non-significant with too little.</p>
+  <p>Common tests: <strong>Welch's t-test</strong> for difference in means (does not assume equal variances; prefer it over Student's), the <strong>two-proportion z-test</strong> or <strong>chi-square test</strong> for conversion rates, <strong>Mann-Whitney U</strong> for a rank-based comparison when distributions are heavily skewed (note it tests stochastic dominance, not a difference in medians), and the <strong>bootstrap</strong> for confidence intervals on awkward statistics like a p90 or a ratio.</p>
+
+  <h3>3.10 A/B testing and its pitfalls</h3>
+  <p>An A/B test randomly assigns units (users, sessions, merchants) to control and treatment, measures a pre-registered primary metric, and compares. The mechanics are easy; the pitfalls are where careers are damaged:</p>
+  <ul>
+    <li><strong>Peeking.</strong> Checking the p-value daily and stopping when it dips below 0.05 inflates the false positive rate far above 5%, because you are taking many shots at significance. Fix: fix the sample size in advance via power analysis, or use sequential methods designed for continuous monitoring (group-sequential boundaries, always-valid p-values / mSPRT).</li>
+    <li><strong>Underpowered tests.</strong> Running for a week "to see what happens" usually produces a non-significant result that is then misread as "no effect". Compute the MDE first.</li>
+    <li><strong>Multiple comparisons.</strong> Twenty metrics at α = 0.05 will produce about one "significant" metric by chance. Designate one primary metric; correct secondary ones (Bonferroni, Holm, or Benjamini–Hochberg for false discovery rate).</li>
+    <li><strong>Sample ratio mismatch (SRM).</strong> If you designed a 50/50 split and observe 50.6/49.4 on a million users, a chi-square test will flag it; something in assignment or logging is broken (bots filtered unevenly, a redirect losing users in one arm). Do not analyse an SRM experiment; fix it.</li>
+    <li><strong>Unit of randomization versus unit of analysis.</strong> If you randomize by user but compute per-session metrics, sessions from the same user are correlated, so naive standard errors are too small. Use the delta method or cluster-robust errors, or analyse per user.</li>
+    <li><strong>Interference / network effects.</strong> In marketplaces (riders and drivers, buyers and sellers), treatment users compete with control users for the same supply, violating independence. Use switchback experiments (randomize by time slice and region) or cluster randomization.</li>
+    <li><strong>Novelty and primacy effects.</strong> Users react to change itself; effects fade or grow over weeks. Look at the effect over time and by user tenure.</li>
+    <li><strong>Twyman's law.</strong> Any figure that looks interesting or different is usually wrong. A +30% conversion lift is far more likely to be a bug than a breakthrough.</li>
+  </ul>
+
+  <h3>3.11 Data visualization: choosing the chart</h3>
+  <p>A chart is an argument. Choose the encoding that makes the comparison you care about easiest for the eye. Position along a common axis is perceived most accurately; area and colour intensity least.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Question</th><th>Chart</th><th>Avoid</th></tr></thead>
+    <tbody>
+      <tr><td>How is one variable distributed?</td><td>Histogram (log x-axis for skewed data), ECDF, box or violin plot</td><td>A single mean bar</td></tr>
+      <tr><td>How does a value change over time?</td><td>Line chart; small multiples per segment</td><td>Pie chart per day</td></tr>
+      <tr><td>Compare a value across categories</td><td>Sorted horizontal bar chart, dot plot</td><td>3-D bars, unsorted bars</td></tr>
+      <tr><td>Relationship between two numeric variables</td><td>Scatter with alpha, hexbin or 2-D density for large n</td><td>Dual-axis line charts (suggest false correlations)</td></tr>
+      <tr><td>Part-to-whole</td><td>Stacked bar, or a pie only for 2–3 parts</td><td>Pie with ten slices</td></tr>
+      <tr><td>Uncertainty</td><td>Error bars / interval bands; show the CI</td><td>Bars with no intervals for experiment results</td></tr>
+    </tbody>
+  </table></div>
+  <p>Library choice: <strong>matplotlib</strong> is the low-level foundation (full control, static output, verbose), <strong>seaborn</strong> builds statistical plots on matplotlib with dataframe-aware APIs (grouped distributions, regression fits, facets), and <strong>plotly</strong> produces interactive HTML charts (hover, zoom) that embed in notebooks and dashboards. For very large data, aggregate first (in SQL, DuckDB, or Polars) and plot the aggregate; never send ten million points to a browser.</p>
+
+  <h3>3.12 The roles: DE, DS, AE and MLE</h3>
+  <p>The four data roles map neatly onto backend concepts you know.</p>
+  <ul>
+    <li><strong>Data engineer (DE)</strong> builds and runs the platform and pipelines that move data reliably: ingestion (CDC, Kafka, APIs), storage (lake, warehouse, table formats), batch and stream processing (Spark, Flink), orchestration, and data quality at the raw and integrated layers. Closest analogue: the platform/infrastructure team that runs Kafka and Postgres for everyone.</li>
+    <li><strong>Analytics engineer (AE)</strong> turns integrated data into clean, tested, documented business models in the warehouse, usually with SQL and dbt: dimensions, facts, metrics definitions. Closest analogue: the team that owns the domain model and its migrations, but for analytical tables.</li>
+    <li><strong>Data scientist (DS)</strong> answers questions and builds models: EDA, experiments, statistical inference, prototyping predictive models, and communicating results to decision makers. Closest analogue: a product-minded engineer whose deliverable is evidence rather than features.</li>
+    <li><strong>ML engineer (MLE)</strong> productionizes models: feature pipelines, training pipelines, model registry, serving, monitoring, retraining. Closest analogue: you, building and operating a latency-sensitive service, except the core logic is a learned artifact that degrades as the world changes.</li>
+  </ul>
+  <p>The boundaries move by company size. In a startup, one person does all four. At scale, the hand-off <em>interfaces</em> (raw tables with contracts, modelled tables with tests, feature definitions, registered model versions) matter more than who sits where. Section 5 draws these hand-offs as a diagram, and Chapter 9.4 returns to them once you have seen the tooling.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working: NumPy, pandas, Arrow, Polars and the Jupyter Kernel</h2>
+
+  <h3>4.1 The NumPy ndarray: a pointer, a dtype, a shape and strides</h3>
+  <p>A NumPy array is a thin header over a single contiguous (or strided) block of raw memory. The header holds a pointer to the data buffer, a <code>dtype</code> (for example <code>float64</code>, 8 bytes per element), a <code>shape</code>, and <code>strides</code>: the number of bytes to step in memory to move one position along each axis. Indexing element <code>[i, j]</code> of a 2-D array is just address arithmetic: <code>base + i*strides[0] + j*strides[1]</code>.</p>
+<pre class="ascii">
+a = np.arange(12, dtype=np.int64).reshape(3, 4)     # C order (row-major)
+shape   = (3, 4)
+strides = (32, 8)    # 4 elements * 8 bytes to next row; 8 bytes to next column
+
+memory: | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |10 |11 |
+          ^row 0          ^row 1          ^row 2
+
+a.T  -&gt; shape (4, 3), strides (8, 32)   # no copy, just swapped strides
+a[:, 1] -&gt; shape (3,), strides (32,)     # a view: every 4th element
+</pre>
+  <p>Because transposes and slices only rewrite the header, they are O(1) <strong>views</strong> that share memory with the original. This is radically different from a Java <code>double[][]</code>, which is an array of separate heap-allocated row arrays, each with its own object header, scattered across the heap. NumPy's layout is what lets it hand a buffer to BLAS, to a C extension, or to the GPU without copying.</p>
+
+  <h3>4.2 Vectorization and ufuncs: why the loop is slow</h3>
+  <p>A Python <code>for</code> loop over a million floats does, per element: fetch a boxed <code>PyFloat</code> object, dispatch the <code>+</code> operator dynamically through type lookups, allocate a new boxed result, and decrement reference counts. That is hundreds of machine instructions for one addition. A NumPy <strong>ufunc</strong> (universal function) such as <code>np.add</code> does the type dispatch once, then runs a tight compiled C loop over raw buffers, which the compiler can unroll and turn into SIMD instructions (AVX2/AVX-512 or NEON), processing 4–16 values per instruction. The speedup is commonly two orders of magnitude.</p>
+  <p><strong>Broadcasting</strong> extends ufuncs to arrays of different shapes without materializing copies: dimensions are aligned from the right, and any dimension of size 1 is virtually stretched (stride 0). Subtracting a per-column mean of shape <code>(4,)</code> from a <code>(1_000_000, 4)</code> matrix never builds a million-row mean matrix.</p>
+  <div class="callout java"><p class="callout-title">Java angle</p><p>The JVM's JIT can auto-vectorize simple loops over primitive <code>double[]</code>, and the incubating Vector API (JEP 338 and successors) exposes SIMD explicitly. The difference is cultural: in Java, a hand-written loop over primitives is idiomatic and fast; in Python, it is the slowest thing you can write, so the idiom is to express whole-column operations and let compiled code do the looping.</p></div>
+
+  <h3>4.3 pandas internals: blocks, dtypes and the object problem</h3>
+  <p>A pandas <code>DataFrame</code> is a set of labelled columns plus an <code>Index</code>. Internally, the <strong>BlockManager</strong> groups columns of the same dtype into 2-D NumPy blocks (all the <code>float64</code> columns in one block, all the <code>int64</code> in another). That makes some row-wise operations fast but means adding columns can trigger consolidation copies, which is one reason why building a frame column-by-column in a loop is slow.</p>
+  <p>The historic weakness was strings. NumPy has no efficient variable-length string type, so pandas stored strings as <code>object</code> dtype: an array of pointers to individual Python <code>str</code> objects on the heap. That costs roughly 50+ bytes of overhead per value, defeats cache locality, and forces every string operation back into the Python interpreter. Missing values were also awkward: integer columns with a null were silently upcast to <code>float64</code> because NumPy integers cannot represent <code>NaN</code>.</p>
+  <p>Fixes arrived in layers: nullable extension dtypes (<code>Int64</code>, <code>boolean</code>, <code>string</code>) with a separate validity mask; the <code>category</code> dtype, which stores integer codes plus a small dictionary of unique values (ideal for low-cardinality columns like <code>payment_type</code>); and, from pandas 2.0, <strong>Arrow-backed dtypes</strong> such as <code>int64[pyarrow]</code> and <code>string[pyarrow]</code>, which store data in Arrow buffers with a validity bitmap. In pandas 3.0 the default string dtype is <code>str</code>, Arrow-backed when PyArrow is installed <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+
+  <h3>4.4 Apache Arrow's memory format</h3>
+  <p>Arrow represents a column as one or more contiguous buffers: a <strong>validity bitmap</strong> (one bit per value, 1 = not null), and a <strong>values buffer</strong>. Variable-length types such as strings use an <strong>offsets buffer</strong> (int32 or int64 positions) plus one contiguous <strong>data buffer</strong> of UTF-8 bytes. Dictionary-encoded columns store indices plus a dictionary. Buffers are 64-byte aligned for SIMD. Because the format is standardized, a Parquet reader in C++, a Polars query in Rust, DuckDB, and pandas can hand the same buffers to each other without copying or re-encoding: zero-copy interchange.</p>
+<pre class="ascii">
+Column zone_name: ["JFK", null, "Midtown"]
+validity : 1 0 1                     (bits)
+offsets  : 0  3  3  10               (int32)
+data     : J F K M i d t o w n        (10 bytes, contiguous)
+</pre>
+
+  <h3>4.5 Copy-on-Write and the end of SettingWithCopyWarning</h3>
+  <p>Old pandas had ambiguous semantics: <code>df[df.fare &gt; 0]["tip"] = 0</code> might modify a temporary copy or the original depending on internal layout, hence the infamous <code>SettingWithCopyWarning</code>. <strong>Copy-on-Write (CoW)</strong>, optional in pandas 2.x and the only mode in 3.0, makes the rule simple: <em>any DataFrame or Series derived from another behaves as a copy</em>. Internally, derived objects share buffers with their parent (cheap), and track references; the first write to a shared buffer triggers a real copy. Consequences: chained assignment never modifies the parent (use <code>df.loc[mask, "tip"] = 0</code>), many operations that used to copy defensively are now free, and memory use drops for pipelines of method calls.</p>
+
+  <h3>4.6 Polars: a query engine disguised as a dataframe</h3>
+  <p>Polars stores columns as Arrow arrays and is written in Rust. Its key difference is the <strong>lazy API</strong>: <code>pl.scan_parquet(...)</code> returns a <code>LazyFrame</code> that records a logical plan. Calling <code>.collect()</code> sends the plan through an optimizer that applies predicate pushdown (filters applied while reading Parquet row groups), projection pushdown (only needed columns are read), common-subexpression elimination, and join reordering, before executing on all cores with a work-stealing thread pool. Its expression API (<code>pl.col("fare").mean().over("zone")</code>) is designed to be parallelized; there is no row index and no implicit alignment, which removes a whole class of pandas surprises. Polars also has a streaming engine that processes data in batches when it does not fit in memory.</p>
+
+  <h3>4.7 How a groupby actually runs</h3>
+  <p>Whether in pandas, Polars or DuckDB, a hash aggregation has the same shape: (1) <em>factorize</em> the key columns into dense integer group ids using a hash table, (2) allocate one accumulator per group per aggregate, (3) scan the value column and update accumulators by group id, (4) materialize results. Polars and DuckDB partition the hash table across threads (each thread aggregates a morsel of rows into a local table, then partitions merge). pandas' classic groupby is single-threaded but uses Cython loops. The lesson for performance work: categorical or integer keys factorize far faster than string keys, and pre-filtering rows before grouping is the cheapest optimization of all.</p>
+
+  <h3>4.8 Jupyter: a browser, a server and a kernel talking over ZeroMQ</h3>
+  <p>The notebook UI (JupyterLab or Notebook 7) runs in the browser and talks HTTP/WebSocket to the <strong>Jupyter Server</strong>, which manages files and kernels. Each notebook is connected to a <strong>kernel</strong> process (ipykernel for Python) over ZeroMQ sockets: a <em>shell</em> channel for execute requests, an <em>IOPub</em> channel that broadcasts outputs and status, <em>stdin</em> for input prompts, <em>control</em> for interrupts and shutdown, and a <em>heartbeat</em>. The kernel holds all state in memory. That is the root of the reproducibility problem: cells can be executed in any order, re-executed, or deleted after their side effects have happened, so the saved <code>.ipynb</code> JSON (cells plus outputs plus execution counts) may not correspond to any linear execution of the code.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: Lifecycle Loops, Role Hand-offs and Notebook Execution</h2>
+
+  <h3>5.1 The lifecycle as a loop</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  BU["Business understanding"] --> DU["Data understanding"]
+  DU --> DP["Data preparation"]
+  DP --> MO["Modelling or testing"]
+  MO --> EV["Evaluation"]
+  EV -->|"meets criteria"| DE["Deployment: decision, report or model"]
+  EV -->|"wrong question"| BU
+  MO -->|"needs features"| DP
+  DU -->|"data gaps"| BU
+  DE --> MON["Monitor outcome"]
+  MON -->|"drift or new question"| BU
+</pre>
+<figcaption>Figure 9.1 — CRISP-DM drawn as the loop it actually is, extended with post-deployment monitoring.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> the forward path is the six CRISP-DM phases, but the back-edges carry most of the traffic in real projects. Data understanding frequently sends you back to rephrase the business question (the data cannot support it); modelling sends you back for more feature preparation; evaluation against the business criterion often reveals that the metric optimized was not the one that mattered. The <code>Monitor outcome</code> node is the addition modern practice makes: a deployed decision or model is an assumption about the world that must be re-checked.</p>
+
+  <h3>5.2 How DE, AE, DS and MLE hand work to each other</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph SRC["Sources (owned by product engineering)"]
+    PG[("Postgres OLTP")]
+    EV[["Kafka events"]]
+    API["SaaS and third-party APIs"]
+  end
+  subgraph DEP["Data engineering"]
+    ING["Ingestion: CDC, Connect, batch loads"]
+    RAW[("Raw and staged tables in lake or warehouse")]
+  end
+  subgraph AEP["Analytics engineering"]
+    DBT["dbt models: facts, dimensions, metrics"]
+    MART[("Tested marts and semantic layer")]
+  end
+  subgraph DSP["Data science"]
+    EDA["EDA, experiments, prototypes"]
+    DEC["Decisions and model prototypes"]
+  end
+  subgraph MLP["ML engineering"]
+    FEAT["Feature pipelines and feature store"]
+    TRAIN["Training pipeline and registry"]
+    SERVE["Serving and monitoring"]
+  end
+  PG --> ING
+  EV --> ING
+  API --> ING
+  ING --> RAW
+  RAW -->|"data contract"| DBT
+  DBT --> MART
+  MART -->|"trusted metrics"| EDA
+  RAW -->|"raw exploration"| EDA
+  EDA --> DEC
+  DEC -->|"model spec and notebook"| FEAT
+  MART --> FEAT
+  FEAT --> TRAIN
+  TRAIN --> SERVE
+  SERVE -->|"predictions and logs"| EV
+  SERVE -->|"monitoring metrics"| EDA
+</pre>
+<figcaption>Figure 9.2 — Hand-offs between the four data roles, from operational sources to served models and back.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> each arrow that crosses a subgraph boundary is an <em>interface</em>, and the health of a data organization is mostly the health of these interfaces. Product engineers own the sources and should own the event schemas (a contract). Data engineers guarantee that raw tables arrive complete and on time. Analytics engineers publish tested, documented models and a single definition per metric, which data scientists consume rather than re-deriving. Data scientists hand ML engineers a model specification, a prototype, and evaluation evidence; ML engineers rebuild it as pipelines with point-in-time-correct features. The loop closes when served predictions are logged back into the event stream, becoming training data and monitoring signals. Notice the arrow from raw tables straight to EDA: data scientists legitimately explore raw data, but any metric they publish should be rebuilt on the modelled layer.</p>
+
+  <h3>5.3 A notebook's journey to production</h3>
+<figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant DS as Data scientist
+  participant NB as Notebook in Git
+  participant CI as CI pipeline
+  participant SCH as Scheduler (Airflow)
+  participant PM as papermill worker
+  participant OS as Object storage
+  DS->>NB: commit parameterized notebook (outputs stripped)
+  NB->>CI: pull request
+  CI->>CI: lint, run notebook on sample data, unit-test extracted modules
+  CI-->>DS: pass or fail
+  SCH->>PM: daily run with parameters run_date and zone
+  PM->>PM: inject parameters cell, execute all cells top to bottom
+  PM->>OS: write executed notebook and outputs
+  PM-->>SCH: success or failure (raises on cell error)
+</pre>
+<figcaption>Figure 9.3 — Promoting a notebook to a scheduled, parameterized job with papermill.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> the two key moves are <em>parameterization</em> (one cell tagged <code>parameters</code> holds defaults that papermill overrides) and <em>linear execution</em> (papermill always runs top to bottom in a fresh kernel, which eliminates hidden state). The executed notebook, with outputs, is stored as an immutable artifact per run, which gives you a readable audit trail of exactly what the job saw. CI runs the same notebook on a small fixture dataset, which catches most breakages before the scheduler does. Logic that other systems depend on should migrate out of the notebook into an importable, unit-tested module; the notebook then becomes a thin report on top of it.</p>
+
+  <h3>5.4 Pandas versus Polars execution</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  subgraph PANDAS["pandas (eager)"]
+    P1["read_parquet: all columns, all rows"] --> P2["filter: new frame"]
+    P2 --> P3["assign: new column"]
+    P3 --> P4["groupby agg: single thread"]
+  end
+  subgraph POLARS["Polars (lazy)"]
+    L1["scan_parquet: plan only"] --> L2["filter and with_columns: plan only"]
+    L2 --> L3["group_by agg: plan only"]
+    L3 --> OPT["optimizer: pushdown and pruning"]
+    OPT --> EX["parallel execution over row groups"]
+  end
+</pre>
+<figcaption>Figure 9.4 — Eager pandas materializes every step; lazy Polars optimizes the whole query before reading data.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> pandas executes each method call immediately, so the full file is read before the filter can discard rows, and each step allocates a new frame (cheaper under Copy-on-Write, but still materialized). Polars builds a plan, lets the optimizer push the filter and column selection into the Parquet scan so that whole row groups are skipped using their min/max statistics, and only then executes in parallel. This is the same idea as a SQL database's query planner, which is why DuckDB and Polars perform similarly on many analytical queries.</p>
+</section>
+
+<section id="math">
+  <h2>6. Mathematical Foundations: Estimation, Testing and Power</h2>
+  <h3>6.1 Mean, variance and a numerically stable way to compute them</h3>
+  <p>Intuition: the mean is the balance point; variance is the average squared distance from it. Formally, for a sample \( x_1,\dots,x_n \):</p>
+  \[ \bar{x} = \frac{1}{n}\sum_{i=1}^{n} x_i, \qquad s^2 = \frac{1}{n-1}\sum_{i=1}^{n}(x_i - \bar{x})^2 \]
+  <p>The \( n-1 \) (Bessel's correction) makes \( s^2 \) unbiased because \( \bar{x} \) was estimated from the same data. Computing \( \sum x^2 - n\bar{x}^2 \) in floating point suffers catastrophic cancellation for large values; streaming systems use <strong>Welford's algorithm</strong>, which updates the mean and the sum of squared deviations \( M_2 \) one value at a time:</p>
+  \[ \delta = x_k - \bar{x}_{k-1},\quad \bar{x}_k = \bar{x}_{k-1} + \frac{\delta}{k},\quad M_{2,k} = M_{2,k-1} + \delta\,(x_k - \bar{x}_k) \]
+  <p>with \( s^2 = M_2/(n-1) \). It is the algorithm behind many "running variance" metrics, and partial results from different partitions can be merged, which is how distributed engines compute variance in one pass.</p>
+
+  <h3>6.2 Standard error and confidence intervals</h3>
+  <p>The sample mean itself varies from sample to sample. Its standard deviation is the <strong>standard error</strong>:</p>
+  \[ \mathrm{SE}(\bar{x}) = \frac{s}{\sqrt{n}} \]
+  <p>Quadrupling the sample halves the uncertainty: the square-root law that dominates experiment design. By the Central Limit Theorem, an approximate 95% interval is \( \bar{x} \pm 1.96\,\mathrm{SE} \). For a proportion \( \hat{p} \), \( \mathrm{SE} = \sqrt{\hat{p}(1-\hat{p})/n} \).</p>
+
+  <h3>6.3 Welch's t-test for a difference in means</h3>
+  \[ t = \frac{\bar{x}_T - \bar{x}_C}{\sqrt{\dfrac{s_T^2}{n_T} + \dfrac{s_C^2}{n_C}}} \]
+  <p>with degrees of freedom from the Welch–Satterthwaite approximation. For large samples \( t \) is essentially standard normal, so \( |t| &gt; 1.96 \) corresponds to \( p &lt; 0.05 \) two-sided.</p>
+
+  <h3>6.4 Power and sample size</h3>
+  <p>Intuition: to detect a small effect, the noise in your estimate (the standard error) must be small relative to the effect. For a two-sided test with significance \( \alpha \) and power \( 1-\beta \), with equal group sizes \( n \) per arm and a metric with standard deviation \( \sigma \), the required sample per arm to detect an absolute difference \( \delta \) is approximately:</p>
+  \[ n \approx \frac{2\,(z_{1-\alpha/2} + z_{1-\beta})^2\,\sigma^2}{\delta^2} \]
+  <p>With \( \alpha = 0.05 \) and power 0.8, \( (1.96 + 0.84)^2 \approx 7.85 \), giving the handy rule \( n \approx 16\sigma^2/\delta^2 \) per arm. <span class="tag illus">Illustrative</span> For a conversion rate of 5% (\( \sigma^2 = 0.05 \times 0.95 = 0.0475 \)) and a desired relative lift of 2% (absolute \( \delta = 0.001 \)): \( n \approx 16 \times 0.0475 / 10^{-6} = 760{,}000 \) users per arm. That single calculation explains why small companies cannot detect small effects and why big ones obsess over variance reduction.</p>
+
+  <h3>6.5 Variance reduction with CUPED</h3>
+  <p>If a pre-experiment covariate \( X \) (say, each user's spend in the prior 4 weeks) correlates with the outcome \( Y \), you can subtract its predictable part: \( Y' = Y - \theta (X - \bar{X}) \) with \( \theta = \mathrm{Cov}(X,Y)/\mathrm{Var}(X) \). The variance shrinks by a factor \( 1-\rho^2 \) where \( \rho \) is the correlation. With \( \rho = 0.6 \), variance drops 36%, which cuts the required sample by the same fraction. Because \( X \) is measured before randomization, it is independent of treatment and the estimate stays unbiased. This technique was published by Microsoft's experimentation team (Deng et al., WSDM 2013).</p>
+
+  <h3>6.6 Multiple comparisons and peeking, quantified</h3>
+  <p>If you test \( m \) independent true-null metrics at level \( \alpha \), the chance of at least one false positive is \( 1-(1-\alpha)^m \). For \( m = 20 \) that is \( 1 - 0.95^{20} \approx 0.64 \). Bonferroni controls this by testing each at \( \alpha/m \). Peeking is the same problem in time: each look is another test, so checking daily over a month and stopping at the first \( p &lt; 0.05 \) can push the actual false positive rate well above the nominal 5%; simulations in the experimentation literature show inflation to several times the nominal rate depending on the number of looks. Exercise 3 asks you to measure it yourself.</p>
+
+  <h3>6.7 Correlation coefficients</h3>
+  \[ r = \frac{\sum (x_i-\bar{x})(y_i-\bar{y})}{\sqrt{\sum (x_i-\bar{x})^2}\sqrt{\sum (y_i-\bar{y})^2}} \]
+  <p>Pearson's \( r \) is a normalized covariance between −1 and 1 and measures linear association only. Spearman's \( \rho \) is Pearson's \( r \) applied to ranks, so it captures any monotonic relationship and is robust to outliers. \( r^2 \) is the fraction of variance in one variable linearly explained by the other: an \( r \) of 0.3 explains only 9%.</p>
+
+  <h3>6.8 Complexity of dataframe operations</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Operation</th><th>Typical complexity</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Vectorized elementwise op</td><td>O(n), SIMD constant factor</td><td>Memory-bandwidth bound for simple ops</td></tr>
+      <tr><td>Hash groupby</td><td>O(n) expected</td><td>Degrades with very high cardinality (cache misses)</td></tr>
+      <tr><td>Sort / sort-based groupby</td><td>O(n log n)</td><td>Used for quantiles and sorted output</td></tr>
+      <tr><td>Hash join</td><td>O(n + m) expected</td><td>Build side should be the smaller table</td></tr>
+      <tr><td>Exact distinct count</td><td>O(n) time, O(d) memory</td><td>HyperLogLog gives approx in O(1) memory (Chapter 9.2)</td></tr>
+      <tr><td>Exact quantile</td><td>O(n) selection or O(n log n) sort</td><td>t-digest/KLL sketches for streaming</td></tr>
+      <tr><td><code>df.apply(f, axis=1)</code></td><td>O(n) Python calls</td><td>Interpreter-bound: avoid</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="code">
+  <h2>7. Code: EDA on NYC Taxi Trips, A/B Tests, Polars, DuckDB and papermill</h2>
+  <p>All examples use the public <a href="https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page">NYC TLC Trip Record Data</a>, published monthly as Parquet. One month of yellow-cab trips is roughly 3 million rows and about 50 MB on disk, small enough for a laptop and large enough for performance differences to show. Tested with Python 3.12, pandas 3.0, Polars 1.x, DuckDB 1.4, SciPy 1.14+ <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+
+<pre data-file="requirements.txt"><code class="language-plaintext">pandas&gt;=3.0
+pyarrow&gt;=17
+polars&gt;=1.10
+duckdb&gt;=1.4
+numpy&gt;=2.0
+scipy&gt;=1.14
+statsmodels&gt;=0.14
+matplotlib&gt;=3.9
+seaborn&gt;=0.13
+plotly&gt;=5.24
+papermill&gt;=2.6</code></pre>
+
+  <h3>7.1 Load, type and profile (pandas)</h3>
+<pre data-file="eda_load.py"><code class="language-python">"""Load one month of NYC yellow-taxi trips and profile it."""
+from __future__ import annotations
+
+import pandas as pd
+
+TRIPS_URL = "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet"
+ZONES_URL = "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv"
+
+COLUMNS = [
+    "tpep_pickup_datetime", "tpep_dropoff_datetime", "passenger_count",
+    "trip_distance", "PULocationID", "DOLocationID", "payment_type",
+    "fare_amount", "tip_amount", "total_amount",
+]
+
+
+def load_trips(url: str = TRIPS_URL) -&gt; pd.DataFrame:
+    # Read only the columns we need; Arrow-backed dtypes keep nulls without float upcasting.
+    df = pd.read_parquet(url, columns=COLUMNS, dtype_backend="pyarrow")
+    df["payment_type"] = df["payment_type"].astype("category")
+    # TLC timestamps are local New York time without a zone marker: make that explicit.
+    for col in ("tpep_pickup_datetime", "tpep_dropoff_datetime"):
+        df[col] = pd.to_datetime(df[col]).dt.tz_localize(
+            "America/New_York", ambiguous="NaT", nonexistent="NaT"
+        )
+    return df
+
+
+def profile(df: pd.DataFrame) -&gt; pd.DataFrame:
+    """One row per column: dtype, null rate, distinct count, quantiles."""
+    rows = []
+    for col in df.columns:
+        s = df[col]
+        row = {
+            "column": col,
+            "dtype": str(s.dtype),
+            "null_pct": round(100 * s.isna().mean(), 3),
+            "n_distinct": s.nunique(dropna=True),
+        }
+        if pd.api.types.is_numeric_dtype(s):
+            q = s.quantile([0.0, 0.01, 0.5, 0.99, 1.0])
+            row.update({"min": q.iloc[0], "p01": q.iloc[1], "p50": q.iloc[2],
+                        "p99": q.iloc[3], "max": q.iloc[4]})
+        rows.append(row)
+    return pd.DataFrame(rows).set_index("column")
+
+
+if __name__ == "__main__":
+    trips = load_trips()
+    print(f"{len(trips):,} rows, {trips.memory_usage(deep=True).sum() / 1e6:.0f} MB in memory")
+    print(profile(trips).to_string())</code></pre>
+  <p>The profile immediately shows the issues every TLC analysis meets: negative fares (refunds and corrections), zero-distance trips, trips with pickup timestamps outside the month, and absurd maxima. That is the input to the cleaning rules.</p>
+
+  <h3>7.2 Clean with counted, named rules</h3>
+<pre data-file="eda_clean.py"><code class="language-python">"""Apply named cleaning rules and report how many rows each removes."""
+from __future__ import annotations
+
+import pandas as pd
+
+from eda_load import load_trips
+
+MONTH_START = pd.Timestamp("2024-01-01", tz="America/New_York")
+MONTH_END = pd.Timestamp("2024-02-01", tz="America/New_York")
+
+
+def clean(df: pd.DataFrame, max_drop_pct: float = 10.0) -&gt; tuple[pd.DataFrame, pd.Series]:
+    duration_min = (df["tpep_dropoff_datetime"] - df["tpep_pickup_datetime"]).dt.total_seconds() / 60
+    speed_mph = df["trip_distance"] / (duration_min / 60)
+
+    rules: dict[str, pd.Series] = {
+        "pickup_outside_month": ~df["tpep_pickup_datetime"].between(MONTH_START, MONTH_END, inclusive="left"),
+        "non_positive_fare": df["fare_amount"] &lt;= 0,
+        "non_positive_distance": df["trip_distance"] &lt;= 0,
+        "duration_out_of_range": ~duration_min.between(1, 180),
+        "impossible_speed": speed_mph &gt; 80,
+        "null_timestamps": df["tpep_pickup_datetime"].isna() | df["tpep_dropoff_datetime"].isna(),
+    }
+    # fillna(False): a rule that cannot be evaluated does not, on its own, drop a row.
+    flags = pd.DataFrame({k: v.fillna(False).astype(bool) for k, v in rules.items()})
+    report = flags.sum().sort_values(ascending=False)
+    drop = flags.any(axis=1)
+
+    drop_pct = 100 * drop.mean()
+    if drop_pct &gt; max_drop_pct:
+        # Fail loudly: a rule removing far more than usual means upstream changed.
+        raise ValueError(f"cleaning would drop {drop_pct:.1f}% of rows; report:\n{report}")
+
+    out = df.loc[~drop].assign(
+        duration_min=duration_min[~drop],
+        tip_pct=lambda d: (d["tip_amount"] / d["fare_amount"]).astype("float64"),
+    )
+    return out, report
+
+
+if __name__ == "__main__":
+    raw = load_trips()
+    trips, report = clean(raw)
+    print(report.to_string())
+    print(f"kept {len(trips):,} of {len(raw):,} rows ({100 * len(trips) / len(raw):.1f}%)")</code></pre>
+
+  <h3>7.3 Exploratory questions with groupby and window-like operations</h3>
+<pre data-file="eda_explore.py"><code class="language-python">"""Answer exploratory questions; note the card-only filter for tips (measurement bias)."""
+import pandas as pd
+
+from eda_clean import clean
+from eda_load import ZONES_URL, load_trips
+
+trips, _ = clean(load_trips())
+zones = pd.read_csv(ZONES_URL)  # LocationID, Borough, Zone, service_zone
+
+trips = trips.merge(
+    zones.rename(columns={"LocationID": "PULocationID", "Borough": "pu_borough", "Zone": "pu_zone"}),
+    on="PULocationID", how="left", validate="many_to_one",   # assert no fan-out
+)
+
+# 1. Hour-of-day by day-of-week demand profile.
+local = trips["tpep_pickup_datetime"]
+demand = (trips.assign(dow=local.dt.day_name(), hour=local.dt.hour)
+               .pivot_table(index="hour", columns="dow", values="fare_amount", aggfunc="size"))
+
+# 2. Tip percentage: only card payments (payment_type 1) record tips.
+card = trips[trips["payment_type"] == 1]
+tip_by_borough = (card.groupby("pu_borough", observed=True)["tip_pct"]
+                      .describe(percentiles=[0.5, 0.9])
+                      .sort_values("50%", ascending=False))
+
+# 3. Rank zones by revenue inside each borough (window-style with transform/rank).
+zone_rev = (trips.groupby(["pu_borough", "pu_zone"], observed=True)["total_amount"]
+                 .sum().rename("revenue").reset_index())
+zone_rev["rank_in_borough"] = zone_rev.groupby("pu_borough")["revenue"].rank(ascending=False, method="dense")
+zone_rev["share_of_borough"] = zone_rev["revenue"] / zone_rev.groupby("pu_borough")["revenue"].transform("sum")
+top3 = zone_rev[zone_rev["rank_in_borough"] &lt;= 3].sort_values(["pu_borough", "rank_in_borough"])
+
+# 4. Correlation: Pearson vs Spearman on skewed variables.
+pearson = trips[["trip_distance", "duration_min", "fare_amount"]].corr(method="pearson")
+spearman = trips[["trip_distance", "duration_min", "fare_amount"]].corr(method="spearman")
+
+print(tip_by_borough.round(3).to_string())
+print(top3.to_string(index=False))
+print(pearson.round(2), spearman.round(2), sep="\n\n")</code></pre>
+  <p>Note <code>validate="many_to_one"</code> on the merge: pandas raises if the zone lookup has duplicate keys, turning a silent fan-out into an exception. Use it on every join you write.</p>
+
+  <h3>7.4 Visualization: matplotlib, seaborn and plotly</h3>
+<pre data-file="eda_plots.py"><code class="language-python">import matplotlib.pyplot as plt
+import numpy as np
+import plotly.express as px
+import seaborn as sns
+
+from eda_clean import clean
+from eda_load import load_trips
+
+trips, _ = clean(load_trips())
+sample = trips.sample(200_000, random_state=42)   # plot a sample, aggregate the rest
+
+fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+
+# Skewed distribution: log-spaced bins tell the truth, linear bins hide it.
+bins = np.logspace(np.log10(1), np.log10(200), 60)
+axes[0].hist(sample["fare_amount"], bins=bins)
+axes[0].set_xscale("log")
+axes[0].set(title="Fare distribution (log x)", xlabel="fare_amount ($)", ylabel="trips")
+
+# Large-n relationship: hexbin instead of an over-plotted scatter.
+axes[1].hexbin(sample["trip_distance"], sample["fare_amount"], gridsize=60, bins="log",
+               extent=(0, 20, 0, 100))
+axes[1].set(title="Fare vs distance (hexbin, log counts)", xlabel="miles", ylabel="$")
+
+# Grouped distribution with seaborn.
+card = sample[sample["payment_type"] == 1]
+sns.boxplot(data=card, x="passenger_count", y="tip_pct", showfliers=False, ax=axes[2])
+axes[2].set(title="Tip % by passenger count (card only)", ylim=(0, 0.6))
+
+fig.tight_layout()
+fig.savefig("eda_overview.png", dpi=150)
+
+# Interactive daily volume with plotly: aggregate first, then plot.
+daily = (trips.set_index("tpep_pickup_datetime").resample("D").size()
+              .rename("trips").reset_index())
+px.line(daily, x="tpep_pickup_datetime", y="trips",
+        title="Daily trips, January 2024").write_html("daily_trips.html")</code></pre>
+
+  <h3>7.5 Same analysis in Polars (lazy) and DuckDB (SQL over Parquet)</h3>
+<div class="code-tabs">
+<pre data-lang="Polars"><code class="language-python">import polars as pl
+
+URL = "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet"
+
+result = (
+    pl.scan_parquet(URL)                                   # nothing is read yet
+      .filter((pl.col("fare_amount") &gt; 0) &amp; (pl.col("trip_distance") &gt; 0)
+              &amp; (pl.col("payment_type") == 1))
+      .with_columns(
+          (pl.col("tip_amount") / pl.col("fare_amount")).alias("tip_pct"),
+          pl.col("tpep_pickup_datetime").dt.hour().alias("hour"),
+      )
+      .group_by("PULocationID", "hour")
+      .agg(pl.len().alias("trips"),
+           pl.col("tip_pct").median().alias("median_tip_pct"))
+      .with_columns(                                       # window: rank within zone
+          pl.col("trips").rank("dense", descending=True).over("PULocationID").alias("busiest_rank"))
+      .filter(pl.col("busiest_rank") == 1)
+      .sort("trips", descending=True)
+)
+print(result.explain())        # inspect the optimized plan: pushdowns are visible
+print(result.collect().head(10))</code></pre>
+<pre data-lang="DuckDB"><code class="language-python">import duckdb
+
+con = duckdb.connect()
+con.sql("INSTALL httpfs; LOAD httpfs;")   # read Parquet over HTTPS
+df = con.sql("""
+    WITH card AS (
+        SELECT PULocationID,
+               hour(tpep_pickup_datetime)   AS hour,
+               tip_amount / fare_amount     AS tip_pct
+        FROM read_parquet('https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet')
+        WHERE fare_amount &gt; 0 AND trip_distance &gt; 0 AND payment_type = 1
+    ),
+    agg AS (
+        SELECT PULocationID, hour, count(*) AS trips, median(tip_pct) AS median_tip_pct
+        FROM card GROUP BY ALL
+    )
+    SELECT * FROM agg
+    QUALIFY dense_rank() OVER (PARTITION BY PULocationID ORDER BY trips DESC) = 1
+    ORDER BY trips DESC
+    LIMIT 10
+""").df()      # result as a pandas DataFrame (zero-copy via Arrow where possible)
+print(df)</code></pre>
+<pre data-lang="pandas"><code class="language-python">import pandas as pd
+
+URL = "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet"
+cols = ["PULocationID", "tpep_pickup_datetime", "fare_amount", "tip_amount",
+        "trip_distance", "payment_type"]
+# Filters push down into the Parquet reader (row-group pruning) when using pyarrow.
+df = pd.read_parquet(URL, columns=cols, filters=[("payment_type", "==", 1),
+                                                  ("fare_amount", "&gt;", 0),
+                                                  ("trip_distance", "&gt;", 0)])
+df = df.assign(tip_pct=df.tip_amount / df.fare_amount,
+               hour=df.tpep_pickup_datetime.dt.hour)
+agg = (df.groupby(["PULocationID", "hour"])
+         .agg(trips=("tip_pct", "size"), median_tip_pct=("tip_pct", "median"))
+         .reset_index())
+agg["busiest_rank"] = agg.groupby("PULocationID")["trips"].rank(method="dense", ascending=False)
+print(agg[agg.busiest_rank == 1].nlargest(10, "trips"))</code></pre>
+</div>
+  <p>All three produce the same answer: the busiest hour per pickup zone and its median card tip percentage. Polars and DuckDB optimize the whole query and run it multithreaded; pandas executes step by step. On a laptop the lazy engines are typically several times faster on this workload <span class="tag illus">Illustrative</span>; benchmark on your own hardware before generalizing.</p>
+
+  <h3>7.6 The Java view: streams versus vectorized columns</h3>
+<div class="code-tabs">
+<pre data-lang="Java"><code class="language-java">// Java 21: grouping in-memory records with streams. Correct, readable, row-at-a-time.
+import java.util.*;
+import java.util.stream.*;
+
+public class TipStats {
+    record Trip(int puLocationId, int paymentType, double fare, double tip) {}
+
+    public static Map&lt;Integer, DoubleSummaryStatistics&gt; tipPctByZone(List&lt;Trip&gt; trips) {
+        return trips.stream()
+            .filter(t -&gt; t.paymentType() == 1 &amp;&amp; t.fare() &gt; 0)
+            .collect(Collectors.groupingBy(
+                Trip::puLocationId,
+                TreeMap::new,
+                Collectors.summarizingDouble(t -&gt; t.tip() / t.fare())));
+    }
+
+    public static void main(String[] args) {
+        var trips = List.of(new Trip(132, 1, 70.0, 14.0), new Trip(132, 1, 52.0, 10.0),
+                            new Trip(161, 1, 12.5, 3.0), new Trip(161, 2, 9.0, 0.0));
+        tipPctByZone(trips).forEach((zone, s) -&gt;
+            System.out.printf("zone=%d n=%d mean=%.3f%n", zone, s.getCount(), s.getAverage()));
+    }
+}</code></pre>
+<pre data-lang="Python"><code class="language-python">import pandas as pd
+
+trips = pd.DataFrame({
+    "PULocationID": [132, 132, 161, 161],
+    "payment_type": [1, 1, 1, 2],
+    "fare_amount": [70.0, 52.0, 12.5, 9.0],
+    "tip_amount": [14.0, 10.0, 3.0, 0.0],
+})
+card = trips.query("payment_type == 1 and fare_amount &gt; 0")
+stats = (card.assign(tip_pct=card.tip_amount / card.fare_amount)
+             .groupby("PULocationID")["tip_pct"].agg(["count", "mean"]))
+print(stats)</code></pre>
+</div>
+  <p>The Java version allocates a <code>Trip</code> object per row and boxes each statistic update through lambdas; at tens of millions of rows the object headers and pointer chasing dominate. The pandas version operates on four contiguous columns. For production analytics in the JVM you would not use streams either; you would push the query to Spark, Trino or DuckDB (which has a JDBC driver), all columnar engines.</p>
+
+  <h3>7.7 A/B test analysis: power, SRM, Welch's t-test, proportions and bootstrap</h3>
+<pre data-file="ab_test.py"><code class="language-python">"""Analyse a (simulated) tipping-prompt experiment end to end.
+
+Scenario (Illustrative): the payment screen shows suggested tip buttons. Treatment
+changes the defaults. Unit of randomization = rider; primary metric = tip % per trip,
+aggregated per rider to respect the randomization unit.
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+from statsmodels.stats.power import NormalIndPower, TTestIndPower
+from statsmodels.stats.proportion import proportions_ztest
+
+rng = np.random.default_rng(7)
+
+# --- 1. Design: how many riders do we need? -----------------------------------
+baseline_sd = 0.09          # sd of per-rider mean tip % from historical data (assumed)
+mde_abs = 0.005             # want to detect +0.5 percentage points
+effect_size = mde_abs / baseline_sd
+n_per_arm = TTestIndPower().solve_power(effect_size=effect_size, alpha=0.05, power=0.8)
+print(f"required riders per arm: {int(np.ceil(n_per_arm)):,}")
+
+# --- 2. Simulate per-rider outcomes (replace with real assignment + metrics) ----
+n = 30_000
+riders = pd.DataFrame({
+    "rider_id": np.arange(2 * n),
+    "arm": np.repeat(["control", "treatment"], n),
+    "pre_period_tip": rng.normal(0.17, 0.08, 2 * n),       # covariate for CUPED
+})
+lift = np.where(riders["arm"] == "treatment", 0.006, 0.0)
+riders["tip_pct"] = (0.6 * riders["pre_period_tip"] + 0.07 + lift
+                     + rng.normal(0, 0.07, 2 * n))
+riders["converted"] = rng.random(2 * n) &lt; np.where(riders["arm"] == "treatment", 0.62, 0.60)
+
+# --- 3. Sample ratio mismatch check (do this first!) ---------------------------
+observed = riders["arm"].value_counts().reindex(["control", "treatment"]).to_numpy()
+chi2, srm_p = stats.chisquare(observed, f_exp=[observed.sum() / 2] * 2)
+assert srm_p &gt; 0.001, f"SRM detected (p={srm_p:.2e}); do not analyse, investigate assignment"
+
+c = riders.loc[riders.arm == "control", "tip_pct"]
+t = riders.loc[riders.arm == "treatment", "tip_pct"]
+
+# --- 4. Welch's t-test and a 95% CI for the difference --------------------------
+res = stats.ttest_ind(t, c, equal_var=False)
+diff = t.mean() - c.mean()
+se = np.sqrt(t.var(ddof=1) / len(t) + c.var(ddof=1) / len(c))
+print(f"diff={diff:.4f}  95% CI=({diff - 1.96 * se:.4f}, {diff + 1.96 * se:.4f})  p={res.pvalue:.4g}")
+
+# --- 5. CUPED variance reduction -----------------------------------------------
+x = riders["pre_period_tip"]
+theta = np.cov(x, riders["tip_pct"])[0, 1] / x.var(ddof=1)
+riders["tip_cuped"] = riders["tip_pct"] - theta * (x - x.mean())
+tc = riders.loc[riders.arm == "treatment", "tip_cuped"]
+cc = riders.loc[riders.arm == "control", "tip_cuped"]
+se_cuped = np.sqrt(tc.var(ddof=1) / len(tc) + cc.var(ddof=1) / len(cc))
+print(f"CUPED SE {se_cuped:.5f} vs raw SE {se:.5f} ({100 * (1 - (se_cuped / se) ** 2):.0f}% variance reduction)")
+
+# --- 6. Conversion (secondary metric): two-proportion z-test --------------------
+counts = riders.groupby("arm")["converted"].sum().reindex(["treatment", "control"]).to_numpy()
+nobs = riders.groupby("arm").size().reindex(["treatment", "control"]).to_numpy()
+z, p_conv = proportions_ztest(counts, nobs)
+print(f"conversion z={z:.2f} p={p_conv:.4g}")
+
+# --- 7. Bootstrap CI for a non-standard statistic: difference in p90 ------------
+def boot_p90_diff(a: np.ndarray, b: np.ndarray, iters: int = 2000) -&gt; tuple[float, float]:
+    draws = np.empty(iters)
+    for i in range(iters):
+        draws[i] = (np.quantile(rng.choice(a, a.size), 0.9)
+                    - np.quantile(rng.choice(b, b.size), 0.9))
+    return tuple(np.quantile(draws, [0.025, 0.975]))
+
+print("p90 diff 95% CI:", boot_p90_diff(t.to_numpy(), c.to_numpy()))
+
+# --- 8. Minimum detectable effect for the proportion metric, for the record -----
+h = NormalIndPower().solve_power(nobs1=n, alpha=0.05, power=0.8, ratio=1.0)
+print(f"MDE (Cohen's h) for conversion at n={n:,}/arm: {h:.4f}")</code></pre>
+  <p>The ordering is deliberate: power analysis <em>before</em> launch, SRM check <em>before</em> looking at outcomes, one pre-registered primary metric with a confidence interval, variance reduction, then secondary metrics. The bootstrap loop is intentionally simple; vectorized or Poisson bootstraps are faster for production use.</p>
+
+  <h3>7.8 Notebooks to production with papermill</h3>
+<pre data-file="notebooks/daily_tip_report.ipynb (parameters cell, shown as Python)"><code class="language-python"># Cell tagged "parameters" in JupyterLab (View → Cell Toolbar → Tags).
+# papermill injects a new cell right after this one with the overriding values.
+run_date = "2024-01-31"
+trips_url = "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet"
+min_rows = 1_000_000</code></pre>
+<pre data-file="run_report.py"><code class="language-python">"""Execute a parameterized notebook top-to-bottom in a fresh kernel."""
+import sys
+from datetime import date
+
+import papermill as pm
+
+run_date = sys.argv[1] if len(sys.argv) &gt; 1 else date.today().isoformat()
+pm.execute_notebook(
+    input_path="notebooks/daily_tip_report.ipynb",
+    output_path=f"s3://analytics-artifacts/reports/daily_tip_report/{run_date}.ipynb",
+    parameters={"run_date": run_date, "min_rows": 1_000_000},
+    kernel_name="python3",
+    log_output=True,          # stream cell output to the scheduler's logs
+)
+# papermill raises PapermillExecutionError if any cell fails, so the scheduler marks the task failed.</code></pre>
+<pre data-file="Makefile / CI step"><code class="language-bash"># Strip outputs before committing so diffs show code, not images.
+pip install nbstripout jupytext
+nbstripout --install                   # git filter for .ipynb outputs
+jupytext --set-formats ipynb,py:percent notebooks/daily_tip_report.ipynb   # pair with a .py for review
+papermill notebooks/daily_tip_report.ipynb /tmp/ci_run.ipynb -p trips_url tests/fixtures/trips_sample.parquet -p min_rows 100</code></pre>
+</section>
+
+<section id="applications">
+  <h2>8. Real-World Applications</h2>
+  <h3>8.1 Product analytics and experimentation</h3>
+  <p>Most data science in product companies is decision support: sizing opportunities, defining metrics, designing and analysing experiments, and explaining metric movements ("why did weekly active riders drop 3% last Tuesday?"). The workflow is EDA on modelled warehouse tables, a hypothesis, an experiment through an experimentation platform, and a written readout. Backend engineers participate directly: they implement assignment (deterministic hashing of user id plus experiment salt into buckets), emit exposure events at the moment the user actually sees the variant, and keep logging consistent between arms.</p>
+  <h3>8.2 Forecasting and capacity planning</h3>
+  <p>Demand forecasting for drivers, inventory, call-centre staffing and, in your world, cluster capacity, uses the same EDA (seasonality by hour and weekday, holiday effects, step changes) followed by time series models. The TLC demand pivot in Section 7.3 is exactly the first plot a forecasting project draws.</p>
+  <h3>8.3 Data quality investigation</h3>
+  <p>A large share of "analysis" is forensics: a metric moved and someone must determine whether the world changed or the pipeline did. The tools are the same as EDA (time-series of row counts, null rates by client version, distribution comparisons before and after a deploy) and they overlap heavily with the data observability practices in Chapter 9.4.</p>
+  <h3>8.4 Model prototyping</h3>
+  <p>Before an ML engineer builds a training pipeline, a data scientist typically proves in a notebook that a model beats a simple baseline on an offline metric, using a carefully time-split validation set. The artifacts handed over are the notebook, the feature definitions, the evaluation, and known caveats; Chapter 10.1 covers how that becomes a reproducible pipeline.</p>
+  <h3>8.5 Reporting automation</h3>
+  <p>Parameterized notebooks run on a schedule produce per-region or per-merchant reports, rendered to HTML or PDF. This is a legitimate production use of notebooks when the notebook is the report; it is an anti-pattern when the notebook computes numbers that other systems consume.</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 Netflix: notebooks as a production interface</h3>
+  <p><span class="tag fact">Verified</span> Netflix's data platform team described in 2018 how they made notebooks a first-class part of the platform, and created and open-sourced <strong>papermill</strong> to parameterize and execute notebooks, storing the executed output notebooks as immutable records of each run, along with a companion post on scheduling notebooks through their workflow system. The design point worth copying is that the executed notebook is both the log and the report: when a scheduled job fails, the engineer opens the output notebook at the failing cell, with all prior outputs intact. Sources: <a href="https://netflixtechblog.com/notebook-innovation-591ee3221233">Beyond Interactive: Notebook Innovation at Netflix</a> and <a href="https://netflixtechblog.com/scheduling-notebooks-348e6c14cfd6">Part 2: Scheduling Notebooks at Netflix</a>.</p>
+  <h3>9.2 Airbnb Minerva: one definition per metric</h3>
+  <p><span class="tag fact">Verified</span> Airbnb's data team wrote in 2021 that different teams were reporting different numbers for what should have been the same metric, and built <strong>Minerva</strong>, a metric platform that serves as a single source of truth for analytics, reporting and experimentation, managing a metric from definition through computation, serving and retirement. The lesson for this chapter: EDA and A/B analysis are only as trustworthy as the metric definitions they consume, which is the analytics engineering interface in Figure 9.2. Source: <a href="https://medium.com/airbnb-engineering/how-airbnb-achieved-metric-consistency-at-scale-f23cc53dea70">How Airbnb Achieved Metric Consistency at Scale</a>.</p>
+  <h3>9.3 Microsoft ExP: CUPED variance reduction</h3>
+  <p><span class="tag fact">Verified</span> Deng, Xu, Kohavi and Walker introduced CUPED (Controlled-experiment Using Pre-Experiment Data) at WSDM 2013, showing that using pre-experiment covariates can substantially reduce metric variance in online experiments at Bing, which translates directly into smaller required sample sizes or shorter experiments. The technique has since been adopted by many experimentation platforms. Source: <a href="https://exp-platform.com/Documents/2013-02-CUPED-ImprovingSensitivityOfControlledExperiments.pdf">Improving the Sensitivity of Online Controlled Experiments by Utilizing Pre-Experiment Data</a>.</p>
+  <h3>9.4 Uber Michelangelo: why data preparation dominates</h3>
+  <p><span class="tag fact">Verified</span> When Uber introduced its Michelangelo ML platform in 2017, the announcement noted that building and managing data pipelines is typically one of the most costly pieces of a complete ML solution, and the platform invested heavily in a shared feature store and data management layer. This is the CRISP-DM "data preparation" phase showing up as platform architecture. Source: <a href="https://www.uber.com/blog/michelangelo-machine-learning-platform/">Meet Michelangelo: Uber's Machine Learning Platform</a>.</p>
+  <h3>9.5 Twelve metric interpretation pitfalls</h3>
+  <p><span class="tag fact">Verified</span> Dmitriev and colleagues at Microsoft catalogued twelve common pitfalls in interpreting metrics from online controlled experiments (KDD 2017), including sample ratio mismatch, misinterpreting ratio metrics, and telemetry loss biased by treatment. It is the best single checklist to read before your first experiment readout. Source: <a href="https://exp-platform.com/Documents/2017-08%20KDDMetricInterpretationPitfalls.pdf">A Dirty Dozen: Twelve Common Metric Interpretation Pitfalls in Online Controlled Experiments</a>.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages, Limitations and Costs</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Tool / practice</th><th>Advantages</th><th>Limitations</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>pandas</td><td>Ubiquitous; huge ecosystem; flexible indexing; every library accepts it</td><td>Mostly single-threaded; eager; memory often 2–10x file size <span class="tag illus">Illustrative</span>; index semantics surprise newcomers</td><td>Low; scales vertically only</td></tr>
+      <tr><td>Polars</td><td>Multithreaded, lazy optimizer, Arrow-native, streaming for out-of-core</td><td>Smaller ecosystem; some libraries need conversion to pandas or NumPy; API still evolving</td><td>Low</td></tr>
+      <tr><td>DuckDB</td><td>Full SQL incl. windows; reads Parquet/CSV/Iceberg directly; embedded</td><td>Single-node; one writer process per database file</td><td>Very low</td></tr>
+      <tr><td>Jupyter</td><td>Interactive, visual, narrative; ideal for exploration and communication</td><td>Hidden state, out-of-order execution, poor diffs, weak testing story</td><td>Moderate if hosted (JupyterHub, managed notebooks)</td></tr>
+      <tr><td>Frequentist A/B testing</td><td>Well understood; strong error-rate guarantees when done right</td><td>Requires fixed horizon or sequential corrections; p-values widely misread</td><td>Needs experimentation platform and traffic</td></tr>
+      <tr><td>Observational causal inference</td><td>Works when experiments are impossible</td><td>Relies on untestable assumptions</td><td>High analyst skill</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs: Choosing Tools and Methods</h2>
+  <h3>11.1 pandas vs Polars vs DuckDB vs Spark</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Situation</th><th>Choose</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Small data (&lt; ~1 GB), heavy use of plotting/statistics libraries</td><td>pandas</td><td>Ecosystem compatibility outweighs speed</td></tr>
+      <tr><td>1–100 GB on one machine, transformation-heavy Python</td><td>Polars (lazy)</td><td>Parallel, optimized, low memory with streaming</td></tr>
+      <tr><td>1–100 GB on one machine, team thinks in SQL</td><td>DuckDB</td><td>SQL with windows and QUALIFY over files, zero infrastructure</td></tr>
+      <tr><td>Larger than a machine, or already on a lakehouse</td><td>Spark / warehouse SQL</td><td>Distributed execution (Chapter 9.3)</td></tr>
+      <tr><td>Interop between all of the above</td><td>Arrow</td><td>Zero-copy hand-off: <code>pl.from_pandas</code>, <code>duckdb.sql(...).pl()</code></td></tr>
+    </tbody>
+  </table></div>
+  <p><span class="tag opinion">Opinion</span> For new analytical code in 2026, default to Polars or DuckDB for the heavy lifting and convert to pandas at the edge only where a downstream library needs it.</p>
+  <h3>11.2 Which statistical test?</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  Q["What is the metric?"] --> B{"Binary per unit?"}
+  B -->|"yes"| PZ["Two-proportion z-test or chi-square"]
+  B -->|"no"| C{"Mean is the quantity of interest?"}
+  C -->|"yes"| W["Welch t-test (large n: CLT holds even if skewed)"]
+  C -->|"no, a quantile or ratio"| BS["Bootstrap CI or delta method"]
+  W --> R{"Randomized by a coarser unit than analysed?"}
+  R -->|"yes"| CL["Aggregate per unit, or cluster-robust SE"]
+  R -->|"no"| OK["Report effect and CI"]
+  PZ --> OK
+  BS --> OK
+  CL --> OK
+</pre>
+<figcaption>Figure 9.5 — Choosing an analysis method for an A/B metric.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> the first question is the metric's type, the second is what summary of it you care about, and the third (often forgotten) is whether the unit of randomization matches the unit of analysis. Every branch ends in the same place: an effect estimate with a confidence interval, not a bare p-value. Mann-Whitney is deliberately absent from the main path: it answers a different question (stochastic dominance) than "did the average change", which is usually what the business asks.</p>
+  <h3>11.3 Notebook or module?</h3>
+  <p>Keep code in a notebook when its primary consumer is a human reading the output. Move code into a Python package with tests when another program consumes its output, when more than one notebook needs it, or when it will run unattended more than a handful of times. A useful middle ground is <em>jupytext</em> percent-format <code>.py</code> files: they open as notebooks but diff and review as code.</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Production Failures</h2>
+  <ul>
+    <li><strong>Silent join fan-out.</strong> Joining trips to a zone lookup that accidentally has duplicate zone ids doubles revenue. Always validate cardinality (<code>validate=</code> in pandas, row-count assertions in SQL).</li>
+    <li><strong>Averaging averages.</strong> The mean of per-zone mean fares is not the mean fare. Weight by counts, or compute from raw sums and counts.</li>
+    <li><strong>Ignoring measurement bias.</strong> Computing average tip across all payment types in TLC data, including cash trips where tips are not recorded.</li>
+    <li><strong>Time zone and DST bugs.</strong> Naive timestamps compared with UTC ones; daily aggregates computed in UTC for a New York business; a missing hour every March.</li>
+    <li><strong>Peeking and stopping early.</strong> Declaring victory the first day <code>p &lt; 0.05</code>.</li>
+    <li><strong>Treating "not significant" as "no effect".</strong> With an underpowered test, the confidence interval usually includes both meaningful positive and negative effects.</li>
+    <li><strong>Mixing up correlation and causation in readouts.</strong> "Users who enable notifications retain 2x better" says nothing about what enabling notifications <em>does</em>.</li>
+    <li><strong>Row-wise <code>apply</code> in pandas.</strong> A 3-million-row <code>df.apply(f, axis=1)</code> takes minutes; the vectorized expression takes milliseconds.</li>
+    <li><strong>Object dtype explosions.</strong> Reading a 2 GB CSV of strings as <code>object</code> columns uses many times that in RAM; use Arrow strings or categories, and read Parquet instead of CSV.</li>
+    <li><strong>Chained assignment under Copy-on-Write.</strong> <code>df[mask]["col"] = v</code> now never modifies <code>df</code>. Use <code>df.loc[mask, "col"] = v</code>.</li>
+    <li><strong>Notebooks with hidden state.</strong> A notebook that only works because cell 14 was run before cell 9 last Tuesday. Restart-and-run-all before sharing, and run it through papermill in CI.</li>
+    <li><strong>Leaking the future.</strong> Random train/test splits on time-ordered data, or features computed with data after the prediction time. Covered deeply in Chapters 9.4 and 10.1.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Performance and memory</h3>
+  <p>Read only needed columns from Parquet; push filters into the reader; convert low-cardinality strings to categoricals; use <code>float32</code> where precision allows; prefer lazy engines for anything over a few GB. Profile memory with <code>df.memory_usage(deep=True)</code>. When a laptop is not enough, move the heavy aggregation into the warehouse or DuckDB and pull only the aggregate into Python.</p>
+  <h3>13.2 Reproducibility</h3>
+  <p>Pin library versions (a lock file via uv, pip-tools or Poetry), record the exact input data (a snapshot id or table version from Chapter 9.2's table formats, or a file hash), set random seeds, and capture the git commit. Treat an analysis that cannot be re-run as a draft.</p>
+  <h3>13.3 Security and privacy</h3>
+  <p>Notebooks are a classic leak vector: outputs embedded in <code>.ipynb</code> files contain real customer rows, and those files get committed, emailed and attached to tickets. Strip outputs before committing, work on pseudonymized or aggregated data where possible, never put credentials in notebook cells (use a secrets manager or environment-injected credentials), and run hosted notebook servers behind SSO with per-user kernels. Chapter 9.4 covers PII classification and access control.</p>
+  <h3>13.4 Monitoring analyses that run on a schedule</h3>
+  <p>A scheduled report needs the same SRE basics as a service: success/failure alerts from the scheduler, freshness checks on input tables, row-count and null-rate assertions inside the notebook (like the <code>max_drop_pct</code> guard in Section 7.2), and an owner.</p>
+  <h3>13.5 Maintainability</h3>
+  <p>Factor reusable logic (cleaning rules, metric definitions, plotting themes) into a package versioned like any other library. Keep notebooks short, linear, and narrative. Document every cleaning decision in prose next to the code that implements it.</p>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>Load one month of TLC yellow-taxi data. Report (a) the fraction of trips paid by card versus cash, (b) the median and p90 fare, and (c) the mean tip percentage for card trips only. Explain why (c) must be restricted to card trips.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-python">import pandas as pd
+df = pd.read_parquet("https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet",
+                     columns=["payment_type", "fare_amount", "tip_amount"])
+print(df["payment_type"].value_counts(normalize=True).head())   # 1 = card, 2 = cash
+valid = df[df.fare_amount &gt; 0]
+print(valid.fare_amount.quantile([0.5, 0.9]))
+card = valid[valid.payment_type == 1]
+print((card.tip_amount / card.fare_amount).mean())</code></pre>
+    <p>Cash tips are not captured by the meter system, so cash trips almost always show a zero tip regardless of what the rider gave. Including them measures the payment mix, not tipping behaviour: classic measurement bias. Also note that the mean tip percentage is pulled up by a few large tips on small fares; report the median as well.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Rewrite the following pandas code so it is vectorized and Copy-on-Write safe, then explain why the original is slow and (in pandas 3) also wrong.</p>
+<pre><code class="language-python">for i, row in df.iterrows():
+    if row["trip_distance"] &gt; 0:
+        df[df.index == i]["speed"] = row["trip_distance"] / row["duration_min"] * 60</code></pre>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-python">import numpy as np
+df["speed"] = np.where(df["trip_distance"] &gt; 0,
+                       df["trip_distance"] / df["duration_min"] * 60,
+                       np.nan)</code></pre>
+    <p>The original iterates in Python (each <code>row</code> is a freshly built Series, so millions of object allocations), and builds a boolean mask over the whole frame <em>per row</em>, making it O(n²). Under Copy-on-Write, <code>df[mask]["speed"] = ...</code> is chained assignment: the first indexing returns a new object, the assignment modifies that temporary, and <code>df</code> is never changed. The vectorized version is a few column operations in compiled code and assigns a whole column at once.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>Simulate 2,000 A/A tests (no true effect) with 20,000 users per arm and a normally distributed metric. In each, compute the p-value after each of 10 equally spaced "daily" looks, and stop at the first look with p &lt; 0.05. What fraction of A/A tests are declared significant? Compare with only looking at the end.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-python">import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(0)
+sims, n, looks = 2000, 20_000, 10
+checkpoints = np.linspace(n / looks, n, looks).astype(int)
+peek_hits = end_hits = 0
+for _ in range(sims):
+    a = rng.normal(0, 1, n)
+    b = rng.normal(0, 1, n)
+    ps = [stats.ttest_ind(a[:k], b[:k], equal_var=False).pvalue for k in checkpoints]
+    peek_hits += any(p &lt; 0.05 for p in ps)
+    end_hits += ps[-1] &lt; 0.05
+print(f"peeking FPR: {peek_hits / sims:.3f}   fixed-horizon FPR: {end_hits / sims:.3f}")</code></pre>
+    <p>The fixed-horizon false-positive rate is close to the nominal 0.05. With ten looks and stopping at the first significant one, it is typically around 0.19–0.20 in this simulation: roughly four times the nominal rate. That is why sequential testing methods exist: they widen the boundary at early looks so that the overall error rate stays at α.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>Your experiment randomizes by rider but the analyst computed a t-test over <em>trips</em> (each rider contributes many trips). Explain why the p-value is too small, and implement a correct analysis using per-rider aggregation and, alternatively, the delta method for the ratio metric "tips per fare dollar".</p>
+    <details class="solution"><summary>Solution</summary><div>
+    <p>Trips from the same rider are correlated (a generous tipper tips on every trip), so the effective sample size is closer to the number of riders than to the number of trips. Treating trips as independent understates the standard error and inflates significance.</p>
+<pre><code class="language-python">import numpy as np
+import pandas as pd
+
+def delta_method_ratio(df: pd.DataFrame) -&gt; tuple[float, float]:
+    """Mean and SE of sum(tip)/sum(fare) across riders, treating riders as the unit."""
+    per = df.groupby("rider_id").agg(t=("tip_amount", "sum"), f=("fare_amount", "sum"))
+    n = len(per)
+    mt, mf = per.t.mean(), per.f.mean()
+    vt, vf = per.t.var(ddof=1), per.f.var(ddof=1)
+    cov = np.cov(per.t, per.f, ddof=1)[0, 1]
+    ratio = mt / mf
+    var = (vt / mf**2 - 2 * mt * cov / mf**3 + mt**2 * vf / mf**4) / n
+    return ratio, np.sqrt(var)
+
+def compare(trips: pd.DataFrame) -&gt; None:
+    r = {arm: delta_method_ratio(g) for arm, g in trips.groupby("arm")}
+    (rt, st), (rc, sc) = r["treatment"], r["control"]
+    diff, se = rt - rc, np.hypot(st, sc)
+    print(f"diff={diff:.4f} CI=({diff - 1.96*se:.4f}, {diff + 1.96*se:.4f})")</code></pre>
+    <p>The simpler alternative is to compute one value per rider (their own tip ratio, or their mean tip %) and run Welch's t-test on riders. That answers a slightly different question (the average rider's ratio rather than the global ratio), so state which one the business wants.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>Turn the EDA in Section 7 into a production-grade daily job: a parameterized notebook, a CI check on a fixture, and a guard that fails the run if the cleaning rules drop more than 10% of rows or if fewer than <code>min_rows</code> rows are loaded. Sketch the Airflow task that runs it.</p>
+    <details class="solution"><summary>Solution</summary><div>
+    <p>Structure: <code>tlc_eda/</code> package holding <code>load_trips</code>, <code>clean</code> and plotting functions with pytest tests on a 1,000-row fixture; <code>notebooks/daily_tip_report.ipynb</code> that imports the package, has a <code>parameters</code> cell, asserts <code>len(raw) &gt;= min_rows</code>, calls <code>clean(raw, max_drop_pct=10)</code>, and renders charts. CI runs pytest and papermill against the fixture. The scheduled task:</p>
+<pre><code class="language-python">from airflow.sdk import dag, task
+import pendulum
+
+@dag(schedule="0 6 * * *", start_date=pendulum.datetime(2026, 1, 1, tz="UTC"), catchup=False)
+def daily_tip_report():
+    @task(retries=2)
+    def run(ds=None):
+        import papermill as pm
+        pm.execute_notebook("notebooks/daily_tip_report.ipynb",
+                            f"s3://analytics-artifacts/daily_tip_report/{ds}.ipynb",
+                            parameters={"run_date": ds, "min_rows": 1_000_000})
+    run()
+
+daily_tip_report()</code></pre>
+    <p>Because papermill raises on a failed cell, the guard assertions become task failures with the executed notebook stored for debugging. Chapter 9.4 explains Airflow's execution model and idempotency in depth.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What does a p-value of 0.03 mean, and what does it not mean?</summary><div><p>If the null hypothesis were true (and the test's assumptions hold), data at least as extreme as what we observed would occur about 3% of the time. It does not mean there is a 3% chance the null is true, nor a 97% chance the treatment works, and it says nothing about the size or business importance of the effect. Always pair it with an effect estimate and confidence interval.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain MCAR, MAR and MNAR with an example of each and how you would handle them.</summary><div><p>MCAR: a sensor drops 1% of readings uniformly at random; dropping rows is unbiased. MAR: older app versions do not send device model; missingness is explained by an observed column, so impute conditionally on app version or model it. MNAR: users with very high spend decline to report income; missingness depends on the unobserved value itself, imputation from observed columns cannot fix it, so collect better data, bound the effect with sensitivity analysis, and state the limitation.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why is NumPy vectorized code so much faster than a Python loop?</summary><div><p>A Python loop pays for dynamic dispatch, boxed objects and reference counting on every element. A ufunc dispatches once on dtype and runs a compiled loop over contiguous typed memory, which is cache friendly and SIMD-vectorizable. Views via strides avoid copies; broadcasting avoids materializing expanded arrays.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> An experiment shows a +8% lift in revenue per user with p = 0.001. What do you check before celebrating?</summary><div><p>Twyman's law: suspiciously large effects are usually bugs. Check sample ratio mismatch; confirm exposure logging is identical across arms; look for outliers (a single whale account can drive revenue means, so check trimmed means or per-user caps); check the effect over time for novelty; check whether any bot filtering or data loss differs by arm; confirm that the metric definition did not change mid-test; and verify with a guardrail metric (orders count, refunds). Only then present it, with a CI.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How would you design the assignment service for an experimentation platform in a Spring Boot ecosystem?</summary><div><p>Deterministic assignment: bucket = hash(experiment_salt + unit_id) mod 10,000, mapped to arms by configured ranges, so no state is stored and every service computes the same answer. Experiment configs are served from a config service and cached locally with versioning. Exposure events are emitted when the variant is actually rendered, to Kafka with the experiment id, version and arm. Layering/namespaces prevent conflicting experiments overlapping. Analysis runs in the warehouse joining exposures to metrics at the randomization unit, with automated SRM checks. Provide a Java SDK and a Python SDK sharing test vectors so hashing is identical across languages.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Given a DataFrame of trips, return the top 3 pickup zones by revenue per borough, with their share of borough revenue, without loops.</summary><div><p>See Section 7.3: group by borough and zone summing revenue, then <code>groupby("borough")["revenue"].rank(method="dense", ascending=False)</code> and <code>transform("sum")</code> for the share, then filter rank ≤ 3. In SQL: a window <code>DENSE_RANK() OVER (PARTITION BY borough ORDER BY revenue DESC)</code> with <code>QUALIFY</code> in DuckDB/Snowflake/BigQuery.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> pandas, Polars or DuckDB for a 40 GB Parquet dataset on a 64 GB laptop?</summary><div><p>Not eager pandas: it would need several times the data size in RAM. Polars lazy (with the streaming engine) or DuckDB, both of which push filters and projections into the Parquet scan, process row groups in parallel, and can spill or stream. Choose DuckDB if the team prefers SQL, Polars if the logic is Python-heavy. Convert only the small final result to pandas for plotting.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Explain the difference between data engineers, analytics engineers, data scientists and ML engineers, and where the hand-offs fail.</summary><div><p>DEs own ingestion, storage and processing platforms and deliver complete, timely raw data; AEs model raw data into tested business tables and metrics; DSs produce evidence and prototypes; MLEs productionize models with pipelines, serving and monitoring. Failures cluster at the interfaces: undocumented schema changes from product teams break raw tables (fix: data contracts); metrics redefined in notebooks diverge from dashboards (fix: semantic layer); notebook prototypes rebuilt in production with different feature logic cause training-serving skew (fix: shared feature definitions and a feature store).</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> A daily active users chart drops 12% overnight. Walk through your investigation.</summary><div><p>Assume a data issue first. Check pipeline freshness and partition completeness (did yesterday's load finish, are all hours present?). Break down by platform, app version, country and event source: a drop isolated to one app version points at a client release that stopped emitting the event. Compare with independent signals (server-side request logs, payments). Check for definition changes in the metric's model. Only once data issues are excluded, investigate real causes (outage, holiday, marketing change).</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> Tell me about a time an analysis you trusted turned out to be wrong.</summary><div><p>A strong answer names a concrete failure (for example a join fan-out or a time-zone bug), how it was detected, the impact, and the systemic fix (assertions on join cardinality, a shared metric layer, peer review of analysis code), rather than just "I was more careful".</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>The data science lifecycle (CRISP-DM and its successors) is a loop that starts with a business decision and is dominated by data understanding and preparation.</li>
+    <li>Bias enters at collection: selection, measurement, logging changes and sampling design matter more than model choice.</li>
+    <li>Report effects with confidence intervals; design experiments with power analysis; check SRM first; never peek without sequential methods.</li>
+    <li>NumPy is fast because of typed contiguous buffers, strides and compiled ufuncs; pandas inherits that, Arrow standardizes it, and Copy-on-Write makes derived frames behave as copies.</li>
+    <li>Polars and DuckDB are query engines with optimizers; prefer them for large single-node workloads.</li>
+    <li>Notebooks are excellent for exploration and reports; promote them with papermill or extract logic into tested modules for production.</li>
+    <li>DE, AE, DS and MLE are distinct roles whose interfaces (contracts, tested models, feature definitions, registered models) determine data quality.</li>
+  </ul>
+  <div class="quiz" data-answer="c">
+    <p class="q">An A/B test is randomized by user, but the metric is computed per page view. What is the main risk of a naive t-test over page views?</p>
+    <ol>
+      <li data-k="a">The effect estimate is biased toward zero</li>
+      <li data-k="b">The test has too little power</li>
+      <li data-k="c">The standard error is underestimated, producing too many false positives</li>
+      <li data-k="d">Sample ratio mismatch becomes impossible to detect</li>
+    </ol>
+    <div class="explain">Page views from the same user are correlated, so treating them as independent overstates the effective sample size and understates the standard error. The estimate itself is not necessarily biased; the uncertainty is wrong. Use per-user aggregation, the delta method, or cluster-robust errors.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">In pandas 3.0, what happens with <code>df[df.fare &gt; 100]["flag"] = True</code>?</p>
+    <ol>
+      <li data-k="a">It updates <code>df</code> and emits SettingWithCopyWarning</li>
+      <li data-k="b">It modifies a temporary object; <code>df</code> is unchanged</li>
+      <li data-k="c">It raises a TypeError</li>
+      <li data-k="d">It updates <code>df</code> silently</li>
+    </ol>
+    <div class="explain">Under Copy-on-Write (the only mode in pandas 3.0), every derived object behaves as a copy, so chained assignment never propagates to the parent. Use <code>df.loc[df.fare &gt; 100, "flag"] = True</code>.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">Why can <code>a.T</code> on a large NumPy array run in constant time?</p>
+    <ol>
+      <li data-k="a">NumPy transposes lazily on a background thread</li>
+      <li data-k="b">The data is copied with SIMD instructions</li>
+      <li data-k="c">NumPy stores matrices in both row and column order</li>
+      <li data-k="d">It returns a view with swapped shape and strides over the same buffer</li>
+    </ol>
+    <div class="explain">Transposition only rewrites the header (shape and strides); no element moves. Operations on the result may be slower if they now walk memory non-contiguously.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">You observe 50,600 users in control and 49,400 in treatment for a designed 50/50 split. What should you do?</p>
+    <ol>
+      <li data-k="a">Treat it as a sample ratio mismatch, investigate assignment and logging, and not trust the results yet</li>
+      <li data-k="b">Reweight treatment users by 50,600/49,400 and proceed</li>
+      <li data-k="c">Ignore it: a 1.2% difference is negligible</li>
+      <li data-k="d">Drop 1,200 random control users to rebalance</li>
+    </ol>
+    <div class="explain">A chi-square test on 100,000 users gives p ≈ 0.0001 for this imbalance, far too unlikely under correct randomization. SRM indicates a systematic bug (bot filtering, redirects, logging loss) that likely also biases the metric; reweighting or dropping users does not remove that bias.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Which role most directly owns the definition of "weekly active riders" used across dashboards and experiments?</p>
+    <ol>
+      <li data-k="a">Data engineer</li>
+      <li data-k="b">ML engineer</li>
+      <li data-k="c">Analytics engineer, via modelled tables and a semantic/metrics layer</li>
+      <li data-k="d">Each data scientist in their own notebook</li>
+    </ol>
+    <div class="explain">Analytics engineering turns raw data into tested, documented business models and canonical metric definitions. Letting each analyst define it produces the inconsistency Airbnb built Minerva to solve.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">With α = 0.05 and power 0.8, roughly how many units per arm are needed to detect an absolute difference δ in a metric with standard deviation σ?</p>
+    <ol>
+      <li data-k="a">\( 4\sigma/\delta \)</li>
+      <li data-k="b">\( 16\sigma^2/\delta^2 \)</li>
+      <li data-k="c">\( 1.96\sigma^2/\delta \)</li>
+      <li data-k="d">\( 100/\delta \)</li>
+    </ol>
+    <div class="explain">\( n \approx 2(1.96+0.84)^2\sigma^2/\delta^2 \approx 16\sigma^2/\delta^2 \). Halving the detectable effect quadruples the required sample.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Ron Kohavi, Diane Tang, Ya Xu, <em>Trustworthy Online Controlled Experiments: A Practical Guide to A/B Testing</em>, Cambridge University Press, 2020.</li>
+    <li><span class="ref-kind">Book</span> Wes McKinney, <em>Python for Data Analysis</em>, 3rd ed., O'Reilly, 2022 (open-access edition at <a href="https://wesmckinney.com/book/">wesmckinney.com/book</a>).</li>
+    <li><span class="ref-kind">Book</span> John W. Tukey, <em>Exploratory Data Analysis</em>, Addison-Wesley, 1977.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://pandas.pydata.org/docs/user_guide/copy_on_write.html">pandas user guide: Copy-on-Write</a> and <a href="https://pandas.pydata.org/docs/user_guide/migration-3-strings.html">migration guide for the pandas 3.0 string dtype</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://numpy.org/doc/stable/reference/arrays.ndarray.html">NumPy: the N-dimensional array (strides and memory layout)</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://arrow.apache.org/docs/format/Columnar.html">Apache Arrow columnar format specification</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.pola.rs/user-guide/lazy/">Polars user guide: lazy API and optimizations</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://papermill.readthedocs.io/">papermill documentation</a>.</li>
+    <li><span class="ref-kind">Paper</span> <a href="https://exp-platform.com/Documents/2013-02-CUPED-ImprovingSensitivityOfControlledExperiments.pdf">Deng et al., Improving the Sensitivity of Online Controlled Experiments by Utilizing Pre-Experiment Data (WSDM 2013)</a>.</li>
+    <li><span class="ref-kind">Paper</span> <a href="https://exp-platform.com/Documents/2017-08%20KDDMetricInterpretationPitfalls.pdf">Dmitriev et al., A Dirty Dozen: Twelve Common Metric Interpretation Pitfalls (KDD 2017)</a>.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://netflixtechblog.com/notebook-innovation-591ee3221233">Netflix: Beyond Interactive: Notebook Innovation at Netflix</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page">NYC TLC Trip Record Data and data dictionaries</a>.</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

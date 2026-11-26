@@ -1,0 +1,1999 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case Studies I: URL Shortener, Messaging, Notifications — AI-Era Software Engineering</title>
+<meta name="description" content="Three end-to-end system designs — a URL shortener, a WhatsApp-class messaging system with end-to-end encryption, and a multi-channel notification platform — with requirements, estimation, APIs, data models, architecture, failure analysis and Spring Boot/Go implementations.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p2-10-case-studies-messaging" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 2 · Chapter 10</p>
+  <h1>Case Studies I: URL Shortener, Messaging &amp; Notifications</h1>
+  <p class="lede">The first nine chapters of Part 2 gave you the parts: load balancers, caches, storage engines, replication, consistency models, Kafka, resilience patterns and multi-region operations. This chapter assembles them into three complete systems, each chosen because it stresses a different axis: a URL shortener (read-dominated, key-generation and cache design), a WhatsApp-class messenger (millions of long-lived connections, ordering, offline delivery and end-to-end encryption), and a notification platform (fan-out to unreliable third parties under priorities, preferences and rate limits).</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> <a href="p2-01-system-design-foundations.html">estimation and SLOs</a>, <a href="p2-03-caching-redis.html">caching &amp; Redis</a>, <a href="p2-05-replication-sharding.html">sharding</a>, <a href="p2-06-consistency-transactions.html">idempotency and outbox</a>, <a href="p2-07-kafka-event-driven.html">Kafka</a>, <a href="p2-08-microservices-resilience.html">circuit breakers</a>.</li>
+    <li><strong>You will be able to:</strong> run a full design end to end, from requirements to numbers to APIs to schemas to failure tables; pick and defend an ID-generation scheme; design a stateful WebSocket tier with routing and offline queues; explain what the Signal protocol actually guarantees; and build a notification pipeline that degrades gracefully when a provider goes down.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: Why These Three Systems</h2>
+  <p>Design case studies are often treated as interview theatre: draw five boxes, say "Kafka", add a cache. That is not what this chapter is for. Each of these three systems exists, in some form, inside almost every company you will work for. Marketing teams want tracked short links. Every product with users eventually needs in-app chat or support messaging. And every product, without exception, sends notifications — password resets, order updates, fraud alerts, and the marketing pushes that users love to disable. When these systems are built naively they fail in ways that are both predictable and expensive: the shortener's database melts under a viral link, the chat server loses messages during a deploy, the notification service sends the same OTP five times or sends none during an SMS-provider outage.</p>
+  <p>The three designs were also chosen because together they cover the main <em>shapes</em> of backend load:</p>
+  <ul>
+    <li><strong>URL shortener</strong> — a key-value lookup at enormous read amplification (roughly 100 reads per write in our assumptions). The interesting parts are generating short, unique, non-guessable keys without a coordination bottleneck, and absorbing hot keys with layered caches. It is the cleanest possible example of read-path optimisation.</li>
+    <li><strong>Messaging</strong> — a <em>stateful</em> system. Unlike the stateless request/response services you build in Spring MVC, a chat gateway holds a live connection per user for hours. That forces you to solve connection routing ("which of 600 servers holds Alice's socket?"), ordering, at-least-once delivery with deduplication, offline storage, presence, and — because users now expect it — end-to-end encryption, which changes what the server is even allowed to see.</li>
+    <li><strong>Notification platform</strong> — a <em>fan-out-to-third-parties</em> system. Your reliability is bounded by APNs, FCM, SMS aggregators and email providers you do not control. The design problem is about priorities, idempotency, rate limits, user preferences, retries and provider failover: the classic asynchronous pipeline built on <a href="p2-07-kafka-event-driven.html">Kafka</a>.</li>
+  </ul>
+  <p>Each design is presented the same way, so you can internalise a repeatable method: requirements, capacity estimation, API, data model, high-level architecture, key flows, component responsibilities, database choices, bottlenecks, failure scenarios, security, trade-offs and an illustrative infrastructure bill. Sections 4 and 5 hold the designs; section 6 collects the estimation maths; section 7 implements the hardest components in Java, Go and Python.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>You have built Spring Boot services with <code>@RestController</code>, JPA repositories over PostgreSQL or MySQL, Redis via Spring Data or Lettuce, and probably <code>@KafkaListener</code> consumers. You may have used <code>spring-boot-starter-websocket</code> with STOMP for a dashboard, <code>@Scheduled</code> jobs for retries, and Resilience4j for circuit breaking. You know that a <code>@Transactional</code> method gives you atomicity within one database.</dd>
+      <dt>Why that is not enough</dt><dd>The default Spring idioms assume stateless instances behind a round-robin load balancer and a single relational database. A chat gateway is not stateless; an in-memory STOMP broker (<code>enableSimpleBroker</code>) works on one node and silently drops messages for users connected to another. A JPA <code>IDENTITY</code> primary key is a single-writer bottleneck when you shard. <code>@Transactional</code> cannot span "write to DB and publish to Kafka". And <code>@Retryable</code> without an idempotency key turns a timeout into a duplicate SMS.</dd>
+      <dt>The modern approach</dt><dd>Decentralised ID generation (Snowflake-style or pre-allocated ranges), connection-routing registries, partitioned wide-column stores for append-heavy timelines, transactional outbox into Kafka, priority-separated topics with per-channel worker pools, idempotency keys at every boundary, and provider abstraction with health-based failover. End-to-end encryption moves trust out of the server entirely.</dd>
+      <dt>Where Python and Go fit</dt><dd>Go is the natural choice for the connection gateway: goroutines are cheap per-connection, memory per socket is small, and the standard library's networking is excellent. Java with Netty (or Spring WebFlux on Reactor Netty) is equally capable but needs more tuning. Python fits the template rendering, analytics and ML-driven send-time optimisation around the notification platform, and admin tooling — not the hot connection path.</dd>
+      <dt>In production</dt><dd>Expect to run a mix: Spring Boot for the business APIs (link management, notification API, preferences), Go or Netty for gateways, Kafka for the spine, Cassandra/ScyllaDB or DynamoDB for message timelines, Redis for presence, rate limits and dedup, and managed providers (APNs, FCM, SES, an SMS aggregator) at the edges.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use these reference designs when you face the same load shape. Avoid copying them at small scale: a shortener for 10,000 links a day is a single PostgreSQL table with a unique index, and a chat feature for an internal tool can be a managed service. The estimation step exists precisely to tell you which regime you are in.</dd>
+    </dl>
+  </div>
+
+  <div class="callout insight"><p class="callout-title">How to read this chapter</p><p>All capacity numbers are <span class="tag illus">Illustrative</span>: they are assumptions chosen to make the arithmetic instructive, not claims about any real company. Wherever we describe what a real company did, the claim is tagged <span class="tag fact">Verified</span> and linked to the company's own engineering write-up in §9. Recommendations are engineering judgement and tagged <span class="tag opinion">Opinion</span> where reasonable people disagree.</p></div>
+</section>
+
+<section id="history">
+  <h2>2. History: How These Systems Evolved in Industry</h2>
+  <h3>2.1 URL shorteners: from convenience to infrastructure</h3>
+  <p>TinyURL launched in 2002 to solve a mundane problem: long URLs broke when wrapped in plain-text email. The idea exploded with Twitter's 140-character limit after 2006, which made every character in a link costly. bit.ly (2008) turned shortening into an analytics business: each redirect is a measurable click with a timestamp, referrer, user-agent and coarse location. Twitter later built its own wrapper, t.co, so that every outbound link could be checked against malware lists and counted. That arc — utility, then analytics, then <em>security gateway</em> — is why a modern shortener design must include abuse detection and click analytics, not just a key-value map. Shorteners have also shown how fragile link permanence is: Google shut down its goo.gl service for new links in 2019, a reminder that the hardest non-functional requirement is often "this must still redirect in ten years".</p>
+  <h3>2.2 Messaging: from XMPP to Erlang to end-to-end encryption</h3>
+  <p>Instant messaging in the late 1990s (ICQ, AIM, MSN) used proprietary protocols over long-lived TCP connections. XMPP (originally Jabber, standardised by the IETF as RFC 3920 in 2004 and revised as RFC 6120 in 2011) offered an open, federated XML protocol, and many early mobile messengers started from an XMPP server. WhatsApp, founded in 2009, began with a heavily modified ejabberd (an Erlang XMPP server) and then rewrote large parts of it; its engineers' talks at Erlang Factory between 2012 and 2014 became the canonical reference for how a handful of engineers could serve hundreds of millions of users on Erlang/FreeBSD with very high connection counts per server (see §9).</p>
+  <p>Three shifts defined the 2010s. First, mobile networks made connections <em>intermittent</em>: phones sleep, switch from Wi-Fi to cellular and lose the socket, so store-and-forward and push-notification wake-ups became core. Second, the browser gained WebSocket (RFC 6455, 2011), giving web clients a full-duplex channel instead of long-polling hacks. Third, end-to-end encryption went mainstream: Open Whisper Systems published the protocol now called the Signal protocol (X3DH key agreement plus the Double Ratchet), and WhatsApp announced it had completed rolling it out to all its users in April 2016. After that, a messaging server is increasingly a blind router of ciphertext.</p>
+  <p>In parallel, team chat (Slack, 2013; Discord, 2015) pushed a different shape: very large channels with long, searchable histories. That drove adoption of wide-column stores for message timelines — Discord's public write-ups moving from MongoDB to Cassandra (2017) and then to ScyllaDB (2023) are the best-known example.</p>
+  <h3>2.3 Notifications: from cron-and-SMTP to platforms</h3>
+  <p>For most of the 2000s "notifications" meant a cron job that ran a SQL query and called an SMTP relay. Apple introduced the Apple Push Notification service with iOS 3 in 2009; Google followed with C2DM (2010), then Google Cloud Messaging (2012), then Firebase Cloud Messaging, which replaced GCM (GCM's server APIs were shut down in 2019). Apple moved APNs to an HTTP/2-based provider API in 2015. Each transition forced companies to rewrite integrations, which is a strong argument for a provider-adapter layer.</p>
+  <p>As products added channels (push, SMS, email, in-app inbox, later WhatsApp/RCS business messaging) teams discovered that the hard problems were not "send" but "should we send, on which channel, how often, and what happens when it fails". Large companies built centralised platforms — Netflix's Rapid Event Notification System is a published example — and a SaaS market grew around the same need. Regulation tightened the requirements: anti-spam laws such as CAN-SPAM (US, 2003) and the EU's GDPR (in force 2018) made consent, unsubscribe and data-minimisation first-class design constraints.</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals: The Recurring Building Blocks</h2>
+  <p>The three designs share a small set of mechanisms. Learn them once here; §4 and §5 apply them.</p>
+
+  <h3>3.1 The design method</h3>
+  <p>Every design in this chapter follows the same loop, which you should treat as a checklist:</p>
+  <ol>
+    <li><strong>Functional requirements</strong> — the verbs (shorten, redirect, send, receive, mark read).</li>
+    <li><strong>Non-functional requirements</strong> — latency targets (p99, not average), availability (99.9% allows about 43 minutes of downtime per 30-day month; 99.99% about 4.3 minutes), durability, consistency expectations, compliance.</li>
+    <li><strong>Estimation</strong> — QPS (average and peak), storage growth, bandwidth, memory for caches and connections. The point is to discover <em>which resource dominates</em>; see <a href="p2-01-system-design-foundations.html">Chapter 2.1</a>.</li>
+    <li><strong>API and data model</strong> — the contract and the access patterns. In wide-column and key-value stores the access pattern <em>is</em> the schema.</li>
+    <li><strong>High-level architecture, then deep dives</strong> on the components that the estimation says are hard.</li>
+    <li><strong>Failure analysis</strong> — for each component: what happens when it is slow, down, or duplicated?</li>
+  </ol>
+
+  <h3>3.2 Unique ID generation</h3>
+  <p>All three systems need identifiers that are unique across many writers: short codes, message IDs, notification IDs. You already know the single-node options — a database sequence or <code>AUTO_INCREMENT</code> — and their weakness: one writer, one point of failure, and IDs that leak business volume. The distributed options are:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Scheme</th><th>How it works</th><th>Strengths</th><th>Weaknesses</th></tr></thead>
+    <tbody>
+      <tr><td>UUIDv4 (random 122 bits)</td><td>Random per writer, no coordination.</td><td>Trivial, collision probability negligible.</td><td>128 bits is long for a URL; random keys fragment B-tree indexes (poor insert locality).</td></tr>
+      <tr><td>UUIDv7 (RFC 9562, 2024)</td><td>48-bit Unix-ms timestamp prefix, then random bits.</td><td>Time-ordered, index-friendly, standard.</td><td>Still 128 bits.</td></tr>
+      <tr><td>Snowflake-style 64-bit</td><td>Timestamp + worker ID + per-ms sequence.</td><td>Fits in a <code>long</code>, roughly time-ordered, no coordination on the hot path.</td><td>Needs unique worker IDs; sensitive to clock going backwards.</td></tr>
+      <tr><td>Range allocation ("ticket server")</td><td>A coordinator hands out blocks (e.g. 1,000,000 IDs) to each node, which then counts locally.</td><td>Dense, short integers ideal for base62 encoding.</td><td>Coordinator must be HA; IDs are sequential (guessable) unless permuted.</td></tr>
+      <tr><td>Hash of content</td><td>Truncate e.g. SHA-256(long URL) to k characters.</td><td>Natural deduplication of identical inputs.</td><td>Collisions must be detected and resolved; truncation increases them.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The Snowflake layout popularised by Twitter in 2010 is 1 unused sign bit, 41 bits of milliseconds since a custom epoch (about 69.7 years of range), 10 bits of worker identity (1,024 workers) and 12 bits of sequence (4,096 IDs per millisecond per worker). Instagram published a variant that generates IDs inside PostgreSQL with 41 bits of time, 13 bits of logical shard ID and 10 bits of sequence <span class="tag fact">Verified</span>. Discord's message IDs are Snowflakes too, which lets it bucket messages by time just by shifting the ID. We implement both Snowflake and base62 in §7.</p>
+
+  <h3>3.3 Base62 encoding and key-space arithmetic</h3>
+  <p>Base62 uses <code>[0-9a-zA-Z]</code>: URL-safe without escaping. A string of length \(k\) has \(62^k\) values: \(62^6 \approx 5.7 \times 10^{10}\), \(62^7 \approx 3.5 \times 10^{12}\). If you encode a <em>dense</em> counter, a 7-character code lasts a very long time. If you encode a <em>random</em> value, the birthday bound governs collisions: with \(n\) random keys in a space of size \(N\), the probability of at least one collision is approximately \(1 - e^{-n^2/2N}\). We work this through in §6.</p>
+
+  <h3>3.4 Read-path caching and hot keys</h3>
+  <p>Read-heavy systems are dominated by a few hot keys (Zipf-like popularity). Layering helps: CDN or edge cache for 301/302 responses, an in-process cache (Caffeine) on each app node, a shared Redis tier, and finally the database. The in-process layer is what saves you from a single viral key overloading one Redis shard; see <a href="p2-03-caching-redis.html">Chapter 2.3</a> for eviction policies and stampede protection (request coalescing, probabilistic early refresh).</p>
+
+  <h3>3.5 Long-lived connections: WebSocket, MQTT and friends</h3>
+  <p>HTTP request/response cannot push. The options for server-to-client delivery are:</p>
+  <ul>
+    <li><strong>Short polling</strong> — wasteful; latency equals poll interval.</li>
+    <li><strong>Long polling</strong> — the server holds the request until data arrives; workable but each delivery costs a new request.</li>
+    <li><strong>Server-Sent Events (SSE)</strong> — one-way server-to-client stream over HTTP; perfect for token streaming and feeds (used in <a href="p2-12-case-studies-realtime-ai.html">Chapter 2.12</a>'s chatbot).</li>
+    <li><strong>WebSocket (RFC 6455)</strong> — full-duplex frames after an HTTP Upgrade; the default for browser chat.</li>
+    <li><strong>MQTT or custom binary over TCP/TLS</strong> — common on mobile for compact framing and keep-alive control. Facebook Messenger's mobile client historically used MQTT; WhatsApp uses its own binary protocol.</li>
+  </ul>
+  <p>Stateful connections break the assumption that "any instance can serve any request". You need a <strong>session registry</strong> mapping <code>userId → (gatewayId, connectionId)</code>, and a way to route a message to the right gateway. You also need to handle <em>connection draining</em> during deploys, because killing a gateway disconnects every user on it at once and they will all reconnect in a thundering herd.</p>
+
+  <h3>3.6 Delivery semantics, acks and idempotency</h3>
+  <p>Across unreliable networks you can only choose between at-most-once and at-least-once delivery; "exactly-once" is at-least-once plus deduplication at the receiver. Every design here therefore uses <strong>client-generated idempotency keys</strong> (a message's client ID, a notification's dedup key, a create-link request's <code>Idempotency-Key</code> header) and stores "already processed" markers with a TTL. The theory is in <a href="p2-06-consistency-transactions.html">Chapter 2.6</a>; here we focus on where to place the keys.</p>
+
+  <h3>3.7 Fan-out: on write versus on read</h3>
+  <p>When one event must reach many recipients you either <em>fan out on write</em> (copy or enqueue for each recipient at send time — fast reads, expensive writes, bad for huge audiences) or <em>fan out on read</em> (store once, recipients pull — cheap writes, more expensive reads). Messaging uses fan-out on write for small groups and per-recipient delivery queues; very large channels (Discord/Slack style) store once per channel and fan out only to <em>online</em> subscribers. Notifications are fan-out on write by nature, but broadcast campaigns to millions should be expanded lazily in batches rather than materialised at once.</p>
+
+  <h3>3.8 Asynchronous pipelines with priorities</h3>
+  <p>Kafka topics do not have priorities: a consumer reads a partition in order. Priority is therefore implemented <em>structurally</em>: separate topics (or separate clusters) for critical, normal and bulk traffic, each with its own consumer pool sized for its SLO, so a 50-million-recipient marketing blast cannot delay a password-reset code. Retries go to delay topics (e.g. <code>retry-1m</code>, <code>retry-10m</code>) and finally a dead-letter topic, rather than blocking the partition. See <a href="p2-07-kafka-event-driven.html">Chapter 2.7</a> for partitioning and consumer-group mechanics.</p>
+
+  <h3>3.9 Rate limiting and backpressure</h3>
+  <p>Rate limits appear three times in this chapter: abuse protection on link creation, per-user send limits in chat (spam), and frequency caps plus provider quotas in notifications. The algorithms (token bucket, sliding window) are covered in <a href="p2-02-scaling-traffic.html">Chapter 2.2</a>. The design question here is the <em>key</em>: per API key, per user, per (user, channel, category), per provider account.</p>
+
+  <h3>3.10 End-to-end encryption in one paragraph</h3>
+  <p>Transport encryption (TLS) protects data between client and server; the server still sees plaintext. End-to-end encryption (E2EE) means only the endpoints hold the keys, so a compromised or subpoenaed server reveals ciphertext and metadata only. The Signal protocol achieves this with an asynchronous key agreement (X3DH, so you can start a session with someone who is offline, using keys they pre-published to the server) and the Double Ratchet (a fresh key per message, giving forward secrecy and post-compromise security). The server's role shrinks to: storing public prekeys, routing ciphertext, and holding undelivered ciphertext. §4.2 goes deeper.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working: Requirements, Estimates, APIs and Data Models</h2>
+  <p>This section develops the inside of each system: what it must do, how big it is, its contract, and how its data is laid out. Section 5 then draws the architecture, flows, and the failure and scaling analysis.</p>
+
+  <h3>4.1 Case study A — URL shortener</h3>
+
+  <h4>Functional requirements</h4>
+  <ul>
+    <li>Create a short link for a long URL, optionally with a custom alias and an expiry time.</li>
+    <li>Redirect <code>GET /{code}</code> to the long URL.</li>
+    <li>Owners can list, disable and delete their links; see click analytics (counts by day, country, referrer, device).</li>
+    <li>Abuse controls: block malware/phishing destinations, rate-limit creation, allow takedowns.</li>
+  </ul>
+  <h4>Non-functional requirements</h4>
+  <ul>
+    <li>Redirect latency p99 under 50 ms server-side from the nearest region (excluding client RTT).</li>
+    <li>Redirect availability 99.99%: a broken short link in a printed QR code cannot be fixed by the sender.</li>
+    <li>Durability: once acknowledged, a mapping must never be lost or changed to point elsewhere (a hijacked link is a security incident).</li>
+    <li>Codes should not be trivially enumerable (to stop scraping of private links).</li>
+    <li>Analytics may lag by up to a minute; redirect must not wait on analytics.</li>
+  </ul>
+
+  <h4>Capacity estimation <span class="tag illus">Illustrative</span></h4>
+  <p>Assume 100 million new links per day and a 100:1 read-to-write ratio, with links retained for 5 years.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Quantity</th><th>Calculation</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>Write QPS (avg)</td><td>100,000,000 / 86,400</td><td>≈ 1,160/s</td></tr>
+      <tr><td>Write QPS (peak, ×3)</td><td>1,160 × 3</td><td>≈ 3,500/s</td></tr>
+      <tr><td>Redirect QPS (avg)</td><td>1,160 × 100</td><td>≈ 116,000/s</td></tr>
+      <tr><td>Redirect QPS (peak, ×3)</td><td>116,000 × 3</td><td>≈ 350,000/s</td></tr>
+      <tr><td>Links over 5 years</td><td>10⁸ × 365 × 5</td><td>≈ 1.8 × 10¹¹</td></tr>
+      <tr><td>Record size</td><td>code 8 B + URL avg 200 B + owner, timestamps, flags ≈ 100 B, plus index/replication overhead</td><td>≈ 500 B on disk per replica</td></tr>
+      <tr><td>Storage (one replica)</td><td>1.8 × 10¹¹ × 500 B</td><td>≈ 91 TB</td></tr>
+      <tr><td>Storage (RF = 3)</td><td>91 TB × 3</td><td>≈ 275 TB</td></tr>
+      <tr><td>Redirect egress</td><td>116,000/s × ~500 B response</td><td>≈ 58 MB/s ≈ 0.46 Gbit/s avg</td></tr>
+      <tr><td>Click events</td><td>116,000/s × ~300 B</td><td>≈ 35 MB/s ≈ 3 TB/day raw</td></tr>
+      <tr><td>Hot-set cache</td><td>Suppose 20% of the links clicked each day take 80% of traffic; daily distinct clicked links ≈ 1 B; 20% × 1 B × 300 B</td><td>≈ 60 GB of Redis</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>What the numbers tell us:</strong> storage is large but unremarkable for a sharded key-value store; write QPS is modest; the dominant problem is <em>350,000 redirects per second with p99 under 50 ms</em>, which is a caching and edge problem, and the click-event stream (3 TB/day) is a separate analytics pipeline. Key-space size: \(62^7 \approx 3.5 \times 10^{12}\) comfortably exceeds \(1.8 \times 10^{11}\), so 7 characters suffice even with only ~5% utilisation, which leaves room for randomisation.</p>
+
+  <h4>API design</h4>
+<pre data-file="shortener-api.http"><code class="language-plaintext">POST /v1/links                         (auth: OAuth2 bearer or API key)
+Idempotency-Key: 6c1e1b0a-...          (optional; same key =&gt; same response)
+{ "longUrl": "https://example.com/very/long?utm=x",
+  "customAlias": "spring-sale",        (optional, 4-30 chars, [a-zA-Z0-9_-])
+  "expiresAt": "2027-06-01T00:00:00Z", (optional)
+  "tags": ["campaign-42"] }
+201 Created
+Location: https://sho.rt/spring-sale
+{ "code": "spring-sale", "shortUrl": "https://sho.rt/spring-sale",
+  "longUrl": "...", "createdAt": "...", "expiresAt": "..." }
+409 Conflict      alias taken
+422 Unprocessable destination blocked by safety check
+429 Too Many Requests (Retry-After)
+
+GET /{code}                            (public, no auth)
+301 Moved Permanently  | 302 Found  | 307 Temporary Redirect
+Location: https://example.com/very/long?utm=x
+Cache-Control: private, max-age=300    (see trade-off below)
+404 Not Found | 410 Gone (expired or taken down)
+
+GET    /v1/links?cursor=...&amp;limit=50  list own links (cursor pagination)
+PATCH  /v1/links/{code}                disable / change expiry (never change target)
+DELETE /v1/links/{code}
+GET    /v1/links/{code}/stats?from=...&amp;to=...&amp;groupBy=day,country</code></pre>
+  <p>Two API decisions deserve justification. <strong>301 versus 302:</strong> a 301 is cacheable by browsers indefinitely by default, which removes load from you but also removes your ability to count clicks, disable a link, or fix a takedown. Most analytics-oriented shorteners use 302 (or 307) with a short <code>Cache-Control</code>; a pure "save characters" shortener can use 301 <span class="tag opinion">Opinion</span>. <strong>Immutable targets:</strong> the <code>PATCH</code> endpoint deliberately cannot change the destination. Allowing it turns every compromised account into a way to redirect already-distributed links to phishing pages.</p>
+
+  <h4>Data model</h4>
+  <figure class="diagram">
+<pre class="mermaid">
+erDiagram
+  ACCOUNT ||--o{ LINK : owns
+  LINK ||--o{ CLICK_EVENT : receives
+  LINK ||--o{ CLICK_ROLLUP : "aggregated into"
+  ACCOUNT {
+    bigint account_id PK
+    string plan
+    int create_quota_per_min
+  }
+  LINK {
+    string code PK "base62, 7 chars or custom"
+    bigint account_id
+    string long_url
+    timestamp created_at
+    timestamp expires_at
+    string status "ACTIVE, DISABLED, BLOCKED"
+  }
+  CLICK_EVENT {
+    string code
+    timestamp ts
+    string country
+    string referrer_host
+    string device_class
+  }
+  CLICK_ROLLUP {
+    string code PK
+    date day PK
+    string dimension PK
+    bigint clicks
+  }
+</pre>
+  <figcaption>Figure 10.1 — Logical data model of the URL shortener.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> <code>LINK</code> is the only entity on the redirect hot path, and it is accessed exclusively by primary key <code>code</code>. <code>CLICK_EVENT</code> is an append-only stream that never lives in the same store as links: it goes to Kafka and then to an OLAP store (ClickHouse, Pinot or Druid — see <a href="p2-12-case-studies-realtime-ai.html">Chapter 2.12</a>). <code>CLICK_ROLLUP</code> is the pre-aggregated table that powers the stats endpoint. A secondary access pattern, "list my links", needs an index on <code>(account_id, created_at)</code>.</p>
+  <p><strong>Database choice.</strong> The redirect path is a single-key read at high QPS with no joins and no transactions spanning keys — the textbook fit for a partitioned key-value or wide-column store: DynamoDB, Cassandra/ScyllaDB, or sharded MySQL/PostgreSQL behind Vitess or Citus. Our choice <span class="tag opinion">Opinion</span>: <strong>DynamoDB or Cassandra</strong> for <code>links</code> (partition key <code>code</code>, uniform hash distribution, linear scaling, multi-region replication available), with a global secondary index (DynamoDB) or a separate table <code>links_by_account(account_id, created_at, code)</code> (Cassandra) for owner listings. If your company already runs PostgreSQL well, a hash-sharded PostgreSQL cluster with 64 logical shards is entirely viable at 3,500 writes/s; the redirect reads mostly hit cache anyway.</p>
+
+  <h4>Key generation — the core algorithm</h4>
+  <p>There are four realistic designs; we compare them and pick one.</p>
+  <ol>
+    <li><strong>Hash and truncate.</strong> <code>base62(sha256(longUrl + salt))[0..7]</code>. On collision (code exists with a different URL), append a counter and retry. Pros: stateless. Cons: the insert must be a conditional write (<code>PutItem</code> with <code>attribute_not_exists(code)</code>, or Cassandra <code>INSERT ... IF NOT EXISTS</code>, which costs a Paxos round), and collisions rise as the table fills.</li>
+    <li><strong>Random code with conditional insert.</strong> Generate 7 random base62 characters from a CSPRNG; insert-if-absent; retry on conflict. Codes are unguessable. With 1.8 × 10¹¹ keys in 3.5 × 10¹² space, the chance a fresh random code collides is about 5% near end of life — fine with a retry, but every insert still needs a conditional write.</li>
+    <li><strong>Counter plus base62.</strong> A global counter (or range allocation) yields a unique integer; encode it. No collisions, no conditional write needed. But sequential codes are enumerable: <code>aaaaab</code> follows <code>aaaaaa</code>.</li>
+    <li><strong>Counter plus bijective scrambling.</strong> Take the unique counter value and apply a keyed permutation over the 7-character space (for example a small Feistel network or format-preserving encryption) before base62 encoding. Uniqueness is preserved because the permutation is a bijection; output looks random; no conditional write is needed.</li>
+  </ol>
+  <p>We choose <strong>option 4 with range allocation</strong>: each shortener instance leases a block of, say, 100,000 counter values from a small strongly consistent store (an etcd key, a DynamoDB atomic counter, or a single-row PostgreSQL sequence with <code>INCREMENT BY 100000</code>). It then issues codes locally until the block is exhausted. A crash wastes at most one block — irrelevant in a 3.5 × 10¹² space. The lease store sees ~1 request per 100,000 links, i.e. about one request every 30 seconds across the whole fleet at peak.</p>
+  <pre class="ascii">
+ lease store (etcd / DynamoDB counter)
+     |  lease [4,200,000 .. 4,299,999]
+     v
+ +-----------------+   n = next() -----&gt; feistel(n, key) -----&gt; base62 -----&gt; "k3Xq9Za"
+ | shortener pod 7 |   unique integer       bijective scramble      7 chars
+ +-----------------+
+  </pre>
+  <p>Custom aliases bypass the generator and use a conditional insert. To prevent an alias from ever colliding with a generated code, either reserve a disjoint namespace (generated codes are exactly 7 characters; aliases must be 4–6 or 8+ characters, or contain a <code>-</code>) or always use conditional inserts. We use the namespace rule <em>and</em> the conditional insert for aliases.</p>
+
+  <h4>Deduplication of long URLs</h4>
+  <p>Should two requests to shorten the same URL return the same code? For an anonymous public shortener, yes (saves space); for an analytics product, no — two campaigns want separate click counts. We scope deduplication to <code>(account_id, long_url_hash)</code> with an optional flag, stored in a separate table. Do not make dedup global: it lets one tenant learn that another tenant shortened a given (possibly private) URL.</p>
+
+  <h3>4.2 Case study B — WhatsApp-class messaging system</h3>
+
+  <h4>Functional requirements</h4>
+  <ul>
+    <li>1:1 chat and group chat (up to 1,024 members in our design) with text, emoji reactions and media (images, video, voice notes, documents).</li>
+    <li>Delivery state per message: <em>sent</em> (server accepted), <em>delivered</em> (recipient device received), <em>read</em>.</li>
+    <li>Offline delivery: messages to offline users are held and delivered when they reconnect; push notification wakes the device.</li>
+    <li>Presence ("online", "last seen") and typing indicators, subject to privacy settings.</li>
+    <li>Multi-device: a user may have a phone plus up to four companion devices.</li>
+    <li>End-to-end encryption of message content and media for 1:1 and groups.</li>
+  </ul>
+  <h4>Non-functional requirements</h4>
+  <ul>
+    <li>End-to-end delivery latency p99 under 500 ms when both parties are online in the same region.</li>
+    <li>No message loss once the sender sees "sent"; no duplicates shown to the user.</li>
+    <li>Per-conversation ordering as seen by all participants (we do not require a global order).</li>
+    <li>High availability of the send path (99.99%); presence may degrade first.</li>
+    <li>The server must not be able to read message content (E2EE); metadata minimisation where feasible.</li>
+    <li>Server-side retention: undelivered messages kept up to 30 days, then dropped; delivered messages are not stored on the server in the WhatsApp-style model (history lives on devices and in optional encrypted backups). A Slack/Discord-style product would instead keep full server-side history — we discuss both.</li>
+  </ul>
+
+  <h4>Capacity estimation <span class="tag illus">Illustrative</span></h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Quantity</th><th>Assumption / calculation</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>Daily active users</td><td>assumption</td><td>500 M</td></tr>
+      <tr><td>Messages sent per DAU</td><td>assumption</td><td>40/day</td></tr>
+      <tr><td>Messages per day</td><td>500 M × 40</td><td>20 B</td></tr>
+      <tr><td>Send QPS avg / peak (×3)</td><td>20 B / 86,400</td><td>≈ 231 K/s / ≈ 700 K/s</td></tr>
+      <tr><td>Group amplification</td><td>assume 30% of messages go to groups averaging 20 members</td><td>deliveries ≈ 0.7 × 20 B + 0.3 × 20 B × 19 ≈ 128 B/day ≈ 1.5 M/s avg</td></tr>
+      <tr><td>Receipts</td><td>delivered + read receipt per delivery (batched)</td><td>≈ 2 × deliveries, but small and coalesced</td></tr>
+      <tr><td>Peak concurrent connections</td><td>30% of DAU online at peak</td><td>150 M sockets</td></tr>
+      <tr><td>Gateway hosts</td><td>150 M / 250 K per host (conservative for tuned Go/Netty on 64 GB)</td><td>600 hosts + 30% headroom ≈ 800</td></tr>
+      <tr><td>Connection memory</td><td>~20–40 KB per socket incl. TLS and buffers</td><td>250 K × 30 KB ≈ 7.5 GB per host</td></tr>
+      <tr><td>Offline queue writes</td><td>assume 25% of deliveries target offline devices; 300 B ciphertext + metadata</td><td>32 B/day × 300 B ≈ 9.6 TB/day transient</td></tr>
+      <tr><td>Media</td><td>assume 5% of messages carry media averaging 200 KB</td><td>1 B × 200 KB = 200 TB/day uploaded</td></tr>
+      <tr><td>Media egress</td><td>with group fan-out ~4× downloads</td><td>≈ 800 TB/day ≈ 74 Gbit/s avg, CDN-served</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>What the numbers tell us:</strong> text is cheap; the hard resources are <em>connections</em> (150 M sockets, so the gateway tier must be extremely memory-efficient) and <em>media bandwidth</em> (tens to hundreds of Gbit/s, which must go through object storage and a CDN, never through the chat servers). Group amplification makes the delivery rate ~6× the send rate.</p>
+
+  <h4>Protocol and API design</h4>
+  <p>Clients keep one persistent connection (WebSocket for web; a compact binary framing over TLS on mobile). Everything on it is a typed frame. REST is used only for bulk or cacheable operations: media upload URLs, prekey bundles, profile and group management.</p>
+<pre data-file="chat-protocol.proto"><code class="language-plaintext">// Frames over the persistent connection (protobuf-like notation)
+message ClientFrame {
+  oneof body {
+    Send        send = 1;      // new message
+    Ack         ack = 2;       // device received server-delivered messages up to ...
+    Receipt     receipt = 3;   // delivered/read receipts for peers
+    Typing      typing = 4;    // ephemeral, never stored
+    PresenceSub presence_sub = 5;
+    Ping        ping = 6;
+  }
+}
+message Send {
+  string client_msg_id = 1;    // UUIDv7 generated on device: idempotency key
+  string conversation_id = 2;  // 1:1 id = hash(sorted(userA,userB)) or group id
+  repeated DeviceCiphertext payloads = 3; // one per recipient device (pairwise sessions)
+  // groups using Sender Keys: a single ciphertext + distribution messages when needed
+  int64  client_ts = 4;
+}
+message ServerFrame {
+  oneof body {
+    SendAck   send_ack = 1;    // {client_msg_id, server_msg_id, conv_seq, server_ts}  =&gt; "sent"
+    Deliver   deliver = 2;     // {server_msg_id, conv_id, conv_seq, sender, ciphertext}
+    Receipt   receipt = 3;     // peer delivered/read up to conv_seq
+    Presence  presence = 4;
+    Pong      pong = 5;
+  }
+}
+
+// REST (HTTPS, authenticated)
+PUT  /v1/keys/{deviceId}            upload identity key, signed prekey, batch of one-time prekeys
+GET  /v1/keys/{userId}/devices      fetch prekey bundles for all of a user's devices (consumes one OTPK each)
+POST /v1/media/uploads              returns pre-signed PUT URL for encrypted blob + mediaId
+GET  /v1/media/{mediaId}            returns short-lived pre-signed GET URL (CDN)
+POST /v1/groups  /  PATCH /v1/groups/{id}/members</code></pre>
+  <p>The crucial fields are <code>client_msg_id</code> (generated by the sender, so a resend after a dropped connection is recognised as a duplicate) and <code>conv_seq</code> (a per-conversation sequence assigned by the server, which defines the order every participant displays and lets receipts be expressed compactly as "read up to seq 1,042").</p>
+
+  <h4>Data model</h4>
+  <figure class="diagram">
+<pre class="mermaid">
+erDiagram
+  USER ||--o{ DEVICE : has
+  DEVICE ||--o{ PREKEY : publishes
+  USER ||--o{ MEMBERSHIP : joins
+  CONVERSATION ||--o{ MEMBERSHIP : contains
+  CONVERSATION ||--o{ MESSAGE : orders
+  DEVICE ||--o{ INBOX_ENTRY : "pending for"
+  USER {
+    bigint user_id PK
+    string phone_hash
+    timestamp created_at
+  }
+  DEVICE {
+    bigint user_id PK
+    int device_id PK
+    bytes identity_pubkey
+    string push_token
+  }
+  PREKEY {
+    bigint user_id PK
+    int device_id PK
+    int prekey_id PK
+    bytes pubkey
+    bool signed
+  }
+  CONVERSATION {
+    string conv_id PK
+    string type "DIRECT or GROUP"
+    bigint last_seq
+  }
+  MEMBERSHIP {
+    string conv_id PK
+    bigint user_id PK
+    string role
+    bigint read_up_to_seq
+  }
+  MESSAGE {
+    string conv_id PK
+    int bucket PK
+    bigint conv_seq PK
+    bigint server_msg_id
+    string client_msg_id
+    bigint sender_id
+    bytes ciphertext
+  }
+  INBOX_ENTRY {
+    bigint user_id PK
+    int device_id PK
+    bigint server_msg_id PK
+    string conv_id
+    bytes ciphertext
+    timestamp expires_at
+  }
+</pre>
+  <figcaption>Figure 10.2 — Messaging data model: identity/keys, conversations, the per-conversation log and per-device inboxes.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> there are two message structures and you should understand why. <code>INBOX_ENTRY</code> is a per-device store-and-forward queue: the sender's ciphertext for <em>that device</em> waits there until the device acknowledges it, then it is deleted. This is all a WhatsApp-style E2EE system needs, because history lives on devices. <code>MESSAGE</code> is a per-conversation log keyed by <code>(conv_id, bucket)</code> and clustered by <code>conv_seq</code>; it is what a Slack/Discord-style product needs for server-side history, search (only possible without E2EE, or with client-side indexes) and multi-device sync. The <code>bucket</code> (for example, a 10-day time window derived from the Snowflake ID) caps partition size so that a decade-old busy group does not become a 100 GB partition — the same technique Discord described for Cassandra.</p>
+  <p><strong>Database choice.</strong> Inbox and message tables are append-heavy, partition-local reads ("give me everything after seq N for this conversation/device"), with TTL-based expiry — a strong fit for <strong>Cassandra/ScyllaDB</strong> (LSM-tree writes, native TTL, tunable consistency) or DynamoDB. User, device and group metadata are small, relational and read-heavy: a sharded MySQL/PostgreSQL or the same wide-column store. Prekeys need an atomic "pop one one-time prekey" operation, which can be a conditional delete in the wide-column store or a small Redis set with <code>SPOP</code> backed by durable storage. The session registry and presence are ephemeral and live in Redis (or in-memory in a dedicated presence service).</p>
+  <p><strong>Tombstone warning:</strong> deleting inbox entries after delivery creates a tombstone per message in Cassandra. If a device's inbox partition receives and deletes millions of entries, reads must scan tombstones until compaction removes them (after <code>gc_grace_seconds</code>). Mitigations: time-bucket inbox partitions (<code>(user_id, device_id, day)</code>) so old buckets are dropped wholesale, use TTLs rather than explicit deletes where possible, and read with a lower bound on the clustering key so the scan starts after the acknowledged position.</p>
+
+  <h4>Ordering: what the server guarantees</h4>
+  <p>A single sender over a single connection sends in order, but two senders in a group race. We assign <code>conv_seq</code> at a single point per conversation: the conversation's owning <em>chat service</em> shard (conversations are hash-partitioned across chat-service instances, and each instance is the single writer for its conversations, similar to Slack's channel servers). The owner increments the in-memory counter, persists the message with that sequence, then fans out. On owner failover, the new owner reads <code>last_seq</code> from storage (persisted with every write or via a conditional update) before accepting new messages. Clients display by <code>conv_seq</code> and buffer out-of-order arrivals briefly; a gap triggers a "sync from seq N" request.</p>
+
+  <h4>End-to-end encryption: what the Signal protocol does, at the level a backend engineer needs</h4>
+  <p>The backend never implements the cryptography (clients use libsignal), but it implements the <em>key distribution service</em> and must respect the protocol's assumptions. In brief:</p>
+  <ul>
+    <li>Each device holds a long-term <strong>identity key pair</strong>, a medium-term <strong>signed prekey</strong> (signed by the identity key, rotated periodically) and a batch of single-use <strong>one-time prekeys</strong>, and uploads the public halves.</li>
+    <li>To message Bob for the first time, Alice's device fetches Bob's <em>prekey bundle</em> (identity key, signed prekey and signature, and one one-time prekey — which the server must hand out exactly once). X3DH combines several Diffie-Hellman outputs into a shared secret, so Alice can send immediately even though Bob is offline. The Signal project published PQXDH in 2023, adding a post-quantum KEM to this handshake.</li>
+    <li>Thereafter the <strong>Double Ratchet</strong> derives a new message key for every message, mixing in new DH outputs whenever the direction of conversation changes. Compromise of today's keys does not reveal past messages (forward secrecy) and the session heals after a compromise once new DH ratchet steps occur (post-compromise security).</li>
+    <li>Groups: pairwise-encrypting each message for 1,000 devices is expensive, so WhatsApp's published design uses <strong>Sender Keys</strong>: each sender distributes a symmetric chain key to each member once (over the pairwise channels), then encrypts each group message once and the server fans out the single ciphertext. The cost moves to membership changes, when sender keys must be rotated.</li>
+    <li>Multi-device: each device is a separate Signal endpoint. The sender encrypts per <em>device</em>, which is why <code>Send.payloads</code> is a list.</li>
+    <li>Media: the sender encrypts the file with a random symmetric key, uploads the ciphertext to blob storage, and sends the key and a hash inside the E2EE message. The blob store and CDN only ever see ciphertext.</li>
+  </ul>
+  <div class="callout warn"><p class="callout-title">Server obligations under E2EE</p><p>The server must hand out each one-time prekey at most once (atomically), rate-limit prekey bundle fetches (they are an enumeration and exhaustion vector), alert clients to replenish prekeys when they run low, and notify contacts when a user's identity key changes so clients can show a "security code changed" warning. Server-side features that need plaintext — search, spam classification on content, link previews — must move to the client or be redesigned around metadata.</p></div>
+
+  <h4>Presence</h4>
+  <p>Presence is the most write-amplified feature in chat and the first one to degrade. A naive design publishes every online/offline change to every contact: with 200 contacts and frequent mobile reconnects, that is an enormous fan-out for data that nobody is looking at. Practical designs:</p>
+  <ul>
+    <li>Store presence as a Redis key <code>presence:{userId} = {status, lastSeen}</code> with a TTL slightly longer than the heartbeat interval (for example a 30 s heartbeat and a 75 s TTL). Absence of the key means offline.</li>
+    <li>Push presence changes only to users who <em>subscribed</em> — i.e. currently have a chat with that user open — and pull "last seen" on demand when a chat opens.</li>
+    <li>Debounce flaps: do not announce "offline" until the TTL expires, which hides network blips.</li>
+    <li>Enforce privacy settings at read time ("last seen: nobody / my contacts").</li>
+  </ul>
+
+  <h3>4.3 Case study C — Multi-channel notification platform</h3>
+
+  <h4>Functional requirements</h4>
+  <ul>
+    <li>Internal services submit notification requests: a <em>template</em>, a recipient (user ID or segment), variables, a category (e.g. <code>security.otp</code>, <code>order.shipped</code>, <code>marketing.weekly</code>), and an optional idempotency key, schedule time and expiry.</li>
+    <li>Channels: mobile push (APNs, FCM), SMS, email, in-app inbox, and web push. The platform chooses channels based on category policy and user preferences, optionally with fallback ("push, then SMS if not opened in 10 minutes").</li>
+    <li>User preferences per category and channel, quiet hours by user time zone, global unsubscribe; legally required messages (security, transactional) bypass marketing opt-outs but not channel feasibility.</li>
+    <li>Templating with localisation and versioning; preview and test sends.</li>
+    <li>Tracking: accepted, sent to provider, delivered (where providers report it), opened/clicked, bounced, failed; queryable per request.</li>
+    <li>Bulk campaigns to segments of millions, with throttled ramp-up.</li>
+  </ul>
+  <h4>Non-functional requirements</h4>
+  <ul>
+    <li>Priority isolation: P0 (OTP, security alerts) reaches the provider within 2 s p99 regardless of marketing load; P1 (transactional) within 30 s; P2 (marketing) best effort within hours.</li>
+    <li>At-least-once processing internally, with <strong>effectively-once</strong> sends to users: no duplicate OTPs or duplicate shipping emails.</li>
+    <li>Provider failover: an SMS or email provider outage must not stop P0 traffic.</li>
+    <li>Respect provider rate limits and per-user frequency caps.</li>
+    <li>Compliance: consent records, unsubscribe in one click for email marketing, PII minimisation, audit trail.</li>
+  </ul>
+
+  <h4>Capacity estimation <span class="tag illus">Illustrative</span></h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Quantity</th><th>Assumption / calculation</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>Notifications per day</td><td>200 M users × 5</td><td>1 B/day</td></tr>
+      <tr><td>Avg QPS</td><td>10⁹ / 86,400</td><td>≈ 11.6 K/s</td></tr>
+      <tr><td>Campaign peak</td><td>a 50 M-recipient campaign drained over 30 min</td><td>≈ 28 K/s on top of baseline</td></tr>
+      <tr><td>Channel mix</td><td>push 70%, email 20%, in-app 8%, SMS 2%</td><td>SMS ≈ 20 M/day ≈ 230/s avg</td></tr>
+      <tr><td>SMS cost</td><td>at an assumed blended $0.01 per segment</td><td>≈ $200 K/day — a strong argument for push-first policies</td></tr>
+      <tr><td>Delivery log</td><td>1 B × ~1 KB (request, status transitions)</td><td>≈ 1 TB/day; keep 90 days hot ≈ 90 TB</td></tr>
+      <tr><td>Dedup keys</td><td>1 B/day × ~100 B, 24 h TTL</td><td>≈ 100 GB Redis (or a cheaper Bloom-filter first pass)</td></tr>
+      <tr><td>Device tokens</td><td>200 M users × 1.5 devices × 300 B</td><td>≈ 90 GB</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>What the numbers tell us:</strong> throughput is moderate by Kafka standards; the difficulty is <em>isolation</em> (a 28 K/s campaign burst must not delay OTPs), <em>external rate limits</em> (providers throttle you, often per account and per destination country), and <em>cost</em> (SMS dominates the bill, so channel policy is a business lever).</p>
+
+  <h4>API design</h4>
+<pre data-file="notification-api.http"><code class="language-plaintext">POST /v1/notifications                       (mTLS / service token; caller = internal service)
+Idempotency-Key: order-81723-shipped         (required for P0/P1)
+{
+  "recipient": { "userId": "u_42" },          // or { "segmentId": "...", "campaignId": "..." }
+  "category": "order.shipped",               // drives priority, allowed channels, opt-out rules
+  "template": { "id": "order_shipped", "version": 7 },
+  "data": { "orderId": "81723", "eta": "2026-11-29" },
+  "channels": ["push", "email"],             // optional override, filtered by policy
+  "sendAt": "2026-11-27T09:00:00Z",          // optional scheduling
+  "expiresAt": "2026-11-27T21:00:00Z"        // drop if not sent by then (e.g. OTPs: 5 min)
+}
+202 Accepted
+{ "notificationId": "ntf_01JD...", "status": "ACCEPTED" }
+
+GET  /v1/notifications/{id}                   status + per-channel attempts
+GET  /v1/users/{userId}/preferences
+PUT  /v1/users/{userId}/preferences           { "marketing.*": {"email": false}, "quietHours": {...} }
+POST /v1/devices                              register/refresh push token {platform, token, appVersion}
+POST /v1/providers/{provider}/webhooks        delivery receipts / bounces (signed by provider)
+GET  /v1/inbox?cursor=...                     in-app inbox for the signed-in user</code></pre>
+  <p>Accepting with <code>202</code> rather than <code>200</code> is deliberate: the API's promise is "durably accepted", not "delivered". The idempotency key is scoped to the calling service (<code>(caller, key)</code>), and the stored response is returned on retries so callers with <code>@Retryable</code> are safe.</p>
+
+  <h4>Data model</h4>
+  <figure class="diagram">
+<pre class="mermaid">
+erDiagram
+  NOTIFICATION ||--o{ DELIVERY_ATTEMPT : "fans out to"
+  TEMPLATE ||--o{ TEMPLATE_VERSION : has
+  USER_PREF }o--|| CATEGORY : "applies to"
+  USER ||--o{ DEVICE_TOKEN : registers
+  USER ||--o{ USER_PREF : sets
+  USER ||--o{ INBOX_ITEM : receives
+  NOTIFICATION {
+    string notification_id PK
+    string caller
+    string idem_key
+    string category
+    string recipient_user_id
+    string template_ref
+    json data
+    string priority
+    string status
+    timestamp send_at
+    timestamp expires_at
+  }
+  DELIVERY_ATTEMPT {
+    string notification_id PK
+    string channel PK
+    int attempt PK
+    string provider
+    string provider_msg_id
+    string status
+    string error_code
+    timestamp ts
+  }
+  CATEGORY {
+    string category_id PK
+    string priority
+    string allowed_channels
+    bool bypass_marketing_optout
+    int freq_cap_per_day
+  }
+  USER_PREF {
+    string user_id PK
+    string category_pattern PK
+    string channel PK
+    bool enabled
+  }
+  DEVICE_TOKEN {
+    string user_id PK
+    string token PK
+    string platform
+    timestamp last_seen
+    bool valid
+  }
+  TEMPLATE_VERSION {
+    string template_id PK
+    int version PK
+    string locale PK
+    string channel PK
+    string body
+  }
+  INBOX_ITEM {
+    string user_id PK
+    string item_id PK
+    string title
+    bool read
+  }
+</pre>
+  <figcaption>Figure 10.3 — Notification platform data model.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> <code>CATEGORY</code> is the policy object: it binds a business event type to a priority, a set of permitted channels, whether it can bypass marketing opt-outs, and a frequency cap. <code>NOTIFICATION</code> is the accepted request; <code>DELIVERY_ATTEMPT</code> records each channel attempt and is updated by provider webhooks via <code>provider_msg_id</code>. <code>TEMPLATE_VERSION</code> is immutable — a notification references an exact version, so a template edit never changes an in-flight message.</p>
+  <p><strong>Database choices.</strong> Templates, categories and preferences are small, relational and read-mostly: PostgreSQL with aggressive caching (preferences are read for every send, so cache them in Redis or in-process with short TTL and invalidation on update). Notifications and attempts are high-volume, append-mostly, keyed by ID, and queried by ID or by user for recent history: Cassandra/DynamoDB with TTL (90 days), or partitioned PostgreSQL tables dropped by month if volume allows. The in-app inbox is a per-user timeline: wide-column store, partition <code>user_id</code>, clustered by time-ordered <code>item_id</code> descending. Dedup keys and rate-limit counters live in Redis.</p>
+
+  <h4>The processing pipeline, stage by stage</h4>
+  <ol>
+    <li><strong>Accept.</strong> The API validates the request, checks the idempotency key (<code>INSERT ... ON CONFLICT DO NOTHING</code> on <code>(caller, idem_key)</code>), writes the notification row and an <em>outbox</em> row in one transaction, and returns 202. A relay (Debezium CDC or a polling publisher) moves outbox rows to the Kafka topic for the category's priority: <code>notif.p0</code>, <code>notif.p1</code>, <code>notif.p2</code>. Scheduled sends go to a scheduler store instead and are released at <code>send_at</code>.</li>
+    <li><strong>Plan.</strong> A planner consumer per priority loads the category policy and the user's preferences, applies opt-outs, quiet hours (P2 is deferred; P0 ignores quiet hours), frequency caps and expiry, resolves device tokens and addresses, and decides the channel plan. It emits one <em>channel task</em> per (notification, channel) to channel topics such as <code>push.p0</code>, <code>sms.p1</code>.</li>
+    <li><strong>Render.</strong> Rendering can happen in the planner or in channel workers. We render in channel workers (closer to the channel-specific format and limits — SMS segment length, push payload limit, email MIME) using cached immutable template versions.</li>
+    <li><strong>Send.</strong> Channel workers check the dedup key <code>(notification_id, channel)</code> with Redis <code>SET NX</code>, acquire a token from the provider's rate limiter, call the provider through an adapter wrapped in timeouts and a circuit breaker, and record the attempt.</li>
+    <li><strong>Retry or fail over.</strong> Retryable errors (timeouts, 429, 5xx) go to delay topics with exponential backoff and jitter; non-retryable errors (invalid token, hard bounce) mark the attempt failed and trigger hygiene (deactivate the token, suppress the address). If the provider's breaker is open, the adapter routes to the secondary provider.</li>
+    <li><strong>Track.</strong> Provider webhooks and app-open events update attempt status, feed analytics, and can trigger escalation rules ("if push not opened in 10 min and category allows, send SMS").</li>
+  </ol>
+
+  <h4>Why dedup needs two layers</h4>
+  <p>The idempotency key at the API stops a <em>caller</em> from creating two notifications. It does nothing about the platform itself sending twice: a channel worker can call APNs, succeed, and crash before committing its Kafka offset; after rebalancing, another worker reprocesses the task. The send-side marker <code>SET dedup:{notificationId}:{channel} 1 NX EX 86400</code> taken <em>before</em> calling the provider closes most of that window. There is an inherent trade-off: if you set the marker and then crash before calling the provider, the message is never sent (at-most-once for that task). For P0 OTPs a lost message is worse than a duplicate, so we store a <em>state</em> rather than a flag — <code>SENDING</code> with a short TTL (e.g. 60 s), then <code>SENT</code> with a 24 h TTL — and allow reprocessing only after <code>SENDING</code> expires. Some providers also accept an idempotency or client reference that suppresses duplicates on their side; use it where available.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: The Three Designs End to End</h2>
+  <p>For each design: the high-level architecture, the key flows, component responsibilities, bottlenecks, failure modes, security, trade-offs and an illustrative infrastructure estimate.</p>
+
+  <h3>5.1 URL shortener — high-level architecture</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  U[Browser or app] --> CDN["CDN / edge (caches 302 briefly)"]
+  CDN --> LB[L7 load balancer]
+  LB --> R["Redirect service (stateless, Caffeine L1)"]
+  LB --> W["Link API (Spring Boot)"]
+  R --> RC[("Redis cluster L2")]
+  R --> KV[("Links KV store: DynamoDB or Cassandra")]
+  W --> KV
+  W --> LS[("Lease store: etcd or atomic counter")]
+  W --> SB["Safe-browsing / malware check"]
+  R -. click events .-> K[(Kafka: clicks)]
+  K --> F["Stream aggregator"]
+  F --> OLAP[("OLAP: ClickHouse / Pinot")]
+  W --> OLAP
+</pre>
+  <figcaption>Figure 10.4 — URL shortener architecture: separate read and write paths, layered caches, asynchronous analytics.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the read path (left to right along the top) and the write path are separate deployables because they scale on completely different axes: 350,000 redirects/s versus 3,500 creates/s. The redirect service is tiny — parse the code, look it up through L1 (in-process Caffeine, a few hundred thousand entries), L2 (Redis), and finally the KV store, then respond. It never blocks on analytics: click events are written to a local buffer and shipped to Kafka asynchronously (if Kafka is unavailable, the buffer drops oldest events rather than slowing redirects). The link API owns validation, safety checks, ID leasing and owner operations, and reads stats from the OLAP store.</p>
+
+  <h4>Key flows</h4>
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant API as Link API
+  participant SB as Safety check
+  participant G as Code generator (in-process)
+  participant KV as Links store
+  C->>API: POST /v1/links (Idempotency-Key)
+  API->>API: auth, rate limit per account, normalise URL
+  API->>SB: check destination reputation
+  SB-->>API: allowed
+  API->>G: next code
+  G-->>API: feistel(counter) as base62
+  API->>KV: put(code, longUrl, owner) if absent
+  KV-->>API: ok
+  API-->>C: 201 Created, shortUrl
+  Note over C,KV: Redirect path
+  C->>API: GET /k3Xq9Za (via CDN and redirect service)
+  API->>API: L1 hit? else Redis? else KV
+  API-->>C: 302 Location longUrl
+  API--)API: enqueue click event (async)
+</pre>
+  <figcaption>Figure 10.5 — Create and redirect flows.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> creation does all slow work (safety check, conditional write) up front, because it is rare. Redirection does nothing but lookups. The "put if absent" is only strictly needed for custom aliases; for generated codes it is a cheap defence in depth. Note the asynchronous arrow for click events: in Spring terms this is <em>not</em> an <code>@Async</code> method that might queue unboundedly, but a bounded, non-blocking producer (Kafka producer with <code>linger.ms</code> batching and <code>max.block.ms</code> set very low).</p>
+
+  <h4>Component responsibilities</h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Component</th><th>Responsibility</th><th>Scaling unit</th></tr></thead>
+    <tbody>
+      <tr><td>CDN / edge</td><td>TLS termination near users; optional short caching of redirects; DDoS absorption.</td><td>Provider-managed</td></tr>
+      <tr><td>Redirect service</td><td>Code lookup through L1/L2/KV; 302 response; click event emission; negative caching of unknown codes.</td><td>Stateless pods, CPU-bound</td></tr>
+      <tr><td>Link API</td><td>AuthN/Z, quota, URL normalisation and validation, safety check, code generation, CRUD.</td><td>Stateless pods</td></tr>
+      <tr><td>Lease store</td><td>Hands out disjoint counter ranges; must be linearizable.</td><td>3–5 node etcd or a managed atomic counter</td></tr>
+      <tr><td>Links store</td><td>Durable mapping; multi-AZ, optionally multi-region replicated.</td><td>Partitions by hash(code)</td></tr>
+      <tr><td>Redis L2</td><td>Shared hot-set cache (~60 GB); also rate-limit counters.</td><td>Cluster shards</td></tr>
+      <tr><td>Click pipeline</td><td>Kafka → stream aggregation (per minute per code/dimension) → OLAP.</td><td>Partitions by code</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Scaling bottlenecks and how to remove them</h4>
+  <ul>
+    <li><strong>Hot key (viral link).</strong> One code at 50,000 req/s would pin a single Redis shard. L1 in-process caching spreads it across all redirect pods; a short CDN cache (even 5–30 s) removes it almost entirely. For extreme cases, replicate hot keys under suffixed keys (<code>code#0..7</code>) in Redis.</li>
+    <li><strong>Cache stampede on cold start or eviction.</strong> Use request coalescing (Caffeine's <code>AsyncLoadingCache</code> ensures a single in-flight load per key per pod) and jittered TTLs.</li>
+    <li><strong>Enumeration and negative lookups.</strong> Scrapers request random codes; each miss hits the KV store. Cache negatives briefly, and front the store with a Bloom filter of existing codes (false positives just fall through to the store).</li>
+    <li><strong>Lease-store dependency.</strong> Pods lease the next block when the current one is 80% consumed, so a lease-store outage of minutes does not stop creation.</li>
+    <li><strong>Analytics write load.</strong> 116 K events/s straight into an OLAP store is possible (ClickHouse and Pinot handle it with batching), but pre-aggregating per minute in the stream processor cuts rows by orders of magnitude.</li>
+  </ul>
+
+  <h4>Failure scenarios and mitigations</h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Failure</th><th>Impact</th><th>Mitigation</th></tr></thead>
+    <tbody>
+      <tr><td>Redis cluster down</td><td>All L2 misses go to KV store; 10–50× load increase on it.</td><td>L1 absorbs the hot set; KV provisioned (or on-demand) for cache-miss surge; circuit breaker around Redis so latency does not cascade.</td></tr>
+      <tr><td>KV store partition unavailable</td><td>Redirects for affected codes fail unless cached.</td><td>Multi-AZ replication, read at consistency ONE/LOCAL_ONE for redirects (data is immutable, so stale reads are harmless); serve from cache past TTL ("stale-if-error").</td></tr>
+      <tr><td>Region outage</td><td>All traffic in region lost.</td><td>Multi-region active-active reads with async replication (DynamoDB global tables or Cassandra multi-DC); because mappings are immutable, conflicts cannot occur except for aliases, which are created only in a home region with a global conditional check.</td></tr>
+      <tr><td>Lease store down</td><td>Cannot obtain new ranges.</td><td>Pre-fetch next range; fallback generator (random code with conditional insert).</td></tr>
+      <tr><td>Kafka down</td><td>Click analytics gap.</td><td>Bounded local buffer, drop with metric; never block redirects. Analytics are explicitly best-effort.</td></tr>
+      <tr><td>Malicious link created</td><td>Your domain becomes a phishing vector; domain gets blocklisted.</td><td>Synchronous reputation check, asynchronous rescans, takedown flag (410) cached with short TTL, abuse reporting endpoint.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Security considerations</h4>
+  <ul>
+    <li><strong>Open-redirect abuse</strong> is the primary risk: validate schemes (<code>http</code>/<code>https</code> only; reject <code>javascript:</code>, <code>data:</code>), reject redirects to your own shortener (loops), and scan destinations.</li>
+    <li><strong>Enumeration:</strong> scrambled codes plus rate limits per IP on 404s. Private links should require auth or a longer random code.</li>
+    <li><strong>Account takeover:</strong> immutable destinations and audit logs.</li>
+    <li><strong>Analytics privacy:</strong> do not store full IP addresses; derive country at the edge and discard the IP; honour Do-Not-Track/consent rules in jurisdictions that require it.</li>
+  </ul>
+
+  <h4>Trade-offs</h4>
+  <p>Counter-based codes avoid conditional writes but need a lease service; random codes need conditional writes but no coordination. 302 keeps control and analytics, 301 saves cost. Global dedup saves storage but leaks information across tenants. Synchronous safety checks add 20–100 ms to creation (acceptable) but must never be on the redirect path.</p>
+
+  <h4>Estimated infrastructure <span class="tag illus">Illustrative</span></h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Tier</th><th>Sizing logic</th><th>Estimate</th></tr></thead>
+    <tbody>
+      <tr><td>Redirect service</td><td>350 K req/s peak; ~10 K req/s per 4-vCPU pod with L1 hits; ×1.5 headroom, ×2 regions</td><td>≈ 100 pods total</td></tr>
+      <tr><td>Link API</td><td>3.5 K req/s; ~500 req/s per pod (safety call latency)</td><td>≈ 12 pods per region</td></tr>
+      <tr><td>Redis</td><td>60 GB hot set + replicas</td><td>6 shards × (primary + replica), 16 GB each, per region</td></tr>
+      <tr><td>Links store</td><td>275 TB at RF 3 after 5 years; ~2 TB per node</td><td>≈ 140 Cassandra nodes eventually (or DynamoDB on-demand)</td></tr>
+      <tr><td>Kafka (clicks)</td><td>35 MB/s, 3-day retention, RF 3</td><td>≈ 27 TB; 6 brokers</td></tr>
+      <tr><td>OLAP</td><td>pre-aggregated rollups ~ 50 GB/day</td><td>6–12 nodes</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>5.2 Messaging — high-level architecture</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  subgraph Clients
+    A[Alice phone]
+    B[Bob phone and laptop]
+  end
+  A -- "TLS / WebSocket" --> GW1["Gateway 17 (Go / Netty)"]
+  B -- "TLS / WebSocket" --> GW2["Gateway 42"]
+  GW1 --> SR[("Session registry: Redis")]
+  GW2 --> SR
+  GW1 -- gRPC --> CS["Chat service (owner of conv shard)"]
+  CS --> MS[("Message log / inbox: Cassandra or ScyllaDB")]
+  CS --> GS["Group service"]
+  GS --> GDB[("Group metadata: sharded SQL")]
+  CS -- "route to gateway" --> GW2
+  CS -- "recipient offline" --> PQ[(Kafka: push-wakeups)]
+  PQ --> PN["Push sender: APNs / FCM"]
+  GW1 --> PS["Presence service"]
+  PS --> PR[("Redis presence keys with TTL")]
+  A -- HTTPS --> MED["Media API"]
+  MED --> OBJ[("Object storage: encrypted blobs")]
+  OBJ --> CDN[CDN]
+  A -- HTTPS --> KEYS["Key distribution service"]
+  KEYS --> KDB[("Prekeys store")]
+</pre>
+  <figcaption>Figure 10.6 — Messaging architecture: stateful gateways, conversation-owning chat services, store-and-forward inboxes and an out-of-band media path.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the gateway tier is the only stateful edge. Gateways terminate TLS and the persistent connection, authenticate the device once at connect time, register <code>(userId, deviceId) → gatewayId</code> in the session registry, and forward frames over gRPC. They contain no business logic, which lets you deploy business changes without disconnecting 150 M users. The chat service is partitioned by conversation (consistent hashing over <code>conv_id</code>, membership via a coordination service), and each conversation has exactly one owner at a time that assigns <code>conv_seq</code>. Media never touches the chat path: clients upload encrypted blobs directly to object storage using pre-signed URLs and send only references through chat. Push notifications are a separate asynchronous path, used only to wake offline devices.</p>
+
+  <h4>Key flow: sending a 1:1 message</h4>
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant A as Alice device
+  participant G1 as Gateway (Alice)
+  participant CS as Chat service owner
+  participant DB as Inbox store
+  participant SR as Session registry
+  participant G2 as Gateway (Bob)
+  participant B as Bob device
+  participant P as Push sender
+  A->>G1: Send(client_msg_id, conv, ciphertexts per device)
+  G1->>CS: forward (authenticated sender)
+  CS->>CS: dedup client_msg_id, assign conv_seq
+  CS->>DB: write inbox entries per recipient device (quorum)
+  DB-->>CS: ok
+  CS-->>G1: SendAck(server_msg_id, conv_seq)
+  G1-->>A: single tick (sent)
+  CS->>SR: lookup Bob devices
+  alt Bob online
+    SR-->>CS: device1 at gateway 42
+    CS->>G2: Deliver(...)
+    G2->>B: Deliver frame
+    B-->>G2: Ack(server_msg_id)
+    G2->>CS: device ack
+    CS->>DB: delete or mark inbox entry
+    CS->>G1: Receipt delivered
+    G1-->>A: double tick (delivered)
+  else Bob offline
+    SR-->>CS: no session
+    CS->>P: wake-up push (no content)
+  end
+</pre>
+  <figcaption>Figure 10.7 — 1:1 send with persistence before acknowledgement, online delivery, device ack and receipts.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the ordering of steps 4–6 is the core durability rule — <em>persist before acknowledging the sender</em>. If the chat service crashed after step 6 but before delivery, Bob's device will still find the message in its inbox when it next syncs. Deduplication in step 3 uses <code>client_msg_id</code> (with a short-lived cache of recently seen IDs per conversation); if Alice's connection drops before she sees the ack, her client resends with the same ID and receives the same <code>server_msg_id</code>. Delivery to Bob is at-least-once; Bob's client dedups by <code>server_msg_id</code>. The inbox entry is removed only after the <em>device</em> acknowledges, not after the gateway writes to the socket — a socket write succeeding says nothing about whether the phone processed it. The push for an offline device carries no message content (with E2EE the server has none); it merely wakes the app to connect and sync.</p>
+
+  <h4>Key flow: reconnect and sync</h4>
+  <p>When a device reconnects (to any gateway), it sends its last acknowledged position. The gateway registers the new session, then asks the inbox service for entries after that position in pages of, say, 100, delivering them before switching to live delivery. A race exists: a live message could arrive while the backlog is being paged. The standard fix is to register the session first (so live messages begin to flow), buffer live messages in the gateway, drain the backlog, then flush the buffer, with the client deduplicating by <code>server_msg_id</code>. Ordering is restored by <code>conv_seq</code> on the client.</p>
+
+  <h4>Key flow: group message with Sender Keys</h4>
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant S as Sender device
+  participant CS as Chat service (group owner)
+  participant GS as Group service
+  participant Q as Per-device inboxes
+  participant GW as Gateways
+  S->>CS: Send(group, one ciphertext under sender key)
+  CS->>GS: members and devices (cached)
+  GS-->>CS: 312 devices
+  CS->>CS: assign conv_seq once
+  CS->>Q: write 312 inbox refs (or one log entry plus cursors)
+  CS-->>S: SendAck
+  par online devices
+    CS->>GW: Deliver to devices grouped by gateway
+  and offline devices
+    CS->>CS: enqueue wake-up pushes (coalesced)
+  end
+</pre>
+  <figcaption>Figure 10.8 — Group fan-out: one ciphertext, one sequence number, per-device delivery grouped by gateway.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> Sender Keys let the server fan out a single ciphertext. Two optimisations matter at scale. First, <strong>batch by gateway</strong>: 312 devices might live on 150 gateways, so the chat service sends 150 RPCs each carrying a device list, not 312. Second, <strong>write once, reference many</strong>: for large groups store the message once in the conversation log and give each device a cursor (<code>read_up_to_seq</code>) rather than copying the payload into 312 inboxes. That is the fan-out-on-read model from §3.7, and it is how channel-oriented products such as Slack and Discord scale to very large channels.</p>
+
+  <h4>Component responsibilities</h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Component</th><th>Responsibility</th><th>State</th></tr></thead>
+    <tbody>
+      <tr><td>Gateway</td><td>TLS, connection lifecycle, auth at connect, heartbeats, frame codec, local buffering, backpressure per connection.</td><td>Connections (soft state)</td></tr>
+      <tr><td>Session registry</td><td>(user, device) → gateway, connection epoch.</td><td>Redis with TTL refreshed by heartbeat</td></tr>
+      <tr><td>Chat service</td><td>Conversation ownership, dedup, sequence assignment, persistence, routing, receipts.</td><td>Per-conversation counters (recoverable)</td></tr>
+      <tr><td>Group service</td><td>Membership, roles, invite links, member-device lists for fan-out.</td><td>Sharded SQL + cache</td></tr>
+      <tr><td>Inbox / message store</td><td>Store-and-forward per device, optional history log.</td><td>Cassandra/ScyllaDB</td></tr>
+      <tr><td>Presence service</td><td>Heartbeat ingestion, subscription-based fan-out, privacy filtering.</td><td>Redis keys with TTL</td></tr>
+      <tr><td>Key distribution</td><td>Store public identity/prekeys; atomic one-time prekey hand-out; low-prekey alerts.</td><td>Durable KV</td></tr>
+      <tr><td>Media API</td><td>Issue pre-signed upload/download URLs, enforce size/type quotas, lifecycle deletion.</td><td>Object storage</td></tr>
+      <tr><td>Push sender</td><td>Wake offline devices via APNs/FCM (could reuse the notification platform in §5.3).</td><td>Kafka consumer</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Database decisions</h4>
+  <p>The inbox write path is ~1.5 M deliveries/s in our estimate. LSM-based stores (Cassandra, ScyllaDB) turn these into sequential appends, and partition-by-(device, day) keeps reads local. Use <code>LOCAL_QUORUM</code> writes before acknowledging so a single replica failure loses nothing, and <code>LOCAL_QUORUM</code> reads on sync. Group metadata needs transactions (add member and bump membership version atomically) and is tiny by comparison: sharded MySQL/PostgreSQL keyed by <code>group_id</code>. The session registry is pure soft state: if Redis loses it, gateways re-register on the next heartbeat, so a non-persistent Redis cluster is acceptable <span class="tag opinion">Opinion</span>.</p>
+
+  <h4>Scaling bottlenecks and how to remove them</h4>
+  <ul>
+    <li><strong>Reconnect storms.</strong> A gateway deploy or crash drops 250 K connections, all of which reconnect within seconds, each performing TLS handshakes, auth and sync. Mitigations: drain gateways gradually (stop accepting, then close connections over minutes with jittered "reconnect" hints), client-side exponential backoff with jitter, TLS session resumption, and rate-limited sync.</li>
+    <li><strong>Hot conversations.</strong> A 1,024-member group in heavy use is one owner and one partition. Keep group payloads written once (cursor model), and bucket the log by time.</li>
+    <li><strong>Session registry lookups.</strong> 1.5 M deliveries/s means 1.5 M lookups/s; cache device→gateway mappings in the chat service, invalidated by connection-epoch changes.</li>
+    <li><strong>Gateway memory.</strong> Per-connection buffers dominate. Use small read buffers, release write buffers when idle, and in Go avoid one goroutine per direction per connection if memory is tight (or accept ~8–16 KB of goroutine stacks per connection).</li>
+    <li><strong>Presence fan-out.</strong> Subscription-based and debounced as described in §4.2; shed presence first under load.</li>
+  </ul>
+
+  <h4>Failure scenarios and mitigations</h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Failure</th><th>Impact</th><th>Mitigation</th></tr></thead>
+    <tbody>
+      <tr><td>Gateway crash</td><td>Its users disconnect; in-flight deliveries not acked.</td><td>Unacked inbox entries persist; clients reconnect elsewhere and sync; session registry entries expire by TTL or are overwritten by a higher epoch.</td></tr>
+      <tr><td>Chat service owner crash</td><td>Conversations on that shard briefly unavailable.</td><td>Ownership lease (e.g. 10 s) moves to another node; new owner restores <code>last_seq</code> from storage; clients retry sends with the same <code>client_msg_id</code>.</td></tr>
+      <tr><td>Split ownership (two owners)</td><td>Duplicate sequence numbers.</td><td>Fencing token: each owner epoch is included in writes, and storage uses a conditional update on <code>(conv_id, last_seq, epoch)</code> so a stale owner's writes fail. See <a href="p2-08-microservices-resilience.html">distributed locks and fencing</a>.</td></tr>
+      <tr><td>Inbox store slow</td><td>Send acks delayed; senders see a clock icon.</td><td>Timeouts with client retry (idempotent); speculative retry to another replica; shed presence and typing first.</td></tr>
+      <tr><td>Push provider outage</td><td>Offline users not woken.</td><td>Messages are safe in inboxes; delivered on next app open; retry pushes with backoff.</td></tr>
+      <tr><td>Region outage</td><td>Users homed there disconnected.</td><td>Clients reconnect to another region; user's inbox replicated cross-region asynchronously (risk: messages accepted in the last seconds before failure may be delayed until recovery). Choose per-user home regions to keep most traffic local.</td></tr>
+      <tr><td>Clock skew</td><td>Misordered display if ordering by timestamps.</td><td>Order by server-assigned <code>conv_seq</code>, never by device clocks.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Security considerations</h4>
+  <ul>
+    <li><strong>E2EE key distribution integrity:</strong> a malicious or compromised server could hand out its own keys (a man-in-the-middle). The protocol's defence is out-of-band verification of safety numbers and warnings on key change; key transparency logs (WhatsApp announced a key-transparency deployment in 2023) make silent substitution detectable.</li>
+    <li><strong>Metadata:</strong> even with E2EE the server sees who talks to whom and when. Minimise logs, shorten retention, and consider sealed-sender-style designs (Signal hides the sender from the server for delivery).</li>
+    <li><strong>Authentication:</strong> device-bound credentials (keys generated on device, registration via SMS/phone verification with abuse limits), token rotation, and per-device revocation.</li>
+    <li><strong>Abuse and spam:</strong> without content access, rely on metadata signals (send rate, new-account fan-out, report rates) and user reporting (which can include the reported messages, decrypted by the reporting client).</li>
+    <li><strong>Media:</strong> pre-signed URLs with short expiry, content-length limits, and scanning only where not E2EE.</li>
+  </ul>
+
+  <h4>Trade-offs</h4>
+  <p>Device-held history (WhatsApp model) minimises server storage and liability but makes multi-device sync and search harder; server-held history (Slack/Discord) enables search, compliance export and seamless multi-device but is incompatible with full E2EE unless clients do the indexing. Per-device pairwise encryption is simple and strong for 1:1 but expensive for large groups; Sender Keys are efficient but weaken post-compromise security within the group until keys rotate (the IETF's Messaging Layer Security, RFC 9420 published in 2023, is designed to give large groups efficient key updates). WebSocket is universal for web; custom binary protocols save bandwidth and battery on mobile.</p>
+
+  <h4>Estimated infrastructure <span class="tag illus">Illustrative</span></h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Tier</th><th>Sizing logic</th><th>Estimate</th></tr></thead>
+    <tbody>
+      <tr><td>Gateways</td><td>150 M connections / 250 K per host, +30%</td><td>≈ 800 hosts (16 vCPU, 64 GB) across regions</td></tr>
+      <tr><td>Chat service</td><td>700 K sends/s peak, ~5 K sends/s per pod (fan-out RPCs)</td><td>≈ 200 pods</td></tr>
+      <tr><td>Inbox store</td><td>1.5 M writes/s + deletes; ~30 K writes/s per ScyllaDB node (illustrative)</td><td>≈ 150–200 nodes incl. RF 3</td></tr>
+      <tr><td>Redis (sessions + presence)</td><td>150 M sessions × ~150 B + presence keys</td><td>≈ 50 GB; 12–20 shards</td></tr>
+      <tr><td>Object storage</td><td>200 TB/day uploaded, 30-day retention for undelivered/expired media</td><td>≈ 6 PB rolling</td></tr>
+      <tr><td>CDN egress</td><td>~74 Gbit/s average, peaks ~3×</td><td>multi-CDN commit</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>5.3 Notification platform — high-level architecture</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  SVC[Internal services] --> API["Notification API (Spring Boot)"]
+  API --> PG[("PostgreSQL: notifications + outbox")]
+  PG -- CDC --> K0[(Kafka notif.p0)]
+  PG -- CDC --> K1[(Kafka notif.p1)]
+  PG -- CDC --> K2[(Kafka notif.p2)]
+  SCH["Scheduler"] --> K1
+  SCH --> K2
+  K0 --> PL["Planner: preferences, caps, quiet hours"]
+  K1 --> PL
+  K2 --> PL
+  PL --> PREF[("Prefs cache: Redis")]
+  PL --> CH0[(push / sms / email topics per priority)]
+  CH0 --> PW["Push workers"]
+  CH0 --> SW["SMS workers"]
+  CH0 --> EW["Email workers"]
+  CH0 --> IW["In-app inbox writer"]
+  PW --> APNS[APNs]
+  PW --> FCM[FCM]
+  SW --> SMSA[SMS provider A]
+  SW --> SMSB[SMS provider B]
+  EW --> ESP[Email provider]
+  IW --> INB[("Inbox store")]
+  APNS -. feedback .-> TR["Tracking service"]
+  SMSA -. webhooks .-> TR
+  ESP -. webhooks .-> TR
+  TR --> OLAP[("Delivery analytics")]
+  PW --> RL[("Redis: dedup + rate limits")]
+  SW --> RL
+  EW --> RL
+</pre>
+  <figcaption>Figure 10.9 — Notification platform: outbox-fed priority topics, a planning stage, per-channel worker pools and provider adapters with feedback.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> priority is structural — three topics, three consumer groups, and per-channel topics split by priority, each with its own worker pool and autoscaling policy. P0 pools are over-provisioned and never shared with P2. The planner is the only component that knows about users (preferences, caps, quiet hours, device tokens); channel workers know only about channels and providers. That separation keeps provider integrations simple and makes the planner the single place where compliance rules live. Feedback (APNs responses, provider webhooks) flows back through a tracking service that updates attempt status and performs hygiene (invalidating tokens, suppressing bounced addresses).</p>
+
+  <h4>Key flow: an OTP with provider failover</h4>
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant Auth as Auth service
+  participant API as Notification API
+  participant K as Kafka sms.p0
+  participant W as SMS worker
+  participant R as Redis
+  participant A as SMS provider A
+  participant B as SMS provider B
+  Auth->>API: POST (category security.otp, Idempotency-Key login-123, expiresAt +5m)
+  API->>API: insert notification + outbox in one tx
+  API-->>Auth: 202 Accepted
+  API--)K: relay outbox to sms.p0
+  K->>W: task(ntf, sms)
+  W->>R: SET dedup:ntf:sms SENDING NX EX 60
+  R-->>W: OK
+  W->>R: token bucket provider A, country IN
+  W->>A: send (timeout 2s)
+  A-->>W: 503 / timeout
+  W->>W: breaker for A records failure (opens at threshold)
+  W->>B: send via secondary provider
+  B-->>W: accepted (msg id)
+  W->>R: SET dedup:ntf:sms SENT EX 86400
+  W->>K: commit offset
+</pre>
+  <figcaption>Figure 10.10 — P0 OTP send path with dedup state, per-provider rate limit and failover.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the OTP is accepted durably before any provider call, so the auth service's latency does not depend on the SMS provider. The worker's dedup marker starts as <code>SENDING</code> with a short TTL so that a crash between steps 7 and 12 permits a retry after a minute (preferring a possible duplicate to a lost OTP) while a completed send is protected for a day. Failover is decided per call by the circuit breaker on provider A; when A recovers, the breaker's half-open probes restore it. An expired OTP (past <code>expiresAt</code>) is dropped at any stage — sending a stale code is worse than not sending.</p>
+
+  <h4>Rate limiting: three different limiters</h4>
+  <p>The platform runs three distinct limiters, and confusing them is a common design error:</p>
+  <ol>
+    <li><strong>Caller quota</strong> at the API (per calling service), protecting the platform from a buggy producer looping.</li>
+    <li><strong>User frequency caps</strong> in the planner (e.g. at most 3 marketing pushes per user per day; P0 exempt), a <em>business</em> rule implemented with per-user counters keyed by day.</li>
+    <li><strong>Provider throughput limits</strong> in channel workers (e.g. an SMS account limited to N messages/s per sender ID or per country; APNs and FCM have their own throttles). These are distributed token buckets shared by all workers, typically a Redis Lua script.</li>
+  </ol>
+  <figure class="diagram">
+    <div class="widget" data-widget="rate-limiter"></div>
+    <figcaption>Figure 10.11 — Interactive: token bucket vs fixed window vs sliding-window log under bursts.</figcaption>
+  </figure>
+  <p><strong>What to try:</strong> configure a burst similar to a campaign start — a large spike after a quiet period. Observe that the fixed-window limiter admits up to twice the limit across a window boundary, which is exactly how you exceed an SMS provider's per-second limit and start receiving 429s. The token bucket smooths the burst to the refill rate after the initial bucket drains, which is the behaviour you want for provider limits; the sliding-window log is precise but memory-hungry, which is acceptable for per-user caps with small limits but not for 10,000 msg/s provider quotas.</p>
+
+  <h4>Component responsibilities</h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Component</th><th>Responsibility</th></tr></thead>
+    <tbody>
+      <tr><td>Notification API</td><td>AuthN of caller services, schema validation, idempotency, caller quotas, transactional outbox, status queries.</td></tr>
+      <tr><td>Scheduler</td><td>Holds future sends and campaign batches; releases them at time (e.g. a time-bucketed table polled per minute, or a delay-queue service); expands segments lazily in pages.</td></tr>
+      <tr><td>Planner</td><td>Category policy, preferences, opt-outs, quiet hours by time zone, frequency caps, expiry, channel selection, address/token resolution.</td></tr>
+      <tr><td>Channel workers</td><td>Rendering, payload limits, dedup state, provider rate limits, provider calls with timeouts/breakers, retries to delay topics, DLQ.</td></tr>
+      <tr><td>Provider adapters</td><td>Uniform interface over APNs (HTTP/2, token-based auth), FCM HTTP v1, SMS and email APIs; error classification (retryable vs permanent).</td></tr>
+      <tr><td>Tracking service</td><td>Webhook ingestion (signature-verified), status updates, token/email hygiene, escalation triggers.</td></tr>
+      <tr><td>Preference service</td><td>CRUD, consent audit log, one-click unsubscribe endpoints, cache invalidation events.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Scaling bottlenecks</h4>
+  <ul>
+    <li><strong>Campaign expansion.</strong> Materialising 50 M notification rows at once floods the database and Kafka. Expand segments in pages (e.g. 10 K users) with a ramp schedule, and do not store a full <code>NOTIFICATION</code> row per marketing recipient — store a campaign row plus per-user attempts.</li>
+    <li><strong>Preference lookups.</strong> One lookup per notification; cache aggressively; batch lookups for campaigns.</li>
+    <li><strong>Provider throughput.</strong> Often the true ceiling. Use multiple provider accounts/sender IDs, and shape campaign traffic to stay under limits rather than relying on 429-driven retries.</li>
+    <li><strong>Head-of-line blocking.</strong> A slow provider stalls a partition. Use bounded in-flight concurrency per worker with async I/O, and move slow retries to delay topics instead of sleeping in the consumer.</li>
+  </ul>
+
+  <h4>Failure scenarios and mitigations</h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Failure</th><th>Impact</th><th>Mitigation</th></tr></thead>
+    <tbody>
+      <tr><td>SMS provider outage</td><td>OTP failures; logins blocked.</td><td>Circuit breaker + secondary provider; per-country routing table; alert on success-rate drop.</td></tr>
+      <tr><td>APNs returns token invalid</td><td>Wasted sends; possible throttling.</td><td>Mark token invalid on the provider's "unregistered"/bad-token responses; stop sending to it.</td></tr>
+      <tr><td>Worker crash after provider call</td><td>Duplicate on reprocessing.</td><td>Dedup state machine (SENDING/SENT) and provider-side idempotency where offered.</td></tr>
+      <tr><td>Kafka partition leader failover</td><td>Brief stall.</td><td>Producer retries with idempotent producer enabled; consumers resume from committed offsets.</td></tr>
+      <tr><td>Bad template deployed</td><td>Broken or embarrassing messages at scale.</td><td>Immutable versions, preview/test sends, canary campaign to a seed list, kill switch per template and per campaign.</td></tr>
+      <tr><td>Runaway producer loop</td><td>Users spammed.</td><td>Caller quotas, per-user frequency caps, anomaly alerts on per-category volume, global kill switch.</td></tr>
+      <tr><td>Preference service down</td><td>Cannot evaluate opt-outs.</td><td>Use last cached preferences; if unknown, fail <em>closed</em> for marketing (do not send) and open for P0.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Security considerations</h4>
+  <ul>
+    <li>Treat templates as code: escape variables in HTML email (template injection and XSS in in-app inbox rendering), restrict who can publish templates, and review them.</li>
+    <li>Never put secrets in notification payloads beyond what is necessary (an OTP is necessary; an account number is not). Push payloads transit Apple/Google and are visible on lock screens.</li>
+    <li>Verify provider webhook signatures; otherwise anyone can mark messages delivered or addresses bounced.</li>
+    <li>SMS pumping fraud: attackers trigger OTPs to premium-rate numbers to earn revenue share. Mitigate with per-number and per-prefix rate limits, country allow-lists, and CAPTCHA/risk scoring before OTP issuance.</li>
+    <li>Email authentication (SPF, DKIM, DMARC) and one-click unsubscribe headers for bulk mail.</li>
+  </ul>
+
+  <h4>Trade-offs</h4>
+  <p>A central platform gives consistent policy, compliance and cost control but becomes a shared dependency (treat it as tier-0 for P0). Rendering early (in the planner) simplifies workers but couples them to user data; rendering late keeps workers channel-specific. Strict dedup risks occasional lost sends; loose dedup risks duplicates — choose per category. Self-hosted email (MTA fleets) can be cheaper at very high volume but deliverability reputation management is a specialist job; most teams should use a provider <span class="tag opinion">Opinion</span>.</p>
+
+  <h4>Estimated infrastructure <span class="tag illus">Illustrative</span></h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Tier</th><th>Sizing logic</th><th>Estimate</th></tr></thead>
+    <tbody>
+      <tr><td>Notification API</td><td>~12 K/s avg, 40 K/s peak, ~2 K/s per pod</td><td>≈ 25 pods</td></tr>
+      <tr><td>Kafka</td><td>~40 K msg/s × 2 KB × several stages, 7-day retention</td><td>6–9 brokers</td></tr>
+      <tr><td>Planner</td><td>40 K/s, preference cache hits</td><td>≈ 20 pods</td></tr>
+      <tr><td>Channel workers</td><td>I/O bound; ~1 K concurrent provider calls per pod</td><td>≈ 30–60 pods across channels</td></tr>
+      <tr><td>Redis</td><td>dedup ~100 GB + counters</td><td>8–12 shards</td></tr>
+      <tr><td>Delivery store</td><td>~90 TB hot</td><td>Cassandra/DynamoDB, ≈ 50 nodes at RF 3 (or managed)</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="math">
+  <h2>6. Mathematical Foundations: The Estimation Toolkit</h2>
+  <p>System-design arithmetic is not about precision; it is about getting the <em>order of magnitude</em> right so you choose the right architecture. Every number below is an input you will revisit with real telemetry. All worked values are <span class="tag illus">Illustrative</span>.</p>
+
+  <h3>6.1 Throughput from user behaviour</h3>
+  <p>Intuition: total daily actions spread over 86,400 seconds, then multiplied by a peak factor because traffic is never flat.</p>
+  \[ \text{QPS}_{\text{avg}} = \frac{\text{DAU} \times a}{86\,400}, \qquad \text{QPS}_{\text{peak}} = k \cdot \text{QPS}_{\text{avg}},\; k \in [2, 5] \]
+  <p>For messaging: \(500\text{M} \times 40 / 86\,400 \approx 231\text{K/s}\), peak \(\approx 700\text{K/s}\) with \(k = 3\). A useful mental shortcut: 1 million per day ≈ 11.6 per second.</p>
+
+  <h3>6.2 Fan-out amplification</h3>
+  <p>If a fraction \(g\) of messages goes to groups of average size \(m\), deliveries per send are</p>
+  \[ D = (1-g)\cdot 1 + g\,(m-1) \]
+  <p>With \(g = 0.3, m = 20\): \(D = 0.7 + 5.7 = 6.4\). Delivery work, not send work, sizes the chat and inbox tiers. Multiply again by devices per user (multi-device) — at 1.3 devices per user, \(D \approx 8.3\).</p>
+
+  <h3>6.3 Storage growth</h3>
+  \[ S = N_{\text{per day}} \times s \times 365 \times Y \times RF \]
+  <p>Shortener: \(10^8 \times 500\,\text{B} \times 365 \times 5 \times 3 \approx 2.7 \times 10^{14}\,\text{B} = 274\,\text{TB}\). Include compaction headroom for LSM stores (often 30–50% free space is recommended during compaction, depending on strategy).</p>
+
+  <h3>6.4 Key space and collisions (birthday bound)</h3>
+  <p>Intuition: collisions appear far sooner than "when the space is full" because every new key can collide with every existing key — the number of pairs grows quadratically. For \(n\) uniformly random keys in a space of size \(N\):</p>
+  \[ P(\text{at least one collision}) \approx 1 - e^{-n^2 / (2N)} \]
+  <p>With \(N = 62^7 \approx 3.52 \times 10^{12}\), a collision becomes 50% likely at only \(n \approx 1.177\sqrt{N} \approx 2.2 \times 10^6\) keys. That is why random codes require a conditional insert: collisions are not rare events you can ignore, they are certain within the first day. What matters operationally is the <em>per-insert</em> collision probability when the table holds \(n\) keys: \(p \approx n/N\). At \(n = 1.8 \times 10^{11}\), \(p \approx 5.1\%\), so the expected number of attempts per insert is \(1/(1-p) \approx 1.05\). A counter-plus-permutation design has \(p = 0\) by construction.</p>
+
+  <h3>6.5 Little's law for concurrency</h3>
+  <p>Intuition: the number of things "in flight" equals arrival rate times how long each stays.</p>
+  \[ L = \lambda W \]
+  <p>Notification workers: \(\lambda = 12\text{K/s}\), provider latency \(W = 300\,\text{ms}\) gives \(L = 3{,}600\) concurrent provider calls. With blocking HTTP clients at 200 threads per pod you need 18 pods just for concurrency; with an async client (or Java 21 virtual threads) a handful of pods suffice and you are bounded by the providers' rate limits instead. Messaging gateways: concurrent connections \(=\) connect rate \(\times\) mean session length — 150 M online users are the \(L\), not an input.</p>
+
+  <h3>6.6 Retry amplification and backoff</h3>
+  <p>If each attempt fails independently with probability \(p\) and you allow up to \(r\) retries, the expected number of attempts is</p>
+  \[ E[\text{attempts}] = \sum_{i=0}^{r} p^{i} = \frac{1 - p^{r+1}}{1 - p} \]
+  <p>At \(p = 0.5\) (a degraded provider) and \(r = 5\), each request costs about 1.97 attempts — nearly doubling load on a provider that is already struggling, which is why retries must be paired with circuit breakers and jittered exponential backoff: \(t_i = \min(t_{\max}, t_0 \cdot 2^{i}) \cdot U(0.5, 1.5)\).</p>
+
+  <h3>6.7 Availability with failover</h3>
+  <p>Components in series multiply availabilities; redundant alternatives multiply <em>un</em>availabilities (assuming independent failures, which is optimistic):</p>
+  \[ A_{\text{series}} = \prod_i A_i, \qquad A_{\text{failover}} = 1 - \prod_j (1 - A_j) \]
+  <p>Two SMS providers each at 99.5% give \(1 - 0.005^2 = 99.9975\%\) in theory. In practice failures correlate (shared carriers, shared country routes), and failover detection takes time, so measured availability is lower — but still far better than a single provider.</p>
+
+  <h3>6.8 Connection memory</h3>
+  \[ M_{\text{host}} = C \times (b_{\text{kernel}} + b_{\text{tls}} + b_{\text{app}}) \]
+  <p>With \(C = 250\text{K}\) and roughly 30 KB per connection, \(M \approx 7.5\,\text{GB}\). Shrinking per-connection application buffers from 16 KB to 4 KB saves 3 GB per host — which across 800 hosts is the difference between needing 64 GB and 32 GB instances.</p>
+
+  <h3>6.9 A small estimation script</h3>
+<pre data-file="estimate.py"><code class="language-python">"""Back-of-envelope calculator for chapter 2.10 (Python 3.10+). All inputs illustrative."""
+import math
+
+DAY = 86_400
+
+def qps(per_day: float, peak_factor: float = 3.0) -&gt; tuple[float, float]:
+    avg = per_day / DAY
+    return avg, avg * peak_factor
+
+def birthday_50(n_space: float) -&gt; float:
+    """Keys at which a collision is 50% likely."""
+    return math.sqrt(2 * n_space * math.log(2))
+
+def expected_attempts(p_fail: float, retries: int) -&gt; float:
+    return sum(p_fail ** i for i in range(retries + 1))
+
+if __name__ == "__main__":
+    space = 62 ** 7
+    print(f"62^7 = {space:.3e}")
+    print(f"50% collision after ~{birthday_50(space):,.0f} random codes")
+    links = 1e8 * 365 * 5
+    print(f"per-insert collision prob at end of life: {links / space:.2%}")
+    avg, peak = qps(20e9)
+    print(f"messages: avg {avg:,.0f}/s, peak {peak:,.0f}/s")
+    print(f"deliveries per send: {0.7 + 0.3 * 19:.1f}")
+    print(f"attempts at p=0.5, r=5: {expected_attempts(0.5, 5):.2f}")
+    print(f"in-flight provider calls: {12_000 * 0.3:,.0f}")</code></pre>
+</section>
+
+<section id="code">
+  <h2>7. Code: Implementing the Hard Parts</h2>
+  <p>Each listing is self-contained and compiles against the versions shown (Java 21, Spring Boot 3.3+, Go 1.22+, Python 3.11+) <span class="tag version">Version-sensitive · checked Nov 2026</span>. Where a listing is a fragment of a larger service, it says so.</p>
+
+  <h3>7.1 Short-code generation: range lease + Feistel permutation + base62</h3>
+  <p>The generator turns a dense, unique counter into a 7-character code that looks random. A balanced Feistel network over 42 bits is a bijection for any round function; <em>cycle-walking</em> (re-applying the permutation until the result falls below \(62^7\)) restricts it to our domain while preserving bijectivity. This is obfuscation against casual enumeration, not cryptography — use a real format-preserving encryption mode (NIST FF1) if codes must resist a determined adversary.</p>
+  <div class="code-tabs">
+<pre data-lang="Java" data-file="CodeGenerator.java"><code class="language-java">package dev.book.shortener;
+
+import java.util.Objects;
+
+/** Maps a unique counter in [0, 62^7) to a unique, random-looking 7-char base62 code. */
+public final class CodeGenerator {
+    private static final char[] ALPHABET =
+        "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ".toCharArray();
+    public static final int LENGTH = 7;
+    public static final long DOMAIN = 3_521_614_606_208L;   // 62^7
+    private static final int HALF_BITS = 21;                  // 2^42 = 4.4e12 &gt; 62^7
+    private static final long HALF_MASK = (1L &lt;&lt; HALF_BITS) - 1;
+
+    private final long[] roundKeys;
+
+    public CodeGenerator(long[] roundKeys) {
+        Objects.requireNonNull(roundKeys);
+        if (roundKeys.length &lt; 4) throw new IllegalArgumentException("use at least 4 rounds");
+        this.roundKeys = roundKeys.clone();
+    }
+
+    public String encode(long counter) {
+        if (counter &lt; 0 || counter &gt;= DOMAIN) throw new IllegalArgumentException("counter out of range");
+        long x = counter;
+        do { x = permute(x); } while (x &gt;= DOMAIN);   // cycle-walking keeps the map bijective
+        return toBase62(x);
+    }
+
+    long permute(long x) {
+        long left = (x &gt;&gt;&gt; HALF_BITS) &amp; HALF_MASK;
+        long right = x &amp; HALF_MASK;
+        for (long k : roundKeys) {
+            long next = left ^ (mix(right ^ k) &amp; HALF_MASK);
+            left = right;
+            right = next;
+        }
+        return (left &lt;&lt; HALF_BITS) | right;
+    }
+
+    private static long mix(long z) {                 // SplitMix64 finaliser as round function
+        z = (z ^ (z &gt;&gt;&gt; 30)) * 0xbf58476d1ce4e5b9L;
+        z = (z ^ (z &gt;&gt;&gt; 27)) * 0x94d049bb133111ebL;
+        return z ^ (z &gt;&gt;&gt; 31);
+    }
+
+    static String toBase62(long v) {
+        char[] out = new char[LENGTH];
+        for (int i = LENGTH - 1; i &gt;= 0; i--) {
+            out[i] = ALPHABET[(int) (v % 62)];
+            v /= 62;
+        }
+        return new String(out);
+    }
+
+    public static long fromBase62(String s) {
+        long v = 0;
+        for (char c : s.toCharArray()) {
+            int d = (c &gt;= '0' &amp;&amp; c &lt;= '9') ? c - '0'
+                  : (c &gt;= 'a' &amp;&amp; c &lt;= 'z') ? c - 'a' + 10
+                  : (c &gt;= 'A' &amp;&amp; c &lt;= 'Z') ? c - 'A' + 36 : -1;
+            if (d &lt; 0) throw new IllegalArgumentException("not base62: " + s);
+            v = v * 62 + d;
+        }
+        return v;
+    }
+}</code></pre>
+<pre data-lang="Go" data-file="codegen.go"><code class="language-go">package shortener
+
+import "errors"
+
+const (
+	alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	codeLen  = 7
+	Domain   = uint64(3_521_614_606_208) // 62^7
+	halfBits = 21
+	halfMask = uint64(1)&lt;&lt;halfBits - 1
+)
+
+type CodeGenerator struct{ keys []uint64 }
+
+func NewCodeGenerator(keys []uint64) (*CodeGenerator, error) {
+	if len(keys) &lt; 4 {
+		return nil, errors.New("use at least 4 rounds")
+	}
+	return &amp;CodeGenerator{keys: append([]uint64(nil), keys...)}, nil
+}
+
+func mix(z uint64) uint64 {
+	z = (z ^ (z &gt;&gt; 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z &gt;&gt; 27)) * 0x94d049bb133111eb
+	return z ^ (z &gt;&gt; 31)
+}
+
+func (g *CodeGenerator) permute(x uint64) uint64 {
+	left, right := (x&gt;&gt;halfBits)&amp;halfMask, x&amp;halfMask
+	for _, k := range g.keys {
+		left, right = right, left^(mix(right^k)&amp;halfMask)
+	}
+	return left&lt;&lt;halfBits | right
+}
+
+func (g *CodeGenerator) Encode(counter uint64) (string, error) {
+	if counter &gt;= Domain {
+		return "", errors.New("counter out of range")
+	}
+	x := g.permute(counter)
+	for x &gt;= Domain { // cycle-walk back into [0, 62^7)
+		x = g.permute(x)
+	}
+	var out [codeLen]byte
+	for i := codeLen - 1; i &gt;= 0; i-- {
+		out[i] = alphabet[x%62]
+		x /= 62
+	}
+	return string(out[:]), nil
+}</code></pre>
+  </div>
+  <p>The counter comes from a leased range. In a Spring Boot service the lease can be a single-row table updated atomically; the returned block is consumed locally with an <code>AtomicLong</code>, and the next lease is fetched in the background when 80% is used.</p>
+<pre data-file="RangeLease.java"><code class="language-java">package dev.book.shortener;
+
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Component;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicReference;
+
+/** Leases disjoint counter blocks from PostgreSQL. Table: id_range(name text primary key, next_start bigint). */
+@Component
+public class RangeLease {
+    private static final long BLOCK = 100_000;
+    private record Block(long start, long end, java.util.concurrent.atomic.AtomicLong next) {}
+
+    private final JdbcTemplate jdbc;
+    private final AtomicReference&lt;Block&gt; current = new AtomicReference&lt;&gt;();
+    private volatile CompletableFuture&lt;Block&gt; prefetch;
+
+    public RangeLease(JdbcTemplate jdbc) { this.jdbc = jdbc; current.set(lease()); }
+
+    private Block lease() {
+        // Single atomic statement: no lost updates even with many pods.
+        Long end = jdbc.queryForObject(
+            "UPDATE id_range SET next_start = next_start + ? WHERE name = 'links' RETURNING next_start",
+            Long.class, BLOCK);
+        long start = end - BLOCK;
+        return new Block(start, end, new java.util.concurrent.atomic.AtomicLong(start));
+    }
+
+    public long next() {
+        while (true) {
+            Block b = current.get();
+            long v = b.next().getAndIncrement();
+            if (v &lt; b.end()) {
+                if (v - b.start() == (long) (BLOCK * 0.8) &amp;&amp; prefetch == null) {
+                    prefetch = CompletableFuture.supplyAsync(this::lease);
+                }
+                return v;
+            }
+            synchronized (this) {                       // block exhausted: swap in the next one
+                if (current.get() == b) {
+                    Block nb = (prefetch != null) ? prefetch.join() : lease();
+                    prefetch = null;
+                    current.set(nb);
+                }
+            }
+        }
+    }
+}</code></pre>
+
+  <h3>7.2 Snowflake IDs in Java, Go and Python</h3>
+  <p>Used for message IDs, notification IDs and anywhere you want 64-bit, roughly time-ordered IDs without coordination. Layout: 41 bits of milliseconds since a custom epoch (2025-01-01T00:00:00Z here), 10 bits of worker ID, 12 bits of sequence. The two subtle parts are the per-millisecond sequence overflow (wait for the next millisecond) and clocks moving backwards (NTP step corrections): small regressions are waited out, large ones fail loudly rather than risk duplicates. Worker IDs must be unique — assign them from the Kubernetes StatefulSet ordinal, or lease them from etcd/ZooKeeper with a TTL.</p>
+  <div class="code-tabs">
+<pre data-lang="Java" data-file="Snowflake.java"><code class="language-java">package dev.book.ids;
+
+public final class Snowflake {
+    private static final long EPOCH_MS = 1_735_689_600_000L; // 2025-01-01T00:00:00Z
+    private static final int WORKER_BITS = 10, SEQ_BITS = 12;
+    private static final long MAX_WORKER = (1L &lt;&lt; WORKER_BITS) - 1;
+    private static final long SEQ_MASK = (1L &lt;&lt; SEQ_BITS) - 1;
+    private static final long MAX_BACKWARD_MS = 10;
+
+    private final long workerId;
+    private long lastMs = -1L;
+    private long seq = 0L;
+
+    public Snowflake(long workerId) {
+        if (workerId &lt; 0 || workerId &gt; MAX_WORKER) throw new IllegalArgumentException("workerId 0..1023");
+        this.workerId = workerId;
+    }
+
+    public synchronized long nextId() {
+        long now = System.currentTimeMillis();
+        if (now &lt; lastMs) {
+            if (lastMs - now &gt; MAX_BACKWARD_MS)
+                throw new IllegalStateException("clock moved backwards by " + (lastMs - now) + " ms");
+            now = waitUntil(lastMs);
+        }
+        if (now == lastMs) {
+            seq = (seq + 1) &amp; SEQ_MASK;
+            if (seq == 0) now = waitUntil(lastMs + 1);  // 4096 IDs used this ms
+        } else {
+            seq = 0;
+        }
+        lastMs = now;
+        return ((now - EPOCH_MS) &lt;&lt; (WORKER_BITS + SEQ_BITS)) | (workerId &lt;&lt; SEQ_BITS) | seq;
+    }
+
+    public static long timestampMs(long id) { return (id &gt;&gt;&gt; (WORKER_BITS + SEQ_BITS)) + EPOCH_MS; }
+
+    private static long waitUntil(long target) {
+        long t;
+        while ((t = System.currentTimeMillis()) &lt; target) Thread.onSpinWait();
+        return t;
+    }
+}</code></pre>
+<pre data-lang="Go" data-file="snowflake.go"><code class="language-go">package ids
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+const (
+	epochMs       = int64(1_735_689_600_000) // 2025-01-01T00:00:00Z
+	workerBits    = 10
+	seqBits       = 12
+	seqMask       = int64(1)&lt;&lt;seqBits - 1
+	maxBackwardMs = 10
+)
+
+type Snowflake struct {
+	mu       sync.Mutex
+	workerID int64
+	lastMs   int64
+	seq      int64
+}
+
+func New(workerID int64) (*Snowflake, error) {
+	if workerID &lt; 0 || workerID &gt;= 1&lt;&lt;workerBits {
+		return nil, fmt.Errorf("workerID %d out of range", workerID)
+	}
+	return &amp;Snowflake{workerID: workerID, lastMs: -1}, nil
+}
+
+func nowMs() int64 { return time.Now().UnixMilli() }
+
+func waitUntil(target int64) int64 {
+	t := nowMs()
+	for t &lt; target {
+		time.Sleep(100 * time.Microsecond)
+		t = nowMs()
+	}
+	return t
+}
+
+func (s *Snowflake) Next() (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := nowMs()
+	if now &lt; s.lastMs {
+		if s.lastMs-now &gt; maxBackwardMs {
+			return 0, fmt.Errorf("clock moved backwards by %d ms", s.lastMs-now)
+		}
+		now = waitUntil(s.lastMs)
+	}
+	if now == s.lastMs {
+		s.seq = (s.seq + 1) &amp; seqMask
+		if s.seq == 0 {
+			now = waitUntil(s.lastMs + 1)
+		}
+	} else {
+		s.seq = 0
+	}
+	s.lastMs = now
+	return (now-epochMs)&lt;&lt;(workerBits+seqBits) | s.workerID&lt;&lt;seqBits | s.seq, nil
+}</code></pre>
+<pre data-lang="Python" data-file="snowflake.py"><code class="language-python">import threading
+import time
+
+EPOCH_MS = 1_735_689_600_000  # 2025-01-01T00:00:00Z
+WORKER_BITS, SEQ_BITS = 10, 12
+SEQ_MASK = (1 &lt;&lt; SEQ_BITS) - 1
+
+
+class Snowflake:
+    def __init__(self, worker_id: int) -&gt; None:
+        if not 0 &lt;= worker_id &lt; (1 &lt;&lt; WORKER_BITS):
+            raise ValueError("worker_id out of range")
+        self._worker = worker_id
+        self._last = -1
+        self._seq = 0
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _now() -&gt; int:
+        return time.time_ns() // 1_000_000
+
+    def next_id(self) -&gt; int:
+        with self._lock:
+            now = self._now()
+            if now &lt; self._last:
+                if self._last - now &gt; 10:
+                    raise RuntimeError(f"clock moved backwards by {self._last - now} ms")
+                while now &lt; self._last:
+                    now = self._now()
+            if now == self._last:
+                self._seq = (self._seq + 1) &amp; SEQ_MASK
+                if self._seq == 0:
+                    while now &lt;= self._last:
+                        now = self._now()
+            else:
+                self._seq = 0
+            self._last = now
+            return ((now - EPOCH_MS) &lt;&lt; (WORKER_BITS + SEQ_BITS)) | (self._worker &lt;&lt; SEQ_BITS) | self._seq</code></pre>
+  </div>
+
+  <h3>7.3 The redirect hot path in Spring Boot</h3>
+  <p>A fragment of the redirect service showing the L1 (Caffeine async cache with request coalescing) → L2 (Redis) → store chain, negative caching, and non-blocking click emission. Dependencies: <code>spring-boot-starter-web</code>, <code>spring-boot-starter-data-redis</code>, <code>spring-kafka</code>, <code>com.github.ben-manes.caffeine:caffeine</code>.</p>
+<pre data-file="RedirectController.java"><code class="language-java">package dev.book.shortener;
+
+import com.github.benmanes.caffeine.cache.AsyncLoadingCache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.web.bind.annotation.*;
+
+import java.net.URI;
+import java.time.Duration;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
+
+@RestController
+public class RedirectController {
+    private static final String MISSING = "\u0000";             // negative-cache sentinel
+    private final AsyncLoadingCache&lt;String, String&gt; l1;
+    private final KafkaTemplate&lt;String, String&gt; kafka;
+
+    public RedirectController(StringRedisTemplate redis, LinkRepository repo,
+                              KafkaTemplate&lt;String, String&gt; kafka) {
+        this.kafka = kafka;
+        this.l1 = Caffeine.newBuilder()
+            .maximumSize(500_000)
+            .expireAfterWrite(Duration.ofMinutes(5))
+            .executor(Executors.newVirtualThreadPerTaskExecutor())
+            .buildAsync(code -&gt; {                                  // one load per key per pod
+                String cached = redis.opsForValue().get("l:" + code);
+                if (cached != null) return cached;
+                String target = repo.findActiveTarget(code).orElse(MISSING);
+                Duration ttl = target.equals(MISSING) ? Duration.ofSeconds(30)
+                                                      : Duration.ofHours(24).plusMinutes((long) (Math.random() * 60));
+                redis.opsForValue().set("l:" + code, target, ttl);
+                return target;
+            });
+    }
+
+    @GetMapping("/{code:[0-9A-Za-z_-]{4,30}}")
+    public CompletableFuture&lt;ResponseEntity&lt;Void&gt;&gt; redirect(@PathVariable String code,
+                                                            @RequestHeader(value = "Referer", required = false) String ref) {
+        return l1.get(code).thenApply(target -&gt; {
+            if (MISSING.equals(target)) return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
+            // fire-and-forget; producer configured with small max.block.ms so a broker outage never blocks here
+            kafka.send("clicks", code, code + "|" + System.currentTimeMillis() + "|" + Optional.ofNullable(ref).orElse(""));
+            return ResponseEntity.status(HttpStatus.FOUND)
+                .location(URI.create(target))
+                .header(HttpHeaders.CACHE_CONTROL, "private, max-age=300")
+                .build();
+        });
+    }
+}
+
+interface LinkRepository {
+    /** Returns the target only if status = ACTIVE and not expired. */
+    Optional&lt;String&gt; findActiveTarget(String code);
+}</code></pre>
+  <div class="callout java"><p class="callout-title">Spring detail</p><p>Wrap <code>kafka.send</code> in a try/catch in production: with <code>max.block.ms</code> set to, say, 5 ms, the producer throws <code>TimeoutException</code> when its buffer is full or metadata is unavailable, and you want to count and drop, not fail the redirect. Also set <code>spring.kafka.producer.properties.linger.ms=20</code> and <code>acks=1</code> for this best-effort stream.</p></div>
+
+  <h3>7.4 A WebSocket gateway with cross-node routing (Go)</h3>
+  <p>A minimal but complete gateway: authenticates at upgrade, registers the session in Redis with a TTL refreshed by heartbeats, subscribes to its own Redis channel (<code>gw:{id}</code>) so chat services can route deliveries to it, and serialises writes per connection through a buffered channel (a <code>websocket.Conn</code> supports one concurrent writer). Slow consumers are disconnected rather than allowed to consume unbounded memory. In production the routing hop would be gRPC from the chat service rather than Redis pub/sub (which is fire-and-forget), but the structure is identical. Modules: <code>github.com/gorilla/websocket v1.5.3</code>, <code>github.com/redis/go-redis/v9</code>.</p>
+<pre data-file="gateway/main.go"><code class="language-go">package main
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/redis/go-redis/v9"
+)
+
+const (
+	sessionTTL   = 75 * time.Second
+	pingInterval = 30 * time.Second
+	writeTimeout = 5 * time.Second
+	sendBuffer   = 256 // frames queued per connection before we drop the client
+)
+
+type Deliver struct {
+	UserID   string          `json:"userId"`
+	DeviceID string          `json:"deviceId"`
+	Frame    json.RawMessage `json:"frame"`
+}
+
+type client struct {
+	key  string // userId:deviceId
+	conn *websocket.Conn
+	send chan []byte
+}
+
+type Gateway struct {
+	id      string
+	rdb     *redis.Client
+	mu      sync.RWMutex
+	clients map[string]*client
+	up      websocket.Upgrader
+}
+
+func (g *Gateway) register(ctx context.Context, c *client) {
+	g.mu.Lock()
+	if old, ok := g.clients[c.key]; ok { // same device reconnected: close the stale socket
+		close(old.send)
+	}
+	g.clients[c.key] = c
+	g.mu.Unlock()
+	g.rdb.Set(ctx, "session:"+c.key, g.id, sessionTTL)
+}
+
+func (g *Gateway) unregister(ctx context.Context, c *client) {
+	g.mu.Lock()
+	if cur, ok := g.clients[c.key]; ok &amp;&amp; cur == c {
+		delete(g.clients, c.key)
+		close(c.send)
+		// only delete the registry entry if it still points at us
+		g.rdb.Eval(ctx, `if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0`,
+			[]string{"session:" + c.key}, g.id)
+	}
+	g.mu.Unlock()
+}
+
+func (g *Gateway) handleWS(w http.ResponseWriter, r *http.Request) {
+	userID, deviceID, ok := authenticate(r) // validate a device-bound token; omitted
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	conn, err := g.up.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	c := &amp;client{key: userID + ":" + deviceID, conn: conn, send: make(chan []byte, sendBuffer)}
+	ctx := context.Background()
+	g.register(ctx, c)
+	go g.writeLoop(ctx, c)
+	g.readLoop(ctx, c) // blocks until the socket closes
+	g.unregister(ctx, c)
+}
+
+func (g *Gateway) readLoop(ctx context.Context, c *client) {
+	defer c.conn.Close()
+	c.conn.SetReadLimit(64 &lt;&lt; 10)
+	c.conn.SetReadDeadline(time.Now().Add(sessionTTL))
+	c.conn.SetPongHandler(func(string) error {
+		c.conn.SetReadDeadline(time.Now().Add(sessionTTL))
+		g.rdb.Expire(ctx, "session:"+c.key, sessionTTL) // heartbeat refreshes the registry
+		return nil
+	})
+	for {
+		_, msg, err := c.conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		forwardToChatService(c.key, msg) // gRPC to the conversation owner; omitted
+	}
+}
+
+func (g *Gateway) writeLoop(ctx context.Context, c *client) {
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case frame, ok := &lt;-c.send:
+			if !ok {
+				c.conn.Close()
+				return
+			}
+			c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			if err := c.conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+				c.conn.Close()
+				return
+			}
+		case &lt;-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				c.conn.Close()
+				return
+			}
+		}
+	}
+}
+
+// consumeRoutes receives deliveries addressed to this gateway and hands them to local sockets.
+func (g *Gateway) consumeRoutes(ctx context.Context) {
+	sub := g.rdb.Subscribe(ctx, "gw:"+g.id)
+	for m := range sub.Channel() {
+		var d Deliver
+		if err := json.Unmarshal([]byte(m.Payload), &amp;d); err != nil {
+			continue
+		}
+		g.mu.RLock()
+		c, ok := g.clients[d.UserID+":"+d.DeviceID]
+		if ok {
+			select {
+			case c.send &lt;- d.Frame:
+			default: // slow consumer: drop the connection; the message is still in the inbox
+				go c.conn.Close()
+			}
+		}
+		g.mu.RUnlock()
+	}
+}
+
+func main() {
+	g := &amp;Gateway{
+		id:      os.Getenv("GATEWAY_ID"),
+		rdb:     redis.NewClient(&amp;redis.Options{Addr: os.Getenv("REDIS_ADDR")}),
+		clients: make(map[string]*client),
+		up:      websocket.Upgrader{ReadBufferSize: 4096, WriteBufferSize: 4096},
+	}
+	go g.consumeRoutes(context.Background())
+	http.HandleFunc("/ws", g.handleWS)
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+func authenticate(r *http.Request) (string, string, bool) { return r.Header.Get("X-User"), r.Header.Get("X-Device"), true } // placeholder: NEVER trust headers in production
+func forwardToChatService(key string, msg []byte)            {}</code></pre>
+  <p><strong>Why the conditional delete in <code>unregister</code>:</strong> when a phone switches from Wi-Fi to LTE it may reconnect to gateway B before gateway A notices the old socket is dead. If A then blindly deleted <code>session:alice:1</code>, it would erase B's fresh registration and Alice would silently stop receiving messages until her next heartbeat. The compare-and-delete Lua script prevents this. A production design adds a monotonically increasing connection epoch.</p>
+  <div class="callout java"><p class="callout-title">The Spring equivalent</p><p>In Spring, the same gateway is a <code>WebSocketHandler</code> on WebFlux (Reactor Netty), where each session's outbound side is a <code>Flux</code> fed by a <code>Sinks.many().unicast().onBackpressureBuffer(queue)</code> with a bounded queue. Avoid the servlet-stack STOMP simple broker for multi-node chat; if you want STOMP, use the broker relay to an external broker (RabbitMQ with the STOMP plugin), which solves cross-node routing for you at a throughput cost.</p></div>
+
+  <h3>7.5 Notification channel worker: dedup state, distributed token bucket, provider failover</h3>
+  <p>A Spring Boot Kafka listener for the <code>sms.p0</code> topic. It applies the <code>SENDING</code>/<code>SENT</code> dedup protocol from §4.3, acquires a provider-rate token from a Redis Lua token bucket, and fails over between providers using Resilience4j circuit breakers. Dependencies: <code>spring-kafka</code>, <code>spring-boot-starter-data-redis</code>, <code>io.github.resilience4j:resilience4j-circuitbreaker</code> 2.x.</p>
+<pre data-file="SmsWorker.java"><code class="language-java">package dev.book.notify;
+
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Component;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+
+record SmsTask(String notificationId, String phone, String body, Instant expiresAt, int attempt) {}
+
+interface SmsProvider {
+    String name();
+    String send(SmsTask task) throws ProviderException;   // returns provider message id
+}
+
+class ProviderException extends Exception {
+    final boolean retryable;
+    ProviderException(String msg, boolean retryable) { super(msg); this.retryable = retryable; }
+}
+
+@Component
+public class SmsWorker {
+    private static final DefaultRedisScript&lt;Long&gt; TOKEN_BUCKET = new DefaultRedisScript&lt;&gt;("""
+        local cap  = tonumber(ARGV[1])
+        local rate = tonumber(ARGV[2])          -- tokens per second
+        local t    = redis.call('TIME')
+        local now  = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+        local b    = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+        local tokens = tonumber(b[1]) or cap
+        local ts     = tonumber(b[2]) or now
+        tokens = math.min(cap, tokens + (now - ts) * rate / 1000)
+        local ok = 0
+        if tokens &gt;= 1 then tokens = tokens - 1; ok = 1 end
+        redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+        redis.call('PEXPIRE', KEYS[1], math.ceil(cap * 1000 / rate) + 1000)
+        return ok
+        """, Long.class);
+
+    private final StringRedisTemplate redis;
+    private final KafkaTemplate&lt;String, SmsTask&gt; kafka;
+    private final List&lt;SmsProvider&gt; providers;              // ordered by preference
+    private final List&lt;CircuitBreaker&gt; breakers;
+
+    public SmsWorker(StringRedisTemplate redis, KafkaTemplate&lt;String, SmsTask&gt; kafka, List&lt;SmsProvider&gt; providers) {
+        this.redis = redis;
+        this.kafka = kafka;
+        this.providers = providers;
+        var cfg = CircuitBreakerConfig.custom()
+            .failureRateThreshold(30)
+            .slidingWindowSize(50)
+            .waitDurationInOpenState(Duration.ofSeconds(20))
+            .permittedNumberOfCallsInHalfOpenState(5)
+            .build();
+        this.breakers = providers.stream().map(p -&gt; CircuitBreaker.of("sms-" + p.name(), cfg)).toList();
+    }
+
+    @KafkaListener(topics = "sms.p0", groupId = "sms-workers-p0", concurrency = "8")
+    public void onTask(SmsTask task) {
+        if (Instant.now().isAfter(task.expiresAt())) return;            // stale OTP: drop
+        String key = "dedup:" + task.notificationId() + ":sms";
+        Boolean claimed = redis.opsForValue().setIfAbsent(key, "SENDING", Duration.ofSeconds(60));
+        if (!Boolean.TRUE.equals(claimed)) return;                      // SENT, or another worker is SENDING
+
+        for (int i = 0; i &lt; providers.size(); i++) {
+            SmsProvider p = providers.get(i);
+            CircuitBreaker cb = breakers.get(i);
+            if (!acquire("rl:sms:" + p.name(), 200, 100)) continue;     // provider quota exhausted: try next
+            try {
+                String providerId = cb.executeCheckedSupplier(() -&gt; p.send(task));
+                redis.opsForValue().set(key, "SENT:" + p.name() + ":" + providerId, Duration.ofHours(24));
+                return;
+            } catch (CallNotPermittedException open) {
+                // breaker open: fall through to next provider
+            } catch (ProviderException e) {
+                if (!e.retryable) { redis.opsForValue().set(key, "FAILED", Duration.ofHours(24)); return; }
+            } catch (Throwable t) {
+                // timeouts and unexpected errors count as failures in the breaker; try next provider
+            }
+        }
+        // every provider failed or was throttled: release the claim and schedule a retry
+        redis.delete(key);
+        int next = task.attempt() + 1;
+        String retryTopic = next &lt;= 1 ? "sms.p0.retry-5s" : next &lt;= 3 ? "sms.p0.retry-30s" : "sms.p0.dlq";
+        kafka.send(retryTopic, task.notificationId(),
+            new SmsTask(task.notificationId(), task.phone(), task.body(), task.expiresAt(), next));
+    }
+
+    private boolean acquire(String bucketKey, int capacity, int perSecond) {
+        Long ok = redis.execute(TOKEN_BUCKET, List.of(bucketKey), String.valueOf(capacity), String.valueOf(perSecond));
+        return ok != null &amp;&amp; ok == 1L;
+    }
+}</code></pre>
+  <p><strong>What to notice:</strong> the retry is published to a delay topic rather than performed with <code>Thread.sleep</code> inside the listener, so one bad message never blocks a partition; the delay-topic consumers simply wait until <code>record.timestamp + delay</code> before re-publishing (Spring Kafka's <code>@RetryableTopic</code> automates this pattern). The worker deletes the <code>SENDING</code> claim before re-queueing so the retry can proceed. Expiry is checked first, because for an OTP lateness is a failure mode, not a success.</p>
+</section>
+
+<section id="applications">
+  <h2>8. Real-World Applications</h2>
+  <ul>
+    <li><strong>Marketing and attribution:</strong> branded short domains carry UTM parameters and power campaign dashboards; the click stream joins with conversion data in the warehouse. The same pattern underlies QR codes on packaging and deep links that route to an app if installed.</li>
+    <li><strong>Security gateways:</strong> email security products and social platforms rewrite links so that every click passes through a scanner at click time, catching destinations that turned malicious after delivery.</li>
+    <li><strong>In-product messaging:</strong> marketplaces (buyer–seller chat), ride-hailing (driver–rider masked chat), healthcare (patient–clinician messaging with retention rules) and customer support (agent chat, now increasingly AI-first, see <a href="p2-12-case-studies-realtime-ai.html">Chapter 2.12</a>). Most of these need server-side history for dispute resolution and compliance, so they choose the Slack-style model, not E2EE.</li>
+    <li><strong>Real-time collaboration:</strong> the gateway-plus-registry pattern is reused for live cursors, multiplayer editing, live sports scores and trading dashboards.</li>
+    <li><strong>Notification platforms</strong> sit behind every login (OTP), every order (transactional), every fraud alert and every re-engagement campaign. Increasingly they include ML for send-time optimisation and channel selection, and they are a primary lever on SMS cost.</li>
+    <li><strong>AI-era twist:</strong> LLM agents now <em>generate</em> notification content (summaries, digests) and <em>consume</em> chat (support bots). This adds new requirements — content safety checks before send, attribution of AI-generated text, and cost controls — but the delivery machinery in this chapter is unchanged.</li>
+  </ul>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies: What Real Companies Did</h2>
+  <h3>9.1 WhatsApp: Erlang, FreeBSD and very dense servers <span class="tag fact">Verified</span></h3>
+  <p>WhatsApp engineers described their architecture in a series of Erlang Factory talks; Rick Reed's 2014 talk "That's 'Billion' with a 'B': Scaling to the Next Level at WhatsApp" covers how the team scaled an Erlang/FreeBSD backend, the per-server tuning they did, and their use of the Mnesia database for parts of their state. Contemporaneous summaries reported very high concurrent-connection counts per server (over two million TCP connections on a single box was reported in 2012). The lesson is not "use Erlang" but "a stateful connection tier can be extremely dense when the per-connection footprint and the kernel are tuned". Sources: <a href="https://www.erlang-factory.com/sfbay2014/rick-reed">Erlang Factory 2014 talk page</a>, <a href="https://highscalability.com/the-whatsapp-architecture-facebook-bought-for-19-billion/">High Scalability summary</a>.</p>
+  <h3>9.2 WhatsApp and Signal: end-to-end encryption at scale <span class="tag fact">Verified</span></h3>
+  <p>WhatsApp's security whitepaper documents its use of the Signal protocol, including prekey bundles, Sender Keys for groups and encrypted media with keys carried inside messages. The Signal project publishes the X3DH, Double Ratchet and PQXDH specifications. These are the primary sources for §4.2. Sources: <a href="https://www.whatsapp.com/security/WhatsApp-Security-Whitepaper.pdf">WhatsApp Encryption Overview (whitepaper)</a>, <a href="https://signal.org/docs/specifications/x3dh/">X3DH spec</a>, <a href="https://signal.org/docs/specifications/doubleratchet/">Double Ratchet spec</a>.</p>
+  <h3>9.3 Discord: storing messages in wide-column stores <span class="tag fact">Verified</span></h3>
+  <p>Discord's 2017 post explains how it moved message storage from MongoDB to Cassandra with a partition key of <code>(channel_id, bucket)</code>, where the bucket is a time window derived from the Snowflake message ID, so partitions stay bounded. Its 2023 follow-up describes migrating to ScyllaDB and placing Rust "data services" in front of the database that coalesce identical concurrent requests — a direct answer to hot partitions in very large channels. Sources: <a href="https://discord.com/blog/how-discord-stores-billions-of-messages">How Discord Stores Billions of Messages</a>, <a href="https://discord.com/blog/how-discord-stores-trillions-of-messages">How Discord Stores Trillions of Messages</a>.</p>
+  <h3>9.4 Slack: channel servers on a consistent-hash ring <span class="tag fact">Verified</span></h3>
+  <p>Slack's engineering blog describes its real-time messaging stack: stateful, in-memory channel servers that own channels via consistent hashing, gateway servers that hold WebSocket connections and subscriptions (deployed in multiple regions near users), and presence servers. This is the same split as Figure 10.6 — edge gateways plus conversation owners. Source: <a href="https://slack.engineering/real-time-messaging/">Real-time Messaging (Slack Engineering)</a>.</p>
+  <h3>9.5 Twitter Snowflake and Instagram IDs <span class="tag fact">Verified</span></h3>
+  <p>Twitter open-sourced Snowflake in 2010 to generate roughly time-ordered 64-bit IDs without a central sequence after moving off MySQL auto-increment. Instagram's post "Sharding &amp; IDs at Instagram" describes generating IDs inside PostgreSQL schemas (41-bit timestamp, 13-bit logical shard, 10-bit sequence) using PL/pgSQL. Sources: <a href="https://github.com/twitter-archive/snowflake">twitter-archive/snowflake</a>, <a href="https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c">Sharding &amp; IDs at Instagram</a>.</p>
+  <h3>9.6 Netflix RENO: priority-separated notification fan-out <span class="tag fact">Verified</span></h3>
+  <p>Netflix's Rapid Event Notification System (2022 write-up) delivers server-initiated events to devices. It prioritises events (a member-triggered change outranks a diagnostic signal) with separate processing per priority so each can be tuned and scaled independently, and parallelises delivery per platform on a best-effort basis so one failing downstream path does not take down the rest — the same isolation principles as Figure 10.9. Source: <a href="https://netflixtechblog.com/rapid-event-notification-system-at-netflix-6deb1d2b57d1">Rapid Event Notification System at Netflix</a>.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages, Limitations and Operational Cost</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Design choice</th><th>Advantages</th><th>Limitations</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>Counter + permutation codes</td><td>No collisions, no conditional writes, short codes</td><td>Needs HA lease store; obfuscation not crypto</td><td>Low: one small etcd cluster</td></tr>
+      <tr><td>Random codes + conditional insert</td><td>No coordinator, unguessable</td><td>Conditional writes (LWT in Cassandra is costly), retries</td><td>Medium: LWT latency and contention</td></tr>
+      <tr><td>Stateful WebSocket gateways</td><td>Lowest latency push, bidirectional</td><td>Deploys disconnect users; routing registry needed; reconnect storms</td><td>High: careful rollout tooling, kernel tuning, capacity headroom</td></tr>
+      <tr><td>Device-held history (E2EE)</td><td>Minimal server data, strong privacy</td><td>No server search; multi-device sync is complex; backups must be encrypted</td><td>Lower storage, higher client complexity</td></tr>
+      <tr><td>Server-held history</td><td>Search, compliance export, easy multi-device</td><td>Large storage; breach exposure; incompatible with E2EE</td><td>High storage, retention management</td></tr>
+      <tr><td>Central notification platform</td><td>Consistent policy, cost control, one integration per provider</td><td>Shared dependency; platform team becomes a bottleneck for new channels</td><td>Dedicated team; tier-0 on-call for P0</td></tr>
+      <tr><td>Multi-provider failover</td><td>Survives provider outages</td><td>Two integrations, divergent error semantics, deliverability differences</td><td>Contract minimums with two vendors</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs and Decisions</h2>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  Q1{"Need push from server to client?"} -- no --> REST[Plain REST + polling is fine]
+  Q1 -- yes --> Q2{"Client to server messages frequent?"}
+  Q2 -- no --> SSE["SSE or long-poll (simpler, HTTP-native)"]
+  Q2 -- yes --> Q3{"Browser clients?"}
+  Q3 -- yes --> WS[WebSocket]
+  Q3 -- "mobile only" --> Q4{"Battery and bandwidth critical?"}
+  Q4 -- yes --> BIN["MQTT or custom binary over TLS"]
+  Q4 -- no --> WS
+  WS --> Q5{"More than one gateway node?"}
+  BIN --> Q5
+  Q5 -- yes --> REG["Session registry + targeted routing (not broadcast)"]
+  Q5 -- no --> MEM[In-memory map is enough]
+</pre>
+  <figcaption>Figure 10.12 — Choosing a real-time transport and routing strategy.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the most common error is jumping straight to WebSocket when the traffic is one-way (feeds, notifications, LLM token streams), where SSE is simpler, works through HTTP infrastructure and reconnects automatically. The second most common is building a multi-node WebSocket tier that <em>broadcasts</em> every message to every node (Redis pub/sub on a single channel); that works at 5 nodes and collapses at 500, because every node processes every message. Targeted routing via a registry scales linearly.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Decision</th><th>Option A</th><th>Option B</th><th>Choose A when</th></tr></thead>
+    <tbody>
+      <tr><td>Redirect status</td><td>302/307</td><td>301</td><td>You need analytics, takedowns or editable expiry</td></tr>
+      <tr><td>Message store</td><td>Wide-column (Cassandra/ScyllaDB)</td><td>Sharded SQL</td><td>Append-heavy, TTL, partition-local reads at very high volume</td></tr>
+      <tr><td>Group encryption</td><td>Sender Keys</td><td>Pairwise per device</td><td>Groups larger than a few dozen devices</td></tr>
+      <tr><td>Fan-out</td><td>On write (copy per inbox)</td><td>On read (log + cursors)</td><td>Small groups, offline-heavy recipients</td></tr>
+      <tr><td>Notification priority</td><td>Separate topics and pools</td><td>One topic with priority field</td><td>Always for P0 vs bulk (Kafka has no in-partition priority)</td></tr>
+      <tr><td>Dedup strictness</td><td>Claim-before-send (at-most-once risk)</td><td>Mark-after-send (duplicate risk)</td><td>Duplicates are costly (payments, marketing); choose B-with-timeout for OTP</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Production Failures</h2>
+  <ul>
+    <li><strong>Using a database auto-increment as the short code.</strong> Enumerable, leaks volume, and becomes a single-writer bottleneck when you shard.</li>
+    <li><strong>Hash-and-truncate without collision handling.</strong> Two different URLs eventually map to the same code and the second silently overwrites the first — a link now points to someone else's page.</li>
+    <li><strong>Allowing destination edits.</strong> A compromised account redirects millions of printed QR codes to phishing.</li>
+    <li><strong>Putting analytics on the redirect path.</strong> A synchronous insert per click couples redirect latency to the analytics database.</li>
+    <li><strong>Acknowledging a chat message before persisting it.</strong> A crash loses messages the sender believes were sent.</li>
+    <li><strong>Deleting from the inbox on socket write instead of device ack.</strong> The phone was backgrounded mid-frame; the message is gone.</li>
+    <li><strong>Ordering messages by device timestamps.</strong> Phones have wrong clocks; conversations appear scrambled.</li>
+    <li><strong>Broadcast routing between gateway nodes.</strong> O(nodes × messages) work; collapses at scale.</li>
+    <li><strong>Restarting all gateways at once.</strong> The reconnect storm overwhelms auth and sync services; the outage is caused by the deploy, not the bug it fixed.</li>
+    <li><strong>Presence fan-out to all contacts.</strong> The most expensive feature nobody looks at.</li>
+    <li><strong>Retrying notification sends without idempotency.</strong> Five copies of the same OTP; users enter the wrong one.</li>
+    <li><strong>One Kafka topic for all priorities.</strong> A marketing campaign delays password resets by an hour.</li>
+    <li><strong>Ignoring provider feedback.</strong> Continuing to send to invalid push tokens or hard-bounced email addresses damages sender reputation and can get you throttled.</li>
+    <li><strong>No kill switch.</strong> A template bug or producer loop sends millions of wrong messages before anyone can stop it.</li>
+    <li><strong>Unbounded OTP issuance.</strong> SMS pumping fraud turns your signup page into someone else's revenue stream.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Readiness</h2>
+  <h3>13.1 Performance</h3>
+  <ul>
+    <li>Redirect service: measure L1/L2 hit ratios separately; alert if L1 drops (deploy without warm-up) or L2 drops (Redis eviction pressure).</li>
+    <li>Gateways: tune file descriptors (<code>ulimit -n</code>), ephemeral ports, TCP keepalive and per-socket buffers; use TLS session resumption; load-test with realistic idle-connection counts, not just message throughput.</li>
+    <li>Notification workers: async HTTP clients or virtual threads, HTTP/2 connection reuse to APNs, bounded in-flight requests per provider.</li>
+  </ul>
+  <h3>13.2 Monitoring — the metrics that matter</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>System</th><th>SLIs</th><th>Saturation signals</th></tr></thead>
+    <tbody>
+      <tr><td>Shortener</td><td>Redirect p99, 5xx rate, % 404 (spike = scraping)</td><td>Cache hit ratio, KV read units, hot-key top-N</td></tr>
+      <tr><td>Messaging</td><td>Send-ack p99, end-to-end delivery p99 (client-reported), undelivered-inbox age</td><td>Connections per gateway, reconnect rate, registry lookup latency, inbox partition sizes</td></tr>
+      <tr><td>Notifications</td><td>Accept-to-provider latency per priority, provider success rate, duplicate rate (measured via dedup hits)</td><td>Consumer lag per topic, provider 429 rate, breaker state, DLQ depth</td></tr>
+    </tbody>
+  </table></div>
+  <h3>13.3 Reliability</h3>
+  <ul>
+    <li>Graceful gateway drain with jittered reconnect hints; canary a small percentage of gateways per wave.</li>
+    <li>Synthetic probes: a bot account per region that sends itself messages every minute and measures delivery; a synthetic OTP to a test number per provider and country.</li>
+    <li>Runbooks for provider outage (manual failover switch), campaign kill switch, and inbox-store degradation (shed presence/typing).</li>
+  </ul>
+  <h3>13.4 Security and compliance</h3>
+  <ul>
+    <li>Link safety scanning, abuse reporting and takedown SLAs.</li>
+    <li>Device-bound auth for chat; key-change notifications; minimised metadata retention.</li>
+    <li>Consent and unsubscribe audit log for notifications; data-subject deletion that reaches preferences, tokens, delivery logs and inboxes.</li>
+  </ul>
+  <h3>13.5 Maintainability</h3>
+  <ul>
+    <li>Version your wire protocol (frame type registry, unknown-field tolerance) because mobile clients stay old for years.</li>
+    <li>Keep provider adapters behind one interface with contract tests against provider sandboxes.</li>
+    <li>Treat templates and category policies as configuration with review, versioning and rollback.</li>
+  </ul>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>Your shortener must support 2 billion new links per year for 10 years using codes of fixed length drawn from base62. What is the minimum code length if you use a dense counter? What length would you choose for random codes if you want the per-insert collision probability at end of life to stay below 0.1%?</p>
+    <details class="solution"><summary>Solution</summary><div><p>Total links \(n = 2 \times 10^{10}\). Dense counter: need \(62^k \ge 2 \times 10^{10}\); \(62^5 \approx 9.2 \times 10^8\) is too small, \(62^6 \approx 5.7 \times 10^{10}\) suffices, so 6 characters. Random codes: per-insert collision probability \(\approx n / 62^k \lt 10^{-3}\) requires \(62^k \gt 2 \times 10^{13}\); \(62^7 \approx 3.5 \times 10^{12}\) is not enough, \(62^8 \approx 2.2 \times 10^{14}\) is, so 8 characters. The difference of two characters is the price of not having a coordinator.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>A single short link goes viral at 80,000 requests/s. Your Redis cluster has 6 shards each comfortable at 100,000 ops/s, and you run 60 redirect pods. Explain what happens with and without the L1 cache, and propose two further mitigations.</p>
+    <details class="solution"><summary>Solution</summary><div><p>Without L1, all 80 K req/s for one key hit one Redis shard, consuming most of its capacity and starving every other key on that shard (latency rises for unrelated links). With L1 (Caffeine, 5-minute TTL), each pod loads the key once per TTL: 60 loads per 5 minutes — effectively zero. Further mitigations: (1) short CDN caching (<code>Cache-Control: public, max-age=30</code> for links flagged hot) so most requests never reach origin; (2) hot-key detection (sampling top-N keys in the redirect service) that pins hot keys in L1 with longer TTL; (3) Redis key replication with suffixes for systems without L1.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>Design the receipt protocol so that a group with 500 members does not generate 500 × 500 read-receipt deliveries when everyone reads a message. What does each client send, what does the server store, and what does each sender see?</p>
+    <details class="solution"><summary>Solution</summary><div><p>Make receipts <em>cumulative watermarks</em>, not per-message events: each device sends <code>Receipt{conv, read_up_to_seq}</code> at most every few seconds (coalesced). The server stores <code>MEMBERSHIP.read_up_to_seq</code> per member. Senders do not receive every member's receipt in real time; instead the client fetches "read by N of 499" lazily when the sender opens message info, computed as count of members with <code>read_up_to_seq ≥ msg.conv_seq</code>. For 1:1 chats, push the watermark to the peer immediately. This turns O(members²) events into O(members) small updates plus on-demand queries; many products also disable per-member read receipts above a group size threshold.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>Your notification platform must guarantee that a user never receives more than 3 marketing pushes per day across all campaigns, even though 40 planner pods process campaigns concurrently. Design the cap so that it is correct under concurrency, cheap, and does not undercount when a send later fails.</p>
+    <details class="solution"><summary>Solution</summary><div><p>Use a per-user, per-day counter in Redis keyed by the user's <em>local</em> day: <code>cap:mkt:{userId}:{yyyymmdd}</code>. Reserve atomically with a Lua script: if the counter is below 3, increment and return OK; otherwise reject. Set an expiry of about 48 h. Reserve in the planner (before enqueuing), and on permanent send failure release the reservation with <code>DECR</code> (guarded so it never goes below 0). Because the reservation is atomic in Redis, concurrency across 40 pods is safe. If Redis is unavailable, fail closed for marketing (skip or defer). For analytics truth, also record actual sends; the counter is an admission-control device, not the system of record.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>Gateway hosts are being upgraded. Each holds 250 K connections; your auth service handles 20 K logins/s and your sync service 30 K syncs/s. Design a rollout that keeps both below 50% utilisation, and compute how long upgrading 800 gateways takes.</p>
+    <details class="solution"><summary>Solution</summary><div><p>Budget: 10 K reconnects/s (50% of the auth capacity, which is the tighter constraint). Draining one gateway by closing connections evenly over 120 s produces ~2 K reconnects/s, so up to 5 gateways can drain concurrently. 800 / 5 = 160 waves × ~3 minutes (2 min drain + restart + health check) ≈ 8 hours. To go faster: support token-based session resumption that skips full auth (cheaper reconnect), let sync resume from the last ack without re-fetching metadata, or add gateway capacity so drained clients spread out. Always add jitter to client reconnect so the arrival rate matches the drain rate.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 6 · Expert</p>
+    <p>Your company wants server-side search over chat history <em>and</em> end-to-end encryption. Outline two designs, their security trade-offs, and which one you would ship.</p>
+    <details class="solution"><summary>Solution</summary><div><p>(1) <strong>Client-side index:</strong> each device indexes its own decrypted history locally (SQLite FTS); search is local; new devices rebuild the index from an encrypted backup. Strong privacy; costs device storage and complicates multi-device. (2) <strong>Searchable encryption / encrypted server index:</strong> clients upload encrypted index tokens (e.g. keyed hashes of terms); the server matches tokens without seeing terms. Leaks access patterns and term frequencies, which is a known weakness of such schemes. (3) Escrow or enterprise key management (compliance products) — not E2EE in the consumer sense. For a consumer product, ship (1) <span class="tag opinion">Opinion</span>; for regulated enterprise chat, be honest that compliance access means the provider or the customer's admin holds keys.</p></div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions and Answers</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why do most analytics-focused URL shorteners return 302 rather than 301?</summary><div><p>Browsers may cache a 301 indefinitely, so subsequent clicks never reach the shortener: no click analytics, no ability to disable a link for abuse, no expiry. A 302/307 keeps every click observable at the cost of more traffic. Pure character-saving shorteners can use 301 with an explicit <code>Cache-Control</code> limit.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How do you generate unique short codes across 100 stateless pods without a per-request database round trip?</summary><div><p>Range allocation: each pod leases a block of counter values from a linearizable store and issues codes locally, prefetching the next block before exhaustion. To make codes non-sequential, apply a keyed bijective permutation (Feistel with cycle-walking, or FF1) before base62 encoding. Alternative: random codes with a conditional insert, which needs no coordinator but costs a conditional write per create.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How does a message reach a user whose WebSocket is on a different server from the sender's?</summary><div><p>The receiver's gateway registers <code>(user, device) → gateway</code> in a session registry on connect, refreshed by heartbeats. The chat service owning the conversation looks up the recipient devices, groups them by gateway and sends targeted RPCs. Offline devices are served from their persisted inbox on reconnect, plus a wake-up push. Broadcasting to all gateways does not scale.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What does the server know in a Signal-protocol messenger, and what does it not know?</summary><div><p>It knows metadata — who is registered, public keys, which device sends to which, timing, sizes, IP addresses (unless mitigated) — and holds undelivered ciphertext. It does not know message content, media content (blobs are encrypted with keys inside the messages), or past message keys. Its integrity matters for key distribution: a malicious server could substitute keys, which safety-number verification and key transparency are designed to detect.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Users report that some messages appear only after they reopen the app. Where do you look?</summary><div><p>Suspects in order: (1) session registry pointing at a stale gateway (race on reconnect; check compare-and-delete and epochs); (2) gateway dropping frames for slow consumers without closing the connection; (3) inbox entries deleted on socket write rather than device ack; (4) live/backlog race during sync; (5) push wake-ups failing (invalid tokens) so the app only syncs on open. Instrument per-message traces: accepted → persisted → routed → written → acked.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How do you prevent a marketing campaign from delaying OTP delivery in a Kafka-based notification system?</summary><div><p>Kafka has no priority within a partition, so isolate structurally: separate topics per priority (and per channel), separate consumer groups and worker pools, separate provider rate-limit budgets (reserve a share of SMS throughput for P0), and ideally separate provider accounts or sender IDs. Monitor lag per priority with P0 alerts at seconds.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Write the core of a Snowflake generator and explain its two edge cases.</summary><div><p>See §7.2. Edge cases: (1) sequence overflow within a millisecond — spin until the next millisecond; (2) clock moving backwards — wait if the regression is small, otherwise refuse to generate (or switch to a reserved worker ID) rather than risk duplicate IDs. Also mention worker-ID uniqueness (StatefulSet ordinal or leased from etcd).</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Your primary SMS provider's success rate in one country drops from 98% to 40%. What should happen automatically, and what manually?</summary><div><p>Automatically: the per-provider (ideally per provider-and-country) circuit breaker opens and traffic fails over to the secondary; retries use backoff; alerting fires on success-rate SLI. Manually: confirm with the provider, adjust routing tables per country, watch the secondary's rate limits and cost, and decide whether to fall back to voice OTP or email for affected users. Post-incident: was the breaker keyed finely enough? A global breaker would have either not tripped (other countries fine) or failed over everything.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why is "exactly-once delivery" of notifications impossible, and what do you build instead?</summary><div><p>Because the provider call and your bookkeeping cannot be atomic: a crash between "provider accepted" and "recorded as sent" leaves you unable to know whether to resend. You build at-least-once processing with deduplication: idempotency keys at the API, send-side dedup state with TTLs, provider-side idempotency references where offered, and per-category choice of whether to err towards duplicates or omissions.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> Tell me about a time a deploy caused an outage. How would you design to prevent it?</summary><div><p>A strong answer describes a concrete incident (for example, restarting all instances of a stateful service at once causing a reconnect storm), the blast radius, the detection signal, the mitigation, and the systemic fix: progressive rollout with automated canary analysis, drain logic with jitter, capacity headroom for reconnects, and a runbook. Emphasise blameless analysis and the guardrail added, not individual fault.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Estimate first: it tells you whether the hard problem is QPS, storage, connections, bandwidth, or third-party limits.</li>
+    <li>Short codes: dense counter plus a bijective permutation avoids both collisions and enumeration; random codes need conditional inserts because of the birthday bound.</li>
+    <li>Read-heavy systems live or die by layered caches; in-process L1 is the defence against hot keys.</li>
+    <li>Stateful gateways need a session registry, targeted routing, device-level acks, and careful drain/reconnect engineering.</li>
+    <li>Persist before acknowledging; delete from inboxes only after device acknowledgement; order by server-assigned sequence numbers.</li>
+    <li>Under E2EE the server becomes a key directory and ciphertext router; Sender Keys make group fan-out efficient.</li>
+    <li>Notification priority must be structural (separate topics and pools); dedup needs two layers (API idempotency and send-side state).</li>
+    <li>Provider failover plus fine-grained circuit breakers turn vendor outages into degraded latency rather than lost OTPs.</li>
+  </ul>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">With 7-character random base62 codes (≈3.5 × 10¹² possibilities), roughly when does the probability of at least one collision reach 50%?</p>
+    <ol>
+      <li data-k="a">After about 1.75 × 10¹² codes (half the space)</li>
+      <li data-k="b">After about 3.5 × 10¹¹ codes (10% of the space)</li>
+      <li data-k="c">After about 2.2 million codes</li>
+      <li data-k="d">Never, if a CSPRNG is used</li>
+    </ol>
+    <div class="explain">The birthday bound puts the 50% point at about 1.18 × √N ≈ 2.2 × 10⁶. A CSPRNG makes codes unpredictable, not collision-free; random-code designs therefore need conditional inserts.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">When should a chat server remove a message from a recipient device's inbox?</p>
+    <ol>
+      <li data-k="a">As soon as the gateway writes the frame to the socket</li>
+      <li data-k="b">When the recipient device sends an acknowledgement for that message</li>
+      <li data-k="c">When the sender receives the delivered receipt</li>
+      <li data-k="d">After a fixed 24-hour TTL regardless of delivery</li>
+    </ol>
+    <div class="explain">A successful socket write does not mean the app processed the message (it may be backgrounded or killed). Only the device's ack proves receipt. TTLs are a backstop for devices that never return.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">Why do large-group E2EE messengers commonly use Sender Keys?</p>
+    <ol>
+      <li data-k="a">They provide stronger post-compromise security than pairwise ratchets</li>
+      <li data-k="b">They let the server read group messages for moderation</li>
+      <li data-k="c">They remove the need for prekeys</li>
+      <li data-k="d">The sender encrypts each message once and the server fans out one ciphertext, instead of encrypting per recipient device</li>
+    </ol>
+    <div class="explain">Sender Keys trade some post-compromise security (until rotation) for O(1) encryption per message. Distribution of the sender key itself still uses pairwise Signal sessions.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">A notification system uses one Kafka topic for all priorities with a "priority" field in each message. What is the main problem?</p>
+    <ol>
+      <li data-k="a">Consumers read partitions in order, so a backlog of bulk messages delays urgent ones behind them</li>
+      <li data-k="b">Kafka rejects messages with custom fields</li>
+      <li data-k="c">Messages with higher priority are compacted away</li>
+      <li data-k="d">Consumer groups cannot be scaled beyond one consumer</li>
+    </ol>
+    <div class="explain">Kafka has no intra-partition priority. Isolation requires separate topics and consumer pools (and separate provider budgets).</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Two SMS providers each have 99.5% availability. Why is the real availability of a failover pair usually lower than the theoretical 99.9975%?</p>
+    <ol>
+      <li data-k="a">Because availabilities in parallel are added, not multiplied</li>
+      <li data-k="b">Because the circuit breaker always reduces availability</li>
+      <li data-k="c">Because failures correlate (shared carriers/routes) and detection plus failover takes time</li>
+      <li data-k="d">Because the formula only applies to databases</li>
+    </ol>
+    <div class="explain">The parallel formula assumes independent failures and instantaneous failover. Shared downstream dependencies and breaker detection windows erode both assumptions.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">In the gateway code, why does <code>unregister</code> delete the session registry entry only if it still contains this gateway's ID?</p>
+    <ol>
+      <li data-k="a">To save a Redis round trip</li>
+      <li data-k="b">Because the device may already have reconnected to another gateway, and an unconditional delete would erase the new registration</li>
+      <li data-k="c">Because Redis does not support DEL inside Lua</li>
+      <li data-k="d">To keep presence status "online" longer</li>
+    </ol>
+    <div class="explain">Reconnect races are common on mobile networks. Compare-and-delete (or epoch-based fencing) ensures stale gateways cannot clobber newer sessions.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, O'Reilly, 2017 — ch. 5 (replication), 6 (partitioning), 11 (stream processing).</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://signal.org/docs/specifications/x3dh/">The X3DH Key Agreement Protocol</a> and <a href="https://signal.org/docs/specifications/doubleratchet/">The Double Ratchet Algorithm</a> — Signal.</li>
+    <li><span class="ref-kind">Paper</span> <a href="https://www.whatsapp.com/security/WhatsApp-Security-Whitepaper.pdf">WhatsApp Encryption Overview (technical whitepaper)</a>.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://www.rfc-editor.org/rfc/rfc6455">RFC 6455: The WebSocket Protocol</a>; <a href="https://www.rfc-editor.org/rfc/rfc9420">RFC 9420: Messaging Layer Security</a>; <a href="https://www.rfc-editor.org/rfc/rfc9562">RFC 9562: UUIDs (incl. UUIDv7)</a>.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://discord.com/blog/how-discord-stores-trillions-of-messages">Discord — How Discord Stores Trillions of Messages</a> (2023).</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://slack.engineering/real-time-messaging/">Slack Engineering — Real-time Messaging</a>.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c">Instagram Engineering — Sharding &amp; IDs at Instagram</a>.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://netflixtechblog.com/rapid-event-notification-system-at-netflix-6deb1d2b57d1">Netflix — Rapid Event Notification System at Netflix</a> (2022).</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://developer.apple.com/documentation/usernotifications/sending-notification-requests-to-apns">Apple — Sending notification requests to APNs</a>; <a href="https://firebase.google.com/docs/cloud-messaging">Firebase Cloud Messaging documentation</a>.</li>
+    <li><span class="ref-kind">Talk</span> <a href="https://www.erlang-factory.com/sfbay2014/rick-reed">Rick Reed — That's 'Billion' with a 'B': Scaling to the Next Level at WhatsApp</a> (Erlang Factory 2014).</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://resilience4j.readme.io/docs/circuitbreaker">Resilience4j CircuitBreaker documentation</a>.</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

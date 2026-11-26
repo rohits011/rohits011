@@ -1,0 +1,968 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data Preprocessing &amp; Feature Engineering — AI-Era Software Engineering</title>
+<meta name="description" content="Turning messy tables into model-ready features: missing values, outliers, scaling, encoding, feature engineering and selection, imbalanced data, correct splits, leakage, and scikit-learn Pipelines.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p6-02-data-preprocessing-features" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 6 · Chapter 2</p>
+  <h1>Data Preprocessing &amp; Feature Engineering</h1>
+  <p class="lede">Models learn from features, not from data. The step that turns raw rows (nulls, typos, timestamps, free text, wildly different scales, a 1-in-500 positive class) into a clean numeric matrix decides more of a model's quality than the choice of algorithm. This chapter treats preprocessing as what it is for a backend engineer: an input-validation and transformation layer with a strict contract, which must behave identically in training and in production.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Chapter 6.1 (means, variances, norms, conditional probability). Working pandas and NumPy.</li>
+    <li><strong>You will be able to:</strong> choose and justify imputation, outlier, scaling and encoding strategies; engineer datetime, text, ratio and aggregate features; select features; handle class imbalance with weights, resampling and thresholds; split data without leakage (random, stratified, grouped, temporal); and package everything in a scikit-learn <code>Pipeline</code>/<code>ColumnTransformer</code> that serialises as one artifact.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: The Input-Validation Layer of ML</h2>
+  <p>In a Spring Boot service you never let raw JSON reach the domain layer. A DTO is deserialised by Jackson, validated with Bean Validation (<code>@NotNull</code>, <code>@Min</code>, <code>@Pattern</code>), normalised (trimmed strings, canonical enums, UTC timestamps), and only then mapped to a domain object. ML has exactly the same layer, with one twist that makes it harder: many of the transformations are <em>learned from data</em>. The mean used to fill missing ages, the standard deviation used for scaling, the list of known categories for one-hot encoding, the per-category target averages for target encoding: all of these are parameters, estimated on the training set and then frozen. Apply them inconsistently between training and serving, or estimate them using data the model should not have seen, and the model silently degrades.</p>
+  <p>That twist produces the two failure modes this chapter is built around. <strong>Training/serving skew</strong>: production computes a feature differently from the training pipeline (different null handling, a different time zone, an unseen category that crashes the encoder). <strong>Data leakage</strong>: information unavailable at prediction time sneaks into training features, so offline metrics are spectacular and production performance is not. Both are bugs of the preprocessing layer, and both are prevented by the same engineering discipline: a single, versioned, testable transformation object that is fit once on training data and used everywhere.</p>
+  <p>Why do models need preprocessing at all? Because each algorithm family makes assumptions. Linear models and neural networks need numeric inputs on comparable scales (the condition-number argument from Chapter 6.1, §6.6). Distance-based methods (k-NN, k-means, SVM with RBF kernel) treat a feature measured in dollars as thousands of times more important than one measured in years unless you rescale. Most scikit-learn estimators reject NaN. Tree ensembles are more forgiving (scale-invariant, and XGBoost/LightGBM/HistGradientBoosting handle missing values natively), but they still need categorical handling and are just as vulnerable to leakage.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>Bean Validation on DTOs, <code>@ControllerAdvice</code> for rejecting bad input, MapStruct for DTO-to-entity mapping, Jackson custom deserialisers, Flyway migrations as versioned schema changes, and contract tests that pin an API's shape. You know that validation must be identical on every entry path.</dd>
+      <dt>Why that is not enough</dt><dd>Bean Validation rejects bad records; ML preprocessing must usually <em>repair</em> them (impute, clip, bucket) because dropping every imperfect row discards most real data. And the repair rules are statistics estimated from a dataset, which introduces leakage and skew risks that ordinary validation never has.</dd>
+      <dt>The modern approach</dt><dd>Express every transformation as a fit/transform object (scikit-learn transformers), compose them in a <code>Pipeline</code> with the model, fit only on the training fold, and serialise the whole thing as one artifact. Add schema/data validation (pandera, Great Expectations, TensorFlow Data Validation) as the ML equivalent of Bean Validation, and use a feature store when the same features feed several models and must be computed identically online and offline.</dd>
+      <dt>Where Python and Go fit</dt><dd>Training-time preprocessing lives in Python (pandas/Polars, scikit-learn). For serving, either (a) export the fitted pipeline to ONNX with <code>skl2onnx</code> so a Java service runs preprocessing and model in one ONNX Runtime session, (b) call a Python model server, or (c) re-implement transformations in Java/Go from exported parameters (scaler means, category vocabularies) with golden-file tests proving parity. Option (c) is the classic source of skew; prefer (a) or (b).</dd>
+      <dt>In production</dt><dd>Feature pipelines run as batch jobs (Spark, dbt) and streaming jobs (Flink, Kafka Streams) that populate an offline store for training and an online store (Redis, DynamoDB) for low-latency lookups. Your Spring service fetches features by entity key, assembles the vector in a fixed order, validates it, and calls the model.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Always put learned preprocessing inside the pipeline. Avoid ad-hoc notebook transformations on the full dataset before splitting, hand-maintained duplicate feature code in two languages, and resampling (SMOTE) anywhere except inside the training fold.</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="history">
+  <h2>2. History: From Data Cleaning to Feature Platforms</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Period</th><th>Development</th><th>Significance</th></tr></thead>
+    <tbody>
+      <tr><td>1976–1987</td><td>Donald Rubin formalises missing-data mechanisms (MCAR, MAR, MNAR) in 1976; Little and Rubin's <em>Statistical Analysis with Missing Data</em> (1987); Rubin's multiple imputation (1987)</td><td>The vocabulary for deciding whether imputation can be unbiased.</td></tr>
+      <tr><td>1990s</td><td>KDD process and CRISP-DM (1996–2000) describe data preparation as the largest phase of data mining projects</td><td>Preprocessing recognised as a first-class engineering phase.</td></tr>
+      <tr><td>2002</td><td>Chawla et al. publish SMOTE in JAIR</td><td>Standard reference for synthetic oversampling of minority classes.</td></tr>
+      <tr><td>2010–2011</td><td>scikit-learn's paper (JMLR 2011) and its fit/transform API; Kaufman et al.'s "Leakage in Data Mining" (KDD 2011)</td><td>A uniform transformer interface; a formal treatment of leakage.</td></tr>
+      <tr><td>2015</td><td>Sculley et al., "Hidden Technical Debt in Machine Learning Systems" (NeurIPS 2015)</td><td>Names pipeline jungles, glue code and data dependencies as ML-specific debt.</td></tr>
+      <tr><td>2017</td><td>Uber describes Michelangelo, including a shared feature store; CatBoost introduces ordered target statistics to make target encoding leakage-resistant</td><td>Feature reuse and online/offline consistency become platform concerns.</td></tr>
+      <tr><td>2018–2019</td><td>scikit-learn 0.20 adds <code>ColumnTransformer</code> (2018); Google publishes TFX data validation work (SysML 2019); Feast open-source feature store (2019)</td><td>Heterogeneous tables handled in one pipeline; schema-based data validation.</td></tr>
+      <tr><td>2021–2024</td><td>scikit-learn adds <code>set_output(transform="pandas")</code> (1.2) and <code>TargetEncoder</code> with internal cross-fitting (1.3); Airbnb open-sources its Chronon feature platform (2024)</td><td>Leakage-safe encoders built in; feature platforms in open source.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The arc is from "clean the data once by hand" to "preprocessing is versioned code with the same lifecycle as the model". The industry learned this the hard way, mostly through skew and leakage incidents.</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 Data types and measurement levels</h3>
+  <p>Before choosing a transformation, classify each column by what arithmetic is meaningful on it:</p>
+  <ul>
+    <li><strong>Continuous numeric</strong> (latency in ms, price): differences and ratios meaningful. Scale, transform, bin.</li>
+    <li><strong>Count</strong> (orders last 30 days): non-negative integers, usually right-skewed. Log-transform or use count-aware losses.</li>
+    <li><strong>Nominal categorical</strong> (country, device type, merchant ID): labels with no order. Arithmetic on their integer codes is meaningless; one-hot, target or hash encode.</li>
+    <li><strong>Ordinal categorical</strong> (size S/M/L, education level, severity): ordered, but distances not defined. Ordinal-encode with an explicit order.</li>
+    <li><strong>Datetime</strong>: decompose into components, cyclic encodings, and elapsed durations.</li>
+    <li><strong>Text</strong>: tokenise and vectorise (TF-IDF, embeddings).</li>
+    <li><strong>Identifiers</strong> (user ID, order UUID): usually <em>not</em> features. Using them invites memorisation and leakage; use them as join keys and grouping variables.</li>
+  </ul>
+
+  <h3>3.2 Missing values: mechanisms first</h3>
+  <p>Why a value is missing determines what you may do about it. Rubin's three mechanisms:</p>
+  <ul>
+    <li><strong>MCAR (missing completely at random)</strong>: missingness unrelated to anything, e.g. a sensor dropping 1% of readings at random. Dropping rows loses data but does not bias.</li>
+    <li><strong>MAR (missing at random)</strong>: missingness depends on <em>observed</em> columns, e.g. income missing more often for younger users, and age is recorded. Imputation conditioned on age can remove the bias.</li>
+    <li><strong>MNAR (missing not at random)</strong>: missingness depends on the missing value itself, e.g. high earners decline to state income. No imputation from observed data fully fixes this; the fact of missingness is itself informative.</li>
+  </ul>
+  <p>Practical consequence: in real systems missingness is often informative ("no previous orders" for new customers), so the best default is <strong>impute plus a missing-indicator column</strong>. The model can then learn both a reasonable value and the signal "this was missing".</p>
+  <p>Imputation strategies, in increasing sophistication:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Strategy</th><th>How</th><th>Pros</th><th>Cons</th></tr></thead>
+    <tbody>
+      <tr><td>Drop rows</td><td><code>dropna()</code></td><td>Simple</td><td>Loses data; biased unless MCAR; production rows still arrive with nulls</td></tr>
+      <tr><td>Mean / median</td><td><code>SimpleImputer(strategy="median")</code></td><td>Fast, robust (median)</td><td>Shrinks variance, distorts correlations</td></tr>
+      <tr><td>Most frequent / constant</td><td>Mode, or a sentinel category "MISSING"</td><td>Natural for categoricals</td><td>Mode inflates the majority category</td></tr>
+      <tr><td>Indicator</td><td><code>add_indicator=True</code></td><td>Preserves informative missingness</td><td>Adds columns</td></tr>
+      <tr><td>k-NN imputation</td><td>Average of the k most similar rows</td><td>Uses feature relationships</td><td>O(n²) memory/time; needs scaling</td></tr>
+      <tr><td>Iterative (MICE-style)</td><td>Model each column from the others, round-robin</td><td>Captures multivariate structure</td><td>Slow; experimental in scikit-learn</td></tr>
+      <tr><td>Native handling</td><td>Gradient-boosted trees learn a default direction for NaN at each split</td><td>No imputation needed</td><td>Only for those models</td></tr>
+    </tbody>
+  </table></div>
+  <p>Numeric example. Ages in training: [25, 31, NaN, 47, 52, NaN, 38]. The median of the observed values [25, 31, 38, 47, 52] is 38. After imputation with indicator: values [25, 31, 38, 47, 52, 38, 38] and indicator [0, 0, 1, 0, 0, 1, 0]. At serving time, a request with missing age gets 38 and indicator 1, using the <em>training</em> median, never a median of the incoming batch.</p>
+
+  <h3>3.3 Outliers</h3>
+  <p>An outlier is a value far from the bulk of the data. It is either an <strong>error</strong> (age 999, a timestamp in 1970 from a zero epoch, a price in cents mixed with prices in dollars) or a <strong>genuine extreme</strong> (a whale customer, a viral post). Errors should be fixed or nulled at the validation layer; genuine extremes should usually be kept but prevented from dominating.</p>
+  <p>Detection rules. The <strong>z-score</strong> rule flags |x − mean| / sd &gt; 3, but the mean and sd are themselves dragged by outliers. The <strong>IQR rule</strong> is robust: compute the first and third quartiles Q1 and Q3, the interquartile range IQR = Q3 − Q1, and flag values outside [Q1 − 1.5·IQR, Q3 + 1.5·IQR]. Example: order values with Q1 = $20, Q3 = $80, IQR = $60; fences are −$70 and $170, so a $5,000 order is flagged. For multivariate outliers, use isolation forests (Chapter 6.4).</p>
+  <p>Treatments: <strong>clip/winsorise</strong> to percentiles (e.g. the 1st and 99th, learned on training data); <strong>transform</strong> with log or Yeo-Johnson so the tail compresses; use <strong>robust scaling</strong> (median and IQR instead of mean and sd); or use models that are insensitive (trees split on order, not magnitude) and losses that are robust (Huber).</p>
+
+  <h3>3.4 Scaling and normalisation</h3>
+  <p>Scaling puts features on comparable ranges. Four common transformers, each with intuition and an example on incomes [30k, 45k, 60k, 1,000k]:</p>
+  <p><strong>Standardisation</strong> (<code>StandardScaler</code>): subtract the mean, divide by the standard deviation, so the result has mean 0 and variance 1. Intuition: express each value as "how many standard deviations from typical". With mean 283.75k and sd ≈ 414k, the values become about [−0.61, −0.57, −0.54, 1.73]. The single outlier compresses everyone else into a tiny range.</p>
+  \[ z = \frac{x - \mu_{\text{train}}}{\sigma_{\text{train}}} \]
+  <p><strong>Min-max scaling</strong> (<code>MinMaxScaler</code>): map the training minimum to 0 and maximum to 1. Same example: [0, 0.015, 0.031, 1]. Even worse with outliers, and production values outside the training range land outside [0, 1].</p>
+  \[ x' = \frac{x - x_{\min}}{x_{\max} - x_{\min}} \]
+  <p><strong>Robust scaling</strong> (<code>RobustScaler</code>): subtract the median, divide by the IQR. Median 52.5k; with linear interpolation Q1 = 41.25k and Q3 = 295k, so IQR ≈ 253.75k: values ≈ [−0.09, −0.03, 0.03, 3.73]. The bulk keeps its spread; the outlier stays visibly extreme.</p>
+  <p><strong>Power/log transforms</strong> (<code>np.log1p</code>, <code>PowerTransformer</code> with Box-Cox or Yeo-Johnson): reshape skewed distributions to look more Gaussian. log10 of the incomes gives [4.48, 4.65, 4.78, 6.0]: the 33× ratio becomes a difference of about 1.5. Income, prices, counts and latencies are almost always better on a log scale.</p>
+  <p>Separately, <strong>row normalisation</strong> (<code>Normalizer</code>) scales each <em>row</em> to unit norm; it is for vectors where direction matters (TF-IDF documents, embeddings), not for tabular features.</p>
+  <div class="callout tip"><p class="callout-title">Which models need scaling?</p><p>Need it: linear/logistic regression with regularisation (the penalty treats all coefficients alike, so unscaled features get unequal penalties), SVMs, k-NN, k-means, PCA, neural networks. Do not need it: decision trees, random forests, gradient-boosted trees, which only compare a feature with thresholds.</p></div>
+
+  <h3>3.5 Encoding categorical variables</h3>
+  <p><strong>One-hot encoding</strong> creates one binary column per category. Device ∈ {ios, android, web} becomes three columns; "android" is [0, 1, 0]. It assumes nothing about order or similarity. Its problems are high cardinality (a merchant ID with 200,000 values yields 200,000 sparse columns) and unseen categories at serving time. scikit-learn's <code>OneHotEncoder(handle_unknown="infrequent_if_exist", min_frequency=...)</code> groups rare categories into an "infrequent" bucket and maps unseen ones there instead of raising. For linear models with an intercept, one column per feature is redundant (the columns always sum to 1, the rank deficiency from Chapter 6.1), which <code>drop="first"</code> removes; with regularisation this rarely matters.</p>
+  <p><strong>Ordinal encoding</strong> maps ordered categories to integers: S → 0, M → 1, L → 2. Fine for truly ordinal data and for tree models (which can split anywhere). Wrong for nominal data in linear models: encoding {red: 0, green: 1, blue: 2} asserts that green is between red and blue.</p>
+  <p><strong>Target (mean) encoding</strong> replaces each category with the average target value for that category. City "Lyon" with 40 orders of which 6 were fraudulent becomes 0.15. One numeric column regardless of cardinality, and directly predictive. Two dangers. First, <strong>small categories are noisy</strong>: a city with 1 order and 1 fraud gets 1.0. The fix is smoothing toward the global mean (the MAP shrinkage from Chapter 6.1):</p>
+  \[ \text{enc}(c) = \frac{n_c\,\bar y_c + m\,\bar y}{n_c + m}, \]
+  <p>where n<sub>c</sub> is the category count, ȳ<sub>c</sub> its target mean, ȳ the global mean and m the smoothing strength. With global fraud rate 0.02 and m = 20: Lyon → (40 × 0.15 + 20 × 0.02) / 60 ≈ 0.107; the 1-order city → (1 × 1 + 20 × 0.02) / 21 ≈ 0.067. Second, and worse, <strong>target leakage</strong>: if a row's own label contributed to its encoding, the feature partially contains the answer. On rare categories the effect is enormous: a category seen once encodes its own label exactly. The fix is <em>out-of-fold</em> encoding: split the training data into k folds and encode each fold using statistics from the other folds only. scikit-learn's <code>TargetEncoder</code> does this cross-fitting inside <code>fit_transform</code> <span class="tag version">Version-sensitive · checked Nov 2026</span>, and CatBoost uses ordered target statistics for the same purpose.</p>
+  <p><strong>Hashing</strong> (<code>FeatureHasher</code>): map each category string through a hash function into one of, say, 2<sup>18</sup> columns. No vocabulary to store, handles unseen values gracefully, constant memory; collisions merge unrelated categories. Identical in spirit to sharding keys with a hash ring.</p>
+  <p><strong>Learned embeddings</strong>: in neural networks, a categorical is mapped to a trainable dense vector (an embedding table). The network learns that similar merchants have nearby vectors. This is the standard for very high cardinality in deep recommenders.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Encoding</th><th>Cardinality</th><th>Model families</th><th>Leakage risk</th><th>Unseen categories</th></tr></thead>
+    <tbody>
+      <tr><td>One-hot</td><td>Low to medium (&lt; ~100)</td><td>All, especially linear</td><td>None</td><td>Ignore or infrequent bucket</td></tr>
+      <tr><td>Ordinal</td><td>Any</td><td>Trees; linear only if truly ordered</td><td>None</td><td>Map to a reserved value</td></tr>
+      <tr><td>Target (smoothed, cross-fitted)</td><td>High</td><td>Trees, linear</td><td>High if not cross-fitted</td><td>Falls back to global mean</td></tr>
+      <tr><td>Hashing</td><td>Very high, unbounded</td><td>Linear, online learning</td><td>None</td><td>Handled natively</td></tr>
+      <tr><td>Embeddings</td><td>Very high</td><td>Neural networks</td><td>None directly</td><td>Reserved "unknown" vector</td></tr>
+      <tr><td>Native categorical</td><td>Medium</td><td>LightGBM, CatBoost, XGBoost, HistGradientBoosting</td><td>Low (CatBoost ordered stats)</td><td>Library-specific</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>3.6 Datetime features</h3>
+  <p>A raw timestamp is a single number that grows forever; models extrapolate poorly on it. Decompose it into what plausibly drives behaviour: hour of day, day of week, month, is_weekend, is_holiday (from a calendar table), and <strong>elapsed durations</strong> relative to the prediction time (days since signup, minutes since last login, days until contract end). Durations are usually the most predictive and the most leak-prone: they must be computed relative to the moment of prediction, not "now" at training time.</p>
+  <p><strong>Cyclic encoding</strong>: hour 23 and hour 0 are adjacent, but as integers they are 23 apart. Map the hour onto a circle with two features:</p>
+  \[ h_{\sin} = \sin\!\left(\frac{2\pi h}{24}\right),\qquad h_{\cos} = \cos\!\left(\frac{2\pi h}{24}\right). \]
+  <p>Hour 0 is (0, 1), hour 6 is (1, 0), hour 23 is (−0.259, 0.966), whose Euclidean distance to hour 0 is about 0.26, the same as one hour apart anywhere on the clock. Trees can use the raw hour directly; linear models and neural networks benefit from the circle. Always normalise time zones: store UTC, derive local hour with the user's zone, exactly as you would in a <code>java.time</code> service.</p>
+
+  <h3>3.7 Text features</h3>
+  <p>The classical pipeline: lowercase and tokenise; build a vocabulary; represent each document as counts of terms (<em>bag of words</em>), optionally n-grams; reweight with <strong>TF-IDF</strong> so terms frequent in this document but rare across documents get high weight. For term t in document d over N documents, with df(t) documents containing t:</p>
+  \[ \text{tfidf}(t,d) = \text{tf}(t,d)\cdot\log\frac{N}{\text{df}(t)}\quad(\text{scikit-learn uses a smoothed variant}). \]
+  <p>Example: in 1,000 support tickets, "refund" appears in 50 and "the" in 990. In a ticket mentioning each twice, "refund" scores 2 × ln(20) ≈ 6.0 and "the" 2 × ln(1.01) ≈ 0.02. TF-IDF plus logistic regression remains a strong, cheap, explainable baseline for ticket routing and spam filtering. Modern alternatives use pretrained sentence embeddings (Chapter 7.3) as dense features. Simple engineered text features also help: length, number of URLs, ratio of capitals, presence of an order number pattern.</p>
+
+  <h3>3.8 Feature engineering</h3>
+  <p>Feature engineering encodes domain knowledge as columns, so the model does not have to discover it from scratch. The most productive patterns:</p>
+  <ul>
+    <li><strong>Ratios and differences</strong>: price per square metre, debt-to-income, (current balance − average balance). A tree needs many splits to approximate a ratio; giving it the ratio directly is far more data-efficient.</li>
+    <li><strong>Aggregations over entities and windows</strong>: for a transaction, the customer's count of transactions in the last 1 h / 24 h / 7 d, mean amount over 30 d, number of distinct devices in 24 h. These "velocity features" are the backbone of fraud models and are computed by streaming jobs. Each must be <em>point-in-time correct</em>: aggregated only over events strictly before the prediction timestamp.</li>
+    <li><strong>Interactions</strong>: products of features (<code>PolynomialFeatures</code>) let linear models capture "high income AND young". Trees and neural nets learn interactions themselves.</li>
+    <li><strong>Binning</strong>: <code>KBinsDiscretizer</code> turns a continuous feature into quantile buckets, letting a linear model learn a non-linear step function; it also stabilises noisy features.</li>
+    <li><strong>Domain transforms</strong>: geohash of coordinates, distance to nearest store, haversine distance between billing and shipping addresses, whether an email domain is free-mail.</li>
+  </ul>
+  <p>California housing illustrates it: the raw data has total rooms and households per district, but "rooms per household" is what predicts value. Adding three such ratios to a linear model typically gives a noticeable improvement in RMSE <span class="tag illus">Illustrative</span>; the exact gain depends on the split.</p>
+
+  <h3>3.9 Feature selection</h3>
+  <p>More features are not free: each one is a pipeline dependency that can break, a source of potential leakage, a latency cost to fetch online, and a degree of freedom to overfit. Selection methods:</p>
+  <ul>
+    <li><strong>Filter methods</strong> score each feature independently of the model: variance threshold (drop constants), correlation with the target, mutual information, chi-squared for counts. Fast but blind to interactions and redundancy.</li>
+    <li><strong>Wrapper methods</strong> search over subsets using model performance: recursive feature elimination (<code>RFECV</code>), forward/backward sequential selection. Accurate but expensive and prone to overfitting the validation set.</li>
+    <li><strong>Embedded methods</strong> select as part of training: L1 (lasso) drives coefficients to zero; tree importances; <code>SelectFromModel</code> wraps these.</li>
+    <li><strong>Permutation importance</strong> on a validation set (Chapter 6.5) measures how much the score drops when a feature is shuffled: model-agnostic and honest, but misleading for correlated features (shuffle one and its twin covers for it).</li>
+  </ul>
+  <p><strong>Mutual information</strong> deserves a sentence of intuition: it is how much knowing X reduces uncertainty (entropy, Chapter 6.1) about Y, I(X; Y) = H(Y) − H(Y | X). Unlike correlation, it detects any dependence, including non-monotone ones. Feature selection must be done <em>inside</em> cross-validation; selecting the top features using all data, then cross-validating, is a classic leakage bug that makes pure noise look predictive.</p>
+
+  <h3>3.10 Imbalanced data</h3>
+  <p>In fraud (often well under 1% positives), churn, defect detection and medical screening, the class of interest is rare. Problems: accuracy is meaningless (predict "not fraud" always and score 99.5%); the model sees few positives; the default 0.5 threshold is badly placed. Remedies, roughly in the order you should try them:</p>
+  <ol>
+    <li><strong>Use the right metric</strong>: precision, recall, PR-AUC, cost-weighted metrics (Chapter 6.5). This changes nothing about the model but everything about your decisions.</li>
+    <li><strong>Tune the decision threshold</strong> on validation data to meet a business constraint (e.g. recall ≥ 0.9, or minimum expected cost). Often the single largest improvement.</li>
+    <li><strong>Class weights</strong>: multiply each example's loss by a weight, e.g. <code>class_weight="balanced"</code> sets w<sub>c</sub> = n / (K · n<sub>c</sub>). With 990 negatives and 10 positives, positives get weight 50 and negatives about 0.505. Equivalent in expectation to oversampling without duplicating data. XGBoost's <code>scale_pos_weight</code> = negatives/positives (99 here) does the same.</li>
+    <li><strong>Resampling</strong>: random undersampling of the majority (fast, discards data), random oversampling of the minority (duplicates, can overfit), or <strong>SMOTE</strong>, which creates synthetic minority points by interpolating between a minority example and one of its k nearest minority neighbours: x<sub>new</sub> = x<sub>i</sub> + u · (x<sub>nn</sub> − x<sub>i</sub>), u ∈ [0, 1]. Example: minority points (1, 2) and (3, 6), u = 0.25: synthetic point (1.5, 3).</li>
+  </ol>
+  <div class="callout warn"><p class="callout-title">Resampling distorts probabilities</p><p>Weighting or resampling changes the class prior the model sees, so predicted probabilities are no longer calibrated to the real base rate. If downstream logic needs probabilities (expected-loss calculations, bidding), recalibrate on untouched validation data or correct analytically. For a model trained with positives weighted by w, the odds are inflated by w: p<sub>true</sub> ≈ p/(p + w(1 − p)). And never resample the validation or test set: it must reflect production. Recent work also questions whether SMOTE helps strong learners such as gradient-boosted trees compared with weighting and threshold tuning; treat it as one option to validate, not a default <span class="tag opinion">Opinion</span>.</p></div>
+
+  <h3>3.11 Train, validation and test splits</h3>
+  <p>The purpose of splitting is to <em>simulate the future</em>: the test set stands in for data the model will see after deployment. So the right split mirrors how production differs from training:</p>
+  <ul>
+    <li><strong>Random split</strong> (e.g. 70/15/15): fine when rows are i.i.d. and the future looks like the past.</li>
+    <li><strong>Stratified split</strong>: preserves class proportions in each part. Essential for imbalanced classification; with 1% positives and a 1,000-row test set, a random split could plausibly give 4 or 16 positives.</li>
+    <li><strong>Group split</strong> (<code>GroupShuffleSplit</code>, <code>GroupKFold</code>): all rows of one user/patient/device go to the same side. Otherwise the model memorises the user and the test score measures recognition, not generalisation.</li>
+    <li><strong>Temporal split</strong>: train on the past, validate on later, test on the latest period, with a gap if labels mature slowly. Mandatory for forecasting, fraud, churn, recommendation: anything where the world drifts.</li>
+  </ul>
+  <p>Roles: the <strong>training</strong> set fits parameters, including preprocessing statistics; the <strong>validation</strong> set (or cross-validation folds) chooses hyperparameters, features and thresholds; the <strong>test</strong> set is touched once, at the end, to estimate production performance. Every time you look at test results and change something, the test set becomes a validation set and its estimate becomes optimistic.</p>
+
+  <h3>3.12 Data leakage</h3>
+  <p>Leakage is any path by which information unavailable at prediction time reaches the training features or the evaluation. Its signature is offline metrics that are too good to be true. Common forms:</p>
+  <ul>
+    <li><strong>Target leakage</strong>: a feature derived from the label or from events after it. "Refund issued" as a feature for predicting fraud; "number of support calls in the account's lifetime" for predicting churn when calls happen after the churn decision; a "status" column that gets updated when the outcome is known.</li>
+    <li><strong>Train-test contamination</strong>: fitting a scaler, imputer, encoder, feature selector or SMOTE on the full dataset before splitting. The test rows influenced the transformation.</li>
+    <li><strong>Temporal leakage</strong>: random splits on time-dependent data, or aggregates computed over windows that extend past the prediction time (a "30-day average" computed with a centred window).</li>
+    <li><strong>Group leakage</strong>: the same entity in train and test (duplicate rows, multiple images of the same patient).</li>
+    <li><strong>Proxy leakage</strong>: an ID or timestamp that correlates with the label because of how the data was collected (positive examples were collected in a later batch, so higher IDs mean positive).</li>
+  </ul>
+  <p>The defence is architectural: features computed point-in-time from an event log, transformations fit only inside the training fold (Pipelines), splits that mirror production, and a sceptical review of any feature with suspiciously high importance.</p>
+
+  <h3>3.13 Pipelines and ColumnTransformer</h3>
+  <p>A scikit-learn <code>Pipeline</code> chains transformers and a final estimator into one estimator. Calling <code>fit</code> fits each step on the output of the previous one, using only the data passed in; <code>predict</code> applies the fitted transformations and the model. A <code>ColumnTransformer</code> routes different columns through different sub-pipelines (numeric: impute → scale; categorical: impute → one-hot) and concatenates the results. Together they give you:</p>
+  <ul>
+    <li><strong>Leak-proof cross-validation</strong>: <code>cross_val_score(pipe, X, y)</code> refits the preprocessing on each training fold.</li>
+    <li><strong>One artifact</strong>: serialise the fitted pipeline with joblib/skops (or export to ONNX), and serving applies exactly the training transformations.</li>
+    <li><strong>Joint tuning</strong>: hyperparameters of preprocessing steps (<code>preprocess__num__imputer__strategy</code>) are searched alongside model hyperparameters.</li>
+  </ul>
+  <p>It is the ML analogue of a Spring <code>HandlerInterceptor</code> chain plus a validated DTO mapper, packaged as one deployable unit.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working: What fit and transform Really Do</h2>
+  <h3>4.1 The transformer contract</h3>
+  <p>Every scikit-learn transformer implements two phases. <code>fit(X, y=None)</code> <em>learns state</em> from data and stores it in attributes ending in an underscore: <code>StandardScaler.mean_</code> and <code>scale_</code>, <code>SimpleImputer.statistics_</code>, <code>OneHotEncoder.categories_</code>, <code>TargetEncoder.encodings_</code>. <code>transform(X)</code> <em>applies</em> that frozen state to any data, training or new. <code>fit_transform</code> does both, sometimes with a different, leakage-aware behaviour (TargetEncoder's cross-fitting happens only in <code>fit_transform</code>, so the training-set encoding differs from what <code>transform</code> would produce on the same rows; this is intentional).</p>
+  <p>Think of the fitted transformer as a compiled configuration: like a Spring <code>@ConfigurationProperties</code> bean whose values were computed from the training set rather than read from YAML, and which must never be recomputed at request time.</p>
+  <h3>4.2 How a Pipeline executes</h3>
+  <ol>
+    <li><code>Pipeline.fit(X_train, y_train)</code>: for each intermediate step i, call <code>fit_transform</code> on the current data and pass the output to step i + 1; finally call <code>fit</code> on the estimator.</li>
+    <li><code>Pipeline.predict(X_new)</code>: for each intermediate step call <code>transform</code> only (no refitting), then <code>predict</code> on the estimator.</li>
+    <li>Inside <code>cross_val_score</code> or <code>GridSearchCV</code>, the whole pipeline is cloned (unfitted) and fit on each training fold separately, so each fold's validation rows never influence the preprocessing state used to score them.</li>
+  </ol>
+  <h3>4.3 How ColumnTransformer assembles the matrix</h3>
+  <p>A <code>ColumnTransformer</code> holds a list of (name, transformer, columns) triples. On fit, it selects each column subset (by name, index or a <code>make_column_selector(dtype_include=...)</code> rule), fits each sub-transformer independently, and horizontally stacks their outputs in the declared order, followed by any <code>remainder</code> columns (dropped by default). If any output is sparse and the overall density is below <code>sparse_threshold</code>, the result is a SciPy sparse matrix. <code>get_feature_names_out()</code> reports the final column names (e.g. <code>cat__workclass_Private</code>), which you need for interpretability and for verifying serving parity. With <code>set_output(transform="pandas")</code>, outputs are DataFrames with those names.</p>
+  <h3>4.4 How native missing-value handling works in boosted trees</h3>
+  <p>When a histogram-based gradient-boosting implementation (XGBoost, LightGBM, scikit-learn's <code>HistGradientBoosting*</code>) evaluates a split on feature j at threshold t, it computes the loss reduction twice: once sending all rows with missing x<sub>j</sub> to the left child and once to the right, and keeps the better "default direction". At prediction time, a missing value follows that learned direction. Missingness thus becomes a learned signal, without imputation, as long as training data contained missing values for that feature.</p>
+  <h3>4.5 How SMOTE generates points</h3>
+  <ol>
+    <li>For each minority example x<sub>i</sub>, find its k nearest minority-class neighbours (default k = 5) in feature space (so features must be scaled).</li>
+    <li>To create a synthetic point, pick one neighbour x<sub>nn</sub> at random and a random u ∈ [0, 1]; output x<sub>i</sub> + u (x<sub>nn</sub> − x<sub>i</sub>), a point on the segment between them.</li>
+    <li>Repeat until the requested ratio is reached. Variants: Borderline-SMOTE focuses on minority points near the class boundary; SMOTE-NC handles mixed categorical/numeric features by taking the majority category among neighbours.</li>
+  </ol>
+  <p>In imbalanced-learn, samplers implement <code>fit_resample</code>, and its <code>Pipeline</code> applies resampling only during <code>fit</code>, never during <code>predict</code>. That is why you must use <code>imblearn.pipeline.Pipeline</code>, not scikit-learn's, when a sampler is a step.</p>
+  <h3>4.6 Point-in-time feature joins</h3>
+  <p>For a training example "transaction T at time t<sub>0</sub>", a correct velocity feature is computed from events with timestamp strictly before t<sub>0</sub> (and, if features in production are refreshed with a delay, before t<sub>0</sub> − delay). Feature stores implement this as an <em>as-of join</em>: for each label row, take the latest feature value whose event time ≤ t<sub>0</sub>. In pandas this is <code>pd.merge_asof</code>; in SQL a window function or a lateral join; in Spark a range join. Getting this wrong (a plain join on the latest feature snapshot) is the most common source of temporal leakage in production ML.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: Preprocessing in the ML System</h2>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph Fit["Training time"]
+    R["Raw training rows"] --> V["Schema and data validation"]
+    V --> S["Split: train / val / test"]
+    S --> FT["Pipeline.fit on train only"]
+    FT --> A["Fitted pipeline artifact (preprocess + model)"]
+  end
+  subgraph Serve["Serving time"]
+    Q["Request DTO"] --> BV["Bean Validation + feature lookup"]
+    BV --> T["Same artifact: transform + predict"]
+    T --> P["Prediction"]
+  end
+  A -- "versioned in model registry" --> T
+  S -- "val/test only transformed, never fit" --> E["Evaluation"]
+</pre>
+  <figcaption>Figure 6.2.1 — One fitted artifact used for both evaluation and serving prevents training/serving skew.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the split happens <em>before</em> any statistics are learned, and only the training partition flows into <code>fit</code>. Validation and test rows are passed through <code>transform</code> by the same artifact. On the serving side, the Spring layer is responsible for structural validation and fetching features, but all learned transformations come from the artifact produced in training, distributed through the model registry. If the serving path reimplemented scaling or encoding by hand, a second arrow of "logic" would appear, and with it skew.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  X["DataFrame X"] --> CT{"ColumnTransformer"}
+  CT -- "age, hours, capital_gain" --> N1["SimpleImputer(median, add_indicator)"]
+  N1 --> N2["log1p for skewed + StandardScaler"]
+  CT -- "workclass, occupation, country" --> C1["SimpleImputer(constant MISSING)"]
+  C1 --> C2["OneHotEncoder(min_frequency, infrequent_if_exist)"]
+  CT -- "education (ordered)" --> O1["OrdinalEncoder(categories=explicit order)"]
+  N2 --> H["hstack in declared order"]
+  C2 --> H
+  O1 --> H
+  H --> M["Estimator: LogisticRegression / HistGradientBoosting"]
+</pre>
+  <figcaption>Figure 6.2.2 — A ColumnTransformer routes each column group through its own sub-pipeline, then concatenates.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> each branch is an independent fit/transform chain over its own columns, so the numeric branch never sees category strings and vice versa. The concatenation order is fixed by the declaration, which is what makes the output column order stable between training and serving. Note the ordinal branch uses an explicit category order supplied by a human, because alphabetical order ("Bachelors" &lt; "Doctorate" &lt; "HS-grad") is meaningless.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant CV as cross_validate
+  participant P as Pipeline clone
+  participant Tr as Train fold k
+  participant Va as Val fold k
+  loop for each fold k
+    CV->>P: clone(unfitted pipeline)
+    CV->>P: fit(Tr)
+    Note over P: imputer, scaler, encoder, selector, SMOTE all fit on Tr only
+    CV->>P: score(Va)
+    Note over P: Va only transformed, never resampled
+    P-->>CV: fold score
+  end
+  CV-->>CV: mean and sd of fold scores
+</pre>
+  <figcaption>Figure 6.2.3 — Why putting preprocessing inside the pipeline makes cross-validation honest.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> every fold gets a fresh clone, so no fitted state carries over from a previous fold. Each validation fold plays the role of "future data" for the preprocessing as well as the model. If instead you had scaled or selected features on the full dataset first, each validation fold would have contributed to the statistics used to transform it: a small leak for scaling, a large one for target encoding, feature selection and SMOTE.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  EV["Event log (Kafka)"] --> ST["Streaming aggregates (Flink / Kafka Streams)"]
+  EV --> BT["Batch backfill (Spark)"]
+  ST --> ON["Online store (Redis)"]
+  BT --> OFF["Offline store (Parquet / warehouse)"]
+  ST --> OFF
+  OFF --> PIT["Point-in-time join with labels"]
+  PIT --> TR["Training set"]
+  ON --> SV["Spring service feature lookup"]
+</pre>
+  <figcaption>Figure 6.2.4 — A feature-store architecture: one definition, two materialisations.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the same feature definition (say, "transactions per card in the last hour") is materialised twice: into a low-latency online store for serving, and into a time-stamped offline store for training. Training sets are built with point-in-time joins so each label sees feature values as they were at that moment. Because both stores come from one definition, the online and offline values agree, eliminating the most insidious skew. This is what Michelangelo's feature store, Feast and Chronon provide.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math Behind the Transformations</h2>
+  <h3>6.1 Why standardisation helps gradient descent</h3>
+  <p><strong>In words:</strong> unscaled features stretch the loss bowl into a narrow ravine, and the learning rate must be small enough for the steepest wall, so progress along the floor crawls. Standardising makes the bowl rounder.</p>
+  <p>For linear regression with MSE the Hessian is \( \frac{2}{m}X^\top X \). If feature 1 is age (sd ≈ 13) and feature 2 is income (sd ≈ 40,000) and both are centred and roughly uncorrelated, the diagonal entries scale with their variances, about 169 versus 1.6 × 10<sup>9</sup>: a condition number near 10<sup>7</sup>. Using the rate bound from Chapter 6.1, convergence along the age direction needs on the order of 10<sup>7</sup> iterations. After standardisation both diagonals are 1 and, absent correlation, κ ≈ 1: gradient descent converges in a handful of steps.</p>
+  <h3>6.2 Variance shrinkage under mean imputation</h3>
+  <p><strong>In words:</strong> filling gaps with the mean adds points at the centre, so the variance shrinks and the feature looks less informative than it is.</p>
+  <p>If a fraction r of n values are missing and replaced by the observed mean \( \bar x \), the sample variance becomes</p>
+  \[ s^2_{\text{imputed}} = \frac{1}{n}\sum_{\text{observed}}(x_i - \bar x)^2 + \frac{1}{n}\sum_{\text{imputed}}0 = (1-r)\,s^2_{\text{observed}}. \]
+  <p>With 30% missing, variance drops by 30%; correlations with other variables are attenuated similarly. This is why multiple imputation and indicator columns exist.</p>
+  <h3>6.3 Smoothed target encoding as a Bayesian estimate</h3>
+  <p>Treat each category's positive rate θ<sub>c</sub> as unknown, with a Beta prior centred on the global rate p̄ with strength m: Beta(m p̄, m(1 − p̄)). After observing k<sub>c</sub> positives in n<sub>c</sub> rows, the posterior mean is</p>
+  \[ \mathbb{E}[\theta_c\mid\text{data}] = \frac{k_c + m\bar p}{n_c + m} = \frac{n_c}{n_c+m}\,\bar y_c + \frac{m}{n_c+m}\,\bar p. \]
+  <p>That is exactly the smoothing formula in §3.5: a weighted average of the category mean and the global mean, with weight shifting to the category as its count grows. scikit-learn's <code>TargetEncoder(smooth="auto")</code> chooses the weight with an empirical-Bayes estimate of the between-category variance.</p>
+  <h3>6.4 How much does target leakage inflate a feature?</h3>
+  <p>Consider a category with n<sub>c</sub> rows and a non-cross-fitted mean encoding. Each row's encoding includes its own label with weight 1/n<sub>c</sub>, so the correlation between the encoding and the row's label is inflated by roughly that amount. For n<sub>c</sub> = 1 the encoding <em>equals</em> the label. With a high-cardinality ID where most categories have 1–3 rows, an unregularised, non-cross-fitted target encoding is close to a copy of the target, and a model will reach near-perfect training and in-sample validation scores. Out-of-fold encoding removes the self-contribution entirely.</p>
+  <h3>6.5 Class weights and the expected loss</h3>
+  <p>With weights w<sub>1</sub> for positives and w<sub>0</sub> for negatives, the weighted log-loss is</p>
+  \[ \mathcal{L}_w = -\frac{1}{m}\sum_i\Big[w_1\,y_i\log\hat p_i + w_0\,(1-y_i)\log(1-\hat p_i)\Big]. \]
+  <p>For a group of identical inputs with true positive rate π, minimising this over p̂ gives \( \hat p = \frac{w_1\pi}{w_1\pi + w_0(1-\pi)} \): the model predicts the probability under a re-weighted prior. With π = 0.01 and w<sub>1</sub>/w<sub>0</sub> = 99, p̂ = 0.99/(0.99 + 0.99) = 0.5. Invert this relation to recover calibrated probabilities. The minimiser derivation: set the derivative \( -w_1\pi/\hat p + w_0(1-\pi)/(1-\hat p) \) to zero.</p>
+  <h3>6.6 Mutual information</h3>
+  <p>For discrete X and Y, \( I(X;Y) = \sum_{x,y}p(x,y)\log\frac{p(x,y)}{p(x)p(y)} \), the KL divergence between the joint distribution and the product of marginals: zero exactly when independent. Example: a binary feature X and label Y with p(X=1,Y=1) = 0.1, p(X=1,Y=0) = 0.1, p(X=0,Y=1) = 0.0, p(X=0,Y=0) = 0.8. Marginals: p(X=1) = 0.2, p(Y=1) = 0.1. I = 0.1 ln(0.1/0.02) + 0.1 ln(0.1/0.18) + 0.8 ln(0.8/0.72) ≈ 0.161 − 0.059 + 0.084 = 0.186 nats, out of H(Y) ≈ 0.325 nats: the feature removes more than half the uncertainty about Y.</p>
+  <h3>6.7 Complexity and memory</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Operation</th><th>Time</th><th>Memory / output</th></tr></thead>
+    <tbody>
+      <tr><td>Scaling, simple imputation</td><td>O(nd) fit and transform</td><td>O(d) state</td></tr>
+      <tr><td>One-hot on cardinality K</td><td>O(n) per column</td><td>O(K) vocabulary; sparse output with n non-zeros per column</td></tr>
+      <tr><td>Target encoding with k-fold cross-fit</td><td>O(kn)</td><td>O(K) table</td></tr>
+      <tr><td>Hashing into 2<sup>b</sup> buckets</td><td>O(n)</td><td>No state; collision rate ≈ K / 2<sup>b</sup> for K ≪ 2<sup>b</sup></td></tr>
+      <tr><td>KNNImputer, SMOTE</td><td>O(n² d) brute force</td><td>O(nd); impractical beyond ~10⁵–10⁶ rows without approximate neighbours</td></tr>
+      <tr><td>Wrapper selection (RFE)</td><td>O(d) model fits or more</td><td>Dominated by model training</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="code">
+  <h2>7. Code: Building a Leak-Proof Preprocessing Pipeline</h2>
+  <p>Environment: Python 3.11+, <code>pip install "scikit-learn&gt;=1.4" pandas numpy imbalanced-learn pandera skl2onnx onnxruntime</code>. Datasets are fetched from OpenML on first run (internet required). Outputs in comments are <span class="tag illus">Illustrative</span>: they were not produced by running these exact scripts for this book and will vary slightly with versions and splits. API details are <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+
+  <h3>7.1 Explore and validate the Adult census data</h3>
+<pre data-file="adult_explore.py"><code class="language-python">import pandas as pd
+from sklearn.datasets import fetch_openml
+
+adult = fetch_openml("adult", version=2, as_frame=True)
+df = adult.frame
+print(df.shape)                       # (48842, 15)
+print(df.dtypes.value_counts())
+print(df.isna().mean().sort_values(ascending=False).head(4))
+# occupation ~0.057, workclass ~0.057, native-country ~0.018 missing (Illustrative)
+print(df["class"].value_counts(normalize=True))   # '&lt;=50K' ~0.76, '&gt;50K' ~0.24
+
+# Skew check: capital-gain is mostly zero with a long tail
+print(df["capital-gain"].describe(percentiles=[0.5, 0.9, 0.99]))
+
+# Cardinalities guide encoding choice
+cat_cols = df.select_dtypes("category").columns.drop("class")
+print(df[cat_cols].nunique().sort_values(ascending=False))   # native-country ~41</code></pre>
+
+  <h3>7.2 Schema validation: the Bean Validation of DataFrames</h3>
+<pre data-file="adult_schema.py"><code class="language-python">import pandera.pandas as pa   # pandera &gt;= 0.24 namespace; older versions: import pandera as pa
+from pandera.pandas import Column, Check, DataFrameSchema
+
+schema = DataFrameSchema(
+    {
+        "age": Column(float, Check.in_range(16, 100), nullable=False, coerce=True),
+        "hours-per-week": Column(float, Check.in_range(1, 99), coerce=True),
+        "capital-gain": Column(float, Check.ge(0), coerce=True),
+        "workclass": Column(str, nullable=True, coerce=True),
+        "education": Column(str, Check.isin([
+            "Preschool", "1st-4th", "5th-6th", "7th-8th", "9th", "10th", "11th", "12th",
+            "HS-grad", "Some-college", "Assoc-voc", "Assoc-acdm", "Bachelors",
+            "Masters", "Prof-school", "Doctorate"]), coerce=True),
+    },
+    strict=False,   # allow other columns; set True for a closed contract
+)
+
+if __name__ == "__main__":
+    from sklearn.datasets import fetch_openml
+    df = fetch_openml("adult", version=2, as_frame=True).frame
+    validated = schema.validate(df, lazy=True)   # lazy=True collects all failures, like @Valid
+    print("schema OK:", validated.shape)</code></pre>
+  <p>Run the same schema in the training pipeline and in a batch-scoring job; in the Java service, mirror the structural rules with Bean Validation annotations on the request DTO. The learned rules (imputation values, vocabularies) stay in the pipeline artifact.</p>
+
+  <h3>7.3 The full pipeline with ColumnTransformer</h3>
+<pre data-file="adult_pipeline.py"><code class="language-python">import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.datasets import fetch_openml
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
+from sklearn.pipeline import Pipeline, make_pipeline
+from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, OrdinalEncoder, StandardScaler
+
+SEED = 42
+df = fetch_openml("adult", version=2, as_frame=True).frame
+y = (df.pop("class") == "&gt;50K").astype(int)
+X = df.drop(columns=["fnlwgt", "education-num"])   # fnlwgt is a census sampling weight; education-num duplicates education
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=SEED)
+
+skewed = ["capital-gain", "capital-loss"]
+numeric = ["age", "hours-per-week"]
+ordered_edu = [["Preschool", "1st-4th", "5th-6th", "7th-8th", "9th", "10th", "11th", "12th",
+                "HS-grad", "Some-college", "Assoc-voc", "Assoc-acdm", "Bachelors",
+                "Masters", "Prof-school", "Doctorate"]]
+nominal = ["workclass", "marital-status", "occupation", "relationship", "race", "sex", "native-country"]
+
+preprocess = ColumnTransformer(
+    transformers=[
+        ("skewed", make_pipeline(
+            SimpleImputer(strategy="median"),
+            FunctionTransformer(np.log1p, feature_names_out="one-to-one"),
+            StandardScaler()), skewed),
+        ("num", make_pipeline(
+            SimpleImputer(strategy="median", add_indicator=True),
+            StandardScaler()), numeric),
+        ("edu", OrdinalEncoder(categories=ordered_edu,
+                               handle_unknown="use_encoded_value", unknown_value=-1), ["education"]),
+        ("cat", make_pipeline(
+            SimpleImputer(strategy="constant", fill_value="MISSING"),
+            OneHotEncoder(handle_unknown="infrequent_if_exist", min_frequency=50,
+                          sparse_output=False)), nominal),
+    ],
+    remainder="drop",
+    verbose_feature_names_out=True,
+).set_output(transform="pandas")
+
+model = Pipeline([
+    ("preprocess", preprocess),
+    ("clf", LogisticRegression(max_iter=2000, C=1.0)),
+])
+
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+scores = cross_validate(model, X_train, y_train, cv=cv,
+                        scoring={"roc_auc": "roc_auc", "pr_auc": "average_precision"})
+print("CV ROC-AUC %.3f +/- %.3f" % (scores["test_roc_auc"].mean(), scores["test_roc_auc"].std()))
+print("CV PR-AUC  %.3f +/- %.3f" % (scores["test_pr_auc"].mean(), scores["test_pr_auc"].std()))
+
+model.fit(X_train, y_train)
+proba = model.predict_proba(X_test)[:, 1]
+print("test ROC-AUC", round(roc_auc_score(y_test, proba), 3))         # ~0.90 (Illustrative)
+print("test PR-AUC ", round(average_precision_score(y_test, proba), 3))  # ~0.75 (Illustrative)
+
+names = model.named_steps["preprocess"].get_feature_names_out()
+print(len(names), names[:8])
+
+# Serving-time robustness: unseen category and missing values do not crash
+probe = X_test.head(2).copy()
+probe.loc[probe.index[0], "native-country"] = "Atlantis"
+probe.loc[probe.index[1], "age"] = np.nan
+print(model.predict_proba(probe)[:, 1])
+
+import joblib
+joblib.dump(model, "adult_pipeline.joblib")   # one artifact: preprocessing + model</code></pre>
+
+  <h3>7.4 Demonstrating leakage: feature selection before vs inside CV</h3>
+  <p>This experiment uses pure noise: 200 rows, 10,000 random features, random labels. Any accuracy meaningfully above 50% is an artefact.</p>
+<pre data-file="leakage_demo.py"><code class="language-python">import numpy as np
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.pipeline import make_pipeline
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(200, 10_000))
+y = rng.integers(0, 2, size=200)
+cv = StratifiedKFold(5, shuffle=True, random_state=0)
+
+# WRONG: select the 20 "best" features using all labels, then cross-validate
+X_sel = SelectKBest(f_classif, k=20).fit_transform(X, y)
+wrong = cross_val_score(LogisticRegression(max_iter=1000), X_sel, y, cv=cv).mean()
+
+# RIGHT: selection is a pipeline step, refit inside each training fold
+pipe = make_pipeline(SelectKBest(f_classif, k=20), LogisticRegression(max_iter=1000))
+right = cross_val_score(pipe, X, y, cv=cv).mean()
+
+print(f"leaky CV accuracy : {wrong:.2f}")   # often ~0.80+ on pure noise (Illustrative)
+print(f"honest CV accuracy: {right:.2f}")   # ~0.50, as it should be</code></pre>
+
+  <h3>7.5 Target encoding done right</h3>
+<pre data-file="target_encoding.py"><code class="language-python">import numpy as np
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import TargetEncoder   # scikit-learn &gt;= 1.3
+
+rng = np.random.default_rng(1)
+n = 5_000
+# A high-cardinality ID with NO real relationship to the label
+X = pd.DataFrame({"merchant_id": rng.integers(0, 3_000, size=n).astype(str)})
+y = rng.integers(0, 2, size=n)
+
+def naive_target_encode(X, y):
+    means = pd.Series(y).groupby(X["merchant_id"].values).mean()
+    return X["merchant_id"].map(means).to_frame()
+
+leaky = cross_val_score(LogisticRegression(), naive_target_encode(X, y), y, cv=5).mean()
+safe = cross_val_score(make_pipeline(TargetEncoder(target_type="binary", random_state=0),
+                                     LogisticRegression()), X, y, cv=5).mean()
+print(f"naive (fit on all rows): {leaky:.2f}")   # well above 0.5 on pure noise (Illustrative)
+print(f"TargetEncoder in pipeline: {safe:.2f}")  # ~0.50</code></pre>
+
+  <h3>7.6 Imbalanced data: weights, SMOTE and threshold tuning</h3>
+<pre data-file="imbalance.py"><code class="language-python">import numpy as np
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
+from sklearn.datasets import make_classification
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import average_precision_score, precision_recall_curve, classification_report
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+SEED = 7
+X, y = make_classification(n_samples=50_000, n_features=20, n_informative=6,
+                           weights=[0.99, 0.01], flip_y=0.002, random_state=SEED)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.3, stratify=y, random_state=SEED)
+X_tr, X_val, y_tr, y_val = train_test_split(X_tr, y_tr, test_size=0.25, stratify=y_tr, random_state=SEED)
+
+candidates = {
+    "plain": Pipeline([("sc", StandardScaler()), ("lr", LogisticRegression(max_iter=1000))]),
+    "class_weight": Pipeline([("sc", StandardScaler()),
+                              ("lr", LogisticRegression(max_iter=1000, class_weight="balanced"))]),
+    "smote": ImbPipeline([("sc", StandardScaler()), ("smote", SMOTE(random_state=SEED)),
+                          ("lr", LogisticRegression(max_iter=1000))]),
+}
+for name, pipe in candidates.items():
+    pipe.fit(X_tr, y_tr)                       # SMOTE runs only here, on training data
+    p = pipe.predict_proba(X_val)[:, 1]
+    print(f"{name:13s} val PR-AUC {average_precision_score(y_val, p):.3f}  mean p {p.mean():.3f}")
+# PR-AUC is often similar across the three; mean predicted probability is not:
+# weighting/SMOTE inflate probabilities far above the 1% base rate (Illustrative).
+
+# Threshold tuning on validation: the smallest threshold achieving precision &gt;= 0.5
+best = candidates["plain"]
+p_val = best.predict_proba(X_val)[:, 1]
+prec, rec, thr = precision_recall_curve(y_val, p_val)
+ok = np.where(prec[:-1] &gt;= 0.5)[0]
+t = thr[ok[0]] if len(ok) else 0.5
+print("chosen threshold", round(float(t), 3), "recall there", round(float(rec[ok[0]]), 3) if len(ok) else None)
+print(classification_report(y_te, (best.predict_proba(X_te)[:, 1] &gt;= t).astype(int), digits=3))</code></pre>
+
+  <h3>7.7 Datetime features and a temporal split</h3>
+<pre data-file="datetime_features.py"><code class="language-python">import numpy as np
+import pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
+
+class DatetimeFeatures(BaseEstimator, TransformerMixin):
+    """Stateless transformer: decomposes a UTC timestamp column into model-ready features."""
+    def __init__(self, column="event_ts", tz="Europe/Paris"):
+        self.column, self.tz = column, tz
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        ts = pd.to_datetime(X[self.column], utc=True).dt.tz_convert(self.tz)
+        out = pd.DataFrame(index=X.index)
+        hour = ts.dt.hour
+        out["hour_sin"] = np.sin(2 * np.pi * hour / 24)
+        out["hour_cos"] = np.cos(2 * np.pi * hour / 24)
+        out["dow"] = ts.dt.dayofweek
+        out["is_weekend"] = (ts.dt.dayofweek &gt;= 5).astype(int)
+        signup = pd.to_datetime(X["signup_ts"], utc=True)
+        # Duration relative to the EVENT time, never to "now"
+        out["days_since_signup"] = (pd.to_datetime(X[self.column], utc=True) - signup).dt.days
+        return out
+
+    def get_feature_names_out(self, input_features=None):
+        return np.array(["hour_sin", "hour_cos", "dow", "is_weekend", "days_since_signup"])
+
+rng = np.random.default_rng(3)
+events = pd.DataFrame({
+    "event_ts": pd.Timestamp("2026-01-01", tz="UTC") + pd.to_timedelta(rng.integers(0, 300*24*60, 10_000), unit="min"),
+    "signup_ts": pd.Timestamp("2025-06-01", tz="UTC") + pd.to_timedelta(rng.integers(0, 200, 10_000), unit="D"),
+}).sort_values("event_ts").reset_index(drop=True)
+feats = DatetimeFeatures().fit_transform(events)
+print(feats.head())
+
+# Temporal split: train on the past, validate on the next period, with a gap for label maturity
+cutoff_train = pd.Timestamp("2026-08-01", tz="UTC")
+gap = pd.Timedelta(days=14)
+train_idx = events["event_ts"] &lt; cutoff_train
+val_idx = events["event_ts"] &gt;= cutoff_train + gap
+print(train_idx.sum(), val_idx.sum())
+
+# Point-in-time join: for each label row, the latest feature value at or before its timestamp
+features = pd.DataFrame({
+    "user": rng.integers(0, 100, 5_000),
+    "feat_ts": pd.Timestamp("2026-01-01", tz="UTC") + pd.to_timedelta(rng.integers(0, 300*24*60, 5_000), unit="min"),
+    "orders_30d": rng.poisson(3, 5_000),
+}).sort_values("feat_ts")
+labels = pd.DataFrame({
+    "user": rng.integers(0, 100, 2_000),
+    "label_ts": pd.Timestamp("2026-02-01", tz="UTC") + pd.to_timedelta(rng.integers(0, 200*24*60, 2_000), unit="min"),
+    "churned": rng.integers(0, 2, 2_000),
+}).sort_values("label_ts")
+train_rows = pd.merge_asof(labels, features, left_on="label_ts", right_on="feat_ts",
+                           by="user", direction="backward",
+                           allow_exact_matches=False)   # strictly before the label time
+assert (train_rows["feat_ts"].dropna() &lt; train_rows.loc[train_rows["feat_ts"].notna(), "label_ts"]).all()
+print(train_rows.head())</code></pre>
+
+  <h3>7.8 Serving the pipeline from Java via ONNX</h3>
+  <p>Export the fitted pipeline with per-column ONNX inputs (numeric columns as float tensors, string columns as string tensors), then run it in a Spring service with ONNX Runtime's Java API. The converter supports common transformers (imputers, scalers, one-hot, ordinal encoders, logistic regression); custom Python transformers such as <code>FunctionTransformer(np.log1p)</code> may not convert and would need to be replaced or registered with a custom converter, so verify conversion and parity in CI <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+  <div class="code-tabs">
+<pre data-lang="Python"><code class="language-python"># export_onnx.py -- run after fitting an ONNX-convertible pipeline named `model`
+import numpy as np
+from skl2onnx import to_onnx
+from skl2onnx.common.data_types import FloatTensorType, StringTensorType
+
+def initial_types(df, numeric_cols, string_cols):
+    return ([(c, FloatTensorType([None, 1])) for c in numeric_cols] +
+            [(c, StringTensorType([None, 1])) for c in string_cols])
+
+# onx = to_onnx(model, initial_types=initial_types(X_train, NUMERIC, STRINGS),
+#               options={"zipmap": False}, target_opset=17)
+# open("adult.onnx", "wb").write(onx.SerializeToString())
+
+# Parity test: compare onnxruntime outputs with sklearn on 1,000 rows
+# import onnxruntime as ort
+# sess = ort.InferenceSession("adult.onnx")
+# feeds = {c: X_test[[c]].to_numpy(np.float32) for c in NUMERIC} | \
+#         {c: X_test[[c]].astype(str).to_numpy() for c in STRINGS}
+# onnx_p = sess.run(None, feeds)[1][:, 1]
+# assert np.allclose(onnx_p, model.predict_proba(X_test)[:, 1], atol=1e-4)</code></pre>
+<pre data-lang="Java"><code class="language-java">// Sketch: Spring component scoring one applicant with ONNX Runtime (com.microsoft.onnxruntime:onnxruntime)
+package com.example.scoring;
+
+import ai.onnxruntime.*;
+import jakarta.annotation.PreDestroy;
+import org.springframework.stereotype.Component;
+import java.util.HashMap;
+import java.util.Map;
+
+@Component
+public class IncomeModel {
+    private final OrtEnvironment env = OrtEnvironment.getEnvironment();
+    private final OrtSession session;
+
+    public IncomeModel() throws OrtException {
+        this.session = env.createSession("models/adult.onnx", new OrtSession.SessionOptions());
+    }
+
+    public float score(Applicant a) throws OrtException {
+        Map&lt;String, OnnxTensor&gt; feeds = new HashMap&lt;&gt;();
+        try {
+            feeds.put("age", OnnxTensor.createTensor(env, new float[][]{{a.age() == null ? Float.NaN : a.age()}}));
+            feeds.put("hours-per-week", OnnxTensor.createTensor(env, new float[][]{{a.hoursPerWeek()}}));
+            feeds.put("workclass", OnnxTensor.createTensor(env, new String[]{a.workclass()}, new long[]{1, 1}));
+            // ... one entry per input column, names and order exactly as exported
+            try (OrtSession.Result r = session.run(feeds)) {
+                float[][] probs = (float[][]) r.get(1).getValue();   // output 1 = probabilities
+                return probs[0][1];
+            }
+        } finally {
+            feeds.values().forEach(OnnxTensor::close);
+        }
+    }
+
+    @PreDestroy
+    void close() throws OrtException { session.close(); }
+}
+
+record Applicant(Float age, float hoursPerWeek, String workclass) {}</code></pre>
+  </div>
+  <p>Note how missing numeric values are passed as NaN so the exported <code>SimpleImputer</code> fills them with the <em>training</em> median, and unseen strings flow into the encoder's unknown handling. The Java side contains no learned logic, which is the point.</p>
+</section>
+
+<section id="applications">
+  <h2>8. Applications: Preprocessing Patterns by Domain</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Domain</th><th>Typical raw data</th><th>Key preprocessing / features</th><th>Main pitfall</th></tr></thead>
+    <tbody>
+      <tr><td>Payments fraud</td><td>Transaction events, device fingerprints, merchant IDs</td><td>Velocity aggregates (1 h/24 h/7 d), amount relative to customer's history, merchant risk via cross-fitted target encoding, geo-distance features; class weights and threshold tuning</td><td>Labels (chargebacks) arrive weeks later; random splits leak future fraud patterns</td></tr>
+      <tr><td>Churn prediction</td><td>Subscription records, usage logs, support tickets</td><td>Recency/frequency/monetary features, trend features (last 30 d vs previous 30 d), tenure, ticket text TF-IDF</td><td>Features recorded after the churn decision (cancellation-flow events)</td></tr>
+      <tr><td>Demand forecasting</td><td>Order counts per SKU per store per day</td><td>Lags, rolling means, calendar and holiday features, price changes, log transform of counts</td><td>Rolling windows that include the target day</td></tr>
+      <tr><td>Search ranking / recommendations</td><td>Impressions, clicks, item catalogue</td><td>Smoothed CTRs, embeddings for users and items, position-bias corrections, recency features</td><td>Popularity features computed over the evaluation period</td></tr>
+      <tr><td>Ops / AIOps</td><td>Metrics, logs, traces</td><td>Robust scaling per service, seasonal decomposition, log-template IDs (Drain), rate-of-change features</td><td>Deploy events and incidents correlated with collection changes</td></tr>
+      <tr><td>Credit risk</td><td>Applications, bureau data</td><td>Monotone binned features (weight of evidence), ratio features, explicit missing indicators; strict feature governance</td><td>Protected attributes or their proxies; regulatory explainability requirements</td></tr>
+    </tbody>
+  </table></div>
+  <p>A recurring engineering pattern is the <strong>feature contract</strong>: each feature has an owner, a definition (SQL or a DSL), a freshness SLA, an allowed range, a null policy and a list of consuming models. It is a data-product version of an OpenAPI spec, and it makes changes reviewable in the same way.</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 Uber Michelangelo: a shared feature store</h3>
+  <p><span class="tag fact">Verified</span> Uber's 2017 description of Michelangelo explains that a large part of the platform's value came from a centralised feature store, in which teams register and share features, computed in batch and near-real-time, available both for offline training and for online low-latency serving, so that the same feature definitions are used in both places. The worked example is UberEATS estimated delivery time. Source: <a href="https://www.uber.com/blog/michelangelo-machine-learning-platform/">"Meet Michelangelo: Uber's Machine Learning Platform"</a>.</p>
+  <h3>9.2 Airbnb Chronon: point-in-time correctness as a platform feature</h3>
+  <p><span class="tag fact">Verified</span> Airbnb open-sourced Chronon, its feature platform, in April 2024. Its stated purpose is to let ML practitioners define features once and have the platform produce both point-in-time-correct training data and low-latency online serving values, along with monitoring of training-serving consistency. Stripe has published how it adapted Chronon for its own feature platform. Sources: <a href="https://medium.com/airbnb-engineering/chronon-airbnbs-ml-feature-platform-is-now-open-source-d9c4dba859e8">Airbnb Tech Blog announcement</a>, <a href="https://github.com/airbnb/chronon">github.com/airbnb/chronon</a>, <a href="https://stripe.com/blog/shepherd-how-stripe-adapted-chronon-to-scale-ml-feature-development">Stripe: Shepherd</a>.</p>
+  <h3>9.3 Google: technical debt and data validation</h3>
+  <p><span class="tag fact">Verified</span> Sculley et al. (NeurIPS 2015) describe ML-specific debt such as "pipeline jungles" (sprawling, ad-hoc preprocessing glue), unstable data dependencies, and undeclared consumers, arguing that preprocessing code accrues maintenance cost faster than model code. Google's TFX later productised schema-based data validation (TensorFlow Data Validation), which infers a schema from training data and checks new data for anomalies and training/serving skew. Sources: <a href="https://papers.nips.cc/paper/5656-hidden-technical-debt-in-machine-learning-systems">Hidden Technical Debt in Machine Learning Systems</a>; <a href="https://www.tensorflow.org/tfx/guide/tfdv">TFX guide: TensorFlow Data Validation</a>.</p>
+  <h3>9.4 A composite leakage incident</h3>
+  <p><span class="tag illus">Illustrative</span> A team builds a churn model on a customer table snapshot. Validation ROC-AUC is 0.97. In production, it is 0.66. Root cause: the snapshot's <code>plan_status</code> and <code>last_support_contact</code> columns were overwritten when customers cancelled, so for churned customers they reflected the cancellation process itself. The fix was architectural: rebuild training data from the event log with point-in-time joins at a fixed "prediction date" for each customer, and add a test asserting that every feature timestamp is strictly before the label's reference time. This pattern (a mutable table masquerading as history) is the most common leakage story the author has encountered <span class="tag opinion">Opinion</span>.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages and Limits of Preprocessing Approaches</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Approach</th><th>Advantages</th><th>Limitations</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>scikit-learn Pipeline + ColumnTransformer</td><td>Leak-proof CV, single artifact, joint tuning, wide transformer library</td><td>In-memory, single-node; Python-centric serving unless converted</td><td>Low; ONNX conversion needs parity tests</td></tr>
+      <tr><td>Hand-written transformations in the serving language</td><td>No Python at serving; full control</td><td>Duplicate logic, skew risk, every change made twice</td><td>High: golden tests, coordinated releases</td></tr>
+      <tr><td>Feature store (Feast, Chronon, managed)</td><td>One definition, online/offline consistency, reuse, point-in-time joins</td><td>Infrastructure to run; learning curve; not for per-model learned transforms</td><td>Medium to high: storage, streaming jobs, on-call</td></tr>
+      <tr><td>Native handling in GBDTs</td><td>No imputation/encoding code; missingness learned</td><td>Ties you to that model family; categorical handling differs by library</td><td>Low</td></tr>
+      <tr><td>Deep learning with embeddings</td><td>Learns representations for text, IDs, images; minimal manual features</td><td>Data-hungry; less interpretable; harder to debug</td><td>GPU training, embedding table memory</td></tr>
+      <tr><td>Schema validation (pandera, TFDV, Great Expectations)</td><td>Catches upstream breakage early; documents contracts</td><td>Only catches what you specify or what drifts measurably</td><td>Low; alert tuning needed</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs and Decisions</h2>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  C["Categorical column"] --> K{"Cardinality?"}
+  K -- "under ~20" --> OH["One-hot"]
+  K -- "20 to ~1000" --> M{"Model family?"}
+  M -- "GBDT" --> NAT["Native categorical or ordinal codes"]
+  M -- "linear / NN" --> TE["Cross-fitted target encoding or one-hot with min_frequency"]
+  K -- "very high or unbounded" --> H{"Neural network?"}
+  H -- yes --> EMB["Learned embedding table"]
+  H -- no --> HS["Hashing or cross-fitted target encoding"]
+  C --> ORD{"Truly ordered?"}
+  ORD -- yes --> OE["OrdinalEncoder with explicit order"]
+</pre>
+  <figcaption>Figure 6.2.5 — Choosing a categorical encoding.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> cardinality is the first branch because it determines memory, sparsity and how many rows each category has (and thus how noisy any per-category statistic is). The model family is the second because trees and neural networks have their own mechanisms. The ordered branch is independent: only use ordinal codes as numbers when the order is real.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Question</th><th>Default choice</th><th>Switch when</th></tr></thead>
+    <tbody>
+      <tr><td>Impute numeric?</td><td>Median + missing indicator</td><td>GBDT (use native NaN); strong multivariate structure and time to validate (iterative imputer)</td></tr>
+      <tr><td>Scale?</td><td>StandardScaler; log1p first for skewed positives</td><td>Heavy outliers (RobustScaler); bounded inputs for NNs (MinMax); trees (none)</td></tr>
+      <tr><td>Outliers?</td><td>Fix errors at validation; clip genuine extremes at learned percentiles</td><td>Outliers are the target (fraud): keep them, use robust models</td></tr>
+      <tr><td>Imbalance?</td><td>Right metric + threshold tuning + class weights</td><td>Very few positives with a weak learner: try SMOTE inside the training fold and compare</td></tr>
+      <tr><td>Split?</td><td>Stratified random</td><td>Temporal drift (time split), repeated entities (group split), both (grouped time split)</td></tr>
+      <tr><td>Where to compute features?</td><td>In the pipeline artifact</td><td>Shared across models or needs real-time aggregation: feature store</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes</h2>
+  <ul>
+    <li><strong>Fitting transformers before splitting.</strong> <code>StandardScaler().fit_transform(X)</code> then <code>train_test_split</code>. Minor leak for scalers, major for selectors, target encoders and SMOTE.</li>
+    <li><strong>Oversampling before cross-validation.</strong> Synthetic points derived from a validation example end up in training, so the model is evaluated on near-copies of what it trained on.</li>
+    <li><strong>Resampling or reweighting the test set.</strong> Test data must reflect production prevalence or metrics like precision are meaningless.</li>
+    <li><strong>Ordinal-encoding nominal categories for linear models.</strong> Imposes a fake order and fake distances.</li>
+    <li><strong>Using IDs as features.</strong> The model memorises entities and fails on new ones; also a privacy hazard.</li>
+    <li><strong>"Now"-relative durations.</strong> Computing <code>days_since_signup</code> as of the training run date rather than as of each event time.</li>
+    <li><strong>Silent category drift.</strong> Upstream renames "iOS" to "ios"; the encoder maps everything to unknown; predictions shift. Monitor the unknown-category rate.</li>
+    <li><strong>Time-zone mismatch.</strong> Training used UTC hour, serving used server local time. A cyclic hour feature makes this a quiet 1–2 hour shift that degrades accuracy without errors.</li>
+    <li><strong>Dropping rows with nulls in training while production rows still have nulls.</strong> The model never learned how to handle them, and the serving code improvises.</li>
+    <li><strong>Trusting suspiciously important features.</strong> If one feature carries most of the importance and the AUC is near 1, assume leakage until proven otherwise.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Training/serving parity tests</h3>
+  <p>Keep a golden dataset of a few thousand raw rows, including nulls, unseen categories and extreme values. In CI, run them through the training pipeline and through the serving path (ONNX in Java, or the model server) and assert outputs match within tolerance. This is a contract test, and it catches the majority of skew bugs before deployment.</p>
+  <h3>13.2 Monitoring</h3>
+  <p>Per feature: null rate, unknown-category rate, min/max/quantiles, PSI against training. Per model: score distribution, fraction above the decision threshold. Emit these as Micrometer metrics from the scoring service or compute them in a streaming job over request logs. Alert on the unknown-category rate in particular; it is the earliest signal of an upstream schema change.</p>
+  <h3>13.3 Performance</h3>
+  <p>Preprocessing can dominate inference latency for small models. One-hot encoding into dense arrays wastes memory (use sparse or index-based inputs), Python-level <code>apply</code> calls are slow, and per-request feature lookups across several stores add network round-trips. Batch lookups (Redis <code>MGET</code>/pipelining), precompute static features, and keep the transformation graph in a compiled runtime (ONNX Runtime) for hot paths.</p>
+  <h3>13.4 Security and privacy</h3>
+  <p>Preprocessing touches raw PII. Minimise: hash or tokenise identifiers before they reach the feature pipeline; never use protected attributes as features without a fairness and legal review (Chapter 6.5), and check for proxies (postcode can proxy ethnicity). Pickled artifacts execute arbitrary code on load: only load joblib/pickle files from your own registry with integrity checks, or use safer formats (skops, ONNX).</p>
+  <h3>13.5 Maintainability</h3>
+  <p>Version the pipeline with the model; record the scikit-learn version (pickles are not guaranteed compatible across versions); log feature names and order with every model; write custom transformers as small, unit-tested classes with <code>get_feature_names_out</code>. Treat feature definitions like database migrations: additive changes are easy, renames and semantic changes require coordinated retraining.</p>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>Training values of a feature: [2, 4, 4, 4, 5, 5, 7, 9]. (a) Compute the standardised value of a serving input x = 11 using training statistics (population sd). (b) Compute min-max scaled x = 11. (c) What do the results tell you about each scaler with out-of-range inputs?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>(a) Mean = 40/8 = 5. Squared deviations: 9, 1, 1, 1, 0, 0, 4, 16 = 32; variance 4; sd 2. z = (11 − 5)/2 = 3.0. (b) (11 − 2)/(9 − 2) = 9/7 ≈ 1.286. (c) Standardisation degrades gracefully: 3 sd is unusual but representable. Min-max produces values outside [0, 1], which can break models (such as networks with bounded-input assumptions) and signals the input is beyond the training range: worth monitoring.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Global conversion rate is 5%. Category A has 2,000 rows at 8%; category B has 4 rows with 2 conversions. Compute smoothed target encodings with m = 100. Then explain what happens to B's encoding without smoothing and without cross-fitting.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>A: (2000 × 0.08 + 100 × 0.05)/2100 = (160 + 5)/2100 ≈ 0.0786. B: (2 + 5)/104 ≈ 0.0673. Unsmoothed, B = 0.5, ten times the global rate on four rows of evidence. Without cross-fitting, each of B's four rows contributes its own label: the two converters see an encoding computed with themselves included, so the feature partially reveals the label. Out-of-fold, a converter in B would see the rate among the other B rows in different folds, removing self-contribution.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>You train with <code>class_weight</code> giving positives weight 20 and negatives weight 1. True base rate is 2%. For an input whose true probability is 10%, what probability does the (ideal) weighted model output? Derive the correction formula and apply it.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>From §6.5, p̂ = w₁π / (w₁π + w₀(1 − π)) = 20 × 0.1 / (2 + 0.9) = 2/2.9 ≈ 0.690. Inverting: odds(p̂) = (w₁/w₀) odds(π), so π = p̂ / (p̂ + (w₁/w₀)(1 − p̂)) = 0.690 / (0.690 + 20 × 0.310) = 0.690/6.89 ≈ 0.100. The base rate does not enter, only the weight ratio. In practice, also verify with a calibration curve on validation data.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>Design the training-data generation for a "will this order be cancelled within 24 h" model. You have an <code>orders</code> table (mutable status), an <code>order_events</code> Kafka topic and a <code>customers</code> table. Specify the prediction time, the label definition, three features with their point-in-time rules, and the split.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Prediction time t₀ = order creation timestamp (the model scores at checkout). Label = 1 if a <code>CANCELLED</code> event occurs in (t₀, t₀ + 24 h]; rows less than 24 h old at training time are excluded because their labels are immature. Features, all from the event log as-of t₀: (1) customer's cancellation rate over orders placed in [t₀ − 180 d, t₀ − 24 h) (the 24 h offset ensures those older orders' labels were known at t₀); (2) number of orders by the customer in the last 1 h before t₀; (3) payment method and basket value from the order-created event itself. Never use the <code>orders.status</code> column, which is mutated. Split temporally: train on months 1–9, validate on month 10, test on month 11, with a 1-day gap between periods. Group-by-customer considerations are secondary given the temporal split but check for heavy repeat customers.</p>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>Write a custom scikit-learn transformer <code>QuantileClipper</code> that learns per-column 1st and 99th percentiles in <code>fit</code> and clips in <code>transform</code>, supports <code>get_feature_names_out</code>, and works inside a ColumnTransformer.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-python">import numpy as np
+from sklearn.base import BaseEstimator, TransformerMixin, OneToOneFeatureMixin
+from sklearn.utils.validation import check_is_fitted, validate_data  # sklearn &gt;= 1.6
+
+class QuantileClipper(OneToOneFeatureMixin, TransformerMixin, BaseEstimator):
+    def __init__(self, lower=0.01, upper=0.99):
+        self.lower, self.upper = lower, upper
+
+    def fit(self, X, y=None):
+        X = validate_data(self, X, ensure_all_finite="allow-nan")
+        self.low_ = np.nanquantile(X, self.lower, axis=0)
+        self.high_ = np.nanquantile(X, self.upper, axis=0)
+        return self
+
+    def transform(self, X):
+        check_is_fitted(self)
+        X = validate_data(self, X, reset=False, ensure_all_finite="allow-nan")
+        return np.clip(X, self.low_, self.high_)</code></pre>
+      <p>The quantiles are learned state (trailing underscore), estimated only on training data; <code>OneToOneFeatureMixin</code> provides <code>get_feature_names_out</code>. On scikit-learn versions before 1.6, use <code>self._validate_data</code> instead of <code>validate_data</code> and <code>force_all_finite</code> instead of <code>ensure_all_finite</code>.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is data leakage? Give three distinct examples.</summary><div><p>Leakage is information available during training or evaluation that would not be available at prediction time, inflating offline metrics. Examples: (1) target leakage, a feature derived from the outcome (refund flag predicting fraud); (2) preprocessing leakage, fitting a scaler, target encoder, feature selector or SMOTE on data including the test set; (3) temporal leakage, random splits or look-ahead windows on time-dependent data; (4) group leakage, the same patient or user in train and test.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> When does a model need feature scaling and when does it not?</summary><div><p>Needed for models whose optimisation or geometry depends on magnitudes: gradient-based linear models and neural networks (conditioning), regularised models (penalty fairness), distance/kernel methods (k-NN, k-means, SVM-RBF), PCA (variance-driven). Not needed for tree-based models, which split on thresholds and are invariant to monotone transformations.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain target encoding, its risks, and how to mitigate them.</summary><div><p>Replace a category by the mean target for that category. Risks: noise for rare categories, and leakage because a row's own label contributes to its encoding. Mitigate with Bayesian smoothing toward the global mean and out-of-fold (cross-fitted) or ordered encoding, as in scikit-learn's TargetEncoder and CatBoost; handle unseen categories with the global mean.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Offline ROC-AUC is 0.98, production is 0.70. How do you investigate?</summary><div><p>Suspect leakage and skew. Check feature importance for dominant features and inspect their provenance and timestamps; rebuild a validation set with a temporal split and point-in-time features; compare feature distributions between training and production logs (null rates, unknown categories, ranges); replay production requests through the training pipeline and compare scores (parity test); verify label definitions match. Also consider genuine drift if the training data is old.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Fraud rate is 0.2%. A colleague proposes SMOTE to 50/50 before splitting. Respond.</summary><div><p>Splitting after SMOTE leaks synthetic points derived from test examples into training and makes the test set unrepresentative. Correct order: split (temporally for fraud), then optionally resample only inside the training fold via an imblearn Pipeline. Before SMOTE, try class weights or <code>scale_pos_weight</code>, evaluate with PR-AUC and cost-based metrics, and tune the threshold on untouched validation data. Recalibrate probabilities if they feed cost calculations.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How do you guarantee the same feature values at training and serving time across a Python training stack and a Java serving stack?</summary><div><p>Options in order of preference: export the whole pipeline (preprocessing + model) to ONNX and run it in ONNX Runtime Java; or serve via a Python model server so the same code runs; or use a feature store with one definition materialised online and offline. If logic must be reimplemented, export learned parameters as data, generate code from one spec, and enforce parity with golden-file contract tests in CI. Monitor unknown-category and null rates in production.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Build a ColumnTransformer that median-imputes and scales numeric columns and one-hot encodes categoricals with unknown handling.</summary><div><pre><code class="language-python">from sklearn.compose import ColumnTransformer, make_column_selector as sel
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+pre = ColumnTransformer([
+    ("num", make_pipeline(SimpleImputer(strategy="median", add_indicator=True), StandardScaler()),
+     sel(dtype_include="number")),
+    ("cat", make_pipeline(SimpleImputer(strategy="most_frequent"),
+                          OneHotEncoder(handle_unknown="ignore")),
+     sel(dtype_include=["object", "category"])),
+])</code></pre><p>Then wrap with the estimator in a Pipeline and cross-validate the whole thing.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why encode hour-of-day with sine and cosine rather than a single sine?</summary><div><p>A single sine maps two different hours to the same value (hour 3 and hour 9 both give sin = 0.707 with a 24-hour period), destroying information. Sine and cosine together give a unique point on the unit circle for each hour, while preserving adjacency between 23:00 and 00:00.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What are MCAR, MAR and MNAR and why does the distinction matter?</summary><div><p>MCAR: missingness independent of everything; MAR: depends only on observed variables; MNAR: depends on the unobserved value itself. Under MCAR dropping or simple imputation is unbiased (but wasteful); under MAR conditioning on observed variables can correct bias; under MNAR no method using only observed data is fully unbiased, and the missingness indicator itself carries signal. In practice, add indicators and validate.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Preprocessing is an input-validation and transformation layer whose parameters are learned; fit on training data only and reuse the fitted object everywhere.</li>
+    <li>Impute with median plus missing indicators by default; GBDTs can learn missing-value directions natively.</li>
+    <li>Log-transform skewed positives; standardise for linear/NN/distance models; trees need no scaling.</li>
+    <li>One-hot for low cardinality; cross-fitted, smoothed target encoding or hashing for high; embeddings in neural networks.</li>
+    <li>Engineer ratios, windowed aggregates and cyclic time features; compute every aggregate point-in-time.</li>
+    <li>For imbalance: right metric, threshold tuning and class weights first; resample only inside training folds; recalibrate.</li>
+    <li>Choose the split that simulates production: stratified, grouped, temporal.</li>
+    <li>Pipelines plus ColumnTransformer make cross-validation honest and produce one deployable artifact; parity tests guard the Java serving path.</li>
+  </ul>
+  <div class="quiz" data-answer="b">
+    <p class="q">Which preprocessing step causes the largest leakage if fit on the full dataset before cross-validation?</p>
+    <ol>
+      <li data-k="a">StandardScaler on numeric columns</li>
+      <li data-k="b">Selecting the top 20 of 10,000 features by correlation with the label</li>
+      <li data-k="c">Lowercasing text</li>
+      <li data-k="d">Converting timestamps to UTC</li>
+    </ol>
+    <div class="explain">Supervised selection uses labels from validation folds to pick features, producing large optimistic bias (even on pure noise). Scaling leaks only mean/variance information; lowercasing and UTC conversion are stateless.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">A feature has 150,000 distinct merchant IDs and you are training logistic regression. Best default encoding?</p>
+    <ol>
+      <li data-k="a">OrdinalEncoder</li>
+      <li data-k="b">Dense one-hot</li>
+      <li data-k="c">Cross-fitted smoothed target encoding or feature hashing</li>
+      <li data-k="d">Drop the feature unconditionally</li>
+    </ol>
+    <div class="explain">Ordinal codes impose fake order in a linear model; dense one-hot is enormous and sparse in information per column; target encoding (leak-safe) or hashing keep dimensionality manageable.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">Where must SMOTE be applied?</p>
+    <ol>
+      <li data-k="a">Only to the training portion, inside each CV fold, via an imblearn Pipeline</li>
+      <li data-k="b">To the whole dataset before splitting</li>
+      <li data-k="c">To the test set so metrics are balanced</li>
+      <li data-k="d">At serving time to balance incoming requests</li>
+    </ol>
+    <div class="explain">Synthetic points must never be derived from or placed into evaluation data, and serving data must not be altered.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">You predict next-week demand. Which split is appropriate?</p>
+    <ol>
+      <li data-k="a">Random 80/20</li>
+      <li data-k="b">Stratified by store</li>
+      <li data-k="c">GroupKFold by SKU</li>
+      <li data-k="d">Train on earlier weeks, validate and test on later weeks</li>
+    </ol>
+    <div class="explain">Forecasting must simulate predicting the future from the past; random splits leak future information through lags and seasonality.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">After mean-imputing 25% missing values, the feature's sample variance becomes approximately:</p>
+    <ol>
+      <li data-k="a">Unchanged</li>
+      <li data-k="b">75% of the observed-data variance</li>
+      <li data-k="c">125% of the observed-data variance</li>
+      <li data-k="d">25% of the observed-data variance</li>
+    </ol>
+    <div class="explain">Imputed points sit exactly at the mean, contributing zero squared deviation: variance scales by (1 − r) = 0.75.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Which model is least affected by whether you standardise features?</p>
+    <ol>
+      <li data-k="a">k-nearest neighbours</li>
+      <li data-k="b">L2-regularised logistic regression</li>
+      <li data-k="c">Random forest</li>
+      <li data-k="d">SVM with RBF kernel</li>
+    </ol>
+    <div class="explain">Tree splits depend only on the ordering of values within a feature, which monotone rescaling preserves.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Docs</span> scikit-learn User Guide, <a href="https://scikit-learn.org/stable/data_transforms.html">Dataset transformations</a> and <a href="https://scikit-learn.org/stable/common_pitfalls.html">Common pitfalls and recommended practices</a> (leakage, randomness).</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://imbalanced-learn.org/stable/">imbalanced-learn documentation</a> — samplers and the imblearn Pipeline.</li>
+    <li><span class="ref-kind">Paper</span> N. V. Chawla et al., "SMOTE: Synthetic Minority Over-sampling Technique", JAIR 16, 2002 — <a href="https://arxiv.org/abs/1106.1813">arXiv:1106.1813</a>.</li>
+    <li><span class="ref-kind">Paper</span> D. Sculley et al., <a href="https://papers.nips.cc/paper/5656-hidden-technical-debt-in-machine-learning-systems">"Hidden Technical Debt in Machine Learning Systems"</a>, NeurIPS 2015.</li>
+    <li><span class="ref-kind">Paper</span> L. Prokhorenkova et al., "CatBoost: unbiased boosting with categorical features", NeurIPS 2018 — <a href="https://arxiv.org/abs/1706.09516">arXiv:1706.09516</a> (ordered target statistics).</li>
+    <li><span class="ref-kind">Book</span> Max Kuhn and Kjell Johnson, <em>Feature Engineering and Selection: A Practical Approach for Predictive Models</em>, CRC Press, 2019 — <a href="https://www.feat.engineering/">free online at feat.engineering</a>.</li>
+    <li><span class="ref-kind">Book</span> Chip Huyen, <em>Designing Machine Learning Systems</em>, O'Reilly, 2022 — chapters on training data, feature engineering and data distribution shifts.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.feast.dev/">Feast feature store documentation</a> and <a href="https://github.com/airbnb/chronon">Airbnb Chronon</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://onnx.ai/sklearn-onnx/">sklearn-onnx documentation</a> and <a href="https://onnxruntime.ai/docs/get-started/with-java.html">ONNX Runtime Java API</a>.</li>
+    <li><span class="ref-kind">Book</span> Roderick J. A. Little and Donald B. Rubin, <em>Statistical Analysis with Missing Data</em>, 3rd ed., Wiley, 2019.</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>
