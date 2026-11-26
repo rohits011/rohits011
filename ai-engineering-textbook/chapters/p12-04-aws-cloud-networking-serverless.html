@@ -453,6 +453,7 @@ resource "aws_eks_pod_identity_association" "orders" {
   <p>With Auto Mode, AWS manages node provisioning (Karpenter-based NodePools), the VPC CNI, kube-proxy, CoreDNS, the EBS CSI driver, load balancer integration and Pod Identity; you manage workloads. Without Auto Mode you would add managed node groups or self-managed Karpenter and the add-ons yourself <span class="tag version">Version-sensitive · checked Nov 2026</span>. The Kubernetes version shown is an example; use a version in standard support.</p>
 
   <h3>7.2 Terraform: RDS PostgreSQL Multi-AZ</h3>
+  <p>Partial example: it assumes <code>terraform_remote_state</code> data sources named <code>network</code> and <code>eks</code> declared as in §7.1, and the EKS root exporting <code>cluster_security_group_id</code>.</p>
 <pre data-file="live/prod/data/main.tf"><code class="language-hcl">resource "aws_db_subnet_group" "orders" {
   name       = "lumen-prod-orders"
   subnet_ids = data.terraform_remote_state.network.outputs.data_subnet_ids
@@ -817,3 +818,238 @@ $ aws logs filter-log-events --log-group-name /vpc/lumen-prod/flow \
     --filter-pattern '"10.40.37.21" "10.40.10.57" "5432" "REJECT"' --max-items 5</code></pre>
   <p>Typical finding: the RDS security group allows the EKS <em>cluster</em> security group, but Auto Mode or security groups for pods attach a different SG to the pod ENIs. Fix the reference, not by opening <code>10.40.0.0/16</code>.</p>
 </section>
+
+<section id="applications">
+  <h2>8. Applications: How Teams Use AWS</h2>
+  <h3>8.1 Multi-account landing zones</h3>
+  <p>Organisations separate workloads into many AWS accounts (per environment, per team or per domain) under AWS Organizations, with Control Tower or custom tooling providing a <em>landing zone</em>: centralised logging (CloudTrail organisation trail to a log archive account), security tooling (GuardDuty, Security Hub, Config) in a security account, IAM Identity Center for human SSO, SCPs as guardrails (deny disabling CloudTrail, deny leaving approved Regions), and a networking account with Transit Gateway and shared VPCs. An account is the strongest isolation boundary AWS offers — blast radius for both security incidents and quota exhaustion.</p>
+  <h3>8.2 Containers on EKS, glue on Lambda</h3>
+  <p>The Lumen pattern is common: long-running, latency-sensitive services on EKS (or ECS), event-driven glue and spiky background work on Lambda, workflows on Step Functions, and managed data services. Platform teams publish Terraform modules and Helm charts for each pattern so application teams compose them rather than design networks.</p>
+  <h3>8.3 AI workloads on AWS</h3>
+  <p>AI services add specific needs: GPU instances (scheduled through Karpenter/Auto Mode NodePools), model artifacts in S3 pulled through gateway endpoints, managed model APIs (Amazon Bedrock) reached privately through interface endpoints with IAM-scoped access to specific models, vector storage (Aurora PostgreSQL with pgvector, OpenSearch, or S3 Vectors), and cost controls on token usage. Keeping model traffic off the public internet via PrivateLink is often a compliance requirement.</p>
+  <h3>8.4 Cost management</h3>
+  <p>Mature teams tag every resource (default tags in Terraform), review Cost Explorer by tag weekly, buy Savings Plans for the steady base, use Spot for stateless and batch capacity (Karpenter handles interruptions), add VPC endpoints to cut NAT processing, keep traffic in-AZ where possible, and set budgets with alerts. FinOps is an engineering practice, not an accounting one.</p>
+  <h3>8.5 Resilience patterns</h3>
+  <p>Multi-AZ by default (EKS nodes in three AZs, RDS Multi-AZ, NAT per AZ); static stability (pre-provisioned capacity so an AZ loss does not require launching new resources during the event); backups and point-in-time recovery tested regularly; and, where justified, warm-standby or active-active in a second Region with Route 53 failover or global data stores (DynamoDB global tables, Aurora Global Database).</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 AWS us-east-1, December 2021: congestion on the internal network</h3>
+  <p><span class="tag fact">Verified</span> On 7 December 2021, an automated activity to scale capacity of an AWS service hosted on AWS's internal network triggered unexpected behaviour from a large number of clients, causing a surge of connection activity that congested the devices between the internal network and the main AWS network. Customer-facing services that depended on internal-network services (including parts of the EC2 APIs, the monitoring used by AWS operators, and the Service Health Dashboard itself) were impaired for hours, while already-running workloads largely continued. Lessons for customers: running capacity is more resilient than control-plane operations during an event (static stability), and your incident detection must not depend on the provider's status page. Source: <a href="https://aws.amazon.com/message/12721/">AWS, "Summary of the AWS Service Event in the Northern Virginia (US-EAST-1) Region"</a>.</p>
+  <h3>9.2 AWS us-east-1, October 2025: a DNS race condition in DynamoDB automation</h3>
+  <p><span class="tag fact">Verified</span> AWS's post-event summary describes an event from 23:48 PDT on 19 October to 14:20 PDT on 20 October 2025. A latent race condition in DynamoDB's automated DNS management system left an empty DNS record for the regional endpoint <code>dynamodb.us-east-1.amazonaws.com</code>, so clients could not resolve it; dependent services, including EC2 instance launches (whose internal systems depend on DynamoDB) and Network Load Balancer health checking, were impaired in later phases, with long recovery tails as backlogs drained. Lessons: DNS is a single point of failure even inside a cloud provider; recovery of control planes can take far longer than the triggering fault; and workloads that needed to launch instances during the event were hit hardest — again an argument for static stability and for understanding your provider dependencies. Source: <a href="https://aws.amazon.com/message/101925/">AWS, "Summary of the Amazon DynamoDB Service Disruption in the Northern Virginia (US-EAST-1) Region"</a>.</p>
+  <h3>9.3 AWS S3, February 2017: a mistyped command</h3>
+  <p><span class="tag fact">Verified</span> On 28 February 2017, an engineer debugging the S3 billing system in us-east-1 ran an established playbook command with a mistyped input that removed a larger set of servers than intended, including subsystems S3 needed to serve requests. Restart of those subsystems took hours because they had not been fully restarted in years while the region had grown. AWS changed its tooling to remove capacity more slowly and to block removals below minimum capacity. Lessons: operational tooling needs guardrails; recovery paths of rarely restarted systems must be exercised. Source: <a href="https://aws.amazon.com/message/41926/">AWS, "Summary of the Amazon S3 Service Disruption in the Northern Virginia (US-EAST-1) Region"</a>.</p>
+  <h3>9.4 Amazon Builders' Library: static stability</h3>
+  <p><span class="tag fact">Verified</span> Amazon's Builders' Library article on static stability explains how AWS designs systems (for example, EC2's data plane and Availability Zone independence) so that they keep working when dependencies such as control planes are impaired, and recommends customers pre-provision capacity across AZs rather than relying on reacting during an event. Source: <a href="https://aws.amazon.com/builders-library/static-stability-using-availability-zones/">Amazon Builders' Library, "Static stability using Availability Zones"</a>.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Strengths, Limits and Operational Cost</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Option</th><th>Strengths</th><th>Limitations</th><th>Cost profile</th></tr></thead>
+    <tbody>
+      <tr><td>EC2 + ASG</td><td>Full control, any software, cheapest at steady scale with Savings Plans/Spot</td><td>You patch and operate OS and runtime</td><td>Pay per instance-hour</td></tr>
+      <tr><td>ECS (Fargate)</td><td>Simple containers, no nodes</td><td>AWS-specific; fewer extensibility hooks</td><td>Per vCPU/GB-hour, premium over EC2</td></tr>
+      <tr><td>EKS (Auto Mode)</td><td>Kubernetes ecosystem with managed nodes and add-ons</td><td>Kubernetes complexity remains; upgrades</td><td>Cluster fee + instances + Auto Mode management fee</td></tr>
+      <tr><td>Lambda</td><td>Zero idle cost, automatic scaling, event integrations</td><td>15-min limit, cold starts, per-request concurrency, vendor-specific</td><td>Per request + GB-s; expensive at steady high load</td></tr>
+      <tr><td>RDS / Aurora</td><td>Managed relational with HA and backups</td><td>Vertical write scaling; failover blips</td><td>Instance + storage + I/O (Aurora)</td></tr>
+      <tr><td>DynamoDB</td><td>Serverless scale, predictable latency</td><td>Access-pattern-first modelling; limited queries</td><td>Per request or provisioned capacity</td></tr>
+      <tr><td>NAT gateway</td><td>Managed, scalable egress</td><td>Zonal; per-GB processing cost; port limits per destination</td><td>Hourly + per GB</td></tr>
+      <tr><td>Interface endpoints</td><td>Private API access, policy control</td><td>Per-AZ hourly cost per service</td><td>Hourly per AZ + per GB</td></tr>
+      <tr><td>Transit Gateway</td><td>Hub-and-spoke routing at scale</td><td>Extra hop; costs per attachment and GB</td><td>Hourly per attachment + per GB</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+  <h3>11.1 Choosing compute</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A["New workload"] --> B{"Event-driven, spiky, short (under 15 min)?"}
+  B -->|yes| C{"Cold start acceptable or fixable (SnapStart, native)?"}
+  C -->|yes| L["Lambda (+ SQS/EventBridge, Step Functions)"]
+  C -->|no| D
+  B -->|no| D{"Already on Kubernetes or need its ecosystem?"}
+  D -->|yes| E["EKS (Auto Mode or Karpenter)"]
+  D -->|no| F{"Simple containerised web service?"}
+  F -->|yes| G["ECS on Fargate or App Runner"]
+  F -->|no| H["EC2 Auto Scaling group (special OS, licensing, GPUs without K8s)"]
+</pre>
+<figcaption>Figure 12.22 — A compute decision tree for backend workloads on AWS.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> the first question is the workload's shape, not the team's preference. Spiky, event-driven, short tasks fit Lambda; steady services fit containers. Kubernetes is chosen for its ecosystem and standardisation across many services, not for a single app. EC2 remains the right answer for unusual requirements.</p>
+  <h3>11.2 Decision table</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Decision</th><th>Option A</th><th>Option B</th><th>Guidance</th></tr></thead>
+    <tbody>
+      <tr><td>Database</td><td>RDS PostgreSQL</td><td>Aurora PostgreSQL</td><td>RDS for simplicity and lower cost at modest scale; Aurora for faster failover, many read replicas, storage that grows automatically, Serverless v2 elasticity</td></tr>
+      <tr><td>Key-value at scale</td><td>DynamoDB</td><td>ElastiCache/Valkey</td><td>DynamoDB for durable data with known access patterns; cache for ephemeral, sub-millisecond reads</td></tr>
+      <tr><td>Messaging</td><td>SQS (+SNS)</td><td>EventBridge</td><td>SQS for work queues; EventBridge for routing domain events across teams; often both (EventBridge → SQS)</td></tr>
+      <tr><td>Load balancer</td><td>ALB</td><td>NLB</td><td>ALB for HTTP routing/WAF/auth; NLB for static IPs, TCP/UDP, PrivateLink, extreme throughput, pass-through TLS</td></tr>
+      <tr><td>VPC connectivity</td><td>Peering</td><td>Transit Gateway / Lattice</td><td>Peering for a few VPCs; TGW for many networks; Lattice for service-to-service with IAM auth and overlapping CIDRs</td></tr>
+      <tr><td>Java on Lambda</td><td>SnapStart</td><td>GraalVM native</td><td>SnapStart for least change; native when you need the lowest latency and memory and can maintain the build</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Production Failures</h2>
+  <ol>
+    <li><strong>Static access keys</strong> in code, environment variables or CI. Use roles everywhere.</li>
+    <li><strong><code>"Action": "*"</code> policies</strong> "to make it work", never tightened.</li>
+    <li><strong>Small subnets for EKS</strong> (/24) leading to IP exhaustion as the cluster grows.</li>
+    <li><strong>One NAT gateway for all AZs</strong> — a single-AZ failure takes down egress for the whole VPC, and cross-AZ NAT traffic costs extra.</li>
+    <li><strong>No VPC endpoints</strong>: paying NAT processing for ECR pulls and S3 traffic.</li>
+    <li><strong>Opening security groups to CIDRs (or 0.0.0.0/0)</strong> instead of referencing security groups.</li>
+    <li><strong>Health checks pointed at liveness or a deep dependency check</strong>, causing the ALB to drain all targets during a database blip.</li>
+    <li><strong>Default ALB deregistration delay (300 s)</strong> slowing every deployment for stateless APIs.</li>
+    <li><strong>Lambda + RDS without a proxy</strong>: a traffic spike opens thousands of connections.</li>
+    <li><strong>Non-idempotent SQS consumers</strong>, and visibility timeouts shorter than processing time, causing duplicate side effects.</li>
+    <li><strong>Spring Boot fat JAR on Lambda without SnapStart</strong>, then blaming Lambda for multi-second latency.</li>
+    <li><strong>Assuming a Region is a single failure domain you can ignore</strong> — or, the opposite, building multi-region active-active before mastering multi-AZ.</li>
+    <li><strong>Ignoring quotas</strong> (Lambda concurrency, ENIs per instance, EIPs, API rate limits) until a launch day.</li>
+  </ol>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Performance</h3>
+  <p>Keep chatty services in the same AZ (topology-aware routing) and close to their databases; use Graviton for price-performance; size Lambda memory by measuring (more memory means more CPU and often lower cost per invocation); enable HTTP keep-alive in SDK clients; use RDS Proxy or the AWS JDBC wrapper for connection-heavy and failover-sensitive workloads.</p>
+  <h3>13.2 Security</h3>
+  <ul>
+    <li>Least-privilege roles per workload; SCP guardrails; IAM Access Analyzer.</li>
+    <li>Private EKS API endpoint; private subnets for all compute; data subnets without internet routes.</li>
+    <li>Encryption at rest with KMS everywhere (EBS, RDS, S3, Secrets); TLS in transit (<code>rds.force_ssl</code>).</li>
+    <li>VPC endpoint policies and S3 bucket policies requiring <code>aws:SourceVpce</code> for sensitive buckets.</li>
+    <li>CloudTrail, VPC Flow Logs, GuardDuty enabled organisation-wide; WAF on public entry points.</li>
+  </ul>
+  <h3>13.3 Scalability</h3>
+  <p>Know your quotas and request increases early (Service Quotas); design partition keys for DynamoDB; use SQS to absorb bursts; pre-warm or pre-provision capacity for known events; consider cell-based architecture (many independent copies of the stack, each serving a subset of customers) for very large systems.</p>
+  <h3>13.4 Monitoring</h3>
+  <p>CloudWatch metrics for managed services (ALB 5xx and target response time, RDS CPU/connections/replica lag, SQS <code>ApproximateAgeOfOldestMessage</code>, Lambda errors/throttles/duration/concurrency, NAT <code>ErrorPortAllocation</code>), exported to Prometheus/Grafana via CloudWatch exporters or the managed Amazon Managed Service for Prometheus and Grafana; X-Ray or OpenTelemetry for traces through Lambda and API Gateway (Chapter 5). Alert on symptoms first (error rate, latency, queue age), causes second.</p>
+  <h3>13.5 Reliability and maintainability</h3>
+  <p>Everything through Terraform; tagging standards; runbooks for AZ evacuation (zonal shift for ALB/NLB), RDS failover and Lambda throttling; game days that simulate AZ loss with AWS Fault Injection Service (Chapter 6); and regular review of AWS Health events for your accounts.</p>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundation</p>
+    <p>A subnet's route table has <code>10.40.0.0/16 → local</code> and <code>0.0.0.0/0 → igw-123</code>. Is it public or private? What else is required for an EC2 instance in it to be reachable from the internet?</p>
+    <details class="solution"><summary>Solution</summary><div><p>Public: its default route points to an Internet Gateway. The instance also needs a public IPv4 or Elastic IP (the IGW maps it 1:1), a security group allowing the inbound port from the source, and NACLs allowing inbound and the return ephemeral ports.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Plan the CIDRs for a VPC hosting an EKS cluster expected to reach 3,000 pods per AZ across three AZs, plus ALBs and RDS. Justify subnet sizes.</p>
+    <details class="solution"><summary>Solution</summary><div><p>VPC <code>10.40.0.0/16</code>. Private subnets /19 per AZ (8,187 usable) to fit 3,000 pods plus nodes and warm IPs with ~2.5x headroom: <code>10.40.32.0/19</code>, <code>10.40.64.0/19</code>, <code>10.40.96.0/19</code>. Public /24 per AZ for ALB nodes and NAT gateways. Data /24 per AZ for RDS and caches. Leave the remaining space (e.g., <code>10.40.128.0/17</code>) unallocated for future tiers or another cluster. Avoid overlap with on-prem and other VPCs that may be connected via Transit Gateway. Alternative: secondary <code>100.64.0.0/16</code> for pods with custom networking, or IPv6.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>Your Java Lambda (1 GB, SQS-triggered) has p99 latency of 4.2 s, mostly cold starts, and creates a Spring <code>ApplicationContext</code> in the handler constructor. Give a prioritised plan.</p>
+    <details class="solution"><summary>Solution</summary><div><p>(1) Enable SnapStart on a published version/alias; add CRaC hooks to refresh connections and credentials after restore. (2) Remove or slim the Spring context (plain handler with static SDK clients; if Spring is needed, use Spring Cloud Function with AOT). (3) Use the lightweight URL connection or CRT HTTP client; avoid classpath scanning. (4) Tune <code>TieredStopAtLevel=1</code>. (5) Measure Init duration in CloudWatch REPORT lines and restore duration. (6) If still insufficient and the function is on a latency-critical path, consider provisioned concurrency or a GraalVM native image. For an SQS consumer, also ask whether cold-start latency matters at all.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>After a traffic spike, orders-service pods calling a third-party payment API through a single NAT gateway see intermittent connection failures, and CloudWatch shows <code>ErrorPortAllocation</code> on the NAT. Explain and fix.</p>
+    <details class="solution"><summary>Solution</summary><div><p>A NAT gateway can support about 55,000 simultaneous connections to each unique destination (IP, port, protocol). Many pods opening new connections per request to the same payment endpoint exhausts source ports, compounded by TIME_WAIT (Chapter 1). Fixes: connection pooling and keep-alive in the HTTP client (primary); NAT gateway per AZ to spread load; additional secondary IPs on the NAT gateway (each adds port capacity); if the provider offers PrivateLink, use it to bypass NAT. Monitor <code>ErrorPortAllocation</code> and active connection counts.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>Write the IAM policy statement allowing <code>assist-service</code> to read only objects under <code>docs/</code> in bucket <code>lumen-knowledge</code>, and only through the VPC endpoint <code>vpce-0abc</code>.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-json">{
+  "Effect": "Allow",
+  "Action": "s3:GetObject",
+  "Resource": "arn:aws:s3:::lumen-knowledge/docs/*",
+  "Condition": {"StringEquals": {"aws:SourceVpce": "vpce-0abc"}}
+}</code></pre>
+      <p>Attach it to the role associated with the <code>lumen/assist</code> ServiceAccount via Pod Identity. For defence in depth add a bucket policy that denies all access not coming through the endpoint (with exceptions for administrative roles), and enable S3 Block Public Access.</p>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What makes a subnet public in AWS?</summary><div><p>Only its route table: a default route to an Internet Gateway. Instances additionally need public IPs to be reachable. Private subnets route to a NAT gateway or nowhere.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Security groups vs NACLs?</summary><div><p>SGs are stateful, allow-only, attached to ENIs, can reference other SGs; NACLs are stateless, allow/deny, ordered rules, attached to subnets, CIDR-only. Use SGs for micro-segmentation and NACLs as coarse guardrails.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain the Lambda execution model and cold starts.</summary><div><p>Each execution environment (Firecracker microVM) handles one invocation at a time; concurrency is the number of environments. A cold start runs Init (runtime start, code load, static init). Environments are reused while warm. SnapStart snapshots post-Init state at publish time; provisioned concurrency keeps environments warm.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Design the network for an EKS-based platform with an RDS database and calls to an external LLM API.</summary><div><p>Three-AZ VPC; public subnets for ALB/NLB and per-AZ NAT; large private subnets for nodes/pods; isolated data subnets for RDS Multi-AZ; gateway endpoints for S3/DynamoDB; interface endpoints for ECR, STS, Secrets Manager, logs and (if used) Bedrock; SG references ALB → pods → RDS; egress to the LLM API via NAT with keep-alive pooling (or PrivateLink if offered); private EKS API endpoint; Flow Logs and WAF.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> When would you choose ECS over EKS?</summary><div><p>Small number of services, AWS-only, team without Kubernetes expertise, desire for minimal operational overhead and deep native integration. EKS when you need the Kubernetes ecosystem (operators, GitOps tooling, KEDA, service mesh), portability, or a platform for many teams.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> A pod gets AccessDenied calling S3 after you moved from IRSA to Pod Identity. Debug it.</summary><div><p>Check the pod identity association (namespace and ServiceAccount names), the role's trust policy (principal <code>pods.eks.amazonaws.com</code> with <code>sts:AssumeRole</code> and <code>sts:TagSession</code>), that the Pod Identity Agent is running, that the SDK version supports the container credentials provider, leftover IRSA env vars taking precedence, the role's permissions, bucket policy and endpoint policy denies, and use CloudTrail to see which principal made the call and why it was denied.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> An SQS-triggered Lambda processes some messages twice. Why, and how do you fix it?</summary><div><p>At-least-once delivery; visibility timeout shorter than processing time (or batch retries); full-batch failure re-delivering successful messages; function timeouts. Fix: idempotency keys (e.g., DynamoDB conditional writes or Powertools idempotency), visibility timeout ≥ 6× function timeout, <code>ReportBatchItemFailures</code>, FIFO with deduplication if ordering and dedupe are needed.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is static stability?</summary><div><p>Designing so a system keeps operating during an impairment without needing to make changes — e.g., provisioning enough capacity in each AZ to absorb the loss of another, so you do not depend on control-plane actions (launching instances) during the event.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Compute the monthly Lambda cost for 50M invocations at 256 MB and 40 ms on arm64, given prices per GB-s and per request.</summary><div><p>GB-s = 5×10⁷ × 0.25 × 0.04 = 500,000 GB-s; multiply by the arm64 GB-s price (roughly 20% below x86 at list) plus 50 × the per-million request price. Show the formula; look up current prices rather than memorising them.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> Tell me about a cloud cost problem you found and fixed.</summary><div><p>A strong answer names the signal (Cost Explorer by tag, unexpected NAT/data transfer line), the root cause (e.g., images pulled through NAT, cross-AZ chatter), the fix (endpoints, topology-aware routing), the measured savings, and the guardrail added (budgets, dashboards, module defaults).</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Design for AZ failure always: resources and NAT per AZ, Multi-AZ databases, static stability.</li>
+    <li>IAM roles with least privilege for every workload; no static keys; explicit deny wins.</li>
+    <li>Subnets are public or private only by their route tables; size EKS subnets for pod IPs.</li>
+    <li>Security groups are stateful and should reference each other; NACLs are stateless guardrails.</li>
+    <li>VPC endpoints remove NAT cost and internet dependency for AWS APIs.</li>
+    <li>ALB for L7 routing; NLB for L4, static IPs and PrivateLink; tune health checks, idle timeouts and deregistration delay.</li>
+    <li>Lambda: one request per environment, cold starts in Init; SnapStart or native images for Java; idempotent SQS consumers.</li>
+    <li>Serverless wins for spiky, event-driven work; containers win for steady high load.</li>
+  </ul>
+  <div class="quiz" data-answer="b">
+    <p class="q">Which component lets instances in a private subnet initiate outbound internet connections without being reachable from the internet?</p>
+    <ol><li data-k="a">Internet Gateway</li><li data-k="b">NAT gateway</li><li data-k="c">Gateway VPC endpoint</li><li data-k="d">Transit Gateway</li></ol>
+    <div class="explain">A NAT gateway performs source NAT for outbound flows. An IGW gives 1:1 public mapping; gateway endpoints only reach S3/DynamoDB.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">A connection from a pod to RDS times out. What is the most likely class of cause?</p>
+    <ol><li data-k="a">Security group, NACL or route table dropping packets</li><li data-k="b">PostgreSQL rejecting the password</li><li data-k="c">The JDBC driver version</li><li data-k="d">The RDS instance being stopped returns "connection refused"</li></ol>
+    <div class="explain">Drops produce timeouts; authentication failures and closed ports produce explicit errors or refusals.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">What does Lambda SnapStart do?</p>
+    <ol><li data-k="a">Keeps environments permanently warm for a fee</li><li data-k="b">Compiles Java to native code</li><li data-k="c">Snapshots the initialised execution environment at publish time and restores new environments from it</li><li data-k="d">Raises the timeout beyond 15 minutes</li></ol>
+    <div class="explain">SnapStart moves Init to publish time. Provisioned concurrency keeps environments warm; GraalVM produces native code.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">Which statement about security groups is true?</p>
+    <ol><li data-k="a">They are stateless</li><li data-k="b">They support explicit deny rules</li><li data-k="c">They attach to subnets</li><li data-k="d">They can reference other security groups as sources</li></ol>
+    <div class="explain">SGs are stateful, allow-only, attached to ENIs, and can reference other SGs.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">A Lambda receives 400 requests/s with an average duration of 250 ms. Roughly how many concurrent execution environments are needed?</p>
+    <ol><li data-k="a">40</li><li data-k="b">100</li><li data-k="c">400</li><li data-k="d">1,600</li></ol>
+    <div class="explain">Little's Law: 400 × 0.25 = 100.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Which is the cheapest way for pods in private subnets to read large volumes from S3?</p>
+    <ol><li data-k="a">Through the NAT gateway</li><li data-k="b">Through an interface endpoint</li><li data-k="c">Through a gateway endpoint</li><li data-k="d">Through Transit Gateway</li></ol>
+    <div class="explain">S3 gateway endpoints have no hourly or data processing charge.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.aws.amazon.com/vpc/latest/userguide/what-is-amazon-vpc.html">Amazon VPC User Guide</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.aws.amazon.com/eks/latest/userguide/automode.html">Amazon EKS Auto Mode</a> and <a href="https://docs.aws.amazon.com/eks/latest/best-practices/introduction.html">EKS Best Practices Guide</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.aws.amazon.com/lambda/latest/dg/snapstart.html">Lambda SnapStart</a> and <a href="https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html">Lambda quotas</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic.html">IAM policy evaluation logic</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html">AWS Well-Architected Framework</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://aws.amazon.com/builders-library/">Amazon Builders' Library</a> — static stability, timeouts and retries, shuffle sharding</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://aws.amazon.com/message/12721/">AWS post-event summary, December 2021</a> and <a href="https://aws.amazon.com/message/101925/">October 2025</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.powertools.aws.dev/lambda/java/">Powertools for AWS Lambda (Java)</a> — idempotency, batch processing, structured logging</li>
+    <li><span class="ref-kind">Paper</span> <a href="https://www.usenix.org/conference/nsdi20/presentation/agache">Agache et al., "Firecracker: Lightweight Virtualization for Serverless Applications", NSDI 2020</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">DeCandia et al., "Dynamo: Amazon's Highly Available Key-value Store", SOSP 2007</a></li>
+    <li><span class="ref-kind">Book</span> Peter Sbarski, Yan Cui, Ajay Nair, <em>Serverless Architectures on AWS</em>, 2nd ed., Manning, 2022.</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Evaluation, Bias–Variance, Cross-Validation, Tuning &amp; Interpretability — AI-Era Software Engineering</title>
+<meta name="description" content="How to measure models honestly: regression, classification, calibration and ranking metrics; the bias-variance decomposition; cross-validation schemes; hyperparameter search; interpretability with permutation importance, PDP, SHAP and LIME; and fairness basics.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p6-05-evaluation-tuning-interpretability" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 6 · Chapter 5</p>
+  <h1>Evaluation, Bias–Variance, Cross-Validation, Tuning &amp; Interpretability</h1>
+  <p class="lede">A model is only as trustworthy as the measurement behind it. This chapter is the test suite of machine learning: which metric answers which business question, why ROC-AUC can look great while the product fails, how to derive and use the bias–variance decomposition, which cross-validation scheme matches your data, how to search hyperparameters efficiently, and how to explain a model's predictions to a regulator, a product manager or yourself at 2 a.m.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Chapters 6.1–6.3 (expectation and variance, confidence intervals, logistic regression, tree ensembles) and 6.2 (splits and leakage).</li>
+    <li><strong>You will be able to:</strong> choose and compute regression, classification, calibration and ranking metrics; pick thresholds from costs; derive the bias–variance decomposition; design k-fold, stratified, grouped and time-series cross-validation; run grid, random and Bayesian (Optuna) searches with early stopping; produce permutation importance, partial dependence, SHAP and LIME explanations and know their failure modes; and run basic fairness checks.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: Measuring What Matters</h2>
+  <p>You would never ship a service whose only test was "it compiles". Yet ML teams routinely ship models validated by one number on one split. Evaluation answers three different questions, and confusing them causes most failures:</p>
+  <ol>
+    <li><strong>Is this model good at its task?</strong> Offline metrics on held-out data: RMSE, PR-AUC, NDCG.</li>
+    <li><strong>Is it better than the alternative, reliably?</strong> Confidence intervals, cross-validation variance, paired comparisons (Chapter 6.1's statistics).</li>
+    <li><strong>Does it improve the product?</strong> Online experiments on business metrics (conversion, losses prevented, time saved), which offline metrics only approximate.</li>
+  </ol>
+  <p>Around these sit two more concerns. <strong>Generalisation</strong>: the model fits the training data, but will it fit the future? That is the domain of overfitting, the bias–variance trade-off, regularisation and cross-validation. <strong>Understanding</strong>: why does it predict what it predicts? That is interpretability, needed for debugging, trust, regulation and fairness.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>JUnit and Testcontainers, contract tests, load tests with Gatling/k6 reporting p50/p99, canary deployments gated by error-rate SLOs, and A/B flags. You know a test is only meaningful if it exercises realistic inputs and that a green build is not the same as a happy customer.</dd>
+      <dt>Why that is not enough</dt><dd>ML correctness is statistical, not boolean. A model is never "correct"; it has an error distribution. Unit tests cannot tell you whether 0.87 AUC is good enough, whether it will hold next month, or whether errors concentrate on one customer group. And the test data itself can leak or be unrepresentative.</dd>
+      <dt>The modern approach</dt><dd>Define metrics from business costs before training; use cross-validation matched to the data's structure; report uncertainty; tune with efficient search and early stopping; slice metrics by segment; check calibration; explain with model-agnostic tools (permutation importance, SHAP); and gate releases on both offline evaluation and online experiments, like a canary.</dd>
+      <dt>Where Python and Go fit</dt><dd>scikit-learn's <code>metrics</code> and <code>model_selection</code> modules, Optuna for tuning, SHAP for explanations, Fairlearn for fairness metrics are all Python. In Java, Tribuo includes evaluation classes, and your Spring service is where online metrics (latency, score distributions, outcome logging) are emitted.</dd>
+      <dt>In production</dt><dd>An evaluation report (metrics with intervals, per-segment slices, calibration plot, top features, fairness table) is generated for every candidate model in CI, stored with the model in the registry, and compared automatically with the champion. Explanations may be returned with predictions (reason codes for credit decisions).</dd>
+      <dt>Use it when / avoid it when</dt><dd>Always. The only thing to avoid is evaluation theatre: tuning on the test set, reporting the best of many runs, or choosing a metric after seeing results.</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="history">
+  <h2>2. History</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Year</th><th>Development</th></tr></thead>
+    <tbody>
+      <tr><td>1940s–1950s</td><td>ROC analysis from signal detection theory (radar operators); later adopted in psychology and medicine.</td></tr>
+      <tr><td>1950</td><td>Glenn Brier proposes the Brier score for probability forecasts (weather).</td></tr>
+      <tr><td>1953</td><td>Lloyd Shapley defines the Shapley value in cooperative game theory.</td></tr>
+      <tr><td>1974</td><td>Stone and Geisser formalise cross-validation for model assessment.</td></tr>
+      <tr><td>1979</td><td>Van Rijsbergen's effectiveness measure, origin of the F-score in information retrieval.</td></tr>
+      <tr><td>1992</td><td>Geman, Bienenstock, Doursat: "Neural Networks and the Bias/Variance Dilemma".</td></tr>
+      <tr><td>1999–2005</td><td>Platt scaling (1999); isotonic calibration (Zadrozny and Elkan, 2002); Niculescu-Mizil and Caruana compare calibration of learners (2005).</td></tr>
+      <tr><td>2001</td><td>Friedman introduces partial dependence plots in the gradient boosting paper; Breiman's permutation importance in random forests.</td></tr>
+      <tr><td>2002</td><td>Järvelin and Kekäläinen: (normalised) discounted cumulative gain.</td></tr>
+      <tr><td>2011–2012</td><td>Hyperopt and TPE (Bergstra et al. 2011); random search beats grid search (Bergstra and Bengio, JMLR 2012); Snoek et al.'s Bayesian optimisation for ML (2012).</td></tr>
+      <tr><td>2016–2017</td><td>LIME (Ribeiro et al., KDD 2016); SHAP (Lundberg and Lee, NeurIPS 2017); Hyperband (Li et al.). Fairness impossibility results (Kleinberg et al.; Chouldechova).</td></tr>
+      <tr><td>2018–2020</td><td>TreeSHAP (exact Shapley values for trees, Lundberg et al.); Optuna (Akiba et al., KDD 2019); Fairlearn released (2020).</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 Regression metrics</h3>
+  <p>Suppose a delivery-time model predicts [30, 25, 40, 50] minutes and actual times were [28, 30, 38, 70].</p>
+  <ul>
+    <li><strong>MAE</strong> (mean absolute error): average size of the miss. |2| + |−5| + |2| + |−20| = 29, /4 = 7.25 minutes. Easy to explain; every minute of error counts equally; optimal constant prediction is the median.</li>
+    <li><strong>MSE / RMSE</strong>: average squared miss, and its square root to return to minutes. Squares: 4, 25, 4, 400 → MSE 108.25, RMSE ≈ 10.40. The single 20-minute miss dominates. Use when large errors are disproportionately bad; optimal constant is the mean.</li>
+    <li><strong>MAPE</strong> (mean absolute percentage error): 2/28, 5/30, 2/38, 20/70 = 7.1%, 16.7%, 5.3%, 28.6% → 14.4%. Scale-free, but undefined at zero targets and asymmetric (penalises over-prediction of small values heavily). Prefer weighted variants (WAPE = Σ|e| / Σ|y| = 29/166 ≈ 17.5%) for demand data.</li>
+    <li><strong>R²</strong>: fraction of variance explained compared with predicting the mean. R² = 1 − SSE/SST. Here ȳ = 41.5, SST = 182.25 + 132.25 + 12.25 + 812.25 = 1139; SSE = 433; R² = 1 − 433/1139 ≈ 0.62. R² can be negative on test data (worse than the mean) and is not comparable across datasets.</li>
+    <li><strong>Quantile (pinball) loss</strong>: for predicting a percentile (an ETA you will be on time for 90% of the time), penalise under- and over-prediction asymmetrically.</li>
+  </ul>
+  \[ \text{MAE} = \frac1m\sum|y_i-\hat y_i|,\quad \text{RMSE} = \sqrt{\frac1m\sum(y_i-\hat y_i)^2},\quad R^2 = 1 - \frac{\sum(y_i-\hat y_i)^2}{\sum(y_i-\bar y)^2}. \]
+
+  <h3>3.2 The confusion matrix</h3>
+  <p>For a binary classifier with a threshold, every prediction lands in one of four cells. Fraud example on 10,000 transactions with 100 frauds; the model flags 150, of which 80 are fraud:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th></th><th>Predicted fraud</th><th>Predicted legit</th><th>Total</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Actual fraud</strong></td><td>TP = 80</td><td>FN = 20</td><td>100</td></tr>
+      <tr><td><strong>Actual legit</strong></td><td>FP = 70</td><td>TN = 9,830</td><td>9,900</td></tr>
+      <tr><td><strong>Total</strong></td><td>150</td><td>9,850</td><td>10,000</td></tr>
+    </tbody>
+  </table></div>
+  <p>From it:</p>
+  <ul>
+    <li><strong>Accuracy</strong> = (TP + TN)/total = 9,910/10,000 = 99.1%. Looks superb; "always legit" scores 99.0%. Useless under imbalance.</li>
+    <li><strong>Precision</strong> = TP/(TP + FP) = 80/150 = 53.3%. Of the flagged, how many are real? The cost of false alarms (customer friction, analyst time).</li>
+    <li><strong>Recall</strong> (sensitivity, TPR) = TP/(TP + FN) = 80/100 = 80%. Of the real frauds, how many did we catch? The cost of misses.</li>
+    <li><strong>Specificity</strong> = TN/(TN + FP) = 9,830/9,900 = 99.3%; <strong>false positive rate</strong> = 1 − specificity = 0.71%.</li>
+    <li><strong>F1</strong> = harmonic mean of precision and recall = 2PR/(P + R) = 2 × 0.533 × 0.8 / 1.333 = 0.64. The harmonic mean is dragged toward the smaller value, so F1 is high only when both are. F<sub>β</sub> weights recall β times as much as precision.</li>
+  </ul>
+  \[ \text{Precision} = \frac{TP}{TP+FP},\quad \text{Recall} = \frac{TP}{TP+FN},\quad F_\beta = (1+\beta^2)\frac{P\cdot R}{\beta^2P + R}. \]
+  <p>For multiclass problems, compute per-class precision/recall and average: <em>macro</em> (unweighted mean over classes, treats rare classes equally), <em>weighted</em> (by class support), or <em>micro</em> (pool all decisions; equals accuracy for single-label multiclass).</p>
+
+  <h3>3.3 Thresholds, ROC curves and ROC-AUC</h3>
+  <p>A probabilistic classifier produces a score; the threshold turns it into a decision, and every threshold gives a different confusion matrix. The <strong>ROC curve</strong> plots recall (TPR) against FPR as the threshold sweeps from 1 to 0. A random classifier traces the diagonal; a perfect one hugs the top-left corner.</p>
+  <p><strong>ROC-AUC</strong> is the area under that curve, with a beautiful interpretation: <em>the probability that a randomly chosen positive is scored higher than a randomly chosen negative</em>. Example: positives scored [0.9, 0.6], negatives [0.7, 0.2, 0.1]. Of the 2 × 3 = 6 pairs, positive wins: (0.9 &gt; 0.7, 0.2, 0.1) = 3; (0.6 &gt; 0.2, 0.1) = 2, loses to 0.7. AUC = 5/6 ≈ 0.833. It measures ranking quality, independent of threshold and of class balance.</p>
+  <h3>3.4 Precision-recall curves and PR-AUC</h3>
+  <p>That independence from class balance is a problem when positives are rare. With 1% fraud, an FPR of 1% means as many false alarms as there are frauds: precision near 50% even with perfect recall. ROC-AUC barely notices, because FPR divides by the huge number of negatives. The <strong>precision-recall curve</strong> plots precision against recall across thresholds; its area, <strong>PR-AUC</strong> (often computed as <em>average precision</em>), is sensitive to exactly the false-alarm burden you care about. The baseline is the positive rate (0.01 here), not 0.5.</p>
+  <p>Rule of thumb: ROC-AUC for balanced problems or when both error types matter similarly; PR-AUC for rare-positive detection (fraud, defects, search relevance). A model can move from ROC-AUC 0.95 to 0.96 while PR-AUC moves from 0.30 to 0.45, a large operational difference.</p>
+
+  <h3>3.5 Choosing a threshold from costs</h3>
+  <p>The right threshold is a business calculation. Suppose a missed fraud costs $200 and a false alarm (a blocked legitimate customer) costs $10. If the model is calibrated, flag a transaction when the expected cost of letting it through exceeds the expected cost of blocking it: p × 200 &gt; (1 − p) × 10, i.e. p &gt; 10/210 ≈ 0.048. Not 0.5. In general, with cost c<sub>FN</sub> of a miss and c<sub>FP</sub> of a false alarm:</p>
+  \[ \text{flag if } p &gt; \frac{c_{FP}}{c_{FP} + c_{FN}}. \]
+  <p>When the constraint is operational (analysts can review 500 cases per day), choose the threshold that yields 500 flags per day on recent traffic, and report precision and recall at that operating point. Always report metrics at the operating threshold, not just threshold-free AUCs.</p>
+
+  <h3>3.6 Calibration</h3>
+  <p>A model is <strong>calibrated</strong> if, among examples to which it assigns probability 0.3, about 30% are positive. Ranking metrics (AUC) ignore calibration entirely: multiply every logit by 10 and AUC is unchanged while the probabilities become absurdly extreme. Calibration matters whenever the probability is used as a number: expected-cost thresholds (above), pricing, bidding, combining models, or showing "70% chance" to users.</p>
+  <p>Diagnose with a <strong>reliability diagram</strong>: bin predictions (0–0.1, 0.1–0.2, …), plot mean predicted probability against observed positive rate per bin; a calibrated model lies on the diagonal. Summaries: the <strong>Brier score</strong>, mean squared error between probability and outcome (lower is better, and it rewards both calibration and sharpness), log-loss, and expected calibration error (ECE, the bin-weighted average gap). Example: predictions [0.9, 0.8, 0.3] for outcomes [1, 0, 0]: Brier = (0.01 + 0.64 + 0.09)/3 ≈ 0.247.</p>
+  <p>Fix with post-hoc calibration on held-out data: <strong>Platt scaling</strong> fits a logistic regression on the model's score (two parameters, good for small data, assumes a sigmoid-shaped distortion); <strong>isotonic regression</strong> fits a non-decreasing step function (flexible, needs more data). <code>CalibratedClassifierCV</code> does either with cross-validation. Class weighting and resampling (Chapter 6.2) distort calibration; random forests and SVMs are typically poorly calibrated out of the box; logistic regression is usually well calibrated.</p>
+
+  <h3>3.7 Ranking metrics</h3>
+  <p>Search, recommendations and retrieval are judged by the order of results, and users only look at the top. Given a ranked list where relevant items are at positions 1, 3 and 6 out of 10, with 4 relevant items in total:</p>
+  <ul>
+    <li><strong>Precision@k</strong>: fraction of the top k that are relevant. P@5 = 2/5 = 0.4.</li>
+    <li><strong>Recall@k</strong>: fraction of all relevant items in the top k. R@5 = 2/4 = 0.5. The standard metric for the retrieval stage of a RAG system or a candidate generator.</li>
+    <li><strong>MRR</strong> (mean reciprocal rank): 1/rank of the first relevant result, averaged over queries. Here 1/1 = 1.0. Good when one right answer suffices.</li>
+    <li><strong>MAP</strong> (mean average precision): average of precision at each relevant position: (1/1 + 2/3 + 3/6)/4 relevant = (1 + 0.667 + 0.5)/4 ≈ 0.542 (the missing fourth contributes 0).</li>
+    <li><strong>NDCG@k</strong>: handles graded relevance (0 = irrelevant, 3 = perfect) and discounts lower positions logarithmically. DCG@k = Σ<sub>i≤k</sub> (2<sup>rel<sub>i</sub></sup> − 1)/log₂(i + 1), normalised by the DCG of the ideal ordering, so NDCG ∈ [0, 1].</li>
+  </ul>
+  \[ \text{DCG@}k = \sum_{i=1}^{k}\frac{2^{\text{rel}_i}-1}{\log_2(i+1)},\qquad \text{NDCG@}k = \frac{\text{DCG@}k}{\text{IDCG@}k}. \]
+  <p>Example with graded relevances [3, 0, 2] at positions 1–3: DCG = 7/1 + 0/1.585 + 3/2 = 8.5. Ideal order [3, 2, 0]: 7 + 3/1.585 + 0 = 8.893. NDCG@3 = 0.956.</p>
+
+  <h3>3.8 Overfitting and underfitting</h3>
+  <p><strong>Underfitting</strong>: the model is too simple to capture the pattern; training and validation error are both high and close together. A straight line through a curved relationship. <strong>Overfitting</strong>: the model has learned noise specific to the training set; training error is low but validation error is much higher. A degree-15 polynomial threading through 20 noisy points. The diagnosis comes from comparing training and validation curves:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Symptom</th><th>Diagnosis</th><th>Remedies</th></tr></thead>
+    <tbody>
+      <tr><td>High train error, high val error, small gap</td><td>Underfitting (high bias)</td><td>More features, more flexible model, less regularisation, train longer</td></tr>
+      <tr><td>Low train error, high val error, large gap</td><td>Overfitting (high variance)</td><td>More data, regularisation, simpler model, early stopping, bagging, feature selection, augmentation</td></tr>
+      <tr><td>Val error falls with more data (learning curve)</td><td>Variance-limited</td><td>Collect more data</td></tr>
+      <tr><td>Val error flat with more data, close to train</td><td>Bias-limited</td><td>Better features/model; more data will not help</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>3.9 The bias–variance trade-off</h3>
+  <p><strong>Intuition.</strong> Imagine retraining the same model type on many different training sets drawn from the same source and looking at its prediction at one fixed input. Two things can go wrong. The <em>average</em> prediction can be off target: that is <strong>bias</strong>, error from the model family's wrong assumptions (a line cannot fit a curve however much data you have). The predictions can <em>scatter</em> from one training set to another: that is <strong>variance</strong>, error from sensitivity to the particular sample (a deep tree changes completely when a few rows change). On top of both sits <strong>irreducible noise</strong>: the target itself is random given the features, and no model can predict it.</p>
+  <p>For squared error, these three add up exactly (derived in §6):</p>
+  \[ \mathbb{E}\big[(y - \hat f(\mathbf{x}))^2\big] = \underbrace{\big(\mathbb{E}[\hat f(\mathbf{x})] - f(\mathbf{x})\big)^2}_{\text{bias}^2} + \underbrace{\mathbb{E}\big[(\hat f(\mathbf{x}) - \mathbb{E}[\hat f(\mathbf{x})])^2\big]}_{\text{variance}} + \underbrace{\sigma^2}_{\text{noise}}. \]
+  <p>Archery analogy: bias is how far the centre of your arrow cluster is from the bullseye; variance is how spread the cluster is. Increasing model flexibility typically lowers bias and raises variance, so test error traces a U-shape against complexity, with the sweet spot in the middle. Regularisation, ensembling and more data move you around this picture: regularisation trades a little bias for a lot less variance; bagging reduces variance; boosting reduces bias; more data reduces variance.</p>
+  <div class="callout insight"><p class="callout-title">Double descent</p><p>Large neural networks complicate the classic U-curve: test error can fall again as parameters grow far beyond the number of training points ("double descent", Belkin et al., 2019; Nakkiran et al., 2019). The decomposition still holds for squared error; what changes is how variance behaves for very over-parameterised models trained with gradient descent and implicit regularisation. For the tabular models in Part 6, the classic picture is the right working model.</p></div>
+
+  <h3>3.10 Regularisation revisited: one idea, many forms</h3>
+  <p>Regularisation is anything that restricts effective model complexity to reduce variance: penalties on weights (L1/L2, Chapter 6.3), tree constraints (depth, min leaf size, γ), shrinkage in boosting, early stopping, dropout and weight decay in neural networks (Chapter 7.1), data augmentation, and ensembling. All of them are "complexity budgets", and all have a strength hyperparameter that must be tuned on validation data, never on the test set.</p>
+
+  <h3>3.11 Cross-validation</h3>
+  <p>A single validation split gives a noisy estimate, especially on small data. <strong>k-fold cross-validation</strong> splits the training data into k folds, trains k models each holding out one fold, and averages the k validation scores. Every example is used for validation exactly once, and the spread of fold scores estimates uncertainty. k = 5 or 10 is typical. Variants match the data's structure:</p>
+  <ul>
+    <li><strong>Stratified k-fold</strong>: each fold preserves class proportions. Default for classification.</li>
+    <li><strong>Group k-fold</strong>: all rows of a group (user, patient, device, session) land in the same fold. Mandatory when the model will face new groups in production.</li>
+    <li><strong>Time-series split</strong>: folds are expanding (or sliding) windows; train on the past, validate on the next block, optionally with a gap. Never shuffle time-dependent data.</li>
+    <li><strong>Repeated k-fold</strong>: repeat with different shuffles to reduce estimate variance.</li>
+    <li><strong>Nested cross-validation</strong>: an outer loop estimates performance, an inner loop tunes hyperparameters within each outer training fold. Without nesting, the CV score of the best configuration found by tuning on the same folds is optimistically biased.</li>
+    <li><strong>Leave-one-out</strong>: k = m; nearly unbiased, high variance and expensive; rarely worth it.</li>
+  </ul>
+  <p>Cross-validation evaluates a <em>procedure</em> (preprocessing + model + hyperparameters). After choosing, refit the procedure on all training data and evaluate once on the untouched test set.</p>
+
+  <h3>3.12 Hyperparameter tuning</h3>
+  <p>Hyperparameters are settings not learned by training (learning rate, depth, regularisation strength). Tuning is an outer optimisation over a noisy, expensive black box: each evaluation is a full cross-validated training run.</p>
+  <ul>
+    <li><strong>Grid search</strong>: try every combination of listed values. Simple and parallel, but cost multiplies with each parameter, and it wastes evaluations on unimportant dimensions.</li>
+    <li><strong>Random search</strong>: sample configurations from distributions (log-uniform for learning rates and regularisation). Bergstra and Bengio showed that, because usually only a few hyperparameters matter, random search explores the important ones far more efficiently: with 9 trials, a 3 × 3 grid tests only 3 distinct values of the important parameter; random search tests 9.</li>
+    <li><strong>Bayesian optimisation</strong>: build a cheap surrogate model of score as a function of hyperparameters from completed trials, and pick the next trial by maximising an acquisition function that balances exploring uncertain regions and exploiting promising ones. Optuna's default sampler, TPE (tree-structured Parzen estimator), models the densities of good and bad configurations and proposes points where the ratio favours "good".</li>
+    <li><strong>Multi-fidelity / early stopping of trials</strong>: evaluate many configurations cheaply (few epochs, a data subset, few boosting rounds) and only continue promising ones: successive halving, Hyperband, Optuna pruners. Within a single run, early stopping on a validation metric chooses the number of trees or epochs automatically.</li>
+  </ul>
+  <p>Practical recipe for a GBDT: fix a moderately high learning rate (0.05–0.1) with early stopping; tune tree complexity (depth/num_leaves, min child weight), subsampling and regularisation with 50–200 Optuna trials; then lower the learning rate and retrain with early stopping for the final model.</p>
+
+  <h3>3.13 Interpretability: global and local</h3>
+  <p>Interpretability methods answer two kinds of question. <strong>Global</strong>: what does the model rely on overall, and how does the prediction change with a feature? <strong>Local</strong>: why did <em>this</em> customer get <em>this</em> score?</p>
+  <p><strong>Built-in importances</strong>: linear coefficients (only comparable on standardised features, unstable under collinearity) and tree impurity importance (total impurity reduction from splits on a feature). Impurity importance is biased toward continuous and high-cardinality features, which offer more split points, and is computed on training data, so it can rank a random ID column highly.</p>
+  <p><strong>Permutation importance</strong>: on validation data, shuffle one feature's column (breaking its relation to the target while keeping its distribution) and measure how much the score drops. Model-agnostic and measured where it matters (generalisation). Caveats: correlated features share credit (shuffle one, its twin still carries the signal, so both look unimportant), and shuffling creates unrealistic rows (a 5-year-old with a mortgage).</p>
+  <p><strong>Partial dependence plots (PDP)</strong>: set a feature to value v for <em>every</em> row, average the predictions, repeat across v, and plot. It shows the average marginal effect: "predicted price rises steeply up to 120 m², then flattens". <strong>ICE plots</strong> draw one line per row instead of the average, revealing heterogeneity (interactions) that the average hides. Both assume you can vary the feature independently of others, which is unrealistic for correlated features; <em>accumulated local effects</em> (ALE) plots address this.</p>
+  <p><strong>SHAP</strong> (SHapley Additive exPlanations) distributes a single prediction among features fairly, borrowing the Shapley value from cooperative game theory. Intuition: the features are players cooperating to move the prediction from the average (base value) to this example's output. A feature's Shapley value is its average marginal contribution when added to every possible coalition of the other features, averaged over all orderings. The values add up exactly: base value + Σ SHAP values = prediction. Example: a model's average prediction is 0.10 default probability (in log-odds space it is additive; we show probabilities for intuition); for one applicant, SHAP gives debt_ratio +0.15, late_payments +0.08, income −0.05, tenure −0.02, so the prediction is 0.26. For trees, TreeSHAP computes exact values in polynomial time; for other models KernelSHAP approximates by sampling. Aggregating |SHAP| over many rows gives a global importance; SHAP dependence plots show effect versus value.</p>
+  <p><strong>LIME</strong> (Local Interpretable Model-agnostic Explanations): perturb the example many times, get the black-box predictions, weight the perturbed samples by proximity to the original, and fit a simple interpretable model (sparse linear) to those local samples. Its coefficients explain the neighbourhood. Fast and flexible (works for text and images), but explanations depend on the perturbation scheme and kernel width and can be unstable between runs.</p>
+  <div class="callout warn"><p class="callout-title">Explanations explain the model, not the world</p><p>A large SHAP value for postcode means the model uses postcode, not that postcode causes default. Interpretability tools are for debugging and accountability; causal claims need causal methods (experiments, causal inference).</p></div>
+
+  <h3>3.14 Fairness basics</h3>
+  <p>A model can be accurate overall and systematically worse, or harsher, for a group. Fairness evaluation slices metrics by a sensitive attribute (or a proxy where legally permitted) and compares:</p>
+  <ul>
+    <li><strong>Demographic parity</strong>: equal positive-prediction (selection) rates across groups. "Approve 30% in each group."</li>
+    <li><strong>Equal opportunity</strong>: equal true positive rates (recall) across groups. "Qualified applicants are approved at the same rate."</li>
+    <li><strong>Equalised odds</strong>: equal TPR and equal FPR across groups.</li>
+    <li><strong>Predictive parity / calibration within groups</strong>: a score of 0.3 means a 30% outcome rate in every group.</li>
+  </ul>
+  <p>A key result (Kleinberg, Mullainathan, Raghavan 2016; Chouldechova 2017): when base rates differ between groups, a non-trivial classifier cannot simultaneously satisfy calibration within groups and equal FPR and FNR. Fairness therefore requires choosing which criterion fits the decision's harms, which is a product, legal and ethical decision, not a purely technical one. Technical mitigations exist (reweighting, constraints during training, group-specific thresholds via Fairlearn's ThresholdOptimizer), and the first step is always measuring. Simply removing the sensitive attribute ("fairness through unawareness") rarely works, because proxies (postcode, name, purchase patterns) remain.</p>
+</section>
