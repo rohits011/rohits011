@@ -736,3 +736,218 @@ class CrossTenantIT {
     <li><strong>LLM evals:</strong> feature-level eval sets (as in Chapters 8.7 and 8.8) run per model route, including fallback routes, so failover does not silently drop quality.</li>
   </ul>
 </section>
+
+<section id="applications">
+  <h2>8. Applications: Implementation Milestones</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Milestone</th><th>Scope</th><th>Acceptance criteria</th></tr></thead>
+    <tbody>
+      <tr><td>M1 Tenancy core</td><td>Tenant registry, internal JWT with <code>tid</code>, platform starter, RLS on all pooled tables</td><td>CrossTenantIT green for every table (generated check); pen-test style IDOR suite passes</td></tr>
+      <tr><td>M2 Gateway v1</td><td>Go proxy with streaming, entitlements, token buckets, usage events</td><td>Overhead p95 &lt; 15 ms; 200-way concurrent admit test never overspends; events for 100% of requests (compare counts)</td></tr>
+      <tr><td>M3 Metering</td><td>Dedupe topology (EOS), hourly aggregates, usage dashboards</td><td>Injected duplicates and replays produce identical aggregates; dashboard numbers match lake queries</td></tr>
+      <tr><td>M4 Billing</td><td>Plans in billing provider, meter publishing, credit ledger, webhooks (invoice paid, payment failed)</td><td>End-to-end test tenant invoiced correctly for seats + overage; replays do not double-bill</td></tr>
+      <tr><td>M5 Fairness and fallbacks</td><td>Provider capacity allocation by plan; fallback routes; load shedding of Free tier</td><td>Noisy-neighbour load test meets NFR-2; provider 429 storm handled without Enterprise errors</td></tr>
+      <tr><td>M6 Enterprise tiers</td><td>Bridge (schema per tenant) and silo via GitOps + Crossplane; per-tenant KMS keys; residency-locked routes</td><td>Silo provisioned from a PR in &lt; 30 min; isolation suite passes against the silo; residency test proves no cross-region calls</td></tr>
+      <tr><td>M7 Reconciliation and margin</td><td>Daily provider-usage reconciliation; per-plan margin reports</td><td>Reconciliation error &lt; 0.5% for 30 consecutive days; margin dashboard reviewed by finance</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies and Reference Architectures</h2>
+  <h3>9.1 AWS SaaS architecture guidance <span class="tag fact">Verified</span></h3>
+  <p>AWS's <a href="https://docs.aws.amazon.com/whitepapers/latest/saas-tenant-isolation-strategies/saas-tenant-isolation-strategies.html">SaaS Tenant Isolation Strategies</a> whitepaper and the <a href="https://docs.aws.amazon.com/wellarchitected/latest/saas-lens/saas-lens.html">SaaS Lens</a> of the Well-Architected Framework define the silo, pool and bridge vocabulary used in §3.3. They argue that isolation must be enforced by mechanisms (IAM policies, database policies) rather than by developer discipline, and that the control plane should be shared across deployment models. <em>Lesson:</em> RLS and scoped credentials are the "mechanism" in this capstone.</p>
+  <h3>9.2 Shuffle sharding for noisy-neighbour containment <span class="tag fact">Verified</span></h3>
+  <p>The Amazon Builders' Library article <a href="https://aws.amazon.com/builders-library/workload-isolation-using-shuffle-sharding/">"Workload isolation using shuffle-sharding"</a> explains how assigning each customer to a random small subset of workers sharply reduces the chance that one bad customer's traffic takes down another customer's entire capacity. <em>Lesson:</em> for the AI workers in Lumen (document processing and RAG), assign each tenant to 2 of N worker pools by hash. A poison workload then affects only tenants sharing both pools.</p>
+  <h3>9.3 Stripe on pricing and metering AI products <span class="tag fact">Verified</span></h3>
+  <p>Stripe's <a href="https://stripe.com/blog/a-framework-for-pricing-ai-products">"A framework for pricing AI products"</a> discusses charge metrics including consumption-based pricing per token or per call, and Stripe's <a href="https://docs.stripe.com/billing/token-billing">LLM token billing documentation</a> describes metering tokens per customer segmented by model and token type, with markup configured over provider prices (a private preview at the time of writing <span class="tag version">Version-sensitive · checked Nov 2026</span>). <em>Lesson:</em> billing platforms are converging on the "events → meters → prices" model that §4.4 implements, which keeps your pipeline portable.</p>
+  <h3>9.4 PostgreSQL row-level security in multi-tenant SaaS <span class="tag fact">Verified</span></h3>
+  <p>The <a href="https://www.postgresql.org/docs/current/ddl-rowsecurity.html">PostgreSQL documentation on row security policies</a> describes <code>USING</code> and <code>WITH CHECK</code> expressions, <code>FORCE ROW LEVEL SECURITY</code> for table owners, and the <code>BYPASSRLS</code> attribute. Several SaaS vendors and Postgres-based platforms publicly recommend RLS keyed on a session setting as a defence-in-depth layer for pooled tenancy. <em>Lesson:</em> it is a well-trodden path, but performance depends on <code>tenant_id</code> leading your indexes, and on policies being simple, non-volatile expressions.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages and Limitations</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Aspect</th><th>Advantages</th><th>Limitations and costs</th></tr></thead>
+    <tbody>
+      <tr><td>Pooled tenancy + RLS</td><td>Lowest cost per tenant; one schema to migrate; instant provisioning</td><td>Blast radius of a bug spans all tenants; RLS adds planning overhead; noisy neighbours need active controls; some customers contractually require more</td></tr>
+      <tr><td>Silo tier</td><td>Strong isolation story; per-tenant keys, residency, maintenance windows</td><td>Fleet management cost; slower provisioning; version skew risk (mitigate with GitOps and one chart)</td></tr>
+      <tr><td>LLM gateway</td><td>Single point for keys, routing, limits, metering, caching, failover; provider changes invisible to apps</td><td>Critical-path dependency: must be highly available and fast; streaming proxy complexity; another team to own it</td></tr>
+      <tr><td>Credits abstraction</td><td>Customers see one unit; you can change models and prices without repackaging</td><td>Must publish conversion rates; disputes require traceability; credits interact with revenue recognition (consult finance)</td></tr>
+      <tr><td>Event-based metering</td><td>Auditable, replayable, supports any pricing change retroactively for analysis</td><td>Pipeline to operate; late events and adjustments; reconciliation work every month</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Decision</th><th>Option A</th><th>Option B</th><th>Guidance</th></tr></thead>
+    <tbody>
+      <tr><td>Tenant isolation in pooled DB</td><td>App-layer filters (Hibernate <code>@TenantId</code>)</td><td>RLS + app-layer</td><td>Use both. App filters give good query plans and clear code; RLS catches the query someone forgot.</td></tr>
+      <tr><td>Per-tenant schema vs shared schema</td><td>Schema per tenant</td><td>Shared tables</td><td>Schema per tenant up to roughly low thousands of tenants (migrations fan out; catalog bloat). Shared tables beyond that. Bridge tier only for those who pay for it.</td></tr>
+      <tr><td>Real-time budget enforcement</td><td>Strict (reserve before call)</td><td>Lenient (check balance, bill overage later)</td><td>Strict for prepaid and Free; lenient with alerts for invoiced Enterprise (blocking a paying customer mid-task is worse than small overage).</td></tr>
+      <tr><td>Billing source of truth</td><td>Your ledger + meters pushed to provider</td><td>Provider meters only</td><td>Keep your own ledger: you need it for limits, dashboards, reconciliation and provider migration.</td></tr>
+      <tr><td>Gateway build vs buy</td><td>Custom Go gateway</td><td>Open-source or commercial AI gateway</td><td>Buy or adopt when standard features suffice; build the parts tightly tied to your billing (reservations, credits) as plugins or a thin layer.</td></tr>
+      <tr><td>Pricing model</td><td>Seats + included credits + overage</td><td>Pure usage (pay-as-you-go)</td><td>Hybrid for collaboration products (predictable revenue). Pure usage for API-first developer products.</td></tr>
+    </tbody>
+  </table></div>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  C["New customer"] --> R{"Contract requires dedicated data or residency?"}
+  R -->|no| S{"Expected spend high or custom SSO/keys?"}
+  S -->|no| POOL["Pool tier (Free/Team)"]
+  S -->|yes| BR["Bridge tier: schema + KMS key per tenant"]
+  R -->|yes| SI["Silo tier: dedicated namespace, DB, key, routes"]
+</pre>
+  <figcaption>Figure 13.1.6 — Choosing a tenancy model at onboarding.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the tenancy model is a <em>commercial</em> decision with technical consequences. Making it a field in the tenant registry, driven by the same provisioning saga, is what keeps it cheap to offer all three.</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes</h2>
+  <ul>
+    <li><strong>Trusting a tenant header from the client.</strong> Any <code>X-Tenant-Id</code> header is attacker-controlled. Derive the tenant from verified tokens or keys only.</li>
+    <li><strong>RLS with a superuser or BYPASSRLS application role.</strong> The policies silently do nothing. Use <code>FORCE ROW LEVEL SECURITY</code> and a <code>NOBYPASSRLS</code> app role, and test it.</li>
+    <li><strong>Tenant setting leaking across pooled connections.</strong> A connection returned without reset carries the previous tenant into the next request. Reset on return, or use <code>SET LOCAL</code> inside transactions.</li>
+    <li><strong>Check-then-act budget enforcement.</strong> Concurrent requests all see a positive balance. Reserve atomically.</li>
+    <li><strong>Metering from application logs.</strong> Logs are sampled, dropped and reformatted. Bill from a dedicated, schema-governed event stream with idempotency keys.</li>
+    <li><strong>Counting tokens yourself instead of using provider usage fields.</strong> Tokenisers differ and cached tokens are priced differently. Meter what the provider reports, and estimate only for admission.</li>
+    <li><strong>One provider API key for everything.</strong> One leaked key, or one tenant's abuse, takes everyone down. Use separate keys per data plane or tier, keep them only in the gateway, and rotate them.</li>
+    <li><strong>Ignoring cancelled streams.</strong> A client disconnects and the provider keeps generating, so you are billed but you do not bill. Propagate cancellation upstream and meter what is reported.</li>
+    <li><strong>Unbounded Free tier.</strong> Free plans attract abuse (scripted sign-ups, prompt farming). Require verification, set strict limits, and shed Free traffic first under provider pressure.</li>
+    <li><strong>Global limits only.</strong> Per-tenant limits without per-API-key limits let one leaked key exhaust a tenant's whole quota. Layer them.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production: Deployment, Observability, Security and Scaling</h2>
+  <h3>13.1 Deployment</h3>
+  <ol>
+    <li>Bootstrap the control plane (global) and one pooled data plane per region with Terraform: VPCs, managed Kubernetes, managed PostgreSQL (with a separate migration owner role and the app role <code>NOBYPASSRLS</code>), Redis Cluster, managed Kafka with Schema Registry, and an object store.</li>
+    <li>Deploy charts with Argo CD. Each data plane is an ApplicationSet generator entry, and silo tenants are additional entries rendered from <code>deploy/tenants/silo/&lt;tenant&gt;</code>.</li>
+    <li>Provider API keys live in Vault (per data plane), injected only into the gateway via External Secrets. App services receive gateway-scoped tokens.</li>
+    <li>Run the isolation suite and synthetic tenants as post-deploy checks (Argo Rollouts analysis). A failure rolls back automatically.</li>
+  </ol>
+  <h3>13.2 Observability</h3>
+  <ul>
+    <li><strong>Per-tenant RED metrics</strong> without cardinality explosion: label metrics with <code>plan</code> and a bounded <code>tenant_tier_bucket</code>. Put per-tenant breakdowns in the usage store and traces (tenant as a span attribute and in baggage), not in Prometheus labels for 20,000 tenants.</li>
+    <li><strong>Gateway:</strong> admits and denies by reason, upstream latency by provider and model, fallback rate, reservation drift (estimate vs actual), stream cancellation rate.</li>
+    <li><strong>Metering:</strong> events in vs out of dedupe, duplicate rate, lag, late-event rate, published-hours backlog, reconciliation error per model per day.</li>
+    <li><strong>Business:</strong> margin per plan, top 50 tenants by COGS, credit burn rate, tenants approaching limits. These feed customer-success alerts, not only engineering.</li>
+  </ul>
+  <h3>13.3 Security</h3>
+  <ul>
+    <li>Isolation in two layers (application + RLS) for pooled tiers; schema, database and key isolation for bridge and silo; KMS keys per tenant for silo and bridge, with crypto-shredding on offboarding (delete the key to make backups unreadable).</li>
+    <li>API keys: hashed with a server-side pepper, prefixed for identification, scoped, rotatable, with last-used tracking and secret-scanning partner registration so leaked keys get reported.</li>
+    <li>Tenant admins get audit logs (logins, key changes, data exports). Lumen staff access to tenant data is just-in-time, approved and logged.</li>
+    <li>The prompt and completion content of tenants is not stored by default. If you store it for debugging, make it opt-in per tenant with retention limits. Choose provider settings (data retention, regional processing) to match the DPA you signed.</li>
+    <li>Abuse controls on Free: email or domain verification, CAPTCHA on sign-up, anomaly detection on credit burn, and the provider's usage-policy requirements reflected in your terms.</li>
+  </ul>
+  <h3>13.4 Scaling and performance</h3>
+  <ul>
+    <li><strong>Gateway:</strong> stateless, horizontal, HPA on concurrent streams per pod (exported metric). Tune HTTP/2 to providers, keep-alive pools and per-provider circuit breakers.</li>
+    <li><strong>Database:</strong> all pooled tables lead with <code>tenant_id</code> in indexes and partition keys. Move very large tenants to bridge (rebalancing) rather than scaling the pool vertically forever. Read replicas serve dashboards.</li>
+    <li><strong>Workers:</strong> shuffle-sharded queues per tenant group, with per-tenant concurrency caps inside each worker.</li>
+    <li><strong>Cost levers:</strong> prompt caching for shared system prompts (per feature, not per tenant, to maximise hits); batch API for non-interactive workflows (cheaper credits, passed on to customers as a "batch" option); semantic caching only for public, non-tenant-specific content. Never cache across tenants.</li>
+  </ul>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>Write a CI check that fails if any table with a <code>tenant_id</code> column lacks an enabled and forced RLS policy.</p>
+    <details class="solution"><summary>Solution</summary><div><p>After migrations run in a Testcontainers database, query <code>pg_class</code> joined with <code>pg_attribute</code> for tables having a <code>tenant_id</code> column, and check <code>relrowsecurity</code> and <code>relforcerowsecurity</code> are true and that <code>pg_policies</code> has at least one policy for the table whose <code>qual</code> references <code>app.tenant_id</code>. Fail with the list of offending tables. Run it in the same Maven <code>verify</code> phase as other ITs.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Design credit packs (prepaid) that expire after 12 months, consumed after the monthly included credits and before overage. Show the ledger entries for a month in which a tenant uses 3,000 credits with 1,500 included and a 1,000-credit pack.</p>
+    <details class="solution"><summary>Solution</summary><div><p>Ledger entries: <code>GRANT included +1500 (period 2026-11)</code>; <code>PURCHASE pack +1000 (expires 2027-11-03, ref invoice in_123)</code>; consumption is posted hourly as <code>CONSUME -n</code> with an allocation order: included first (FIFO by expiry), then packs (earliest expiry first), then <code>OVERAGE</code>. For 3,000 used: −1,500 from included, −1,000 from the pack, −500 recorded as overage and published to the billing meter. At period end, unused included credits get an <code>EXPIRE</code> entry. Balances per bucket are derived by summing entries by <code>bucket_id</code>. Redis holds a combined real-time balance (included remaining + packs remaining, plus overage allowance if enabled).</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>Add weighted fair sharing of provider capacity in the gateway: Enterprise 50%, Team 35%, Free 15%, with unused share redistributed.</p>
+    <details class="solution"><summary>Solution</summary><div><p>Maintain per-plan token buckets whose refill rates are recomputed every second from the provider limit \(C\) and current demand. Measure each plan's admitted and denied demand over the last 10 s, compute weighted max-min allocations (§6.3), and set refill rates accordingly. Admission requires tokens from both the tenant bucket and the plan bucket. When the provider returns 429s, multiplicatively reduce \(C\) (AIMD) and recover additively. Test with a simulator that replays recorded traffic.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>Migrate a large tenant from the pooled database to a bridge schema with less than 1 minute of write unavailability.</p>
+    <details class="solution"><summary>Solution</summary><div><p>Create the target schema and run migrations. Use logical replication (a publication with a row filter on <code>tenant_id</code>, available in PostgreSQL 15+) or CDC (Debezium) to stream the tenant's rows into the target and let it catch up. Put the tenant in a short "write freeze" (the gateway and API return 503 with <code>Retry-After</code> for writes; reads continue), wait for replication lag to reach zero, verify row counts and checksums per table, flip the tenant's <code>data_plane</code> and <code>tenancy_model</code> in the registry (services resolve the DataSource per tenant from the registry), and lift the freeze. Delete pooled rows after a retention window, then rotate the tenant's KMS key association.</p></div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview: Presenting the Capstone</h2>
+  <p><strong>Pitch (90 seconds):</strong> "Lumen is a multi-tenant AI SaaS. One control plane manages pooled, bridged and siloed data planes. Isolation is enforced in the app and in PostgreSQL RLS. Every model call goes through a Go gateway that checks entitlements, rate-limits with token buckets, reserves credits atomically, fails over between providers per plan policy, and emits idempotent usage events. Those are deduplicated with Kafka Streams exactly-once, aggregated hourly, and pushed to billing with idempotency identifiers. We reconcile against provider usage daily, with error under 0.5%."</p>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How do you prevent cross-tenant data leaks in a pooled database?</summary><div><p>Tenant from verified tokens only; tenant set on the connection for every transaction; RLS with <code>FORCE</code> and a <code>NOBYPASSRLS</code> app role, failing closed when unset; app-layer filters as well; a generated CI check that every tenant table has policies; and cross-tenant integration tests plus pen tests.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Silo vs pool vs bridge: when would you pick each?</summary><div><p>Pool for many small tenants (cost, agility); bridge when tenants need stronger data separation or custom keys but compute can be shared; silo for contractual or regulatory isolation, residency or dedicated capacity. Keep one control plane and the same code for all three.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Implement a token bucket in Redis that is safe under concurrency.</summary><div><p>A Lua script that reads tokens and timestamp, refills by elapsed time × rate capped at capacity, denies if tokens &lt; cost, otherwise decrements and writes back with a TTL. Scripts execute atomically. Hash-tag keys per tenant for cluster mode. Return a retry-after value derived from the deficit and the rate.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Finance says your AI costs from the provider are 4% higher than what you billed customers. How do you investigate?</summary><div><p>Reconcile by model and day: compare provider usage with our metered tokens. Common causes: cancelled streams not metered, gateway crashes after the upstream call but before emitting (check the WAL spill), internal traffic (evals, staging) on the production key, cache-write tokens not priced, fallbacks to a pricier model billed at the primary's credit rate, or retries billed upstream but metered once. Fix the cause, then backfill adjustments where contractually allowed.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Why reserve credits before the call instead of charging after?</summary><div><p>Because concurrency makes check-then-charge unsafe: many in-flight requests would each see sufficient balance. Reservation makes admission atomic. Settlement corrects the estimate. Expired reservations are reconciled from usage events.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> One tenant's batch job is causing 429s from the provider for everyone. What do you do now, and what do you change?</summary><div><p>Now: tighten that tenant's tokens-per-minute bucket via an entitlement override and shed its lowest-priority traffic. Change: per-plan capacity allocation at the gateway, a batch API route for bulk jobs (separate provider limits and cheaper), and shuffle-sharded worker pools. Add an alert on any single tenant exceeding X% of provider capacity.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> How do you price an AI feature whose cost varies by 100× between requests?</summary><div><p>Abstract to credits with published per-model rates; include a credit allowance in seat plans for predictability; meter overage; offer cheaper models and batch modes as explicit choices; protect margins with caps on <code>max_tokens</code> and context size per plan; and watch heavy-tail tenants in a margin dashboard.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> Describe a time you balanced customer needs against platform safety.</summary><div><p>Example structure: an Enterprise customer wanted unlimited throughput for a launch. Instead of removing limits, you provisioned a temporary dedicated capacity route (silo-like routing at the gateway) with its own provider quota, monitored margins, and documented the arrangement in their entitlements. Both the customer and the platform were protected.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>One control plane, many data-plane shapes: pool, bridge, silo.</li>
+    <li>Enforce isolation with mechanisms (RLS, scoped credentials, per-tenant keys), not only conventions.</li>
+    <li>The LLM gateway is the choke point for keys, routing, fallbacks, limits and metering.</li>
+    <li>Reserve-then-settle makes budgets safe under concurrency. Token buckets handle rate.</li>
+    <li>Meter from idempotent events, deduplicate with exactly-once processing, keep your own ledger, and reconcile with providers.</li>
+    <li>Price with credits plus hybrid plans, and watch heavy-tail tenants for margin.</li>
+  </ul>
+  <div class="quiz" data-answer="c">
+    <p class="q">Your RLS policy is in place but a query from the app returns other tenants' rows. Most likely cause?</p>
+    <ol><li data-k="a">Missing index on tenant_id</li><li data-k="b">Using JdbcClient instead of JPA</li><li data-k="c">The app connects as the table owner or a role with BYPASSRLS, without FORCE ROW LEVEL SECURITY</li><li data-k="d">The policy uses WITH CHECK</li></ol>
+    <div class="explain">Owners and BYPASSRLS roles skip policies unless FORCE is set. Use a dedicated NOBYPASSRLS app role.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">Why is the usage topic keyed by tenant ID?</p>
+    <ol><li data-k="a">Duplicates of an event and all events of a tenant land in the same partition, enabling local dedupe state and per-tenant ordering</li><li data-k="b">To encrypt events per tenant</li><li data-k="c">Kafka requires string keys</li><li data-k="d">To make billing faster</li></ol>
+    <div class="explain">Partition affinity lets the dedupe store be partition-local and keeps per-tenant aggregates ordered.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">A Free tenant fires 50 concurrent requests with a balance for 10. With check-then-charge, what happens?</p>
+    <ol><li data-k="a">Exactly 10 succeed</li><li data-k="b">All fail</li><li data-k="c">Redis rejects concurrent reads</li><li data-k="d">Many more than 10 may succeed because each check sees the same positive balance</li></ol>
+    <div class="explain">That is the race that atomic reservation (a Lua script) prevents.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">Which identifier should be sent with each meter event to the billing provider?</p>
+    <ol><li data-k="a">A random UUID per attempt</li><li data-k="b">A deterministic ID such as tenant:meter:hour, so retries are deduplicated</li><li data-k="c">The provider's request ID</li><li data-k="d">None; providers deduplicate automatically by value</li></ol>
+    <div class="explain">Deterministic identifiers make publication idempotent across retries and restarts.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Where should per-tenant breakdowns for 20,000 tenants live?</p>
+    <ol><li data-k="a">As Prometheus labels on every metric</li><li data-k="b">In application logs only</li><li data-k="c">In the usage store and traces (span attributes), with bounded labels in metrics</li><li data-k="d">Nowhere; aggregate only by plan</li></ol>
+    <div class="explain">High-cardinality labels overload time-series databases. Use stores built for per-entity queries.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.aws.amazon.com/whitepapers/latest/saas-tenant-isolation-strategies/saas-tenant-isolation-strategies.html">AWS — SaaS Tenant Isolation Strategies (whitepaper)</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.aws.amazon.com/wellarchitected/latest/saas-lens/saas-lens.html">AWS Well-Architected — SaaS Lens</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://aws.amazon.com/builders-library/workload-isolation-using-shuffle-sharding/">Amazon Builders' Library — Workload isolation using shuffle-sharding</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://www.postgresql.org/docs/current/ddl-rowsecurity.html">PostgreSQL — Row Security Policies</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.stripe.com/billing/subscriptions/usage-based">Stripe — Usage-based billing</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.stripe.com/billing/token-billing">Stripe — Bill for LLM tokens</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://stripe.com/blog/a-framework-for-pricing-ai-products">Stripe — A framework for pricing AI products</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://kafka.apache.org/documentation/streams/">Apache Kafka Streams documentation</a> — exactly-once processing</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://redis.io/docs/latest/develop/interact/programmability/eval-intro/">Redis — Scripting with Lua</a></li>
+    <li><span class="ref-kind">Book</span> Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, O'Reilly, 2017 — ch. 11 (stream processing, exactly-once).</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

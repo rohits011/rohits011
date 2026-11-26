@@ -367,21 +367,21 @@ transport:
   schema_registry_subject: domain.trip-events-value
   compatibility: BACKWARD_TRANSITIVE
 schema:
-  - name: trip_id        ; type: string ; required: true ; unique: true
-  - name: pu_location_id ; type: int    ; required: true ; description: TLC taxi zone id (1-265)
-  - name: dropoff_ts     ; type: timestamp(ms, UTC) ; required: true ; description: event time
-  - name: total_amount   ; type: decimal(10,2) ; unit: USD ; required: true ; checks: [">= 0"]
-  - name: rider_id       ; type: string ; required: true ; classification: pii:pseudonymous_id
+  - {name: trip_id,        type: string,            required: true, unique: true}
+  - {name: pu_location_id, type: int,               required: true, description: "TLC taxi zone id (1-265)"}
+  - {name: dropoff_ts,     type: "timestamp(ms)",   required: true, description: "event time, UTC"}
+  - {name: total_amount,   type: "decimal(10,2)",   required: true, unit: USD, checks: ["&gt;= 0"]}
+  - {name: rider_id,       type: string,            required: true, classification: "pii:pseudonymous_id"}
 quality:
   - "duplicate trip_id rate &lt; 0.01% per hour (at-least-once producer)"
   - "late events (dropoff_ts older than 1h at publish) &lt; 0.5%"
 sla:
   freshness: "p99 publish delay &lt; 60s"
   availability: "99.9% monthly"
-change_policy: >
+change_policy: &gt;
   Additive optional fields: minor version. Removing/renaming fields or changing types or
   units: new major version on a new subject, 90-day dual-publish, consumers notified via catalog.</code></pre>
-  <p>The semicolon-separated field lines are a compact illustrative notation; ODCS and similar standards express the same information as nested YAML. What matters is that the contract lives in the producer's repository and CI fails when a code change violates it.</p>
+  <p>This is an illustrative, simplified contract format; the Open Data Contract Standard and similar specifications express the same information with a richer schema. What matters is that the contract lives in the producer's repository and CI fails when a code change violates it.</p>
 
   <h3>7.2 An idiomatic Airflow 3 DAG: assets, deferrable sensor, mapping, Spark and dbt</h3>
 <pre data-file="dags/tlc_daily.py"><code class="language-python">"""Daily TLC pipeline: wait for the raw file, load bronze with Spark, run dbt, publish assets."""

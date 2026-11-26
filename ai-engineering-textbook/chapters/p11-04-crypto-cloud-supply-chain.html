@@ -156,3 +156,194 @@
   <h3>3.19 Security logging, audit and SIEM at the platform level</h3>
   <p>Collect: cloud control-plane audit logs (AWS CloudTrail including data events for sensitive buckets, GCP Cloud Audit Logs, Azure Activity Logs), KMS and secret-manager access logs, Kubernetes audit logs, VPC flow logs or equivalent, identity provider logs, CI/CD logs, and application security events (Chapter 11.1). Centralise in a SIEM, protect log integrity (separate account, object lock), correlate on identities, and write detections for high-signal events: root account use, IAM policy changes, disabling of logging, new access keys, secret reads by unexpected principals, KMS key deletion scheduled, privileged pods created, exec into production pods.</p>
 </section>
+
+<section id="internals">
+  <h2>4. Internal Working</h2>
+
+  <h3>4.1 The TLS 1.3 handshake, message by message</h3>
+  <ol>
+    <li><strong>ClientHello</strong>: supported versions, cipher suites, supported groups (e.g. X25519MLKEM768, X25519, P-256), signature algorithms, a <em>key share</em> for the client's preferred group(s), a random value, SNI (server name), and ALPN (e.g. <code>h2</code>).</li>
+    <li><strong>ServerHello</strong>: chosen suite and group plus the server's key share. Both sides now compute the shared secret and, via HKDF, derive handshake traffic keys. If the client guessed the wrong group, the server sends a HelloRetryRequest (costing one extra round trip).</li>
+    <li>Everything after ServerHello is encrypted: <strong>EncryptedExtensions</strong>, optional <strong>CertificateRequest</strong> (for mTLS), <strong>Certificate</strong> (the chain), <strong>CertificateVerify</strong> (a signature over the handshake transcript with the certificate's private key — proving possession), and <strong>Finished</strong> (a MAC over the transcript).</li>
+    <li>The client validates the chain and hostname, verifies CertificateVerify and Finished, sends its own Certificate/CertificateVerify if requested, then <strong>Finished</strong>. Application data flows under traffic keys derived from the key schedule.</li>
+    <li>The server may send <strong>NewSessionTicket</strong> messages enabling resumption (PSK), optionally with 0-RTT early data next time.</li>
+  </ol>
+  <p>Because the key exchange is ephemeral and the certificate key is used only to sign the transcript, compromise of the certificate key later does not expose past sessions (forward secrecy). With a hybrid group such as X25519MLKEM768, the shared secret combines an X25519 secret and an ML-KEM-768 secret; an attacker must break both.</p>
+
+  <h3>4.2 Certificate chain validation</h3>
+  <p>The client (e.g. Java's <code>PKIXValidator</code> via the default <code>X509TrustManager</code>) builds a path from the leaf to a trust anchor using issuer/subject names and key identifiers, possibly fetching missing intermediates (Java does not fetch AIA by default — servers must send the full chain). For each certificate it checks the signature with the issuer's public key, validity period, basic constraints (only CAs may sign), key usage, extended key usage (serverAuth/clientAuth), name constraints, and policy. Then the endpoint identification algorithm checks that the requested hostname matches a SAN entry (Java's <code>HttpsURLConnection</code>/<code>HttpClient</code> do this; raw <code>SSLSocket</code> does not unless you set <code>SSLParameters.setEndpointIdentificationAlgorithm("HTTPS")</code>). Disabling any of these "for testing" is how production ends up trusting anyone.</p>
+
+  <h3>4.3 Envelope encryption with AWS KMS, step by step</h3>
+  <ol>
+    <li>Service calls <code>GenerateDataKey</code> with the KEK ID, key spec AES_256 and an encryption context (e.g. <code>{"tenant":"t-42","purpose":"invoice"}</code>). KMS checks the caller's IAM permissions and the key policy, then returns <code>Plaintext</code> (32 bytes) and <code>CiphertextBlob</code> (the DEK encrypted under the KEK, including a key version reference). CloudTrail records the call with the context.</li>
+    <li>Service generates a 96-bit random nonce and encrypts the data with AES-256-GCM, using the context (or record ID) as associated data.</li>
+    <li>Service stores <code>{version, encryptedDek, nonce, ciphertext+tag}</code>, and zeroes/drops the plaintext DEK.</li>
+    <li>To read: call <code>Decrypt</code> with the encrypted DEK and the same context. KMS authorises, logs, unwraps with the right key version, returns the DEK. Decrypt locally; the GCM tag check fails if anything was altered.</li>
+    <li>Caching DEKs for a short time (AWS Encryption SDK supports a caching cryptographic materials manager) reduces KMS calls and cost, trading some audit granularity.</li>
+  </ol>
+
+  <h3>4.4 How IRSA turns a service account into AWS credentials</h3>
+  <ol>
+    <li>The EKS cluster has an OIDC issuer; an IAM OIDC identity provider for that issuer is registered in the account.</li>
+    <li>The pod's service account is annotated with a role ARN. The EKS pod identity webhook mutates the pod to project a service-account token with audience <code>sts.amazonaws.com</code> into a file and sets <code>AWS_ROLE_ARN</code> and <code>AWS_WEB_IDENTITY_TOKEN_FILE</code>.</li>
+    <li>The AWS SDK's default credential chain finds these and calls <code>sts:AssumeRoleWithWebIdentity</code> with the token.</li>
+    <li>STS validates the token's signature against the cluster's OIDC discovery keys and evaluates the role's <strong>trust policy</strong>, which should restrict <code>sub</code> to <code>system:serviceaccount:&lt;namespace&gt;:&lt;name&gt;</code> and <code>aud</code> to <code>sts.amazonaws.com</code>.</li>
+    <li>STS returns temporary credentials (typically valid for an hour); the SDK refreshes them automatically.</li>
+  </ol>
+  <p>A trust policy that omits the <code>sub</code> condition lets <em>any</em> service account in the cluster assume the role — a common and serious misconfiguration. EKS Pod Identity simplifies this with an association API and an on-node agent, avoiding per-cluster OIDC providers.</p>
+
+  <h3>4.5 The Kubernetes request path and admission</h3>
+  <p>Every API request passes: authentication (client certs, OIDC tokens, service-account tokens) → authorization (RBAC, plus Node authorizer and webhooks) → mutating admission (defaults, sidecar injection, Kyverno mutate rules) → object schema validation → validating admission (Pod Security Admission, ValidatingAdmissionPolicy, Kyverno/Gatekeeper validate rules, image-signature verification webhooks) → persistence in etcd. Policies that must not be bypassed belong in validating admission, which sees the final object after all mutations. Note that admission only applies to API writes; it does not re-check running pods when policies change (use audit/background scans for that).</p>
+
+  <h3>4.6 Producing and verifying provenance in CI</h3>
+  <ol>
+    <li>The CI job (e.g. GitHub Actions on a hosted runner) builds the artifact from a specific commit.</li>
+    <li>The job requests an OIDC token from the CI provider, whose claims identify the repository, workflow file, ref and commit.</li>
+    <li>cosign (or <code>actions/attest-build-provenance</code>) generates an ephemeral key pair, obtains a short-lived certificate from Fulcio binding the public key to the OIDC identity, signs the artifact digest and an in-toto provenance statement, and records the signature in Rekor.</li>
+    <li>The signature and attestations are stored in the registry next to the image (as OCI referrers).</li>
+    <li>At deploy time, an admission controller (Kyverno <code>verifyImages</code>, Sigstore policy-controller) verifies: the signature is valid; the certificate identity matches an expected workflow (e.g. <code>https://github.com/acme/orders/.github/workflows/release.yml@refs/heads/main</code>); the issuer is the expected OIDC issuer; the Rekor entry exists; and optionally that provenance claims (source repo, builder) match policy.</li>
+  </ol>
+
+  <h3>4.7 How Log4Shell worked (defender's view)</h3>
+  <p>Log4j 2 supported "lookups" — <code>${...}</code> expressions expanded inside log messages — including a JNDI lookup. When an application logged an attacker-controlled string (a header, a username), Log4j expanded the lookup, made a JNDI request (e.g. LDAP) to an attacker-controlled server, and could load and execute a remote Java class (on older JDKs or via deserialization gadgets on newer ones). The root causes: an interpreter (lookup expansion) hidden inside a logging call — an injection sink nobody considered a sink — plus unrestricted outbound network access from servers. Effective mitigations, in order: upgrade (2.17.1+ for the 2.x line, now later versions), remove the <code>JndiLookup</code> class as a stopgap, restrict egress so servers cannot reach arbitrary LDAP/HTTP endpoints, and WAF rules as temporary virtual patching. Early mitigations such as the <code>formatMsgNoLookups</code> flag turned out to be incomplete (CVE-2021-45046), which is why "upgrade and verify" beats configuration workarounds.</p>
+
+  <h3>4.8 How the xz backdoor worked (defender's view)</h3>
+  <p>Over roughly two years, a contributor using the name "Jia Tan" built trust in the xz-utils project, aided by sock-puppet accounts pressuring the overworked maintainer to add a co-maintainer. Having gained release rights, they shipped release tarballs for versions 5.6.0 and 5.6.1 (February–March 2024) containing build-script modifications not present in the Git repository, which extracted a malicious object from binary "test files" during the build. On certain Linux distributions where OpenSSH's <code>sshd</code> is linked against <code>libsystemd</code>, which in turn loads <code>liblzma</code>, the payload hooked RSA key verification in <code>sshd</code> to allow an attacker holding a specific key to execute commands. It was caught before reaching most stable distributions because Andres Freund noticed sshd logins using unusually high CPU and Valgrind errors, and investigated. Lessons: release artifacts that differ from the source repository are a risk (reproducible builds and building from source tags address this); test fixtures and build scripts deserve review; maintainer burnout is a security issue; and transitive dependency chains (sshd → libsystemd → liblzma) are often invisible.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: Handshakes, Chains, Envelopes, Policies and Pipelines</h2>
+
+  <h3>5.1 TLS 1.3 with mutual authentication</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client (orders-api)
+  participant S as Server (payments-api)
+  C->>S: ClientHello: versions, suites, groups, key_share (X25519MLKEM768), SNI, ALPN
+  S->>C: ServerHello: chosen suite, key_share
+  Note over C,S: Both derive handshake keys (HKDF). Remaining handshake is encrypted.
+  S->>C: EncryptedExtensions, CertificateRequest
+  S->>C: Certificate (server chain), CertificateVerify, Finished
+  C->>C: validate chain to private root, check SAN, verify signature over transcript
+  C->>S: Certificate (client chain, SPIFFE ID in SAN), CertificateVerify, Finished
+  S->>S: validate client chain, map SPIFFE ID to principal
+  C->>S: Application data (HTTP/2) under traffic keys
+</pre>
+  <figcaption>Figure 1 — TLS 1.3 1-RTT handshake with client certificates (mTLS) and hybrid post-quantum key exchange.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the key exchange completes in the first flight (ClientHello/ServerHello), so the certificates travel encrypted — an observer cannot see which service identities are talking. CertificateVerify is a signature over the whole transcript, which both authenticates the server and prevents downgrade tampering. In mTLS the server's CertificateRequest triggers the client's own certificate; the server then maps the SPIFFE URI in the client certificate's SAN to an authorization principal. In a mesh, sidecars perform this on behalf of both applications.</p>
+
+  <h3>5.2 A certificate chain</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  R["Root CA (offline, in client trust store, long validity)"] -- signs --> I["Intermediate CA (online issuing CA, constrained)"]
+  I -- signs --> L["Leaf: CN/SAN api.example.com, EKU serverAuth, short validity"]
+  L -. "presented by server with intermediate" .-> V{"Client validation"}
+  V --> V1["Signatures up to a trusted root"]
+  V --> V2["Dates, key usage, basic constraints"]
+  V --> V3["Hostname matches SAN"]
+  V --> V4["Revocation / short lifetime policy"]
+</pre>
+  <figcaption>Figure 2 — PKI chain from leaf to root and the checks a client performs.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the root key is kept offline because compromising it compromises everything below; day-to-day issuance uses an intermediate that can be revoked and replaced. The server must send the leaf <em>and</em> intermediate; the client already has the root. Each check on the right is a place where custom "trust all" code silently disables security.</p>
+
+  <h3>5.3 Envelope encryption</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant A as Invoice service
+  participant K as KMS (KEK never leaves)
+  participant S as Object store
+  A->>K: GenerateDataKey(KEK, AES_256, context tenant=t-42)
+  K-->>A: DEK plaintext + DEK encrypted under KEK
+  A->>A: AES-256-GCM encrypt invoice with DEK, random nonce, AAD=context
+  A->>S: put {encDEK, nonce, ciphertext+tag}
+  A->>A: discard plaintext DEK
+  Note over A,K: Later, to read
+  A->>S: get object
+  A->>K: Decrypt(encDEK, context tenant=t-42)
+  K-->>A: DEK plaintext (call authorised and logged)
+  A->>A: decrypt locally, tag verified
+</pre>
+  <figcaption>Figure 3 — Envelope encryption with a KMS-held key-encryption key.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the KMS only ever handles 32-byte keys, so bulk data never leaves your service, while every decryption still requires a KMS call that IAM can deny and CloudTrail records. The encryption context must match on decrypt; a blob copied from tenant t-42 into tenant t-7's records fails to decrypt under t-7's context.</p>
+
+  <h3>5.4 AWS IAM policy evaluation (simplified)</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  S["Request: principal, action, resource, context"] --> D{"Explicit Deny in any applicable policy?"}
+  D -- yes --> X["DENY"]
+  D -- no --> O{"Allowed by SCPs / RCPs (if Organizations)?"}
+  O -- no --> X
+  O -- yes --> RB{"Allowed by resource-based policy?"}
+  RB -- "yes (same account)" --> A["ALLOW (subject to boundary/session nuances)"]
+  RB -- no --> B{"Permission boundary allows (if set)?"}
+  B -- no --> X
+  B -- yes --> SP{"Session policy allows (if set)?"}
+  SP -- no --> X
+  SP -- yes --> I{"Identity-based policy allows?"}
+  I -- yes --> A
+  I -- no --> X
+</pre>
+  <figcaption>Figure 4 — Simplified single-account evaluation logic; cross-account access requires allows on both sides.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the default is deny; an explicit Deny anywhere is final; guardrails (SCPs/RCPs, boundaries, session policies) can only restrict, never grant; and a grant must come from an identity- or resource-based policy. The real algorithm has more nuance (e.g. how resource-based policies interact with boundaries for role sessions); consult the AWS documentation's evaluation flowchart when debugging. For KMS keys, the key policy is required to allow access — identity policies alone are not enough unless the key policy delegates to IAM.</p>
+
+  <h3>5.5 Kubernetes defence layers</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph Build["Build"]
+    B1["Minimal, non-root image"] --> B2["Scan + SBOM"] --> B3["Sign + provenance"]
+  end
+  subgraph Admit["Admission"]
+    A1["RBAC: who may deploy"] --> A2["Pod Security Admission: restricted"] --> A3["Kyverno: signed images, limits, no latest"]
+  end
+  subgraph Run["Runtime"]
+    R1["NetworkPolicy default deny"] --> R2["Workload identity, no static creds"] --> R3["Read-only FS, seccomp, no caps"] --> R4["Falco/Tetragon detection"]
+  end
+  Build --> Admit --> Run
+</pre>
+  <figcaption>Figure 5 — Controls across build, admission and runtime for a Kubernetes workload.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> build-time controls reduce what can go wrong; admission controls ensure only compliant workloads start; runtime controls limit and detect what a compromised workload can do. Each layer catches failures of the previous one: an unsigned image is rejected at admission; a signed-but-vulnerable image is constrained by NetworkPolicy and a read-only filesystem; an exploit that spawns a shell is detected at runtime (and fails outright on distroless, which has no shell).</p>
+
+  <h3>5.6 Supply chain from source to cluster</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  Dev["Developer (SSO, MFA, signed commits)"] --> Repo["Repo: branch protection, review, CODEOWNERS"]
+  Deps["Dependencies via private proxy, lockfiles"] --> Build
+  Repo --> Build["Ephemeral hosted builder (SLSA Build L3)"]
+  Build --> Art["Image + SBOM + provenance"]
+  Art --> Sign["cosign keyless signature, Rekor log entry"]
+  Sign --> Reg["Registry"]
+  Reg --> Adm["Admission: verify signature identity and provenance"]
+  Adm --> Prod["Cluster"]
+  Reg --> Scan["Continuous scanning against new CVEs"]
+</pre>
+  <figcaption>Figure 6 — Supply-chain controls mapped to each step.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> each arrow is a trust transfer that an attacker could intercept. The controls ensure that what runs in production can be traced to reviewed source built by a trusted builder from known dependencies — and that this is checked by machine at deploy time rather than assumed. Continuous scanning closes the loop: an image that was clean when built becomes vulnerable when a new CVE is published, and the SBOM makes that query instant.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math: Nonces, Key Sizes, Security Levels and Rotation</h2>
+  <h3>6.1 Random nonce collisions in AES-GCM</h3>
+  <p>Intuition: if you pick nonces at random from a space of size \( N \), collisions become likely after about \( \sqrt{N} \) picks (the birthday bound). The probability of at least one collision among \( q \) random \( b \)-bit nonces is approximately</p>
+  \[ P_{\text{coll}} \approx \frac{q^2}{2^{b+1}} \]
+  <p>For GCM's 96-bit nonces and a target \( P \le 2^{-32} \): \( q^2 \le 2^{65} \Rightarrow q \le 2^{32.5} \). That is why NIST SP 800-38D limits random-nonce GCM to \( 2^{32} \) invocations per key. <span class="tag illus">Illustrative</span> A service encrypting 10,000 records per second would hit \( 2^{32} \approx 4.3\times10^9 \) in about 5 days with a single key — but with envelope encryption, each object has its own DEK and the bound is irrelevant. XChaCha20's 192-bit nonce pushes the bound to \( 2^{80} \).</p>
+  <h3>6.2 Security levels</h3>
+  <p>"Bits of security" means the attacker needs about \( 2^{n} \) operations. Approximate equivalences (NIST SP 800-57): AES-128 ≈ 128 bits; RSA-3072 ≈ 128 bits; ECC P-256 / X25519 ≈ 128 bits; RSA-2048 ≈ 112 bits; SHA-256 collision resistance ≈ 128 bits. Against quantum attackers, Grover roughly halves symmetric security (AES-256 → ~128), while Shor breaks RSA/ECC entirely regardless of size — hence ML-KEM. ML-KEM-768 targets roughly AES-192-equivalent security (NIST category 3).</p>
+  <h3>6.3 Key rotation exposure</h3>
+  <p>If a key is compromised at a uniformly random time and remains in use until the next rotation every \( T \), the expected data exposed under that key (for constant write rate \( w \)) is \( w\,T \) for past data (if no forward secrecy at rest) and the exposure window for future data averages \( T/2 \). Rotation does not help past data already encrypted under a stolen KEK unless you re-encrypt; it bounds future exposure.</p>
+  <h3>6.4 Credential lifetime</h3>
+  <p>Static access keys have unbounded lifetime until someone rotates them; workload-identity credentials typically last about an hour. If a credential leaks at a random point in its life, the expected remaining validity for 1-hour credentials is 30 minutes; for a key rotated yearly, about six months. This back-of-envelope comparison is the strongest argument for workload identity.</p>
+  <h3>6.5 TLS overhead</h3>
+  <p>A full TLS 1.3 handshake costs one round trip plus a signature and a key exchange; on modern servers ECDHE + ECDSA/RSA verification takes well under a millisecond of CPU. Hybrid ML-KEM adds roughly a kilobyte to the ClientHello and ServerHello — which can push ClientHello over a single packet and break buggy middleboxes, the main practical deployment issue Chrome and Cloudflare reported. Connection reuse (HTTP/2, keep-alive pools) amortises handshakes; for mTLS-heavy meshes, CPU cost is dominated by data encryption (AES-GCM with AES-NI runs at gigabytes per second per core).</p>
+</section>

@@ -704,3 +704,114 @@ flowchart TD
     </div></details>
   </div>
 </section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What does k-means optimise and why is it guaranteed to converge?</summary><div><p>It minimises within-cluster sum of squared distances. The assignment step chooses each point's nearest centroid (cannot increase the objective) and the update step sets centroids to means (the minimiser of squared distance for fixed assignments). The objective is non-increasing and bounded below with finitely many partitions, so it converges, but only to a local minimum, hence k-means++ and multiple restarts.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> When would you choose DBSCAN/HDBSCAN over k-means?</summary><div><p>When clusters are non-convex or of varying shapes, when the number of clusters is unknown, and when there is noise that should not be forced into clusters (geospatial traces, embedding topics, fraud rings). Choose k-means for compact, comparably sized clusters, when every point must be assigned, or when you need a cheap, servable model.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> How is PCA related to SVD, and how do you choose the number of components?</summary><div><p>For centred X = UΣVᵀ, principal directions are V's columns, scores are UΣ, and component variances σ²/(m − 1). Choose k from a scree plot or a cumulative explained-variance target, but best by downstream performance (model metric or retrieval recall) versus cost.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain EM for Gaussian mixtures and its relation to k-means.</summary><div><p>E-step computes posterior responsibilities of each component for each point by Bayes' rule; M-step re-estimates weights, means and covariances as responsibility-weighted MLEs. Each iteration does not decrease likelihood. K-means is the hard-assignment limit with equal spherical covariances shrinking to zero.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> A stakeholder shows a t-SNE plot with two distant clusters and concludes the two customer groups are "very different". How do you respond?</summary><div><p>Explain that t-SNE preserves local neighbourhoods but not global distances or cluster sizes; separation can be exaggerated and depends on perplexity and seed. Validate with quantitative comparisons in the original space (feature distributions, distances, a classifier's ability to separate the groups), check stability across perplexities, and compare with PCA.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Your isolation-forest alerts page on-call 40 times a day, mostly false positives. What do you change?</summary><div><p>Lower the alert rate by thresholding on rank to match capacity; add persistence requirements; deseasonalise features (ratios to time-of-week baselines) so normal peaks are not anomalous; suppress during deploys and known events; group correlated anomalies into incidents; collect feedback and evaluate precision@k; consider per-service models; eventually train a supervised classifier on labelled alerts.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Write vectorised NumPy for the k-means assignment step.</summary><div><pre><code class="language-python">def assign(X, C):
+    d2 = (X**2).sum(1)[:, None] - 2 * X @ C.T + (C**2).sum(1)[None, :]
+    return d2.argmin(1)</code></pre><p>Uses the norm expansion to turn the distance computation into one matrix multiplication; mention clipping tiny negative values due to floating point if distances are needed.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Design nightly customer segmentation consumed by several Spring services.</summary><div><p>Batch job: extract behavioural features from the warehouse as of the run date, apply a versioned pipeline (log transform, scaling, k-means), align clusters to the previous run's IDs by centroid matching, validate (segment sizes, silhouette, stability, drift versus last run), and publish to a segment table keyed by customer with a definition version. Services read via a cache or feature store; new customers are assigned online by nearest centroid using exported parameters. Monitor assignment distributions and keep the previous version for rollback.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why do isolation forests use small subsamples per tree?</summary><div><p>Anomalies are isolated near the root regardless of sample size, while small samples reduce swamping (normal points near anomalies looking anomalous) and masking (clusters of anomalies hiding each other), and make training linear and cheap. Depth is capped at about log₂ ψ because only short paths matter.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Unsupervised results depend on representation and objective; "similar" is a design choice.</li>
+    <li>K-means minimises within-cluster squared distance with alternating assign/update steps; k-means++ seeding and restarts mitigate local minima.</li>
+    <li>Choose k by silhouette, elbow, stability and business usefulness, not inertia alone.</li>
+    <li>Hierarchical clustering gives a dendrogram; DBSCAN/HDBSCAN find arbitrary shapes and noise; GMMs give soft assignments and densities via EM.</li>
+    <li>PCA = eigenvectors of the covariance = right singular vectors of centred data; explained variance guides dimension.</li>
+    <li>t-SNE and UMAP are for visualisation: trust neighbourhoods, not distances or sizes.</li>
+    <li>Isolation forests score anomalies by how quickly random cuts isolate a point; operational alert quality is the real metric.</li>
+  </ul>
+  <div class="quiz" data-answer="c">
+    <p class="q">Which algorithm can label points as noise rather than assigning them to a cluster?</p>
+    <ol>
+      <li data-k="a">k-means</li>
+      <li data-k="b">Gaussian mixture</li>
+      <li data-k="c">DBSCAN</li>
+      <li data-k="d">Ward agglomerative clustering</li>
+    </ol>
+    <div class="explain">DBSCAN (and HDBSCAN) label points outside dense regions as noise (−1); the others assign every point.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">What does the k-means++ initialisation do?</p>
+    <ol>
+      <li data-k="a">Chooses each new seed with probability proportional to squared distance from existing seeds</li>
+      <li data-k="b">Chooses k seeds uniformly at random</li>
+      <li data-k="c">Places seeds on a grid</li>
+      <li data-k="d">Runs PCA and uses the top k components</li>
+    </ol>
+    <div class="explain">D(x)² sampling spreads seeds out, giving an O(log k) expected approximation before Lloyd iterations.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">The first two principal components have eigenvalues 6 and 3 out of a total of 12. Cumulative explained variance?</p>
+    <ol>
+      <li data-k="a">50%</li>
+      <li data-k="b">25%</li>
+      <li data-k="c">90%</li>
+      <li data-k="d">75%</li>
+    </ol>
+    <div class="explain">(6 + 3)/12 = 0.75.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">Which statement about t-SNE plots is correct?</p>
+    <ol>
+      <li data-k="a">Distances between clusters reflect true distances.</li>
+      <li data-k="b">Local neighbourhoods are meaningful; global distances and cluster sizes generally are not.</li>
+      <li data-k="c">Results are independent of perplexity.</li>
+      <li data-k="d">t-SNE coordinates are good features for production models.</li>
+    </ol>
+    <div class="explain">t-SNE's KL objective prioritises preserving neighbours; global geometry is distorted and parameter-dependent.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">An isolation forest gives a point an anomaly score of about 0.85. What does that suggest?</p>
+    <ol>
+      <li data-k="a">The point is very normal.</li>
+      <li data-k="b">The point is average.</li>
+      <li data-k="c">The point is isolated in few random splits: likely anomalous.</li>
+      <li data-k="d">The model has not converged.</li>
+    </ol>
+    <div class="explain">Scores near 1 correspond to short average path lengths; around 0.5 is typical; well below 0.5 is normal.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">Why must features usually be standardised before k-means?</p>
+    <ol>
+      <li data-k="a">Euclidean distance would otherwise be dominated by large-scale features.</li>
+      <li data-k="b">k-means requires Gaussian inputs.</li>
+      <li data-k="c">Standardisation makes k-means convex.</li>
+      <li data-k="d">It removes the need to choose k.</li>
+    </ol>
+    <div class="explain">Distances weight features by their numeric ranges; scaling equalises influence.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Docs</span> scikit-learn User Guide: <a href="https://scikit-learn.org/stable/modules/clustering.html">Clustering</a>, <a href="https://scikit-learn.org/stable/modules/decomposition.html">Decomposition (PCA)</a>, <a href="https://scikit-learn.org/stable/modules/outlier_detection.html">Novelty and outlier detection</a>.</li>
+    <li><span class="ref-kind">Paper</span> David Arthur, Sergei Vassilvitskii, "k-means++: The Advantages of Careful Seeding", SODA 2007.</li>
+    <li><span class="ref-kind">Paper</span> Laurens van der Maaten, Geoffrey Hinton, "Visualizing Data using t-SNE", JMLR 9, 2008 — <a href="https://www.jmlr.org/papers/v9/vandermaaten08a.html">jmlr.org</a>.</li>
+    <li><span class="ref-kind">Paper</span> Leland McInnes, John Healy, James Melville, "UMAP: Uniform Manifold Approximation and Projection" — <a href="https://arxiv.org/abs/1802.03426">arXiv:1802.03426</a>; <a href="https://umap-learn.readthedocs.io/">umap-learn docs</a>.</li>
+    <li><span class="ref-kind">Blog</span> Martin Wattenberg, Fernanda Viégas, Ian Johnson, <a href="https://distill.pub/2016/misread-tsne/">"How to Use t-SNE Effectively"</a>, Distill, 2016.</li>
+    <li><span class="ref-kind">Paper</span> Fei Tony Liu, Kai Ming Ting, Zhi-Hua Zhou, "Isolation Forest", ICDM 2008.</li>
+    <li><span class="ref-kind">Paper</span> Martin Ester et al., "A Density-Based Algorithm for Discovering Clusters in Large Spatial Databases with Noise", KDD 1996.</li>
+    <li><span class="ref-kind">Book</span> Christopher M. Bishop, <em>Pattern Recognition and Machine Learning</em>, Springer, 2006 — chapter 9 (mixture models and EM) and chapter 12 (PCA).</li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/logpai/loghub">Loghub</a> — public log datasets for parsing and anomaly detection.</li>
+    <li><span class="ref-kind">Book</span> Gareth James et al., <em>An Introduction to Statistical Learning</em>, chapter 12 (Unsupervised Learning) — <a href="https://www.statlearning.com/">statlearning.com</a>.</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

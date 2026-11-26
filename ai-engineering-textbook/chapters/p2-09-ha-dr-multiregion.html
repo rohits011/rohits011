@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Observability, High Availability, Disaster Recovery &amp; Multi-Region — AI-Era Software Engineering</title>
+<meta name="description" content="Observability for distributed systems, high availability design (redundancy, health checks, cells, static stability), disaster recovery (RPO/RTO, backup to multi-site, DR testing, chaos engineering), multi-region architecture and cloud-native design principles.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p2-09-ha-dr-multiregion" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 2 · Chapter 9</p>
+  <h1>Observability, High Availability, Disaster Recovery &amp; Multi-Region</h1>
+  <p class="lede">Previous chapters taught you to build services that behave correctly when individual calls fail. This chapter zooms out to the failure of whole machines, availability zones and regions, and to the question every on-call engineer faces first: what is actually happening? It covers observability for distributed systems, the design principles of high availability (redundancy, health checks, active-active, cells, static stability), disaster recovery strategies and how to prove they work, multi-region architecture with its data-replication and routing trade-offs, and the cloud-native principles that make all of this operable.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> <a href="p2-01-system-design-foundations.html">Chapter 1 (SLOs, estimation)</a>, <a href="p2-05-replication-sharding.html">Chapter 5 (replication)</a>, <a href="p2-06-consistency-transactions.html">Chapter 6 (consistency, CAP)</a>, <a href="p2-08-microservices-resilience.html">Chapter 8 (resilience patterns)</a>.</li>
+    <li><strong>You will be able to:</strong> instrument a Spring Boot service with metrics, traces, logs and correlation IDs; choose RED, USE or golden signals for a component; design health checks that help rather than hurt; remove single points of failure; compare active-passive, active-active and cell-based designs; apply static stability; pick a DR strategy from RPO/RTO and cost; run DR tests and chaos experiments; design multi-region data replication, global routing and failover runbooks; and apply 12-factor and immutable-infrastructure principles.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: Designing for the Day the Data Centre Disappears</h2>
+  <p>High availability is not a feature you add; it is a property that emerges from many decisions: how many copies of each component exist, where they run, how failures are detected, how traffic moves away from failures, and whether the remaining capacity can absorb the load. Disaster recovery is the plan for when those decisions are not enough: a region fails, data is corrupted, or an operator deletes the production database. Both depend on <strong>observability</strong>, the ability to ask arbitrary questions about the system's behaviour from its outputs, because you cannot fail over from, or recover from, a failure you have not detected and understood.</p>
+  <p>For a Spring Boot engineer the building blocks are familiar: Actuator health endpoints, Micrometer metrics, logs with MDC, database replicas, Kubernetes deployments with several replicas. What changes at this level is the scope (zones and regions rather than pods), the quantitative reasoning (RPO, RTO, error budgets, blast radius), and the discipline (runbooks, game days, chaos experiments) needed to make recovery routine rather than heroic.</p>
+  <p>AI-era systems raise the stakes in specific ways. GPU capacity is scarce and often concentrated in particular regions, so "fail over to another region" may mean "fail over to a region with half the inference capacity". Vector indexes and feature stores are large derived datasets whose rebuild time determines RTO. Model providers are external dependencies with their own regional outages. And observability must extend to quality signals (hallucination rate, retrieval hit rate, token spend) alongside latency and errors.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>Spring Boot Actuator (<code>/actuator/health</code>, <code>/actuator/prometheus</code>), Micrometer meters and timers, SLF4J/Logback with MDC, Spring Cloud Sleuth or Micrometer Tracing, HikariCP pool metrics, database read replicas, and deploying several replicas of a service behind a load balancer.</dd>
+      <dt>Why that is not enough</dt><dd>Three replicas in one availability zone are one failure domain. A health check that pings the database can take down every instance during a database blip. Backups that have never been restored are hopes, not backups. And a dashboard of CPU graphs does not tell you whether users can check out.</dd>
+      <dt>The modern approach</dt><dd>Instrument with OpenTelemetry-compatible signals (metrics, traces, logs, increasingly profiles) correlated by trace id; alert on SLO burn rates of user-facing signals; spread every tier across at least three zones; design for static stability so the system survives a zone loss without control-plane actions; isolate blast radius with cells; choose a DR strategy per workload from its RPO/RTO; and continuously verify with restore tests, game days and chaos experiments.</dd>
+      <dt>Where Python and Go fit</dt><dd>OpenTelemetry SDKs exist for both, with the same semantic conventions, so traces flow across Java, Go and Python services. Go is the language of most cloud-native infrastructure you will operate (Kubernetes, Prometheus, etcd, the OpenTelemetry Collector); Python dominates ops scripting and ML pipelines whose recovery you must also plan.</dd>
+      <dt>In production</dt><dd>Prometheus or a managed metrics service, Grafana, an OpenTelemetry Collector pipeline to a tracing backend (Tempo, Jaeger, vendor APM), structured JSON logs to Loki/Elasticsearch, multi-AZ Kubernetes and managed databases, cross-region replicas and backups, DNS or anycast-based global routing, and runbooks exercised in regular game days.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Multi-AZ is the baseline for any production workload. Multi-region active-active is justified only when the business impact of a regional outage or global latency exceeds its considerable cost and complexity; many systems are better served by multi-AZ plus a tested warm-standby or pilot-light DR region.</dd>
+    </dl>
+  </div>
+  <p>This chapter treats observability at the level of system design: what to measure and why. The tooling (Prometheus internals, Grafana, OpenTelemetry Collector configuration, log pipelines) is covered in depth in <a href="p12-05-observability-otel.html">Chapter 12.5</a>.</p>
+</section>
+
+<section id="history">
+  <h2>2. History: From Pagers and Tape Backups to Cells and Chaos</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Year</th><th>Milestone</th><th>Significance</th></tr></thead>
+    <tbody>
+      <tr><td>1970s–1990s</td><td>Mainframe hot standby, RAID (1988 paper by Patterson, Gibson and Katz), tape-based off-site backup</td><td>Redundancy and off-site copies as the original HA and DR tools.</td></tr>
+      <tr><td>2001</td><td>September 11 attacks expose weaknesses in financial-sector DR; regulators push geographically separated recovery sites</td><td>Formalised RPO/RTO requirements and DR testing in regulated industries.</td></tr>
+      <tr><td>2006</td><td>AWS launches S3 and EC2; Availability Zones introduced with EC2 (2008)</td><td>Commodity fault domains: design across zones became possible for everyone.</td></tr>
+      <tr><td>2010</td><td>Google publishes the Dapper tracing paper</td><td>Distributed tracing at scale; ancestor of Zipkin, Jaeger and OpenTelemetry.</td></tr>
+      <tr><td>2011</td><td>Netflix introduces Chaos Monkey; AWS us-east-1 EBS outage (April)</td><td>Deliberately injecting failure to prove resilience; the outage motivated many multi-AZ designs.</td></tr>
+      <tr><td>2011–2012</td><td>The Twelve-Factor App published by Heroku engineers</td><td>Cloud-native application principles: config in environment, disposability, statelessness.</td></tr>
+      <tr><td>2012–2013</td><td>Netflix Christmas Eve 2012 outage caused by a regional ELB problem; Netflix moves to multi-region active-active</td><td>Large-scale public example of regional active-active.</td></tr>
+      <tr><td>2012–2016</td><td>Brendan Gregg's USE method; Tom Wilkie's RED method; Google's SRE book (2016) with the four golden signals</td><td>Vocabulary for what to measure.</td></tr>
+      <tr><td>2016–2017</td><td>OpenTracing (2016) and OpenCensus (2017); Prometheus joins CNCF (2016)</td><td>Open standards and tools for metrics and traces.</td></tr>
+      <tr><td>2017</td><td>GitLab.com database incident and backup failures (January); S3 us-east-1 outage (February)</td><td>Untested backups and hidden regional dependencies, made public.</td></tr>
+      <tr><td>2019</td><td>OpenTelemetry formed by merging OpenTracing and OpenCensus; W3C Trace Context becomes a Recommendation (2020)</td><td>One vendor-neutral standard for telemetry and context propagation.</td></tr>
+      <tr><td>2018–2023</td><td>AWS Builders' Library articles on static stability and shuffle sharding; AWS cell-based architecture whitepaper (2023); Slack's migration to cells (2023)</td><td>Blast-radius reduction as a first-class design goal.</td></tr>
+      <tr><td>2024–2026</td><td>OpenTelemetry logs signal stable and profiles signal in development; widespread AI-workload observability (token, cost, quality metrics)</td><td>Profiles as a fourth pillar; observability for LLM systems. <span class="tag version">Version-sensitive · checked Nov 2026</span></td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 Monitoring versus observability</h3>
+  <p><strong>Monitoring</strong> answers known questions: is CPU above 80%, is the error rate above 1%? <strong>Observability</strong> is the property that lets you answer <em>new</em> questions without shipping new code: why are checkout requests from Android clients in eu-west slow only for customers with more than 50 cart items? That requires high-cardinality, correlated telemetry: you must be able to slice by arbitrary attributes and jump from an aggregate (a latency spike) to individual examples (traces) to the detail (logs, profiles).</p>
+
+  <h3>3.2 The pillars: metrics, traces, logs, and profiles</h3>
+  <ul>
+    <li><strong>Metrics:</strong> numeric time series aggregated over time (counters, gauges, histograms). Cheap to store and query, ideal for alerting and dashboards, but they lose per-request detail and their cost grows with label cardinality (a label with user ids creates a series per user).</li>
+    <li><strong>Traces:</strong> the causal tree of <em>spans</em> for a single request across services, each with timing and attributes. They show where time goes and which dependency failed. Volume forces sampling (head-based: decide at the start; tail-based: decide after seeing the whole trace, e.g., keep all errors and slow traces).</li>
+    <li><strong>Logs:</strong> timestamped discrete events, ideally structured (JSON) with a trace id and span id. Rich context, expensive at volume.</li>
+    <li><strong>Profiles:</strong> continuous sampling of where CPU time, allocations or lock contention go, down to the function. They answer "why is this service slow or expensive" when traces only say "this span took 300 ms". Async-profiler and JFR on the JVM, pprof in Go, and continuous-profiling backends (Pyroscope, Parca, vendor tools) provide this.</li>
+  </ul>
+  <p>The value comes from <strong>correlation</strong>: exemplars link a metric data point to a trace; logs carry the trace id; profiles can be linked to spans. The OpenTelemetry project standardises APIs, SDKs, the wire protocol (OTLP), the Collector, and semantic conventions (standard attribute names like <code>http.request.method</code>) across all of these.</p>
+
+  <h3>3.3 What to measure: golden signals, RED and USE</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Method</th><th>Signals</th><th>Apply to</th></tr></thead>
+    <tbody>
+      <tr><td>Four golden signals (Google SRE)</td><td>Latency (split successful vs failed), traffic, errors, saturation</td><td>Any user-facing system</td></tr>
+      <tr><td>RED (Tom Wilkie)</td><td>Rate, Errors, Duration per endpoint or operation</td><td>Request-driven services: every microservice, every dependency call</td></tr>
+      <tr><td>USE (Brendan Gregg)</td><td>Utilisation, Saturation, Errors per resource</td><td>Resources: CPUs, disks, network interfaces, connection pools, thread pools, queues, GPUs</td></tr>
+    </tbody>
+  </table></div>
+  <p>Use RED for services and USE for the resources beneath them; the golden signals are the union for a user journey. <strong>Saturation</strong> is the most neglected and most predictive: queue depth, pool wait time, CPU run-queue length, and GC pause time tell you a failure is coming before latency spikes. For AI services add token throughput, time to first token, cost per request, cache hit rates and quality metrics.</p>
+
+  <h3>3.4 SLIs, SLOs and alerting on burn rate</h3>
+  <p>Chapter 1 introduced SLOs. For HA the key practice is alerting on <strong>error-budget burn rate</strong> rather than on raw thresholds: with a 99.9% monthly SLO, a burn rate of 14.4 over one hour consumes 2% of the monthly budget in that hour, which is worth paging for; a slow burn of 1–3 over days deserves a ticket. Multi-window, multi-burn-rate alerts (fast and slow windows) catch both sudden outages and gradual degradations with few false positives, as described in Google's SRE workbook.</p>
+
+  <h3>3.5 Correlation IDs and context propagation</h3>
+  <p>A correlation id ties together every log line, span and message produced by one logical operation across services. The modern standard is the W3C Trace Context <code>traceparent</code> header (<code>00-&lt;trace-id&gt;-&lt;span-id&gt;-&lt;flags&gt;</code>) plus <code>tracestate</code>, and <code>baggage</code> for application key-values. Micrometer Tracing and OpenTelemetry instrumentation propagate it automatically over HTTP clients, servlet and WebFlux servers, Kafka headers and many other transports, and put <code>traceId</code>/<code>spanId</code> into the logging MDC. Asynchronous boundaries (thread pools, <code>@Async</code>, reactive operators, message queues) are where propagation breaks; use context-propagating executors and instrumented clients.</p>
+
+  <h3>3.6 Availability, failure domains and single points of failure</h3>
+  <p>Availability is the fraction of time (or of requests) a service performs correctly. A <strong>failure domain</strong> is a set of components that can fail together: a process, a host, a rack, an availability zone (one or more data centres with independent power and networking), a region, a cloud provider, and also logical domains like a deployment, a configuration push or a shared dependency. A <strong>single point of failure (SPOF)</strong> is any component whose failure makes the service unavailable. Classic SPOFs that survive "we run three replicas": a single NAT gateway, a single primary database without automated failover, a DNS provider, a certificate that expires, a secrets manager in one region, a CI/CD system needed to deploy a fix, and humans (the one engineer who knows how to fail over).</p>
+
+  <h3>3.7 Redundancy models</h3>
+  <ul>
+    <li><strong>N+1 / N+2:</strong> enough capacity to lose one (or two) units. Across three zones, to survive a zone loss each zone must be able to carry 50% of peak load, i.e., provision 150% of peak in total.</li>
+    <li><strong>Active-passive (hot, warm, cold standby):</strong> a standby takes over when the active fails. Simple data consistency (one writer); failover takes time and the standby may not work when needed if not exercised.</li>
+    <li><strong>Active-active:</strong> all sites serve traffic. Capacity is used, failover is just "stop sending traffic there", and the passive-rot problem disappears, but data written in multiple places must be replicated and reconciled (Chapter 6).</li>
+  </ul>
+
+  <h3>3.8 Health checks</h3>
+  <p>Health checks drive automated recovery, so badly designed ones cause outages. Kubernetes distinguishes three probes:</p>
+  <ul>
+    <li><strong>Liveness:</strong> "is this process stuck beyond repair?" Failure restarts the container. It should check only the process itself (event loop responsive, not deadlocked), never downstream dependencies.</li>
+    <li><strong>Readiness:</strong> "should this instance receive traffic now?" Failure removes it from Service endpoints without restarting. Use it during startup, warm-up, graceful shutdown and local overload. Checking a hard dependency here is debatable: if the database is down for everyone, removing every pod from rotation turns degraded service into no service.</li>
+    <li><strong>Startup:</strong> protects slow-starting apps from liveness kills during boot.</li>
+  </ul>
+  <p>Spring Boot Actuator exposes <code>/actuator/health/liveness</code> and <code>/actuator/health/readiness</code> groups backed by <code>ApplicationAvailability</code>, and by default does not include external dependencies in the liveness group. Load balancers have their own health checks (shallow vs deep); deep checks across a fleet must fail open: if more than a threshold of targets look unhealthy, keep routing to all of them (AWS ALB and Route 53 behave this way in some configurations), because a fleet-wide health failure is more likely a bad check than a fleet-wide outage.</p>
+
+  <h3>3.9 Cell-based architecture</h3>
+  <p>A <strong>cell</strong> is a complete, independent instance of a workload (its services, data stores and queues) that serves a subset of customers, selected by a partition key such as tenant id. A thin <strong>cell router</strong> maps each request to its cell. Cells do not call each other or share data stores. Benefits: a bad deployment, poison request, noisy tenant or data corruption affects one cell's customers, not everyone; cells scale out by adding more cells of a tested size; and deployments roll out cell by cell. Costs: the router becomes critical (keep it extremely simple and statically stable), cross-cell features (global search, analytics) need separate aggregation paths, migrating tenants between cells is non-trivial, and fixed per-cell overhead. <strong>Shuffle sharding</strong> is a related technique: give each customer a random small subset of resources so that any two customers rarely share all their resources, limiting the blast radius of a poison customer.</p>
+
+  <h3>3.10 Static stability</h3>
+  <p>A system is <strong>statically stable</strong> if it keeps working through a failure without needing to make changes, especially without calling a control plane (an API that creates, scales or reconfigures resources). The motivating observation from AWS: control planes are more complex and less available than data planes, and during a large event everyone calls them at once. Examples: pre-provision capacity in each zone to absorb a zone loss instead of relying on autoscaling to launch instances during the event; cache credentials and configuration so instances keep running if the config service is down; keep the last known good routing table if the discovery service fails. Static stability trades extra cost (idle headroom) for not depending on anything during recovery.</p>
+
+  <h3>3.11 Disaster recovery: RPO and RTO</h3>
+  <ul>
+    <li><strong>Recovery Point Objective (RPO):</strong> maximum acceptable data loss, measured in time. RPO 5 min means you may lose at most the last 5 minutes of writes.</li>
+    <li><strong>Recovery Time Objective (RTO):</strong> maximum acceptable time from disaster to restored service.</li>
+  </ul>
+  <p>Disasters include region loss, but far more often logical events: a bad migration, ransomware, a buggy batch job that corrupts data, an accidental <code>DROP TABLE</code>. Replication does not protect against logical corruption, because the corruption replicates too. Point-in-time recovery from backups and immutable (write-once) backup copies in a separate account are the defence.</p>
+
+  <h3>3.12 DR strategies</h3>
+  <p>AWS's DR whitepaper describes a spectrum that applies to any cloud:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Strategy</th><th>What runs in the recovery region</th><th>Typical RPO</th><th>Typical RTO</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td>Backup and restore</td><td>Nothing; backups (snapshots, object copies) and infrastructure-as-code</td><td>Hours (backup frequency)</td><td>Hours to a day</td><td>Lowest</td></tr>
+      <tr><td>Pilot light</td><td>Data replicated continuously; core infrastructure defined, compute off or minimal</td><td>Seconds to minutes</td><td>Tens of minutes to hours</td><td>Low</td></tr>
+      <tr><td>Warm standby</td><td>A scaled-down but functional copy of the full stack, receiving replicated data</td><td>Seconds to minutes</td><td>Minutes</td><td>Medium</td></tr>
+      <tr><td>Multi-site active-active</td><td>Full production serving traffic in multiple regions</td><td>Near zero to seconds</td><td>Near zero (traffic shift)</td><td>Highest</td></tr>
+    </tbody>
+  </table></div>
+  <p><span class="tag illus">Illustrative</span> The RPO/RTO ranges are typical orders of magnitude, not guarantees; your numbers depend on replication technology, automation and practice.</p>
+
+  <h3>3.13 DR testing and chaos engineering</h3>
+  <p>A DR plan that has not been executed recently does not work; configuration drift, expired credentials, missing capacity quotas and unknown dependencies accumulate silently. Testing levels: tabletop exercises (walk through the runbook), component tests (restore a backup into a scratch environment and verify data), game days (simulate a zone or region failure in staging or production with the team), and full failover drills. <strong>Chaos engineering</strong> generalises this into a practice: form a hypothesis about steady-state behaviour ("checkout success rate stays above 99.5% if one zone's instances are terminated"), inject a real-world fault (instance termination, latency, dependency failure, zone evacuation), observe, and minimise blast radius while you learn. Netflix's Chaos Monkey (instance termination) and Chaos Kong (region evacuation) are the canonical examples; managed services such as AWS Fault Injection Service and open-source tools such as Chaos Mesh and LitmusChaos bring the practice to Kubernetes.</p>
+
+  <h3>3.14 Multi-region architecture</h3>
+  <p>Reasons to go multi-region: survive regional outages, serve users with lower latency, and meet <strong>data residency</strong> requirements (some data must stay in a jurisdiction). Each reason implies a different design. The core problems are:</p>
+  <ul>
+    <li><strong>Data replication strategy:</strong> single-writer with async cross-region replicas (simple; failover loses replication lag worth of data; reads in remote regions are stale), single-writer per partition with home regions (each user's data has a home; writes routed there; avoids conflicts), multi-writer with conflict resolution (DynamoDB global tables-style LWW or CRDTs), or synchronous consensus across regions (Spanner, CockroachDB multi-region; RPO zero, but every write pays inter-region latency).</li>
+    <li><strong>Global traffic routing:</strong> DNS-based (GeoDNS, latency-based, weighted, failover records with health checks; limited by resolver caching and TTLs), <strong>anycast</strong> (the same IP announced from many locations via BGP; the network routes users to the nearest edge; failover by withdrawing routes, typically seconds; used by CDNs, Cloudflare, Google Cloud's global load balancer and AWS Global Accelerator), and application-level routing (the client or edge picks a region from a user's home-region mapping).</li>
+    <li><strong>Latency:</strong> the speed of light in fibre is about 200 km/ms, so a transatlantic round trip is at least ~60–80 ms in practice. Chatty cross-region calls are unacceptable on the request path.</li>
+    <li><strong>Conflict handling:</strong> any multi-writer design needs the conflict-resolution machinery of Chapter 6 (LWW, vector clocks, CRDTs, or home-region routing to avoid conflicts).</li>
+    <li><strong>Failover runbooks:</strong> who decides, with which signals, which steps (fence the old primary, promote replicas, shift traffic, scale up, verify), and how to fail back.</li>
+  </ul>
+
+  <h3>3.15 Cloud-native design principles</h3>
+  <ul>
+    <li><strong>Twelve-factor:</strong> one codebase, explicit dependencies, config in the environment, backing services as attached resources, strict build/release/run separation, stateless processes, port binding, concurrency via processes, disposability (fast start, graceful stop), dev/prod parity, logs as event streams, admin processes as one-off jobs. Spring Boot's externalised configuration, Actuator and fat-jar/container model map naturally to these.</li>
+    <li><strong>Immutable infrastructure:</strong> never patch running servers; build a new image (container or VM) and replace. Combined with infrastructure as code (Terraform, Pulumi, CloudFormation), it makes environments reproducible, which is the foundation of DR: you can recreate a region from code.</li>
+    <li><strong>Autoscaling:</strong> horizontal pod autoscaling on CPU or custom metrics (queue lag via KEDA), node autoscaling (Cluster Autoscaler, Karpenter), and scheduled scaling for predictable peaks. Autoscaling handles gradual load changes; it is not an HA mechanism for sudden zone loss (static stability).</li>
+    <li><strong>Managed services trade-offs:</strong> managed databases, queues and caches buy you multi-AZ replication, backups and patching, at the cost of less control, provider-specific failure modes and limits, and potential lock-in. You inherit their SLAs (and must read what they exclude), and you still own the configuration that makes them highly available (multi-AZ flags, backup retention, cross-region copies).</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

@@ -288,3 +288,532 @@ stateDiagram-v2
 </figure>
   <p><strong>Reading the diagram:</strong> everything in Init is paid once per environment, so put expensive setup (SDK clients, connection pools sized to 1, configuration loading) there, not in the handler. With SnapStart, Init happens at publish time and new environments take the Restore path; any state that must be unique per environment (random seeds, network connections, credentials) must be refreshed in <code>afterRestore</code>. Because each environment handles one request at a time, concurrency equals the number of environments, and each environment with a database connection is one more connection on your database — hence RDS Proxy.</p>
 </section>
+
+<section id="math">
+  <h2>6. The Numbers: IP Planning, Availability and Cost</h2>
+  <h3>6.1 IP address planning for EKS</h3>
+  <p>With the VPC CNI each pod consumes a VPC IP, and nodes pre-allocate warm IPs or /28 prefixes. If Lumen expects up to 60 nodes per AZ running ~40 pods each, it needs roughly \(60 \times 40 = 2{,}400\) pod IPs per AZ plus node IPs and warm pools — comfortably inside a /19 (8,187 usable) but not a /22 (1,019). Running out of subnet IPs shows up as pods stuck in <code>ContainerCreating</code> with CNI errors. Mitigations: larger subnets, secondary CIDRs (e.g., <code>100.64.0.0/16</code> for pods with custom networking), prefix delegation, or IPv6 clusters.</p>
+  <h3>6.2 Availability arithmetic</h3>
+  <p>Intuition: independent redundant components multiply their <em>unavailability</em>; components in series multiply their <em>availability</em>. If one AZ-local deployment of a service is available 99.5% of the time and AZ failures are independent, a three-AZ deployment that survives any single-AZ loss has unavailability roughly \(\binom{3}{2}(0.005)^2 \approx 7.5 \times 10^{-5}\) — about 99.99% — before accounting for correlated failures and regional dependencies (which dominate in reality). In series, a request path of CloudFront (99.99%) × ALB (99.99%) × app (99.95%) × RDS Multi-AZ (99.95%) yields about \(0.9999^2 \times 0.9995^2 \approx 99.88\%\) <span class="tag illus">Illustrative</span>. Your SLO cannot exceed the product of your hard dependencies (Chapter 6).</p>
+  <h3>6.3 NAT and data transfer cost</h3>
+  <p>Data transfer pricing is a first-order architecture input. As a rough guide to public list prices in large US/EU Regions: a NAT gateway charges about \$0.045 per hour plus about \$0.045 per GB processed; cross-AZ traffic costs about \$0.01 per GB in each direction; internet egress starts around \$0.09 per GB; gateway endpoints for S3/DynamoDB are free; interface endpoints cost about \$0.01 per hour per AZ plus \$0.01 per GB <span class="tag version">Version-sensitive · checked Nov 2026</span> — verify on the AWS pricing pages for your Region. Example: if Lumen's nodes pull 3 TB/month of images and model artifacts from ECR and S3 through NAT, NAT processing alone is \(3{,}000 \times 0.045 = \$135\) per month that endpoints eliminate (S3 gateway endpoint free; ECR interface endpoints cost far less at this volume). Chatty cross-AZ service calls at 50 TB/month cost \(50{,}000 \times 0.02 = \$1{,}000\) per month — the case for topology-aware routing.</p>
+  <h3>6.4 Lambda cost model</h3>
+  <p>Lambda charges per request and per GB-second of duration (billed per millisecond), with a lower price on ARM/Graviton. Using commonly published x86 list prices of about \$0.20 per million requests and \$0.0000166667 per GB-second <span class="tag version">Version-sensitive · checked Nov 2026</span>:</p>
+  \[ \text{monthly cost} \approx N \times \left( \frac{0.20}{10^6} + M_{\text{GB}} \times t_{\text{s}} \times 0.0000166667 \right) \]
+  <p>For 10 million invocations of the notification function at 1 GB and 120 ms: \(10^7 \times (2 \times 10^{-7} + 1 \times 0.12 \times 1.667 \times 10^{-5}) = 2 + 20 = \$22\) per month. A steady 300 requests/second API at 512 MB and 80 ms is \(7.8 \times 10^8\) invocations/month: \(156 + 7.8 \times 10^8 \times 0.5 \times 0.08 \times 1.667 \times 10^{-5} \approx 156 + 520 = \$676\) per month, versus a few hundred dollars for two or three small always-on containers that could serve the same load — the break-even intuition behind "serverless for spiky, containers for steady" <span class="tag illus">Illustrative</span>.</p>
+  <h3>6.5 Lambda concurrency</h3>
+  <p>By Little's Law (Chapter 1 §6.5), required concurrency = arrival rate × duration. At 500 requests/s and 200 ms average duration, you need \(500 \times 0.2 = 100\) concurrent environments. If each opens a database connection, that is 100 connections; a 2,000 req/s burst with a 2 s cold-start-inflated duration briefly needs 4,000 — far beyond what PostgreSQL tolerates. Use RDS Proxy, reserved concurrency limits or a queue in front.</p>
+  <h3>6.6 SQS visibility timeout</h3>
+  <p>Set the visibility timeout to at least six times the function timeout when Lambda consumes SQS (AWS's documented guidance), so that a message being processed — including retries within a batch — does not reappear and get processed twice in parallel. With a 30 s function timeout: visibility timeout ≥ 180 s.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code: Lumen on AWS</h2>
+
+  <h3>7.1 Terraform: EKS with Auto Mode and Pod Identity</h3>
+<pre data-file="live/prod/eks/main.tf"><code class="language-hcl"># Requires the AWS provider with EKS Auto Mode support (5.79+ / 6.x).
+data "terraform_remote_state" "network" {
+  backend = "s3"
+  config = {
+    bucket = "lumen-tfstate-123456789012"
+    key    = "prod/network.tfstate"
+    region = "eu-west-1"
+  }
+}
+
+locals {
+  name    = "lumen-prod"
+  subnets = data.terraform_remote_state.network.outputs.private_subnet_ids
+}
+
+data "aws_iam_policy_document" "cluster_assume" {
+  statement {
+    actions = ["sts:AssumeRole", "sts:TagSession"]
+    principals {
+      type        = "Service"
+      identifiers = ["eks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "cluster" {
+  name               = "${local.name}-cluster"
+  assume_role_policy = data.aws_iam_policy_document.cluster_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "cluster" {
+  for_each = toset([
+    "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy",
+    "arn:aws:iam::aws:policy/AmazonEKSComputePolicy",
+    "arn:aws:iam::aws:policy/AmazonEKSBlockStoragePolicy",
+    "arn:aws:iam::aws:policy/AmazonEKSLoadBalancingPolicy",
+    "arn:aws:iam::aws:policy/AmazonEKSNetworkingPolicy",
+  ])
+  role       = aws_iam_role.cluster.name
+  policy_arn = each.value
+}
+
+data "aws_iam_policy_document" "node_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "node" {
+  name               = "${local.name}-node"
+  assume_role_policy = data.aws_iam_policy_document.node_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "node" {
+  for_each = toset([
+    "arn:aws:iam::aws:policy/AmazonEKSWorkerNodeMinimalPolicy",
+    "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly",
+  ])
+  role       = aws_iam_role.node.name
+  policy_arn = each.value
+}
+
+resource "aws_eks_cluster" "this" {
+  name     = local.name
+  role_arn = aws_iam_role.cluster.arn
+  version  = "1.36"                       # pin; upgrade deliberately (Chapter 2 §13.5)
+
+  bootstrap_self_managed_addons = false   # required for Auto Mode
+  access_config {
+    authentication_mode = "API"           # EKS access entries instead of aws-auth ConfigMap
+  }
+  vpc_config {
+    subnet_ids              = local.subnets
+    endpoint_private_access = true
+    endpoint_public_access  = false        # reach the API via VPN/bastion/CI runners in the VPC
+  }
+  compute_config {
+    enabled       = true
+    node_pools    = ["general-purpose", "system"]
+    node_role_arn = aws_iam_role.node.arn
+  }
+  kubernetes_network_config {
+    elastic_load_balancing { enabled = true }
+  }
+  storage_config {
+    block_storage { enabled = true }
+  }
+  encryption_config {
+    resources = ["secrets"]
+    provider { key_arn = aws_kms_key.eks.arn }
+  }
+  enabled_cluster_log_types = ["api", "audit", "authenticator"]
+  depends_on                = [aws_iam_role_policy_attachment.cluster]
+}
+
+resource "aws_kms_key" "eks" {
+  description         = "EKS secrets envelope encryption"
+  enable_key_rotation = true
+}
+
+# Workload identity for orders-service: ServiceAccount lumen/orders -&gt; IAM role
+data "aws_iam_policy_document" "pod_identity_assume" {
+  statement {
+    actions = ["sts:AssumeRole", "sts:TagSession"]
+    principals {
+      type        = "Service"
+      identifiers = ["pods.eks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "orders" {
+  name               = "${local.name}-orders"
+  assume_role_policy = data.aws_iam_policy_document.pod_identity_assume.json
+}
+
+resource "aws_iam_role_policy" "orders" {
+  role = aws_iam_role.orders.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      { Effect = "Allow", Action = ["events:PutEvents"],
+        Resource = "arn:aws:events:eu-west-1:123456789012:event-bus/lumen" },
+      { Effect = "Allow", Action = ["secretsmanager:GetSecretValue"],
+        Resource = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:lumen/orders/*" }
+    ]
+  })
+}
+
+resource "aws_eks_pod_identity_association" "orders" {
+  cluster_name    = aws_eks_cluster.this.name
+  namespace       = "lumen"
+  service_account = "orders"
+  role_arn        = aws_iam_role.orders.arn
+}</code></pre>
+  <p>With Auto Mode, AWS manages node provisioning (Karpenter-based NodePools), the VPC CNI, kube-proxy, CoreDNS, the EBS CSI driver, load balancer integration and Pod Identity; you manage workloads. Without Auto Mode you would add managed node groups or self-managed Karpenter and the add-ons yourself <span class="tag version">Version-sensitive · checked Nov 2026</span>. The Kubernetes version shown is an example; use a version in standard support.</p>
+
+  <h3>7.2 Terraform: RDS PostgreSQL Multi-AZ</h3>
+<pre data-file="live/prod/data/main.tf"><code class="language-hcl">resource "aws_db_subnet_group" "orders" {
+  name       = "lumen-prod-orders"
+  subnet_ids = data.terraform_remote_state.network.outputs.data_subnet_ids
+}
+
+resource "aws_security_group" "orders_db" {
+  name   = "lumen-prod-orders-db"
+  vpc_id = data.terraform_remote_state.network.outputs.vpc_id
+}
+
+resource "aws_vpc_security_group_ingress_rule" "orders_db_from_eks" {
+  security_group_id            = aws_security_group.orders_db.id
+  referenced_security_group_id = data.terraform_remote_state.eks.outputs.cluster_security_group_id
+  ip_protocol                  = "tcp"
+  from_port                    = 5432
+  to_port                      = 5432
+  description                  = "PostgreSQL from EKS pods/nodes only"
+}
+
+resource "aws_db_parameter_group" "orders" {
+  name   = "lumen-prod-orders-pg17"
+  family = "postgres17"
+  parameter {
+    name  = "rds.force_ssl"
+    value = "1"
+  }
+  parameter {
+    name  = "log_min_duration_statement"
+    value = "500"                          # log queries slower than 500 ms
+  }
+}
+
+resource "aws_db_instance" "orders" {
+  identifier                  = "lumen-prod-orders"
+  engine                      = "postgres"
+  engine_version              = "17"
+  instance_class              = "db.r7g.large"
+  allocated_storage           = 100
+  max_allocated_storage       = 500        # storage autoscaling
+  storage_type                = "gp3"
+  storage_encrypted           = true
+  multi_az                    = true
+  db_name                     = "orders"
+  username                    = "orders_admin"
+  manage_master_user_password = true       # password generated and rotated in Secrets Manager
+  db_subnet_group_name        = aws_db_subnet_group.orders.name
+  vpc_security_group_ids      = [aws_security_group.orders_db.id]
+  parameter_group_name        = aws_db_parameter_group.orders.name
+  backup_retention_period     = 14
+  deletion_protection         = true
+  copy_tags_to_snapshot       = true
+  performance_insights_enabled = true
+  auto_minor_version_upgrade  = true
+  apply_immediately           = false      # changes in the maintenance window
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+output "orders_db_endpoint" { value = aws_db_instance.orders.address }</code></pre>
+
+  <h3>7.3 An SQS-triggered Lambda in Java 21 with SnapStart</h3>
+<pre data-file="notify/src/main/java/com/lumen/notify/OrderPlacedHandler.java"><code class="language-java">package com.lumen.notify;
+
+import com.amazonaws.services.lambda.runtime.Context;
+import com.amazonaws.services.lambda.runtime.RequestHandler;
+import com.amazonaws.services.lambda.runtime.events.SQSBatchResponse;
+import com.amazonaws.services.lambda.runtime.events.SQSEvent;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.crac.Core;
+import org.crac.Resource;
+import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.sesv2.SesV2Client;
+import software.amazon.awssdk.services.sesv2.model.*;
+
+import java.util.ArrayList;
+import java.util.List;
+
+// Dependencies: aws-lambda-java-core, aws-lambda-java-events, software.amazon.awssdk:sesv2,
+// software.amazon.awssdk:url-connection-client, org.crac:crac, jackson-databind.
+public class OrderPlacedHandler implements RequestHandler&lt;SQSEvent, SQSBatchResponse&gt;, Resource {
+
+    // Initialised once per execution environment (or once at snapshot time with SnapStart).
+    private static final ObjectMapper JSON = new ObjectMapper();
+    private SesV2Client ses = newClient();
+
+    public OrderPlacedHandler() {
+        Core.getGlobalContext().register(this);   // receive SnapStart (CRaC) lifecycle callbacks
+    }
+
+    private static SesV2Client newClient() {
+        return SesV2Client.builder()
+                .region(Region.of(System.getenv("AWS_REGION")))
+                .httpClient(UrlConnectionHttpClient.create())  // lightweight, fast to initialise
+                .build();
+    }
+
+    @Override
+    public void beforeCheckpoint(org.crac.Context&lt;? extends Resource&gt; ctx) {
+        // Warm up class loading and JSON paths so the snapshot contains initialised code.
+        JSON.convertValue(new OrderPlaced("warmup", "warmup@example.com", 0), OrderPlaced.class);
+    }
+
+    @Override
+    public void afterRestore(org.crac.Context&lt;? extends Resource&gt; ctx) {
+        ses = newClient();   // never reuse connections/credentials captured in the snapshot
+    }
+
+    @Override
+    public SQSBatchResponse handleRequest(SQSEvent event, Context context) {
+        List&lt;SQSBatchResponse.BatchItemFailure&gt; failures = new ArrayList&lt;&gt;();
+        for (SQSEvent.SQSMessage msg : event.getRecords()) {
+            try {
+                OrderPlaced order = JSON.readValue(msg.getBody(), OrderPlaced.class);
+                sendConfirmation(order);   // must be idempotent: SQS is at-least-once
+            } catch (Exception e) {
+                context.getLogger().log("failed " + msg.getMessageId() + ": " + e);
+                failures.add(new SQSBatchResponse.BatchItemFailure(msg.getMessageId()));
+            }
+        }
+        return new SQSBatchResponse(failures);   // only failed messages are retried
+    }
+
+    private void sendConfirmation(OrderPlaced o) {
+        ses.sendEmail(SendEmailRequest.builder()
+                .fromEmailAddress("orders@lumen.example.com")
+                .destination(Destination.builder().toAddresses(o.email()).build())
+                .content(EmailContent.builder().simple(Message.builder()
+                        .subject(Content.builder().data("Order " + o.orderId() + " confirmed").build())
+                        .body(Body.builder().text(Content.builder()
+                                .data("Thank you! Total: " + o.totalCents() / 100.0).build()).build())
+                        .build()).build())
+                .build());
+    }
+
+    public record OrderPlaced(String orderId, String email, long totalCents) {}
+}</code></pre>
+<pre data-file="live/prod/serverless/notify.tf"><code class="language-hcl">resource "aws_lambda_function" "notify" {
+  function_name = "lumen-notify"
+  role          = aws_iam_role.notify.arn
+  runtime       = "java21"
+  architectures = ["arm64"]                   # Graviton: cheaper per GB-second
+  handler       = "com.lumen.notify.OrderPlacedHandler::handleRequest"
+  filename      = "${path.module}/build/notify.jar"
+  source_code_hash = filebase64sha256("${path.module}/build/notify.jar")
+  memory_size   = 1024
+  timeout       = 30
+  publish       = true                        # SnapStart works on published versions
+  snap_start {
+    apply_on = "PublishedVersions"
+  }
+  environment {
+    variables = { JAVA_TOOL_OPTIONS = "-XX:+TieredCompilation -XX:TieredStopAtLevel=1" }
+  }
+}
+
+resource "aws_lambda_alias" "live" {
+  name             = "live"
+  function_name    = aws_lambda_function.notify.function_name
+  function_version = aws_lambda_function.notify.version
+}
+
+resource "aws_sqs_queue" "notify_dlq" {
+  name                      = "lumen-notify-dlq"
+  message_retention_seconds = 1209600         # 14 days
+}
+
+resource "aws_sqs_queue" "notify" {
+  name                       = "lumen-notify"
+  visibility_timeout_seconds = 180            # at least 6 x function timeout
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.notify_dlq.arn
+    maxReceiveCount     = 5
+  })
+}
+
+resource "aws_lambda_event_source_mapping" "notify" {
+  event_source_arn                   = aws_sqs_queue.notify.arn
+  function_name                      = aws_lambda_alias.live.arn
+  batch_size                         = 10
+  maximum_batching_window_in_seconds = 2
+  function_response_types            = ["ReportBatchItemFailures"]
+  scaling_config {
+    maximum_concurrency = 50                  # protect SES quotas and downstream systems
+  }
+}</code></pre>
+
+  <h3>7.4 The same consumer in Python and Go</h3>
+<div class="code-tabs">
+<pre data-lang="Python" data-file="notify_py/handler.py"><code class="language-python"># Python 3.12 Lambda for the same SQS queue (SnapStart is also available for Python 3.12+).
+import json
+import os
+
+import boto3
+
+ses = boto3.client("sesv2", region_name=os.environ["AWS_REGION"])  # created once per environment
+
+
+def handler(event, context):
+    failures = []
+    for record in event["Records"]:
+        try:
+            order = json.loads(record["body"])
+            ses.send_email(
+                FromEmailAddress="orders@lumen.example.com",
+                Destination={"ToAddresses": [order["email"]]},
+                Content={"Simple": {
+                    "Subject": {"Data": f"Order {order['orderId']} confirmed"},
+                    "Body": {"Text": {"Data": f"Total: {order['totalCents'] / 100:.2f}"}},
+                }},
+            )
+        except Exception as exc:  # noqa: BLE001 - report and continue with the batch
+            print(json.dumps({"level": "ERROR", "messageId": record["messageId"], "error": str(exc)}))
+            failures.append({"itemIdentifier": record["messageId"]})
+    return {"batchItemFailures": failures}</code></pre>
+<pre data-lang="Go" data-file="notify_go/main.go"><code class="language-go">// Go Lambda on the provided.al2023 runtime (build: GOOS=linux GOARCH=arm64 go build -o bootstrap)
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+
+	"github.com/aws/aws-lambda-go/events"
+	"github.com/aws/aws-lambda-go/lambda"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/sesv2"
+	"github.com/aws/aws-sdk-go-v2/service/sesv2/types"
+)
+
+type orderPlaced struct {
+	OrderID    string `json:"orderId"`
+	Email      string `json:"email"`
+	TotalCents int64  `json:"totalCents"`
+}
+
+var client *sesv2.Client // initialised once per execution environment
+
+func handle(ctx context.Context, ev events.SQSEvent) (events.SQSEventResponse, error) {
+	var resp events.SQSEventResponse
+	for _, m := range ev.Records {
+		var o orderPlaced
+		if err := json.Unmarshal([]byte(m.Body), &amp;o); err != nil {
+			resp.BatchItemFailures = append(resp.BatchItemFailures, events.SQSBatchItemFailure{ItemIdentifier: m.MessageId})
+			continue
+		}
+		_, err := client.SendEmail(ctx, &amp;sesv2.SendEmailInput{
+			FromEmailAddress: aws.String("orders@lumen.example.com"),
+			Destination:      &amp;types.Destination{ToAddresses: []string{o.Email}},
+			Content: &amp;types.EmailContent{Simple: &amp;types.Message{
+				Subject: &amp;types.Content{Data: aws.String("Order " + o.OrderID + " confirmed")},
+				Body:    &amp;types.Body{Text: &amp;types.Content{Data: aws.String(fmt.Sprintf("Total: %.2f", float64(o.TotalCents)/100))}},
+			}},
+		})
+		if err != nil {
+			slog.Error("send failed", "messageId", m.MessageId, "err", err)
+			resp.BatchItemFailures = append(resp.BatchItemFailures, events.SQSBatchItemFailure{ItemIdentifier: m.MessageId})
+		}
+	}
+	return resp, nil
+}
+
+func main() {
+	cfg, err := config.LoadDefaultConfig(context.Background())
+	if err != nil {
+		panic(err)
+	}
+	client = sesv2.NewFromConfig(cfg)
+	lambda.Start(handle)
+}</code></pre>
+</div>
+
+  <h3>7.5 Least-privilege IAM for the Lambda</h3>
+<pre data-file="live/prod/serverless/notify-iam.tf"><code class="language-hcl">data "aws_iam_policy_document" "notify" {
+  statement {
+    sid       = "ConsumeQueue"
+    actions   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes", "sqs:ChangeMessageVisibility"]
+    resources = [aws_sqs_queue.notify.arn]
+  }
+  statement {
+    sid       = "SendFromVerifiedIdentityOnly"
+    actions   = ["ses:SendEmail"]
+    resources = ["arn:aws:ses:eu-west-1:123456789012:identity/lumen.example.com"]
+  }
+  statement {
+    sid       = "Logs"
+    actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = ["arn:aws:logs:eu-west-1:123456789012:log-group:/aws/lambda/lumen-notify:*"]
+  }
+}
+
+resource "aws_iam_role" "notify" {
+  name = "lumen-notify"
+  assume_role_policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [{ Effect = "Allow", Action = "sts:AssumeRole", Principal = { Service = "lambda.amazonaws.com" } }]
+  })
+}
+
+resource "aws_iam_role_policy" "notify" {
+  role   = aws_iam_role.notify.id
+  policy = data.aws_iam_policy_document.notify.json
+}</code></pre>
+
+  <h3>7.6 VPC endpoints for private AWS API access</h3>
+<pre data-file="live/prod/network/endpoints.tf"><code class="language-hcl">resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = module.vpc.vpc_id
+  service_name      = "com.amazonaws.eu-west-1.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = module.vpc.private_route_table_ids   # assumes the module exports these
+}
+
+resource "aws_security_group" "endpoints" {
+  name   = "lumen-prod-endpoints"
+  vpc_id = module.vpc.vpc_id
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["10.40.0.0/16"]
+  }
+}
+
+resource "aws_vpc_endpoint" "interface" {
+  for_each = toset(["ecr.api", "ecr.dkr", "sts", "sqs", "secretsmanager", "logs", "bedrock-runtime"])
+
+  vpc_id              = module.vpc.vpc_id
+  service_name        = "com.amazonaws.eu-west-1.${each.key}"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = module.vpc.private_subnet_ids
+  security_group_ids  = [aws_security_group.endpoints.id]
+  private_dns_enabled = true
+}</code></pre>
+
+  <h3>7.7 Troubleshooting session: "the pod cannot reach RDS"</h3>
+<pre data-file="aws-network-debug.txt"><code class="language-bash"># 1. From inside the pod's network namespace: DNS, then TCP
+$ kubectl -n lumen debug -it orders-7d9f6c5b8-2xkqp --image=nicolaka/netshoot --target=app -- bash
+netshoot$ dig +short lumen-prod-orders.abc123.eu-west-1.rds.amazonaws.com
+10.40.10.57
+netshoot$ nc -vz -w 3 10.40.10.57 5432
+nc: connect to 10.40.10.57 port 5432 (tcp) timed out          # timeout =&gt; dropped, not refused
+
+# 2. Which security groups are involved?
+$ aws rds describe-db-instances --db-instance-identifier lumen-prod-orders \
+    --query 'DBInstances[0].VpcSecurityGroups[].VpcSecurityGroupId'
+$ aws ec2 describe-security-group-rules --filters Name=group-id,Values=sg-0db123 \
+    --query 'SecurityGroupRules[?IsEgress==`false`].[FromPort,ReferencedGroupInfo.GroupId,CidrIpv4]'
+
+# 3. Ask AWS to reason about the path (VPC Reachability Analyzer)
+$ aws ec2 create-network-insights-path --source eni-0pod123 --destination eni-0rds456 \
+    --protocol tcp --destination-port 5432
+$ aws ec2 start-network-insights-analysis --network-insights-path-id nip-0abc
+$ aws ec2 describe-network-insights-analyses --network-insights-analysis-ids nia-0def \
+    --query 'NetworkInsightsAnalyses[0].[NetworkPathFound,Explanations[0].ExplanationCode]'
+
+# 4. Confirm with VPC Flow Logs (REJECT records for the pod IP)
+$ aws logs filter-log-events --log-group-name /vpc/lumen-prod/flow \
+    --filter-pattern '"10.40.37.21" "10.40.10.57" "5432" "REJECT"' --max-items 5</code></pre>
+  <p>Typical finding: the RDS security group allows the EKS <em>cluster</em> security group, but Auto Mode or security groups for pods attach a different SG to the pod ENIs. Fix the reference, not by opening <code>10.40.0.0/16</code>.</p>
+</section>

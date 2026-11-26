@@ -1,0 +1,1030 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model Selection, Fine-Tuning &amp; Quantization — AI-Era Software Engineering</title>
+<meta name="description" content="Choosing between hosted and open-weight models with an evaluation-led process, understanding model licences, deciding when to prompt, retrieve or fine-tune, the mathematics and practice of LoRA, QLoRA, DPO and distillation, quantization formats (INT8, INT4, GPTQ, AWQ, GGUF, FP8) and serving open models with vLLM, llama.cpp and Ollama.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p8-03-models-finetuning-quantization" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 8 · Chapter 3</p>
+  <h1>Model Selection, Open Models, Fine-Tuning, LoRA/QLoRA &amp; Quantization</h1>
+  <p class="lede">Which model should you use, and should you ever change its weights? This chapter replaces vibes and leaderboard-watching with an evaluation-led selection process, explains what licences actually allow, and shows — with the low-rank mathematics and a runnable training script — how parameter-efficient fine-tuning and quantization let a single GPU adapt and serve models that once needed a cluster.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> <a href="p8-01-llm-foundations.html">Chapter 1</a> (pretraining, SFT, DPO, KV cache) and <a href="p8-02-prompting-structured-tools.html">Chapter 2</a> (prompting, structured outputs); basic linear algebra (matrix rank); familiarity with GPUs from <a href="p7-04-gpu-training-evaluation.html">Part 7 Chapter 4</a> helps.</li>
+    <li><strong>You will be able to:</strong> build a model-selection matrix backed by your own evaluation set; read a model licence for commercial risk; decide between prompting, RAG and fine-tuning; fine-tune an open model with QLoRA using Hugging Face TRL and PEFT; choose a quantization format; and serve the result behind an OpenAI-compatible endpoint consumed by Spring AI.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: The Model Is a Dependency You Choose</h2>
+  <p>In Chapter 2 the model was a configuration value: <code>llm.primary-model=…</code>. That value is one of the most consequential dependency decisions your system makes. It sets quality, latency, cost per request, where data goes, which jurisdictions you can serve, what licence obligations you carry, and how hard it will be to switch later. Unlike most dependencies, it also changes behaviour silently when a vendor updates it, and its "performance" cannot be read off a datasheet — it must be measured on your task.</p>
+  <p>This chapter covers three decisions, in the order you should make them. First, <strong>which model</strong>: hosted frontier API, hosted open-weight model, or self-hosted open weights, chosen by evaluation against your own data. Second, <strong>whether to change the model at all</strong>: most problems are solved by better prompts or retrieval; fine-tuning is the right tool for a narrower set of problems than its popularity suggests. Third, <strong>how to run it efficiently</strong>: quantization and specialised serving engines decide whether an open model is economical.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>Choosing PostgreSQL vs. a managed cloud database vs. Oracle involves capability, operational burden, licence (GPL vs. Apache vs. commercial), cost and lock-in. You have weighed OpenJDK distributions and their licences, tuned JVM heap and GC for throughput vs. latency, and accepted that a managed service trades control for convenience. You configure an application rather than modifying the framework's source — and you fork a library only as a last resort.</dd>
+      <dt>Why that is not enough</dt><dd>Model capability is task-specific and non-transitive: a model that wins public benchmarks can lose on your support tickets. Licences for "open" models are often custom documents with usage restrictions, not OSI licences. And "modifying the source" — fine-tuning — is cheap enough to tempt teams into it when prompting or retrieval would be better, more maintainable choices.</dd>
+      <dt>The modern approach</dt><dd>Build a small, representative evaluation set first; shortlist models on capability, latency, cost and data constraints; measure; pick the cheapest model that passes. Fine-tune only to change <em>behaviour</em> (format, style, a narrow skill, latency via a smaller model), not to inject frequently changing knowledge. Use parameter-efficient methods (LoRA/QLoRA) and quantization to make open models affordable, and serve them through an OpenAI-compatible endpoint so your Spring code does not care where the model runs.</dd>
+      <dt>Where Python and Go fit</dt><dd>Training, evaluation and quantization tooling is Python (Hugging Face <code>transformers</code>, <code>peft</code>, <code>trl</code>, <code>bitsandbytes</code>). Serving engines are Python/C++/CUDA (vLLM) or C/C++ (llama.cpp); Ollama is written in Go. Your Spring Boot services consume models over HTTP and never need the training stack.</dd>
+      <dt>In production</dt><dd>Teams run a model registry (model ID, licence, evaluation scores, approved routes), re-evaluate on every candidate model, version adapters like artefacts, and operate GPU serving with autoscaling, KV-cache monitoring and canary rollouts.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Self-host or fine-tune when data residency, cost at scale, latency, offline operation or a narrow repeatable task justify the operational burden. Avoid it when volume is low, requirements change weekly, or the task needs frontier-level reasoning — a hosted API will be cheaper in engineer time.</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="history">
+  <h2>2. History: How Adapting and Shrinking Models Became Cheap</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Year</th><th>Milestone</th><th>Why it mattered</th></tr></thead>
+    <tbody>
+      <tr><td>2018–2019</td><td>BERT popularises "pretrain, then fine-tune all weights per task"; adapter modules (Houlsby et al., 2019) insert small trainable layers instead.</td><td>Fine-tuning becomes standard, and the idea that you need only train a few parameters appears.</td></tr>
+      <tr><td>2021</td><td>LoRA (Hu et al.) learns low-rank weight updates; prefix- and prompt-tuning variants appear.</td><td>Adapting a huge model with a tiny number of trainable parameters and no inference latency penalty once merged.</td></tr>
+      <tr><td>2022</td><td>LLM.int8() (Dettmers et al.) enables 8-bit inference with outlier handling; GPTQ (Frantar et al.) quantizes to 3–4 bits post-training.</td><td>Large models start to fit on smaller GPUs.</td></tr>
+      <tr><td>2023</td><td>Meta releases LLaMA (Feb) and Llama 2 with a commercial-use licence (Jul); llama.cpp runs models on laptops (Mar) and introduces the GGUF format (Aug); QLoRA (May) fine-tunes 4-bit models; AWQ (Jun); vLLM and PagedAttention (Sep paper); Mistral 7B under Apache-2.0 (Sep); Mixtral MoE (Dec); DPO paper (May).</td><td>The open-weight ecosystem explodes; fine-tuning on a single GPU becomes routine.</td></tr>
+      <tr><td>2024</td><td>Llama 3 family; Qwen and DeepSeek release strong open-weight models; FP8 inference on recent NVIDIA GPUs becomes common; Apple ships on-device foundation models with LoRA adapters and low-bit quantization.</td><td>Open models approach closed models on many tasks; quantization becomes a default deployment step.</td></tr>
+      <tr><td>2025</td><td>DeepSeek-R1 (MIT licence) and distilled reasoning models (Jan); OpenAI releases open-weight gpt-oss models under Apache-2.0 (Aug); Hugging Face places Text Generation Inference in maintenance mode, recommending vLLM and SGLang (Dec).</td><td>Open reasoning models and permissive licences from major labs; serving consolidates around vLLM/SGLang.</td></tr>
+      <tr><td>2026</td><td>Open-weight releases from Alibaba (Qwen), Mistral, DeepSeek, Meta and others continue at a monthly cadence; mixture-of-experts and low-precision (FP8/4-bit) weights are standard. <span class="tag version">Version-sensitive · checked Nov 2026</span></td><td>Model selection is a continuous process, not a one-time decision.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The economic story is that adapting and running models became one to two orders of magnitude cheaper in three years, mostly through ideas that are simple once seen: train a low-rank correction instead of the whole matrix; store weights in 4 bits with per-group scales; manage the KV cache like virtual memory. Each is a direct application of engineering instincts you already have.</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 Closed, open-weight and open-source</h3>
+  <p>Three categories are often confused:</p>
+  <ul>
+    <li><strong>Closed (proprietary) models</strong> are available only through an API or a cloud partner (Anthropic's Claude, OpenAI's flagship GPT models, Google's Gemini). You never see weights; you get the provider's serving, safety systems, and update cadence.</li>
+    <li><strong>Open-weight models</strong> publish trained weights you can download, run and usually fine-tune (Llama, Qwen, Mistral's open models, DeepSeek, Gemma, gpt-oss). Training data and full training code are usually <em>not</em> published.</li>
+    <li><strong>Open-source models</strong>, in the stricter sense used by the Open Source Initiative's Open Source AI Definition (2024), also make available enough information about training data and the code to reproduce training. Few frontier-scale models meet this bar; projects such as AI2's OLMo aim to.</li>
+  </ul>
+  <p>For an engineer the practical distinction is control: with weights you choose hardware, location, quantization, fine-tuning and version pinning; you also own uptime, scaling, security patching and safety filtering.</p>
+
+  <h3>3.2 Licences: read them like a lawyer would</h3>
+  <p>Open-weight licences range from permissive OSI licences to custom terms with real restrictions. Typical patterns <span class="tag version">Version-sensitive · checked Nov 2026</span>:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Licence pattern</th><th>Examples</th><th>What to check</th></tr></thead>
+    <tbody>
+      <tr><td>Apache-2.0 / MIT</td><td>Many Qwen and Mistral open models, DeepSeek-R1 (MIT), gpt-oss (Apache-2.0)</td><td>Permissive; patent grant (Apache); attribution notices. Still check the model card for additional use policies.</td></tr>
+      <tr><td>Custom community licences</td><td>Meta Llama licences</td><td>Acceptable-use policy; attribution requirements; a clause requiring a separate licence for very large services (Llama 2/3 set the threshold at 700 million monthly active users); restrictions on using outputs to improve other models in some versions.</td></tr>
+      <tr><td>Custom terms of use</td><td>Google Gemma terms (some releases)</td><td>Prohibited-use policy that flows down to your users; redistribution conditions.</td></tr>
+      <tr><td>Research / non-commercial</td><td>Some research releases and certain larger models from various labs</td><td>No production use without a commercial agreement.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Practical rules: record the licence of every model in your model registry; involve legal for custom licences; check whether fine-tuned derivatives inherit obligations (they usually do); and remember that datasets used for fine-tuning carry their own licences. Hosted APIs have their own terms covering data use, retention and output ownership — read those too.</p>
+
+  <h3>3.3 Model cards</h3>
+  <p>A model card documents architecture, parameter count (total and active for MoE), context length, training data summary, intended uses, evaluation results, known limitations, safety evaluations, chat template and licence. Read it before shortlisting: context length, supported languages, tool-calling support and the chat template are operationally decisive; benchmark tables are a starting signal only.</p>
+
+  <h3>3.4 Model selection: the four-way trade-off</h3>
+  <p>Every model choice balances four forces:</p>
+  <ul>
+    <li><strong>Capability</strong> on your task (accuracy, instruction following, tool use, language coverage, reasoning).</li>
+    <li><strong>Latency</strong>: TTFT and tokens per second at your expected concurrency.</li>
+    <li><strong>Cost</strong>: per-token API prices, or GPU-hours plus engineering time for self-hosting.</li>
+    <li><strong>Privacy and control</strong>: where data is processed and retained, regulatory constraints, offline needs, version pinning.</li>
+  </ul>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Option</th><th>Capability</th><th>Latency</th><th>Cost profile</th><th>Privacy / control</th><th>Ops burden</th></tr></thead>
+    <tbody>
+      <tr><td>Frontier hosted API (large tier)</td><td>Highest, esp. reasoning and agents</td><td>Moderate; reasoning adds seconds</td><td>Highest per token; zero fixed cost</td><td>Vendor processing; regional and retention options vary</td><td>Lowest</td></tr>
+      <tr><td>Hosted API (small/fast tier)</td><td>Good on routine tasks</td><td>Low</td><td>Low per token</td><td>Same as above</td><td>Lowest</td></tr>
+      <tr><td>Open-weight via cloud platform (managed endpoints)</td><td>Varies by model</td><td>Low–moderate</td><td>Per token or per instance-hour</td><td>Your cloud tenancy</td><td>Low–moderate</td></tr>
+      <tr><td>Self-hosted open-weight on your GPUs</td><td>Varies; can be specialised by fine-tuning</td><td>Tunable; best when GPUs are dedicated</td><td>High fixed cost, low marginal cost at high utilisation</td><td>Full control, on-prem possible</td><td>High (GPU ops, scaling, upgrades)</td></tr>
+      <tr><td>On-device / edge (quantized small model)</td><td>Limited</td><td>Lowest network latency</td><td>No per-call cost</td><td>Data never leaves device</td><td>Distribution and update complexity</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>3.5 Evaluation-led selection</h3>
+  <p>Public leaderboards measure general skills on public data that may have leaked into training sets. Your decision should rest on a private evaluation set drawn from your domain:</p>
+  <ol>
+    <li><strong>Collect 100–500 representative inputs</strong> with expected outputs or grading rubrics, including hard and adversarial cases. Production logs (anonymised) are the best source.</li>
+    <li><strong>Define metrics</strong> per task: exact-match accuracy for classification, field-level F1 for extraction, rubric-based LLM-as-judge scores for generation (with human spot checks), schema-validity rate, latency percentiles, cost per 1,000 requests.</li>
+    <li><strong>Run every shortlisted model</strong> with the same prompt (adjusted only for templates), several samples per input to measure variance.</li>
+    <li><strong>Choose the cheapest model that meets the quality bar</strong>, with a margin, then re-run the set on every model or prompt change.</li>
+  </ol>
+  <p>This is test-driven development applied to model choice. Chapter 5 covers evaluation design in depth; §7.4 gives a runnable harness that compares any OpenAI-compatible endpoints, hosted or self-hosted.</p>
+
+  <h3>3.6 Prompt, RAG or fine-tune?</h3>
+  <p>These are complementary tools for different gaps:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Gap</th><th>Best first tool</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Model does not know your facts (policies, product catalogue, tickets)</td><td>RAG (Chapter 4)</td><td>Knowledge changes; retrieval updates instantly, cites sources, respects permissions. Fine-tuning bakes in stale facts and hallucinates the rest.</td></tr>
+      <tr><td>Model does not follow your format or style consistently</td><td>Prompting + structured outputs; then fine-tune</td><td>Most format problems vanish with schemas; persistent style needs (brand voice, terse clinical notes) are a good fine-tuning target.</td></tr>
+      <tr><td>Task is narrow, high-volume and a big model is too slow or expensive</td><td>Fine-tune (or distil into) a small model</td><td>A specialised 1–8B model can match a large general model on one narrow task at a fraction of cost and latency.</td></tr>
+      <tr><td>Model lacks a specialised skill (a domain-specific DSL, an internal code convention)</td><td>Few-shot first; fine-tune if examples are not enough</td><td>Skills learned from thousands of examples outperform prompt-stuffed examples.</td></tr>
+      <tr><td>Data must not leave your premises</td><td>Self-hosted open model (+ RAG; fine-tune if needed)</td><td>A deployment constraint, not a training one.</td></tr>
+      <tr><td>Model refuses or hedges on legitimate domain requests</td><td>System prompt context; preference tuning if self-hosting</td><td>Explain the context first; DPO on examples of desired behaviour if that fails.</td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout tip"><p class="callout-title">Tip</p><p>A useful slogan <span class="tag opinion">Opinion</span>: <em>RAG for knowledge, fine-tuning for behaviour, prompting for everything first.</em> Fine-tuning is the most expensive to maintain because every base-model upgrade requires retraining and re-evaluation.</p></div>
+
+  <h3>3.7 Full fine-tuning</h3>
+  <p>Full fine-tuning updates every weight with gradient descent on your data. It is the most expressive option and the most expensive. With the Adam optimiser in mixed precision, each parameter typically needs about 16 bytes of GPU memory during training (2 for BF16 weights, 2 for gradients, 4 for an FP32 master copy, 8 for Adam's two moment estimates), plus activations. An 8B-parameter model therefore needs on the order of 128 GB before activations — multiple GPUs with sharding (DeepSpeed ZeRO or PyTorch FSDP). The output is a full copy of the model per task, and aggressive training risks <strong>catastrophic forgetting</strong> of general abilities. For application teams, full fine-tuning is rarely justified.</p>
+
+  <h3>3.8 Parameter-efficient fine-tuning (PEFT)</h3>
+  <p>PEFT methods freeze the pretrained weights and train a small number of new parameters. Variants include adapters (small bottleneck layers inserted between blocks), prefix/prompt tuning (trainable virtual tokens), IA³ (learned scaling vectors), and — dominant in practice — <strong>LoRA</strong>. Benefits: far less memory (no gradients or optimiser state for frozen weights), small artefacts (megabytes instead of gigabytes), many task adapters sharing one base model, and lower risk of forgetting. Hugging Face's <code>peft</code> library implements these behind one API.</p>
+
+  <h3>3.9 LoRA: low-rank adaptation</h3>
+  <p>LoRA's insight (Hu et al., 2021) is that the <em>change</em> needed to adapt a pretrained weight matrix has low intrinsic rank. Instead of learning a full update \(\Delta W\) of shape \(d \times k\), learn two thin matrices \(B\) (\(d \times r\)) and \(A\) (\(r \times k\)) with rank \(r \ll \min(d,k)\), so \(\Delta W = BA\). The forward pass becomes \(h = W_0 x + \frac{\alpha}{r} B A x\). \(B\) is initialised to zero so training starts from exactly the base model. After training, \(BA\) can be <strong>merged</strong> into \(W_0\), so inference has zero extra latency — or kept separate so many adapters can be hot-swapped on one base model.</p>
+  <p>Key hyperparameters: <strong>rank</strong> \(r\) (commonly 8–64; higher for harder or broader tasks), <strong>alpha</strong> \(\alpha\) (scales the update; often set to \(r\) or \(2r\)), <strong>target modules</strong> (originally attention query/value projections; applying LoRA to all linear layers usually works better), dropout, and a learning rate around \(10^{-4}\) — roughly ten times higher than full fine-tuning, because only the new parameters are learned.</p>
+
+  <h3>3.10 QLoRA: LoRA on a 4-bit base model</h3>
+  <p>QLoRA (Dettmers et al., 2023) keeps LoRA's trainable adapters in 16-bit precision but stores the frozen base model in 4 bits, cutting memory roughly fourfold. The paper reported fine-tuning a 65B-parameter model on a single 48 GB GPU while matching 16-bit fine-tuning performance on its benchmarks. Three innovations make it work:</p>
+  <ul>
+    <li><strong>4-bit NormalFloat (NF4)</strong>: pretrained weights are approximately normally distributed, so NF4 places its 16 quantization levels at quantiles of a normal distribution rather than evenly spaced, giving each level equal expected usage — information-theoretically well suited to such weights.</li>
+    <li><strong>Double quantization</strong>: weights are quantized in blocks (64 values) with an FP32 scale per block; QLoRA quantizes those scales too (8-bit, in blocks of 256), saving about 0.37 bits per parameter — around 3 GB on a 65B model.</li>
+    <li><strong>Paged optimisers</strong>: optimiser states use NVIDIA unified memory so that memory spikes (for example, long sequences with gradient checkpointing) page to CPU RAM instead of crashing with out-of-memory errors.</li>
+  </ul>
+  <p>During the forward and backward passes, each 4-bit block is dequantized to BF16 on the fly for the matrix multiply; gradients flow through the frozen quantized weights into the LoRA matrices only. The cost is some training speed (dequantization overhead); the benefit is fine-tuning 7–14B models on a single 24 GB consumer or cloud GPU.</p>
+
+  <h3>3.11 Preference tuning with DPO</h3>
+  <p>Supervised fine-tuning teaches "produce this answer." Preference tuning teaches "prefer this answer over that one," which suits qualities that are easier to compare than to write: tone, helpfulness, conciseness, refusing correctly. DPO (Chapter 1, §3.8) trains on triples <em>(prompt, chosen, rejected)</em> against a frozen reference model, with a hyperparameter \(\beta\) controlling how far the policy may move from the reference. Typical pipeline: SFT on demonstrations → DPO on preference pairs collected from users (thumbs up/down, edits), from human raters, or from an LLM judge with a rubric. TRL's <code>DPOTrainer</code> supports LoRA, so it fits on the same hardware as QLoRA SFT.</p>
+
+  <h3>3.12 Distillation</h3>
+  <p>Knowledge distillation (Hinton et al., 2015) trains a small <em>student</em> to imitate a large <em>teacher</em>. In the LLM world the common, practical form is <strong>sequence-level distillation</strong>: generate high-quality outputs from a strong model on your task's inputs, filter them (validation, judges, humans), and fine-tune a small model on them. Classic distillation also matches the teacher's full probability distribution (soft labels), which requires access to logits — usually only possible with open models. Before distilling from a hosted model, check the provider's terms: many prohibit using outputs to develop competing models.</p>
+
+  <h3>3.13 Quantization</h3>
+  <p>Quantization stores weights (and sometimes activations and the KV cache) in fewer bits. Memory falls proportionally; decode speed usually improves because decoding is memory-bandwidth-bound (Chapter 1, §4.4); quality degrades slightly, more so at lower bit-widths and for smaller models.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Format / method</th><th>Bits</th><th>How it works</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td>BF16 / FP16</td><td>16</td><td>Native training precision</td><td>Reference quality; baseline</td></tr>
+      <tr><td>FP8 (E4M3/E5M2)</td><td>8</td><td>Floating-point 8-bit with per-tensor or per-channel scales; hardware support on recent NVIDIA GPUs</td><td>Production GPU serving with near-lossless quality; FP8 KV cache</td></tr>
+      <tr><td>INT8 (LLM.int8(), SmoothQuant)</td><td>8</td><td>Integer weights; LLM.int8() keeps outlier feature dimensions in 16-bit</td><td>Memory savings with small quality loss</td></tr>
+      <tr><td>GPTQ</td><td>3–4 (weights)</td><td>Post-training, layer-by-layer quantization using approximate second-order (Hessian) information to compensate errors, calibrated on sample data</td><td>GPU serving of 4-bit models (vLLM supports it)</td></tr>
+      <tr><td>AWQ</td><td>4 (weights)</td><td>Activation-aware: identifies the small fraction of weight channels that matter most (by activation magnitude) and scales them to protect them before quantizing</td><td>GPU serving; robust 4-bit quality</td></tr>
+      <tr><td>bitsandbytes NF4 / INT8</td><td>4 / 8</td><td>On-the-fly quantization at load time; no calibration</td><td>QLoRA training; quick experiments (slower inference than GPTQ/AWQ kernels)</td></tr>
+      <tr><td>GGUF (llama.cpp k-quants, e.g. Q4_K_M, Q5_K_M, Q8_0)</td><td>2–8</td><td>File format bundling weights, tokenizer and metadata; block-wise quantization with super-block scales</td><td>CPU, Apple Silicon and consumer GPU inference via llama.cpp, Ollama, LM Studio</td></tr>
+      <tr><td>4-bit floating formats (MXFP4, NVFP4)</td><td>4</td><td>Micro-scaled floating point with shared block scales; native on newest GPUs</td><td>Emerging default for very large MoE models <span class="tag version">Version-sensitive</span></td></tr>
+    </tbody>
+  </table></div>
+  <p>Rules of thumb <span class="tag opinion">Opinion</span>: 8-bit is close to lossless for most tasks; 4-bit with a good method (AWQ, GPTQ, Q4_K_M or better) is usually acceptable for 7B+ models but measurably worse on precise tasks (maths, code, long-context retrieval); below 4 bits quality drops quickly. Always evaluate the quantized model on your task — not just perplexity.</p>
+
+  <h3>3.14 Serving open models</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Engine</th><th>Strengths</th><th>Best for</th></tr></thead>
+    <tbody>
+      <tr><td>vLLM</td><td>PagedAttention KV management, continuous batching, prefix caching, tensor/pipeline parallelism, many quantization formats, multi-LoRA serving, OpenAI-compatible server, structured output support</td><td>Production GPU serving at high concurrency</td></tr>
+      <tr><td>SGLang</td><td>High-throughput runtime with RadixAttention prefix reuse and a structured-generation frontend</td><td>High-throughput serving, agent workloads with shared prefixes</td></tr>
+      <tr><td>TensorRT-LLM (NVIDIA)</td><td>Compiled, highly optimised kernels for NVIDIA hardware</td><td>Maximum performance on NVIDIA when you can invest in build pipelines</td></tr>
+      <tr><td>Hugging Face TGI</td><td>Mature server used widely in 2023–2025</td><td>Existing deployments; in maintenance mode since late 2025, with vLLM and SGLang recommended for new services <span class="tag version">Version-sensitive</span></td></tr>
+      <tr><td>llama.cpp</td><td>Portable C/C++ inference, GGUF, CPU/Metal/CUDA/Vulkan backends, <code>llama-server</code> with OpenAI-compatible API</td><td>Edge, laptops, CPU-only servers, small deployments</td></tr>
+      <tr><td>Ollama</td><td>Developer-friendly model runner built on llama.cpp-style backends, model library, REST and OpenAI-compatible APIs</td><td>Local development, prototypes, small internal tools</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working</h2>
+
+  <h3>4.1 One QLoRA training step, end to end</h3>
+  <ol>
+    <li><strong>Load.</strong> The base model's linear-layer weights are quantized to NF4 at load time in blocks of 64 values, each block with its own scale (itself 8-bit quantized under double quantization). Embeddings, norms and the LM head usually stay in 16-bit.</li>
+    <li><strong>Attach adapters.</strong> For each targeted linear layer, PEFT wraps the module: the original quantized weight is frozen, and two new BF16 matrices \(A\) (random init) and \(B\) (zeros) are added. Only these require gradients.</li>
+    <li><strong>Batch.</strong> Conversations are rendered through the chat template, tokenized, optionally packed into fixed-length sequences, and a loss mask marks which tokens contribute to the loss (for assistant-only training, user and system tokens are masked out).</li>
+    <li><strong>Forward.</strong> In each wrapped layer, the NF4 weight block is dequantized to BF16 in GPU registers, multiplied with the input, and the LoRA path \( \frac{\alpha}{r} B(Ax) \) is added. Gradient checkpointing discards most intermediate activations, recomputing them during the backward pass to save memory.</li>
+    <li><strong>Loss.</strong> Cross-entropy on the next token, only over unmasked (assistant) positions.</li>
+    <li><strong>Backward.</strong> Gradients propagate through the frozen dequantized weights (no gradient is stored for them) into \(A\) and \(B\).</li>
+    <li><strong>Optimise.</strong> A paged 8-bit AdamW updates only adapter parameters; optimiser state pages to CPU memory if GPU memory spikes.</li>
+    <li><strong>Save.</strong> Checkpoints contain only adapter weights (tens to hundreds of MB) plus configuration naming the base model.</li>
+  </ol>
+
+  <h3>4.2 Block-wise quantization</h3>
+  <p>A weight matrix is split into blocks (for example 64 or 128 consecutive values). For each block, compute a scale (for symmetric schemes, the absolute maximum divided by the largest representable level) and store each weight as a small integer index into the format's levels. Dequantization multiplies indices' level values by the block scale. Smaller blocks track local magnitude better (higher quality) but store more scales (more memory). GGUF k-quants add a second level: super-blocks of blocks with quantized sub-scales. GPTQ goes further by quantizing columns one at a time and adjusting not-yet-quantized columns to compensate for the error just introduced, using an approximation of the layer's Hessian computed from calibration data. AWQ observes that a small fraction of weight channels see large activations; scaling those channels up before quantization (and inversely scaling the activations) protects them from rounding error.</p>
+
+  <h3>4.3 What a serving engine does with your model</h3>
+  <p>vLLM loads weights (possibly sharded across GPUs with tensor parallelism), reserves a configurable fraction of remaining GPU memory for the KV cache, and divides that pool into fixed-size <strong>blocks</strong> (pages) of a few tokens each. Each sequence holds a block table mapping its logical positions to physical blocks — exactly like an OS page table — so memory is allocated on demand, fragmentation is minimal, and sequences that share a prefix (the same system prompt) can share physical blocks (prefix caching). The scheduler runs continuous batching: each iteration it admits waiting requests if blocks are free, runs one decode step for all running sequences, and preempts (swaps or recomputes) sequences if memory runs out. With multi-LoRA serving, requests specify an adapter name; the engine batches requests for different adapters together and applies each adapter's low-rank update with specialised kernels.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture</h2>
+
+  <h3>5.1 The adaptation decision</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A["Quality gap found by evaluation"] --&gt; B{"Missing knowledge or facts?"}
+  B -- yes --&gt; R["Add / improve RAG (Chapter 4)"]
+  B -- no --&gt; C{"Fixed by clearer prompt, examples or schema?"}
+  C -- yes --&gt; P["Ship prompt change + eval"]
+  C -- no --&gt; D{"Narrow, stable, high-volume task?"}
+  D -- yes --&gt; F["Fine-tune small model (LoRA/QLoRA) or distil"]
+  D -- no --&gt; E{"Behaviour/style preference issue?"}
+  E -- yes --&gt; G["SFT then DPO on preference pairs"]
+  E -- no --&gt; H["Try a more capable model / higher effort"]
+  F --&gt; V["Evaluate vs baseline, then canary"]
+  G --&gt; V
+  R --&gt; V
+</pre>
+<figcaption>Figure 8.13 — Choosing the cheapest fix for a measured quality gap.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> every path starts from an evaluation result, not a hunch. Knowledge gaps go to retrieval; specification gaps go to prompts; only stable, narrow, high-volume or behavioural gaps justify training — and every path ends in evaluation and a canary rollout. "Try a more capable model" is a legitimate exit: sometimes the cheapest fix is paying for a better model on a single route.</p>
+
+  <h3>5.2 LoRA inside a linear layer</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  X["input x (dim k)"] --&gt; W0["Frozen W0 (d x k), NF4 in QLoRA"]
+  X --&gt; A["A (r x k), trainable"]
+  A --&gt; B["B (d x r), trainable, init zero"]
+  B --&gt; S["scale by alpha / r"]
+  W0 --&gt; SUM(("+"))
+  S --&gt; SUM
+  SUM --&gt; H["output h (dim d)"]
+</pre>
+<figcaption>Figure 8.14 — A LoRA-wrapped linear layer: frozen path plus a trainable low-rank bypass.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> the input takes two paths. The frozen path is the original (possibly 4-bit) weight; the bypass first compresses \(x\) to \(r\) dimensions with \(A\), then expands back with \(B\). Because \(B\) starts at zero, the bypass contributes nothing at step zero — training starts from the exact base model. After training, \(W_0 + \frac{\alpha}{r}BA\) can be computed once and stored, collapsing the two paths into one.</p>
+
+  <h3>5.3 From training to serving</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  D["Curated dataset (versioned)"] --&gt; T["QLoRA SFT / DPO with TRL + PEFT"]
+  BM["Base model (pinned revision)"] --&gt; T
+  T --&gt; AD["Adapter artefact + metrics"]
+  AD --&gt; EV{"Eval gate: beats baseline?"}
+  EV -- no --&gt; D
+  EV -- yes --&gt; REG["Model registry: base, adapter, licence, scores"]
+  REG --&gt; M1["Option A: serve base + adapter in vLLM multi-LoRA"]
+  REG --&gt; M2["Option B: merge, quantize (AWQ/GGUF), serve"]
+  M1 --&gt; GW["OpenAI-compatible endpoint behind gateway"]
+  M2 --&gt; GW
+  GW --&gt; APP["Spring AI / LangChain4j services"]
+</pre>
+<figcaption>Figure 8.15 — An MLOps path for fine-tuned open models.</figcaption>
+</figure>
+  <p><strong>Reading the diagram:</strong> data and base model are both pinned inputs — reproducibility needs both. The evaluation gate is the equivalent of a CI quality gate. Serving has two options: keep adapters separate (one GPU fleet serves many tenant- or task-specific adapters) or merge and quantize (simplest and fastest for a single task). Either way the application sees an OpenAI-compatible HTTP endpoint, so Spring services are insulated from the choice.</p>
+
+  <h3>5.4 vLLM PagedAttention block tables</h3>
+<pre class="ascii">Logical KV (sequence A, 10 tokens, block size 4)      Physical GPU KV blocks
+ A: [t0 t1 t2 t3][t4 t5 t6 t7][t8 t9 _ _ ]           #0 [A t0..t3]   #5 [B t4..t7]
+ block table A -&gt; #0, #3, #7                          #3 [A t4..t7]   #7 [A t8,t9,_,_]
+ B shares A's system prompt (t0..t3):                 #2 [free]       #9 [free]
+ block table B -&gt; #0 (shared, ref-count 2), #5
+</pre>
+  <p>The illustration shows why paging matters: sequences allocate blocks only as they grow (no reserving the maximum context up front), the only waste is the partially filled last block, and identical prefixes share physical blocks with copy-on-write. The PagedAttention paper attributes vLLM's throughput gains largely to this near-zero waste, which lets more sequences fit in a batch.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math</h2>
+
+  <h3>6.1 LoRA parameter count</h3>
+  <p>A full update to a \(d \times k\) matrix has \(dk\) parameters; LoRA has \(r(d + k)\). For a \(4096 \times 4096\) projection: full = 16,777,216; LoRA with \(r = 16\) = \(16 \times 8192 = 131{,}072\) — 0.78% of the full matrix. Applied to all seven linear projections in each of 32 layers of a typical 8B model (q, k, v, o in attention with GQA-reduced k/v widths; gate, up, down in the MLP), LoRA at \(r=16\) trains on the order of 40 million parameters — about 0.5% of the model. <span class="tag illus">Illustrative</span></p>
+
+  <h3>6.2 The LoRA forward pass and why the scale exists</h3>
+  \[ h = W_0 x + \frac{\alpha}{r} B A x, \qquad B \in \mathbb{R}^{d \times r},\ A \in \mathbb{R}^{r \times k} \]
+  <p>Intuition for \(\alpha / r\): if you double the rank, the update's magnitude would roughly change too, forcing you to retune the learning rate. Dividing by \(r\) keeps the effective update scale stable across ranks, so \(\alpha\) works like a rank-independent learning-rate multiplier. (Variants such as rsLoRA scale by \(\alpha/\sqrt{r}\) for better behaviour at high ranks.)</p>
+
+  <h3>6.3 Training memory: full vs. LoRA vs. QLoRA</h3>
+  <p>For \(N\) parameters, approximate training memory excluding activations:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Method</th><th>Weights</th><th>Grads + optimiser</th><th>8B model ≈</th></tr></thead>
+    <tbody>
+      <tr><td>Full FT (BF16 + FP32 master + Adam)</td><td>2N + 4N</td><td>2N + 8N</td><td>~128 GB</td></tr>
+      <tr><td>LoRA on BF16 base</td><td>2N</td><td>~16 bytes × adapter params</td><td>~16 GB + ~0.7 GB</td></tr>
+      <tr><td>QLoRA on NF4 base</td><td>~0.5N (+ scales)</td><td>same as LoRA (paged 8-bit Adam less)</td><td>~5 GB + ~0.5 GB</td></tr>
+    </tbody>
+  </table></div>
+  <p>Activations add memory proportional to batch size × sequence length × hidden size × layers; gradient checkpointing reduces this at the cost of roughly one extra forward pass. These numbers are why an 8B QLoRA run fits a single 24 GB GPU with moderate sequence lengths, while full fine-tuning needs a multi-GPU node. <span class="tag illus">Illustrative</span></p>
+
+  <h3>6.4 NF4 levels</h3>
+  <p>For a standard normal distribution, choose 16 values \(q_i\) so that each level covers equal probability mass: roughly, \(q_i = \Phi^{-1}\!\left(\frac{i + 0.5}{16}\right)\) normalised to \([-1, 1]\), with an exact zero included (QLoRA's construction uses asymmetric halves to represent zero exactly). A block of weights is normalised by its absolute maximum \(m\), each value is mapped to the nearest level, and dequantization is \(\hat{w} = m \cdot q_{\text{index}}\). Dense levels near zero, where most weights live, minimise expected rounding error compared with evenly spaced INT4.</p>
+
+  <h3>6.5 Inference memory and speed under quantization</h3>
+  <p>Weights memory ≈ \(N \times \text{bits}/8\): an 8B model needs ~16 GB at BF16, ~8 GB at 8-bit, ~4.5–5 GB at 4-bit including scales. Since decode reads all weights per step, an upper bound on single-sequence decode speed is memory bandwidth ÷ bytes read per token. With ~1 TB/s of bandwidth (a common order for a data-centre GPU; check your hardware), an 8B BF16 model is bounded near \(10^{12} / (16 \times 10^9) \approx 60\) tokens/s for one sequence; at 4-bit, the bound rises toward ~200 tokens/s. Batching raises total throughput because the weight read is shared across sequences. <span class="tag illus">Illustrative</span></p>
+
+  <h3>6.6 The DPO objective</h3>
+  \[ \mathcal{L}_{\text{DPO}} = -\,\mathbb{E}_{(x, y^+, y^-)} \left[ \log \sigma\!\left( \beta \left[ \log\frac{\pi_\theta(y^+ \mid x)}{\pi_{\text{ref}}(y^+ \mid x)} - \log\frac{\pi_\theta(y^- \mid x)}{\pi_{\text{ref}}(y^- \mid x)} \right] \right) \right] \]
+  <p>Intuition: increase the log-probability of the chosen answer relative to the reference model, decrease it for the rejected answer, and stop pushing once the margin is large (the sigmoid saturates). \(\beta\) (often 0.1) sets how strongly preferences can pull the model away from the reference; too high a pull and quality on everything else degrades.</p>
+
+  <h3>6.7 Self-hosting break-even</h3>
+  <p>Let a GPU instance cost \(G\) per hour and sustain \(T\) output tokens per second at your quality and latency targets, at utilisation \(u\). Cost per million output tokens is \( \frac{G}{3600\, T\, u} \times 10^6 \). Example <span class="tag illus">Illustrative</span>: \(G = \$4\)/h, \(T = 2{,}000\) tokens/s aggregate under batching, \(u = 0.4\): \(4 / (3600 \times 2000 \times 0.4) \times 10^6 \approx \$1.39\) per million output tokens — before engineering time, redundancy (you need at least two instances), and the input tokens your workload also processes. Low utilisation is the usual reason self-hosting loses to APIs; high, steady volume on a small specialised model is the usual reason it wins.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code: Fine-Tune, Evaluate, Quantize, Serve, Integrate</h2>
+  <p>The training scripts need a CUDA GPU (24 GB is enough for the 0.6–8B models shown with QLoRA) and were written against <code>transformers</code> 5.x, <code>trl</code> 1.x, <code>peft</code> 0.2x and <code>bitsandbytes</code> 0.5x. <span class="tag version">Version-sensitive · checked Nov 2026</span> Start with the smallest model to validate the pipeline end to end, then scale up.</p>
+
+  <h3>7.1 The dataset: conversational JSONL</h3>
+  <p>TRL accepts "conversational" records — the same role/content messages you send to APIs — and applies the model's chat template for you. A ticket-triage training set looks like this (one JSON object per line):</p>
+<pre data-file="data/triage_train.jsonl"><code class="language-json">{"messages": [{"role": "system", "content": "Classify the ticket. Reply with JSON {\"category\": BILLING|TECHNICAL|ACCOUNT, \"priority\": 1-4}."}, {"role": "user", "content": "I was charged twice for my March invoice."}, {"role": "assistant", "content": "{\"category\": \"BILLING\", \"priority\": 2}"}]}
+{"messages": [{"role": "system", "content": "Classify the ticket. Reply with JSON {\"category\": BILLING|TECHNICAL|ACCOUNT, \"priority\": 1-4}."}, {"role": "user", "content": "App crashes on startup since the 5.2 update, can't access anything."}, {"role": "assistant", "content": "{\"category\": \"TECHNICAL\", \"priority\": 1}"}]}</code></pre>
+  <p>Quality matters far more than quantity: a few hundred to a few thousand clean, diverse, correctly labelled examples typically beat tens of thousands of noisy ones. Hold out a test split that is never used for training or tuning decisions, and deduplicate across splits.</p>
+
+  <h3>7.2 QLoRA supervised fine-tuning with TRL + PEFT (Python)</h3>
+<pre data-file="train_qlora.py"><code class="language-python">"""QLoRA SFT of an open-weight chat model on conversational JSONL.
+pip install "transformers&gt;=5" "trl&gt;=1" "peft&gt;=0.20" "bitsandbytes&gt;=0.45" datasets accelerate
+Run: python train_qlora.py --model Qwen/Qwen3-0.6B --train data/triage_train.jsonl --eval data/triage_eval.jsonl
+"""
+import argparse
+
+import torch
+from datasets import load_dataset
+from peft import LoraConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from trl import SFTConfig, SFTTrainer
+
+
+def main() -&gt; None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    p.add_argument("--train", required=True)
+    p.add_argument("--eval", required=True)
+    p.add_argument("--out", default="adapters/triage-v1")
+    p.add_argument("--rank", type=int, default=16)
+    p.add_argument("--epochs", type=float, default=2.0)
+    args = p.parse_args()
+
+    data = load_dataset("json", data_files={"train": args.train, "eval": args.eval})
+
+    bnb = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",            # NormalFloat4
+        bnb_4bit_use_double_quant=True,       # quantize the block scales too
+        bnb_4bit_compute_dtype=torch.bfloat16 # dequantize to BF16 for matmuls
+    )
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model, quantization_config=bnb, dtype=torch.bfloat16, device_map="auto")
+
+    lora = LoraConfig(
+        r=args.rank,
+        lora_alpha=2 * args.rank,
+        lora_dropout=0.05,
+        target_modules="all-linear",          # attention + MLP projections
+        task_type="CAUSAL_LM",
+    )
+
+    config = SFTConfig(
+        output_dir=args.out,
+        num_train_epochs=args.epochs,
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=4,        # effective batch 16
+        learning_rate=2e-4,                   # adapters tolerate higher LRs than full FT
+        lr_scheduler_type="cosine",
+        warmup_steps=20,
+        max_length=1024,                      # truncate long examples; check none are cut
+        assistant_only_loss=True,             # learn only the assistant turns
+        gradient_checkpointing=True,
+        optim="paged_adamw_8bit",             # QLoRA's paged optimiser
+        bf16=True,
+        logging_steps=10,
+        eval_strategy="steps",
+        eval_steps=50,
+        save_strategy="steps",
+        save_steps=50,
+        save_total_limit=2,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        report_to="none",
+        seed=42,
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        args=config,
+        train_dataset=data["train"],
+        eval_dataset=data["eval"],
+        processing_class=tokenizer,
+        peft_config=lora,
+    )
+    trainer.model.print_trainable_parameters()   # expect well under 1% trainable
+    trainer.train()
+    trainer.save_model(args.out)                 # saves the adapter only
+    tokenizer.save_pretrained(args.out)
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+  <p>What to watch while it trains: training loss should fall smoothly; evaluation loss should fall then flatten — if it rises while training loss keeps dropping, you are overfitting (reduce epochs or rank, add data). <code>print_trainable_parameters()</code> confirms you are training adapters only. Then evaluate with <em>task metrics</em> (§7.4), not just loss: a lower loss does not guarantee better JSON or better labels.</p>
+
+  <h3>7.3 Merge the adapter, smoke-test, and (optionally) DPO (Python)</h3>
+<pre data-file="merge_and_test.py"><code class="language-python">"""Merge a LoRA adapter into its base model (BF16) for serving or quantization."""
+import json
+import sys
+
+import torch
+from peft import AutoPeftModelForCausalLM
+from transformers import AutoTokenizer
+
+adapter_dir, merged_dir = sys.argv[1], sys.argv[2]   # e.g. adapters/triage-v1 merged/triage-v1
+
+# Load base in BF16 (not 4-bit) so the merged weights are full precision.
+model = AutoPeftModelForCausalLM.from_pretrained(adapter_dir, dtype=torch.bfloat16)
+model = model.merge_and_unload()                     # W = W0 + (alpha/r) * B @ A
+tok = AutoTokenizer.from_pretrained(adapter_dir)
+model.save_pretrained(merged_dir)
+tok.save_pretrained(merged_dir)
+
+messages = [
+    {"role": "system", "content": "Classify the ticket. Reply with JSON {\"category\": BILLING|TECHNICAL|ACCOUNT, \"priority\": 1-4}."},
+    {"role": "user", "content": "Password reset email never arrives."},
+]
+prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+inputs = tok(prompt, return_tensors="pt")
+out = model.generate(**inputs, max_new_tokens=40, do_sample=False)
+reply = tok.decode(out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+print(reply)
+print(json.loads(reply))   # fails loudly if the fine-tune did not learn the format</code></pre>
+<pre data-file="train_dpo.py"><code class="language-python">"""Preference tuning with DPO on top of the SFT adapter.
+Each JSONL record: {"prompt": [...messages...], "chosen": [...assistant msg...], "rejected": [...]}"""
+from datasets import load_dataset
+from peft import AutoPeftModelForCausalLM
+from transformers import AutoTokenizer
+from trl import DPOConfig, DPOTrainer
+
+sft_adapter = "adapters/triage-v1"
+model = AutoPeftModelForCausalLM.from_pretrained(sft_adapter, is_trainable=True)
+tok = AutoTokenizer.from_pretrained(sft_adapter)
+pairs = load_dataset("json", data_files="data/triage_prefs.jsonl", split="train")
+
+trainer = DPOTrainer(
+    model=model,                      # with a PEFT model, the frozen base acts as the reference
+    args=DPOConfig(output_dir="adapters/triage-v1-dpo", beta=0.1, learning_rate=5e-6,
+                   num_train_epochs=1, per_device_train_batch_size=2,
+                   gradient_accumulation_steps=8, bf16=True, report_to="none"),
+    train_dataset=pairs,
+    processing_class=tok,
+)
+trainer.train()
+trainer.save_model("adapters/triage-v1-dpo")</code></pre>
+  <p>Note the much lower learning rate for DPO: preference tuning nudges an already competent model and is easily destabilised. Monitor TRL's <code>rewards/margins</code> and <code>rewards/accuracies</code> metrics — margins should grow and accuracy should rise above 0.5 — and, as always, run the task evaluation afterwards.</p>
+
+  <h3>7.4 An evaluation harness across hosted and self-hosted models (Python)</h3>
+  <p>The harness below runs one labelled dataset against several backends — Claude through the Anthropic SDK, and any open model behind an OpenAI-compatible server (vLLM, llama.cpp, Ollama) through the <code>openai</code> client — and reports accuracy, JSON validity, latency and token usage. This is the core of evaluation-led selection.</p>
+<pre data-file="compare_models.py"><code class="language-python">"""pip install anthropic openai
+Usage: python compare_models.py data/triage_test.jsonl"""
+import json
+import statistics
+import sys
+import time
+from dataclasses import dataclass, field
+
+import anthropic
+from openai import OpenAI
+
+SYSTEM = ('Classify the ticket. Reply with JSON {"category": BILLING|TECHNICAL|ACCOUNT, '
+          '"priority": 1-4} and nothing else.')
+
+
+@dataclass
+class Result:
+    name: str
+    correct: int = 0
+    valid_json: int = 0
+    latencies: list[float] = field(default_factory=list)
+    in_tokens: int = 0
+    out_tokens: int = 0
+
+
+class AnthropicBackend:
+    def __init__(self, model: str):
+        self.name, self.model, self.client = f"anthropic:{model}", model, anthropic.Anthropic()
+
+    def __call__(self, text: str) -&gt; tuple[str, int, int]:
+        r = self.client.messages.create(model=self.model, max_tokens=200, system=SYSTEM,
+                                        output_config={"effort": "low"},
+                                        messages=[{"role": "user", "content": text}])
+        return ("".join(b.text for b in r.content if b.type == "text"),
+                r.usage.input_tokens, r.usage.output_tokens)
+
+
+class OpenAICompatibleBackend:
+    """vLLM (`vllm serve ...`), llama.cpp (`llama-server`) or Ollama all expose /v1."""
+    def __init__(self, base_url: str, model: str):
+        self.name, self.model = f"local:{model}", model
+        self.client = OpenAI(base_url=base_url, api_key="not-needed-locally")
+
+    def __call__(self, text: str) -&gt; tuple[str, int, int]:
+        r = self.client.chat.completions.create(
+            model=self.model, max_tokens=200, temperature=0,
+            messages=[{"role": "system", "content": SYSTEM}, {"role": "user", "content": text}])
+        return r.choices[0].message.content, r.usage.prompt_tokens, r.usage.completion_tokens
+
+
+def evaluate(backend, rows) -&gt; Result:
+    res = Result(backend.name)
+    for row in rows:
+        start = time.perf_counter()
+        reply, tin, tout = backend(row["text"])
+        res.latencies.append(time.perf_counter() - start)
+        res.in_tokens += tin
+        res.out_tokens += tout
+        try:
+            parsed = json.loads(reply.strip())
+            res.valid_json += 1
+            res.correct += parsed.get("category") == row["category"]
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    return res
+
+
+def main(path: str) -&gt; None:
+    rows = [json.loads(line) for line in open(path, encoding="utf-8")]   # {"text":..., "category":...}
+    backends = [
+        AnthropicBackend("claude-haiku-5-5"),                         # Version-sensitive model IDs
+        AnthropicBackend("claude-sonnet-5-5"),
+        OpenAICompatibleBackend("http://localhost:8000/v1", "triage"),  # vLLM base + LoRA adapter
+        OpenAICompatibleBackend("http://localhost:8000/v1", "Qwen/Qwen3-8B"),  # base model, no adapter
+    ]
+    print(f"{'backend':38} {'acc':&gt;6} {'json':&gt;6} {'p50 s':&gt;6} {'p95 s':&gt;6} {'in tok':&gt;8} {'out tok':&gt;8}")
+    for b in backends:
+        r = evaluate(b, rows)
+        n = len(rows)
+        lat = sorted(r.latencies)
+        p95 = lat[int(0.95 * (n - 1))]
+        print(f"{r.name:38} {r.correct / n:6.1%} {r.valid_json / n:6.1%} "
+              f"{statistics.median(lat):6.2f} {p95:6.2f} {r.in_tokens:8d} {r.out_tokens:8d}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1])</code></pre>
+  <p>Multiply token counts by each provider's current prices (or your GPU cost model from §6.7) to add a cost column. A typical outcome pattern <span class="tag illus">Illustrative</span>: the fine-tuned small model matches the large hosted model on this narrow task with lower latency, while the un-tuned base small model trails on both accuracy and JSON validity — evidence that justifies (or refutes) the fine-tuning investment.</p>
+
+  <h3>7.5 Quantize and serve</h3>
+<pre data-file="quantize_fp8.py"><code class="language-python">"""FP8 weight + dynamic activation quantization with llm-compressor (vLLM project).
+pip install llmcompressor   # Version-sensitive · checked Nov 2026"""
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from llmcompressor import oneshot
+from llmcompressor.modifiers.quantization import QuantizationModifier
+
+SRC, DST = "merged/triage-v1", "merged/triage-v1-FP8"
+model = AutoModelForCausalLM.from_pretrained(SRC)
+tok = AutoTokenizer.from_pretrained(SRC)
+
+# Round-to-nearest FP8 needs no calibration data; for 4-bit AWQ/GPTQ recipes, pass a
+# calibration dataset (a few hundred in-domain samples) to oneshot().
+recipe = QuantizationModifier(targets="Linear", scheme="FP8_BLOCK", ignore=["lm_head"])
+oneshot(model=model, recipe=recipe)
+model.save_pretrained(DST)
+tok.save_pretrained(DST)</code></pre>
+<pre data-file="serve.sh"><code class="language-bash"># --- Option A: vLLM serving the base model + LoRA adapter (OpenAI-compatible on :8000) ---
+pip install vllm
+vllm serve Qwen/Qwen3-8B \
+  --max-model-len 16384 \
+  --gpu-memory-utilization 0.90 \
+  --enable-lora --max-lora-rank 64 \
+  --lora-modules triage=./adapters/triage-v1
+# Requests with "model": "triage" use the adapter; "Qwen/Qwen3-8B" uses the base model.
+
+# --- Option B: vLLM serving the merged, FP8-quantized model ---
+vllm serve ./merged/triage-v1-FP8 --served-model-name triage --max-model-len 16384
+
+# --- Option C: llama.cpp / GGUF for CPU, Apple Silicon or small GPUs ---
+git clone https://github.com/ggml-org/llama.cpp &amp;&amp; cd llama.cpp &amp;&amp; cmake -B build &amp;&amp; cmake --build build -j
+python convert_hf_to_gguf.py ../merged/triage-v1 --outfile triage-v1-f16.gguf --outtype f16
+./build/bin/llama-quantize triage-v1-f16.gguf triage-v1-Q4_K_M.gguf Q4_K_M
+./build/bin/llama-server -m triage-v1-Q4_K_M.gguf --port 8080 -c 8192   # OpenAI-compatible /v1
+
+# --- Option D: Ollama for local development ---
+cat &gt; Modelfile &lt;&lt;'EOF'
+FROM ./triage-v1-Q4_K_M.gguf
+PARAMETER num_ctx 8192
+EOF
+ollama create triage -f Modelfile
+ollama run triage "Password reset email never arrives."   # API: http://localhost:11434/v1
+
+# Smoke test any of them:
+curl -s http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"triage","messages":[{"role":"user","content":"Refund not received"}],"max_tokens":50}'</code></pre>
+  <p>Options A and B are production patterns on GPUs; C and D are excellent for development, CI evaluation runs and edge deployments. Pin every artefact by revision or digest — base model commit, adapter version, GGUF file hash — just as you pin container images.</p>
+
+  <h3>7.6 Consuming self-hosted and hosted models from Spring AI</h3>
+  <p>Because vLLM, llama.cpp and Ollama speak the OpenAI wire protocol, Spring AI's OpenAI module can talk to them by changing the base URL. With two providers on the classpath, build each <code>ChatClient</code> explicitly and route per use case.</p>
+<pre data-file="application.yml"><code class="language-yaml">spring:
+  ai:
+    chat:
+      client:
+        enabled: false               # we build ChatClients ourselves (two providers)
+    anthropic:
+      api-key: ${ANTHROPIC_API_KEY}
+      chat:
+        model: claude-sonnet-5-5     # Version-sensitive · checked Nov 2026
+        max-tokens: 2048
+    openai:
+      base-url: http://vllm.internal:8000/v1   # self-hosted vLLM
+      api-key: ""                               # empty disables auth for local servers
+      chat:
+        model: triage                           # the LoRA adapter name served by vLLM
+        max-tokens: 200</code></pre>
+<pre data-file="ModelRoutingConfig.java"><code class="language-java">package com.example.routing;
+
+import org.springframework.ai.anthropic.AnthropicChatModel;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.openai.OpenAiChatModel;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.stereotype.Service;
+
+@Configuration
+class ModelRoutingConfig {
+    @Bean
+    ChatClient frontierClient(AnthropicChatModel model) {   // complex, open-ended requests
+        return ChatClient.builder(model).build();
+    }
+
+    @Bean
+    ChatClient triageClient(OpenAiChatModel model) {        // fine-tuned small model on vLLM
+        return ChatClient.builder(model).build();
+    }
+}
+
+record TriageLabel(String category, int priority) {}
+
+@Service
+class SupportRouter {
+    private final ChatClient triage;
+    private final ChatClient frontier;
+
+    SupportRouter(@Qualifier("triageClient") ChatClient triage,
+                  @Qualifier("frontierClient") ChatClient frontier) {
+        this.triage = triage;
+        this.frontier = frontier;
+    }
+
+    TriageLabel classify(String ticket) {
+        return triage.prompt().user(ticket).call().entity(TriageLabel.class);
+    }
+
+    String draftReply(String ticket, TriageLabel label) {
+        return frontier.prompt()
+                .system("You draft empathetic, accurate support replies. Category: " + label.category())
+                .user(ticket)
+                .call()
+                .content();
+    }
+}</code></pre>
+  <p>Combine this with the resilience wrapper from Chapter 2: a self-hosted endpoint needs the same timeouts, breakers and fallbacks as a vendor API — arguably more, because you are now also the vendor.</p>
+
+  <h3>7.7 A tiny Go client for an OpenAI-compatible local server</h3>
+  <p>Gateways, sidecars and CLIs written in Go can call a local model with nothing but the standard library.</p>
+<pre data-file="localchat.go"><code class="language-go">package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+)
+
+type message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type chatRequest struct {
+	Model     string    `json:"model"`
+	Messages  []message `json:"messages"`
+	MaxTokens int       `json:"max_tokens"`
+}
+
+type chatResponse struct {
+	Choices []struct {
+		Message message `json:"message"`
+	} `json:"choices"`
+	Usage struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage"`
+}
+
+func main() {
+	base := os.Getenv("LLM_BASE_URL") // e.g. http://localhost:11434/v1 (Ollama) or :8000/v1 (vLLM)
+	if base == "" {
+		base = "http://localhost:8000/v1"
+	}
+	body, _ := json.Marshal(chatRequest{
+		Model:     "triage",
+		Messages:  []message{{Role: "user", Content: "Refund not received after 10 days"}},
+		MaxTokens: 100,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, base+"/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "request failed:", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintln(os.Stderr, "unexpected status:", resp.Status)
+		os.Exit(1)
+	}
+	var out chatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&amp;out); err != nil || len(out.Choices) == 0 {
+		fmt.Fprintln(os.Stderr, "bad response:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("%s\n(tokens in=%d out=%d)\n", out.Choices[0].Message.Content,
+		out.Usage.PromptTokens, out.Usage.CompletionTokens)
+}</code></pre>
+</section>
+
+<section id="applications">
+  <h2>8. Applications: How Teams Use Model Choice, Fine-Tuning and Quantization</h2>
+  <ul>
+    <li><strong>Model portfolios.</strong> Mature teams run several models: a frontier model for complex reasoning and agentic flows, a small hosted model for high-volume simple tasks, and sometimes a self-hosted open model for sensitive data. A routing layer chooses per route, backed by evaluation scores (Chapter 5 covers cascades).</li>
+    <li><strong>Specialised small models for narrow tasks.</strong> Classification, entity extraction, PII detection, query rewriting and routing are classic fine-tuning targets: stable task definitions, abundant labelled data from production, and high volume where latency and cost dominate.</li>
+    <li><strong>Brand voice and format.</strong> Marketing copy, clinical note formatting, or legal clause drafting in house style — behaviours that are easier to demonstrate with thousands of examples than to describe in a prompt.</li>
+    <li><strong>Data-residency deployments.</strong> Regulated industries (healthcare, banking, government) self-host open models in their own VPC or data centre, combined with RAG over internal documents, to keep data within jurisdiction.</li>
+    <li><strong>Multi-tenant adapters.</strong> SaaS vendors serve one base model with per-customer or per-task LoRA adapters via multi-LoRA serving, keeping GPU fleets small while offering customisation.</li>
+    <li><strong>Edge and offline.</strong> Quantized 1–8B models run on laptops, phones, factory gateways or ships with intermittent connectivity, via llama.cpp or vendor on-device runtimes.</li>
+    <li><strong>Evaluation infrastructure.</strong> Local quantized models served by Ollama or llama.cpp run inside CI to test prompt and parsing logic cheaply, while final quality gates use the production model.</li>
+  </ul>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+
+  <h3>9.1 LoRA: adapting GPT-3 175B with a fraction of the parameters</h3>
+  <p><span class="tag fact">Verified</span> The original LoRA paper (Hu et al., Microsoft, 2021) reported that, compared with full fine-tuning of GPT-3 175B with Adam, LoRA reduced the number of trainable parameters by 10,000 times and GPU memory by about three times, while matching or exceeding fine-tuning quality on the evaluated tasks and adding no inference latency once merged. <strong>Lesson:</strong> the adaptation an application needs is low-dimensional; you rarely need to touch all the weights. (<a href="https://arxiv.org/abs/2106.09685">arXiv:2106.09685</a>)</p>
+
+  <h3>9.2 QLoRA and Guanaco: a 65B fine-tune on one GPU</h3>
+  <p><span class="tag fact">Verified</span> Dettmers et al. (2023) introduced NF4, double quantization and paged optimisers, and reported fine-tuning a 65B-parameter model on a single 48 GB GPU while preserving 16-bit fine-tuning performance. Their Guanaco models, trained this way in about a day on a single GPU, were reported to reach 99.3% of ChatGPT's performance on the Vicuna benchmark at the time. The authors also cautioned about the limits of such chatbot benchmarks. <strong>Lesson:</strong> memory engineering, not new learning algorithms, democratised fine-tuning; and benchmark claims need your own evaluation behind them. (<a href="https://arxiv.org/abs/2305.14314">arXiv:2305.14314</a>)</p>
+
+  <h3>9.3 LoRA Land: many small specialists versus one generalist</h3>
+  <p><span class="tag fact">Verified</span> Predibase's "LoRA Land" study (Zhao et al., 2024) trained 310 LoRA adapters (4-bit base models) across 10 base models and 31 tasks and reported that fine-tuned models outperformed their base models by 34 points and GPT-4 by 10 points on average across those tasks; it also described serving many adapters on a single GPU with their LoRAX server. <strong>Lesson:</strong> for narrow, well-defined tasks, a fine-tuned small open model can beat a general frontier model of its era — but results are task-dependent, and frontier models have improved since, so measure on your own data. (<a href="https://arxiv.org/abs/2405.00732">arXiv:2405.00732</a>)</p>
+
+  <h3>9.4 Apple's on-device models: adapters plus aggressive quantization</h3>
+  <p><span class="tag fact">Verified</span> In June 2024, Apple's machine-learning research blog described its on-device foundation model for Apple Intelligence: a roughly 3B-parameter model compressed with a mixed 2-bit/4-bit scheme averaging about 3.5 bits per weight, with task-specific LoRA adapters (rank 16) loaded dynamically on top of a shared base model for features such as summarisation and proofreading. <strong>Lesson:</strong> the base-plus-adapters architecture and low-bit quantization are not just research ideas; they are how a consumer product ships many specialised behaviours within strict memory budgets. (<a href="https://machinelearning.apple.com/research/introducing-apple-foundation-models">Apple Machine Learning Research</a>)</p>
+
+  <h3>9.5 vLLM: serving efficiency through memory management</h3>
+  <p><span class="tag fact">Verified</span> Kwon et al. (SOSP 2023) introduced PagedAttention, which stores the KV cache in non-contiguous fixed-size blocks managed like virtual-memory pages, and reported that vLLM improved throughput of popular LLMs by 2–4× at the same latency compared with the state-of-the-art serving systems they evaluated (FasterTransformer and Orca), with larger gains for longer sequences and more complex decoding. <strong>Lesson:</strong> for self-hosting, the serving engine can matter as much as the model; operating-system ideas transfer directly. (<a href="https://arxiv.org/abs/2309.06180">arXiv:2309.06180</a>)</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages, Limitations and Operational Cost</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Approach</th><th>Advantages</th><th>Limitations</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>Hosted frontier API</td><td>Best capability; zero infrastructure; fast feature access</td><td>Vendor data processing; rate limits; model deprecations; per-token cost at scale</td><td>Pure variable cost; engineering for resilience and evaluation</td></tr>
+      <tr><td>Self-hosted open-weight</td><td>Data control; version pinning; customisation; predictable marginal cost</td><td>Capability gap on hardest tasks; you own safety filtering and uptime</td><td>GPUs (often idle), MLOps staff, security patching, capacity planning</td></tr>
+      <tr><td>Full fine-tuning</td><td>Maximum expressiveness</td><td>Huge memory; catastrophic forgetting; one full model copy per task</td><td>Multi-GPU training; large artefacts; re-training per base upgrade</td></tr>
+      <tr><td>LoRA / QLoRA</td><td>Single-GPU training; small artefacts; hot-swappable adapters</td><td>Lower ceiling than full FT for big behaviour shifts; QLoRA trains slower</td><td>Modest; dataset curation dominates</td></tr>
+      <tr><td>DPO</td><td>Simple preference learning without RL infrastructure</td><td>Needs quality preference pairs; can over-optimise and degrade other skills</td><td>Preference data collection pipeline</td></tr>
+      <tr><td>Distillation</td><td>Small, fast models for a task</td><td>Bounded by teacher quality; provider terms may forbid using outputs</td><td>Teacher inference cost for data generation</td></tr>
+      <tr><td>Quantization (8-bit)</td><td>~2× memory saving, near-lossless</td><td>Needs hardware/kernel support for speed gains</td><td>Low</td></tr>
+      <tr><td>Quantization (4-bit and below)</td><td>~4× memory saving; faster decode</td><td>Quality loss on precise tasks; method and calibration matter</td><td>Calibration runs; per-format evaluation</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Decision</th><th>Choose this</th><th>When</th></tr></thead>
+    <tbody>
+      <tr><td>API vs. self-host</td><td>API</td><td>Volume is low or spiky; you need the best reasoning; small team; no strict residency requirement</td></tr>
+      <tr><td></td><td>Self-host</td><td>High steady volume on a task a small model handles; strict residency or offline needs; you already operate GPUs</td></tr>
+      <tr><td>RAG vs. fine-tune</td><td>RAG</td><td>Knowledge that changes, needs citations or per-user permissions</td></tr>
+      <tr><td></td><td>Fine-tune</td><td>Stable behaviour, format or narrow skill; latency/cost reduction via a smaller model</td></tr>
+      <tr><td>LoRA rank</td><td>Low (8–16)</td><td>Narrow format/classification tasks; small datasets</td></tr>
+      <tr><td></td><td>High (32–64+)</td><td>Broader skills, larger datasets; verify gains with evaluation</td></tr>
+      <tr><td>Merge vs. separate adapters</td><td>Merge</td><td>Single task per deployment; simplest and fastest serving; quantize after merging</td></tr>
+      <tr><td></td><td>Separate</td><td>Many tasks/tenants on one base; frequent adapter updates</td></tr>
+      <tr><td>Quantization format</td><td>FP8</td><td>Recent data-centre GPUs, near-lossless needs</td></tr>
+      <tr><td></td><td>AWQ/GPTQ 4-bit</td><td>GPU serving with tight memory</td></tr>
+      <tr><td></td><td>GGUF Q4_K_M–Q8_0</td><td>CPU, Apple Silicon, edge, local dev</td></tr>
+      <tr><td>Serving engine</td><td>vLLM / SGLang</td><td>GPU production with concurrency</td></tr>
+      <tr><td></td><td>llama.cpp / Ollama</td><td>Local, edge, small internal tools</td></tr>
+    </tbody>
+  </table></div>
+  <p>Underneath every row is the same principle <span class="tag opinion">Opinion</span>: start with the option that has the lowest <em>total</em> cost of ownership — usually a hosted API plus prompting and RAG — and move rightwards (self-hosting, fine-tuning, aggressive quantization) only when an evaluation shows a measurable win that pays for the added operational complexity.</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Production Failures</h2>
+  <ul>
+    <li><strong>Fine-tuning to add knowledge.</strong> The model memorises some facts, hallucinates neighbouring ones confidently, and goes stale the moment documents change. Use RAG for knowledge.</li>
+    <li><strong>Choosing by leaderboard.</strong> Public benchmarks may be contaminated and rarely resemble your task. Build the private evaluation set first.</li>
+    <li><strong>Ignoring the licence.</strong> Shipping a product on a non-commercial or custom-licensed model without review creates legal risk; fine-tuned derivatives usually inherit terms.</li>
+    <li><strong>Wrong chat template.</strong> Training with one template and serving with another (or none) silently ruins quality. Use the tokenizer's template in both places and test the rendered prompt.</li>
+    <li><strong>Training on prompts, not just answers.</strong> Without assistant-only or completion-only loss, the model also learns to generate user and system text, wasting capacity.</li>
+    <li><strong>Train/test leakage.</strong> Near-duplicate tickets in both splits inflate scores; deduplicate by normalised text or embeddings.</li>
+    <li><strong>Evaluating only loss.</strong> Lower loss can coexist with worse JSON validity or label accuracy. Use task metrics.</li>
+    <li><strong>Merging into a 4-bit base.</strong> Merging LoRA weights into quantized weights loses precision; merge into the BF16 base, then quantize.</li>
+    <li><strong>Over-quantizing small models.</strong> 3-bit or 2-bit quantization of small models often collapses quality; test before shipping.</li>
+    <li><strong>Unpinned base models.</strong> A model repository can be updated; pin revisions (commit hashes) so a re-run reproduces training.</li>
+    <li><strong>Forgetting safety.</strong> Fine-tuning can weaken a model's safety behaviour; re-run safety and refusal evaluations, and add guardrails (Chapter 5) for self-hosted models.</li>
+    <li><strong>Under-provisioned KV cache.</strong> Serving fails or thrashes under long prompts because the KV pool was sized for short ones; size with Chapter 1's formula and set <code>--max-model-len</code> deliberately.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Engineering</h2>
+  <h3>13.1 Model registry and governance</h3>
+  <ul>
+    <li>Record per model/adapter: base model and revision, dataset version, training config, evaluation scores per route, licence, approved data classifications, owner, deprecation date.</li>
+    <li>Promote through environments with automated evaluation gates and canary traffic; keep rollback to the previous adapter one config change away.</li>
+  </ul>
+  <h3>13.2 Serving operations</h3>
+  <ul>
+    <li>Monitor GPU utilisation, KV-cache usage, queue length, preemptions, TTFT and tokens/s (vLLM exposes Prometheus metrics); autoscale on queue depth or KV usage, not CPU.</li>
+    <li>Run at least two replicas across failure domains; warm new replicas before taking traffic (model load takes minutes).</li>
+    <li>Set request limits (max context, max output, concurrent requests per tenant) at a gateway in front of the engine.</li>
+  </ul>
+  <h3>13.3 Security</h3>
+  <ul>
+    <li>Download models only from trusted sources, verify hashes, and prefer the <code>safetensors</code> format over pickle-based checkpoints, which can execute code on load.</li>
+    <li>Never expose inference servers directly to the internet; put authentication, rate limiting and logging in front.</li>
+    <li>Treat training data as sensitive: fine-tuned models can regurgitate training examples, so scrub PII and secrets before training.</li>
+    <li>Supply-chain risk (poisoned models or datasets) is an OWASP LLM Top 10 category; Chapter 6 and Part 11 Chapter 5 go deeper.</li>
+  </ul>
+  <h3>13.4 Cost management</h3>
+  <ul>
+    <li>Track cost per 1,000 requests per route for both hosted and self-hosted options, including idle GPU time.</li>
+    <li>Consolidate low-volume tasks onto one base model with multiple adapters; scale to zero for development environments.</li>
+    <li>Re-run the API-vs-self-host comparison quarterly: API prices and open-model capabilities both move fast.</li>
+  </ul>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>Compute the number of LoRA parameters for rank 8 applied to the q, k, v and o projections of a model with hidden size 2048, 16 layers, and KV projection width 512. What fraction of a 1.5B-parameter model is that?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>q: 8 × (2048 + 2048) = 32,768; k: 8 × (2048 + 512) = 20,480; v: 20,480; o: 32,768. Per layer 106,496; × 16 layers = 1,703,936 ≈ 1.7M parameters, about 0.11% of 1.5B.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>A product team wants to fine-tune a model "so it knows our 4,000-page product documentation." Write the reply you would send, including what you would build instead and how you would measure success.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Explain that fine-tuning is poor at reliably injecting large, changing knowledge: the model would learn some facts imperfectly, hallucinate others with confidence, could not cite sources, and would need retraining every documentation release. Propose RAG: parse and chunk the docs, embed them into a vector index with metadata (product, version), retrieve and rerank per question, and instruct the model to answer only from retrieved passages with citations. Success metrics: a golden set of 200 real questions with expected answers and source pages; retrieval recall@10 and answer faithfulness/correctness via LLM-as-judge with human spot checks; latency and cost per answer. Fine-tuning may come later for tone or answer format if evaluation shows a gap.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>Run <code>train_qlora.py</code> on a small public instruction dataset (or your own 500 examples) with ranks 4, 16 and 64. Plot eval loss and a task metric against rank. What do you expect, and why might the task metric disagree with loss?</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Expect diminishing returns: rank 4 may underfit a broad task; 16 often captures most of the gain; 64 may overfit a small dataset (eval loss rising late). The task metric can disagree because loss averages over all assistant tokens (including phrasing) while the metric checks only what matters (label correctness, JSON validity). A model can reduce loss by matching wording style better without improving decisions. Choose the rank by task metric with a held-out set, and prefer the smallest rank within noise of the best.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>Your company processes 30 million short classification requests per month (≈400 input, 10 output tokens each). Build a cost model comparing (a) a small hosted model, (b) a self-hosted fine-tuned 1.5B model on two GPU instances. List every cost component and the break-even volume. Use placeholder prices and state assumptions explicitly.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p><span class="tag illus">Illustrative</span> (a) Hosted: tokens/month = 30M × 400 = 12B input, 300M output. With placeholder prices \$0.10 per M input and \$0.50 per M output: \$1,200 + \$150 = \$1,350/month, plus engineering for resilience. (b) Self-hosted: two instances at \$2/h × 730 h = \$2,920/month, plus storage/egress/monitoring (~\$200), plus engineering time (e.g. 0.2 FTE for operations — often the largest component), plus fine-tuning and evaluation runs. Capacity check: 30M requests/month ≈ 11.6 req/s average; a 1.5B model on vLLM handles this comfortably. Break-even on infrastructure alone requires hosted cost &gt; ~\$3,100/month, i.e. roughly 2.3× today's volume at these prices — and higher once staff time is included. Conclusion: at this volume and these prices, the hosted small model wins unless residency or latency requirements force self-hosting. The model's value is in making assumptions explicit and re-running it when prices or volumes change.</p>
+    </div></details>
+  </div>
+
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>Design a CI pipeline that retrains a triage adapter weekly from newly labelled production tickets and promotes it only if it is better. Include data, training, evaluation and rollout stages, and the guardrails against silent regressions.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <ol>
+        <li><strong>Data:</strong> export the week's human-corrected labels; PII scrubbing; deduplicate against the frozen test set; version the dataset (e.g. DVC or object-store snapshot with hash).</li>
+        <li><strong>Train:</strong> QLoRA job on a GPU runner with pinned base revision and config; store adapter and metrics.</li>
+        <li><strong>Evaluate:</strong> frozen golden test set plus a rolling "recent" set; metrics: accuracy per class, JSON validity, latency; safety/refusal suite; compare with the production adapter using a paired test (e.g. McNemar on per-example correctness).</li>
+        <li><strong>Gate:</strong> promote only if overall accuracy is not worse within confidence bounds and no class regresses beyond a threshold.</li>
+        <li><strong>Rollout:</strong> register adapter; vLLM multi-LoRA loads it under a new name; route 5% traffic (canary) and compare online metrics (human override rate); then 100%.</li>
+        <li><strong>Rollback:</strong> routing config points back to the previous adapter name; keep the last three adapters loaded.</li>
+      </ol>
+    </div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain LoRA and why it adds no inference latency.</summary><div><p>LoRA freezes a pretrained weight \(W_0\) and learns a low-rank update \(\Delta W = BA\) with rank \(r\), scaled by \(\alpha/r\). Only \(A\) and \(B\) train, a tiny fraction of parameters. After training, \(W = W_0 + \frac{\alpha}{r}BA\) can be computed once and stored, so the deployed model has exactly the original architecture and cost. Keeping adapters unmerged adds a small overhead but enables multi-adapter serving.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What three ideas make QLoRA work?</summary><div><p>NF4 4-bit storage of the frozen base model with levels matched to normally distributed weights; double quantization of the per-block scales to save memory; paged optimisers using unified memory to survive memory spikes. Computation happens in BF16 by dequantizing blocks on the fly, and gradients flow only into 16-bit LoRA adapters.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How would you choose a model for a new summarisation feature?</summary><div><p>Define requirements (quality bar, latency, volume, data constraints, budget). Build an evaluation set of 100–300 real documents with reference summaries or a rubric; define metrics (faithfulness and coverage via LLM-as-judge with human calibration, length, latency, cost). Shortlist 3–5 models across tiers (hosted large/small, open-weight if residency matters). Run, compare, choose the cheapest that passes with margin. Re-evaluate on model updates.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Leadership asks to "fine-tune our own model to stop hallucinations." How do you respond?</summary><div><p>Fine-tuning does not remove hallucination and can increase confident errors when used to inject knowledge. Hallucination is mitigated by grounding (RAG with citations), constrained outputs, abstention instructions, verification steps and evaluation (Chapter 5). Propose measuring hallucination rate on a golden set first, then applying those fixes; fine-tune only for behaviours like abstaining correctly or format, if evaluation shows a residual gap.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Compare GPTQ, AWQ and GGUF.</summary><div><p>GPTQ is post-training weight quantization that uses approximate second-order information to compensate rounding error layer by layer with calibration data; good GPU kernels exist. AWQ protects salient weight channels identified from activation statistics by rescaling before quantization; robust 4-bit quality and fast GPU inference. GGUF is a file format (llama.cpp) containing weights in various block-quantized types (k-quants), tokenizer and metadata, optimised for CPU/Apple Silicon/consumer GPUs. GPTQ/AWQ are methods; GGUF is a container with its own quantization types.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Design multi-tenant customisation for a SaaS product where each enterprise customer wants its own tone.</summary><div><p>One base open model on vLLM with multi-LoRA serving; per-tenant adapters trained with QLoRA on tenant-approved examples; adapter registry mapping tenant to adapter version; gateway injects the adapter name per request; per-tenant evaluation and rollback; isolation of training data per tenant; cap the number of adapters per GPU and load on demand. For tenants with few examples, use per-tenant prompt templates instead.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> What does <code>assistant_only_loss=True</code> do in TRL, and what goes wrong without it?</summary><div><p>It masks the loss so only assistant-turn tokens contribute to gradients. Without it, the model also learns to predict system and user text, which wastes capacity and can make the model imitate user phrasing or regurgitate system prompts. It requires a chat template that marks generation spans; TRL patches known templates.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> After quantizing to 4-bit, JSON validity drops from 99% to 93%. What do you try?</summary><div><p>Enable constrained/guided decoding in the serving engine (vLLM supports JSON-schema-guided generation) so validity no longer depends on the model; try a better 4-bit method (AWQ vs. naive), larger group size settings or keep sensitive layers (embeddings, LM head) in higher precision; try 8-bit/FP8 if memory allows; add calibration data from your domain; re-evaluate accuracy, not just validity.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is the difference between open-weight and open-source models, and why does it matter commercially?</summary><div><p>Open-weight releases publish weights under some licence but usually not training data or full training code; open-source (per OSI's Open Source AI Definition) also provides enough data information and code to reproduce. Commercially, what matters is the licence: permissive (Apache/MIT) vs. custom terms with use restrictions or user-count thresholds, and whether derivatives inherit obligations.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Choose models with a private evaluation set: the cheapest model that meets the quality bar wins.</li>
+    <li>Read licences; "open" ranges from Apache/MIT to custom terms with real restrictions.</li>
+    <li>RAG for knowledge, fine-tuning for behaviour, prompting first.</li>
+    <li>LoRA learns \(BA\) low-rank updates; QLoRA adds NF4, double quantization and paged optimisers to fit large models on one GPU.</li>
+    <li>DPO tunes preferences without RL; distillation transfers a task from a large teacher to a small student (check terms).</li>
+    <li>8-bit is near-lossless; 4-bit needs a good method and evaluation; formats differ by hardware target.</li>
+    <li>vLLM/SGLang for GPU production; llama.cpp/Ollama for local and edge; expose OpenAI-compatible endpoints to your services.</li>
+  </ul>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">Why is \(B\) initialised to zero in LoRA?</p>
+    <ol>
+      <li data-k="a">To make the adapter sparse</li>
+      <li data-k="b">To reduce memory usage</li>
+      <li data-k="c">So the adapted model starts exactly equal to the base model</li>
+      <li data-k="d">So that the rank can be changed during training</li>
+    </ol>
+    <div class="explain">With B = 0, BA = 0, so the initial forward pass equals the pretrained model and training starts from a known-good point.</div>
+  </div>
+
+  <div class="quiz" data-answer="a">
+    <p class="q">Which problem is RAG better suited for than fine-tuning?</p>
+    <ol>
+      <li data-k="a">Answering questions from frequently updated internal policies with citations</li>
+      <li data-k="b">Producing output in a strict house writing style</li>
+      <li data-k="c">Reducing latency by moving a narrow task to a smaller model</li>
+      <li data-k="d">Teaching an internal DSL's syntax</li>
+    </ol>
+    <div class="explain">Changing knowledge with provenance is retrieval's strength. Style, latency via smaller models, and skills are fine-tuning targets.</div>
+  </div>
+
+  <div class="quiz" data-answer="d">
+    <p class="q">Roughly how much GPU memory do the frozen weights of an 8B-parameter model take in NF4?</p>
+    <ol>
+      <li data-k="a">About 32 GB</li>
+      <li data-k="b">About 16 GB</li>
+      <li data-k="c">About 1 GB</li>
+      <li data-k="d">About 4.5–5 GB including quantization scales</li>
+    </ol>
+    <div class="explain">4 bits = 0.5 bytes per parameter → 4 GB, plus block scales and unquantized layers, giving roughly 4.5–5 GB.</div>
+  </div>
+
+  <div class="quiz" data-answer="b">
+    <p class="q">You trained a LoRA adapter on a 4-bit base. What is the recommended way to produce a deployable quantized model?</p>
+    <ol>
+      <li data-k="a">Merge the adapter directly into the 4-bit weights</li>
+      <li data-k="b">Merge into the BF16 base model, then quantize the merged model</li>
+      <li data-k="c">Discard the adapter and quantize the base</li>
+      <li data-k="d">Convert the adapter to GGUF only</li>
+    </ol>
+    <div class="explain">Merging into quantized weights loses precision; merge into full-precision weights first, then apply the chosen quantization method and re-evaluate.</div>
+  </div>
+
+  <div class="quiz" data-answer="c">
+    <p class="q">What is the main reason vLLM achieves high throughput?</p>
+    <ol>
+      <li data-k="a">It uses a smaller vocabulary</li>
+      <li data-k="b">It disables the KV cache</li>
+      <li data-k="c">Paged KV-cache management with continuous batching fits more sequences in GPU memory</li>
+      <li data-k="d">It always quantizes to 2 bits</li>
+    </ol>
+    <div class="explain">PagedAttention eliminates most KV-cache fragmentation and enables prefix sharing; continuous batching keeps the GPU busy, so many more concurrent sequences fit.</div>
+  </div>
+
+  <div class="quiz" data-answer="a">
+    <p class="q">A model's licence requires a separate agreement above a monthly active user threshold. Which licence family typically has such a clause?</p>
+    <ol>
+      <li data-k="a">Meta's Llama community licences</li>
+      <li data-k="b">Apache-2.0</li>
+      <li data-k="c">MIT</li>
+      <li data-k="d">BSD-3-Clause</li>
+    </ol>
+    <div class="explain">Llama 2 and 3 licences required a separate licence for products exceeding 700 million monthly active users. OSI licences such as Apache, MIT and BSD have no such clause.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2106.09685">Hu et al., "LoRA: Low-Rank Adaptation of Large Language Models" (2021)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2305.14314">Dettmers et al., "QLoRA: Efficient Finetuning of Quantized LLMs" (2023)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2208.07339">Dettmers et al., "LLM.int8()" (2022)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2210.17323">Frantar et al., "GPTQ" (2022)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2306.00978">Lin et al., "AWQ: Activation-aware Weight Quantization" (2023)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2309.06180">Kwon et al., "Efficient Memory Management for LLM Serving with PagedAttention" (2023)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2305.18290">Rafailov et al., "Direct Preference Optimization" (2023)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/1503.02531">Hinton, Vinyals &amp; Dean, "Distilling the Knowledge in a Neural Network" (2015)</a></li>
+    <li><span class="ref-kind">Paper</span> <a href="https://arxiv.org/abs/2405.00732">Zhao et al., "LoRA Land" (2024)</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://huggingface.co/docs/peft">Hugging Face PEFT</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://huggingface.co/docs/trl">Hugging Face TRL (SFTTrainer, DPOTrainer)</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://huggingface.co/docs/transformers/main/en/quantization/overview">Transformers quantization overview</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.vllm.ai/">vLLM documentation</a></li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/ggml-org/llama.cpp">ggml-org/llama.cpp</a></li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/vllm-project/llm-compressor">vllm-project/llm-compressor</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.ollama.com/">Ollama documentation</a></li>
+    <li><span class="ref-kind">Spec</span> <a href="https://opensource.org/ai/open-source-ai-definition">OSI — The Open Source AI Definition</a></li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>
