@@ -173,6 +173,10 @@ flowchart LR
 
   <h3>4.5 Tenant provisioning</h3>
   <p>Provisioning is a saga run by the control plane: create the tenant record → create the IdP organisation (SSO connection for Enterprise) → create the billing customer and subscription → allocate the data plane (pooled: insert a row; bridge: create a schema and run migrations; silo: trigger a GitOps pipeline that renders a tenant overlay and waits for health) → seed defaults → mark the tenant <code>ACTIVE</code>. Each step is idempotent and has a compensation (delete the billing customer, and so on). Pooled provisioning finishes in seconds. Silo provisioning can take tens of minutes and is tracked as a long-running operation in the console.</p>
+
+  <h3>4.6 Plan changes and entitlement propagation</h3>
+  <p>Upgrades, downgrades, add-on purchases and support overrides all change what a tenant may do, and every gateway instance must notice quickly. The control plane writes entitlement changes to PostgreSQL and publishes an <code>EntitlementsChanged{tenantId, version}</code> event on a compacted Kafka topic. Gateways keep an in-memory map of entitlements, warmed from the compacted topic on start-up and updated as events arrive, with a 60-second TTL fallback that refetches from the control plane API if an event is missed. The <code>version</code> field makes updates monotonic, so a reordered older event cannot downgrade a tenant who just upgraded. Upgrades take effect immediately. Downgrades take effect at the end of the billing period, unless they come from non-payment, in which case they are immediate and also revoke active API keys' write scopes. Support overrides (a temporary higher rate limit for a launch) are entitlement rows with an expiry, so they cannot be forgotten.</p>
+  <p>Credit balances follow the same pattern but are owned by the ledger. When a tenant buys a credit pack, the billing webhook (<code>invoice.paid</code>) is verified by signature, deduplicated by event ID, written to the ledger, and then the Redis balance is incremented. If Redis loses data, a rebuild job recomputes balances from the ledger minus unsettled consumption for the current hour.</p>
 </section>
 
 <section id="architecture">
@@ -852,6 +856,15 @@ flowchart TD
     <li><strong>Database:</strong> all pooled tables lead with <code>tenant_id</code> in indexes and partition keys. Move very large tenants to bridge (rebalancing) rather than scaling the pool vertically forever. Read replicas serve dashboards.</li>
     <li><strong>Workers:</strong> shuffle-sharded queues per tenant group, with per-tenant concurrency caps inside each worker.</li>
     <li><strong>Cost levers:</strong> prompt caching for shared system prompts (per feature, not per tenant, to maximise hits); batch API for non-interactive workflows (cheaper credits, passed on to customers as a "batch" option); semantic caching only for public, non-tenant-specific content. Never cache across tenants.</li>
+  </ul>
+
+  <h3>13.5 Disaster recovery and runbooks</h3>
+  <ul>
+    <li><strong>Gateway unavailable:</strong> app services fail fast (circuit breaker) and show a degraded state. The gateway has no persistent state of its own, so recovery means redeploying. Redis is the dependency to protect: if it is down, the gateway runs in a <em>fail-open-with-caps</em> mode for paid plans (a conservative in-memory per-pod limit) and fail-closed for Free, and emits usage events as normal so billing stays correct.</li>
+    <li><strong>Kafka unavailable:</strong> the gateway spills usage events to a local write-ahead file on a persistent volume and replays them when Kafka returns. The dedupe stage makes replays safe. Alert when the spill exceeds a size threshold.</li>
+    <li><strong>Billing provider outage:</strong> meter publishing pauses, and unpublished hours accumulate in PostgreSQL. Nothing customer-facing breaks, because enforcement uses our own ledger.</li>
+    <li><strong>Provider outage:</strong> plan-approved fallbacks are exercised monthly in a game day so they are known to work. Residency-locked tenants degrade instead of failing over across regions, and their status page entry says so.</li>
+    <li><strong>Regional loss:</strong> pooled data planes are regional by design (residency), so DR is cross-zone within a region plus point-in-time recovery from backups in a paired region of the same jurisdiction. The global control plane runs active-passive across two regions.</li>
   </ul>
 </section>
 

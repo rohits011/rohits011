@@ -235,7 +235,7 @@ sequenceDiagram
   T--&gt;&gt;S: SHIPPED / error NOT_FOUND
   S-&gt;&gt;M: history + assistant turn + ONE user message [tool_result a, tool_result b is_error]
   M--&gt;&gt;S: final text, stop_reason=end_turn
-  S--&gt;&gt;U: "ORD-1 shipped; ORD-2 was not found - please check the ID"
+  S--&gt;&gt;U: "ORD-1 shipped, ORD-2 was not found - please check the ID"
 </pre>
 <figcaption>Figure 8.8 — A tool-use round trip with two parallel calls, one of which fails.</figcaption>
 </figure>
