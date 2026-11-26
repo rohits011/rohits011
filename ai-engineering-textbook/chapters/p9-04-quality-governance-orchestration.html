@@ -54,3 +54,114 @@
   <h3>2.5 Feature stores (2017–2026)</h3>
   <p>Uber's 2017 description of Michelangelo included a shared feature store with offline and online components, popularizing the pattern. Feast was released in 2019 by Gojek with Google Cloud and is now the most widely used open-source feature store. LinkedIn open-sourced Feathr (2022) and Airbnb open-sourced Chronon (2024). Managed offerings exist on every major ML platform.</p>
 </section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 Data quality dimensions</h3>
+  <p>"The data is bad" is not actionable. Name the dimension:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Dimension</th><th>Question</th><th>Example check (TLC trips)</th></tr></thead>
+    <tbody>
+      <tr><td>Completeness</td><td>Is everything that should be there present?</td><td>No null <code>pickup_ts</code>; all 24 hours present for each day; row count within expected range</td></tr>
+      <tr><td>Validity</td><td>Do values conform to type, format, range and domain?</td><td><code>payment_type</code> in {0..6}; <code>fare_amount</code> ≥ 0; zone ids exist in the lookup</td></tr>
+      <tr><td>Uniqueness</td><td>Are entities represented once?</td><td><code>trip_id</code> unique; one current row per merchant in SCD2</td></tr>
+      <tr><td>Consistency</td><td>Do related values agree, within and across datasets?</td><td><code>total_amount ≈ fare + tip + tolls + surcharges</code>; dashboard revenue equals finance ledger</td></tr>
+      <tr><td>Timeliness (freshness)</td><td>Is the data recent enough for its use?</td><td>Latest partition loaded by 06:00; max <code>pickup_ts</code> within 2 hours of now for streaming tables</td></tr>
+      <tr><td>Accuracy</td><td>Does data reflect reality?</td><td>Sampled trips reconciled with meter records; hardest to automate, usually via reconciliation</td></tr>
+    </tbody>
+  </table></div>
+  <p>Add <strong>distributional</strong> checks (null rate, mean, quantiles, category frequencies compared with recent history) because many failures produce valid-looking but wrong data: every value in range, but the share of card payments halved overnight.</p>
+
+  <h3>3.2 Kinds of data tests</h3>
+  <ul>
+    <li><strong>Schema tests</strong>: columns, types, nullability; usually enforced by table formats, contracts or registry compatibility.</li>
+    <li><strong>Constraint tests</strong>: uniqueness, not-null, accepted values, ranges, referential integrity (relationships).</li>
+    <li><strong>Business-rule tests</strong>: cross-column logic and reconciliations (total equals sum of parts; refunds never exceed original charge).</li>
+    <li><strong>Volume and freshness tests</strong>: row counts, partition presence, max timestamp lag.</li>
+    <li><strong>Distribution / anomaly tests</strong>: statistical comparisons with history; most observability tools automate these.</li>
+    <li><strong>Unit tests for transformation logic</strong>: fixed inputs, expected outputs, run in CI without production data (dbt unit tests, pytest on PySpark functions).</li>
+  </ul>
+  <p>Severity matters: some tests should <em>block</em> publication (write-audit-publish), others should <em>warn</em>. A test suite where everything blocks becomes a suite where everything gets disabled.</p>
+
+  <h3>3.3 Data contracts</h3>
+  <p>A data contract is an agreement between a data producer and its consumers, owned by the producer, that specifies: the schema (fields, types, nullability), semantics (what each field means, units, enumerations), quality guarantees (uniqueness, ranges), service levels (freshness, availability), ownership and support channel, versioning policy and deprecation process, and sometimes classification of sensitive fields. Crucially, it is <strong>enforced at the producer</strong>: in the producing service's CI (does this change break the contract?) and at runtime (schema registry compatibility, validation before publish). It shifts responsibility left, the same way consumer-driven contract tests shift API compatibility checks into the provider's build. Formats include JSON Schema/Avro/Protobuf with metadata, dbt model contracts for warehouse tables, and specification efforts such as the Open Data Contract Standard (ODCS) under the Linux Foundation's Bitol project.</p>
+
+  <h3>3.4 Tools: Great Expectations, Soda, dbt tests</h3>
+  <p><strong>Great Expectations (GX Core)</strong> is a Python framework: you define <em>expectations</em> (<code>ExpectColumnValuesToBeBetween</code>, <code>ExpectColumnValuesToBeUnique</code>, and many more) grouped in suites, bind them to batches of data from pandas, Spark or SQL sources, and run validations that produce detailed results and HTML "Data Docs". Strong for programmable, Python-centric pipelines. <strong>Soda</strong> uses SodaCL, a YAML language of checks (<code>row_count &gt; 0</code>, <code>missing_count(col) = 0</code>, <code>freshness(ts) &lt; 2h</code>, anomaly detection) executed by Soda Core against warehouses and Spark. Strong for readable checks maintained by analysts. <strong>dbt tests</strong> are SQL queries that return failing rows: generic tests (<code>unique</code>, <code>not_null</code>, <code>accepted_values</code>, <code>relationships</code>, plus packages like dbt-utils and dbt-expectations), singular tests (custom SQL files), source freshness checks, and unit tests on model logic. Strong because tests live next to the models they protect and run in the same DAG.</p>
+
+  <h3>3.5 Data observability</h3>
+  <p>Observability for data mirrors service observability. The commonly cited pillars are <strong>freshness</strong>, <strong>volume</strong>, <strong>schema</strong> changes, <strong>distribution</strong>, and <strong>lineage</strong> (to find root cause upstream and impact downstream). Tools learn baselines from metadata and query history and alert on anomalies without hand-written tests for every table. Treat them like APM: they catch unknown unknowns; explicit tests catch known invariants. Both are needed.</p>
+
+  <h3>3.6 Data catalogs</h3>
+  <p>A catalog makes data discoverable and understandable: searchable inventory of tables, dashboards, pipelines and ML models; schemas; descriptions; owners; tags (domain, tier, PII classes); usage statistics; quality status; and lineage. Note two meanings of "catalog": the <em>technical</em> catalog that engines use to resolve table names and commit metadata (Hive Metastore, Glue, Iceberg REST, Unity, Polaris, from Chapter 9.2), and the <em>business/metadata</em> catalog for humans (DataHub, OpenMetadata, Atlan, Collibra, Unity Catalog's discovery features). Some products do both.</p>
+
+  <h3>3.7 Lineage and OpenLineage</h3>
+  <p>Lineage records which datasets and jobs produced which datasets, ideally down to columns. Uses: impact analysis (what breaks if I drop this column?), root-cause analysis (why is this dashboard wrong?), compliance (where does this PII flow?), and cost attribution. Lineage can be derived by parsing SQL, by reading query logs, or by <strong>instrumenting execution</strong>. <strong>OpenLineage</strong> is an open specification for runtime lineage: integrations in Airflow, Spark, dbt, Flink and others emit <code>RunEvent</code>s (<code>START</code>, <code>RUNNING</code>, <code>COMPLETE</code>, <code>FAIL</code>, <code>ABORT</code>) describing a <em>job</em>, a <em>run</em>, and <em>input</em> and <em>output datasets</em>, with extensible <em>facets</em> (schema, column lineage, data quality metrics, SQL, source code location). Events go to a backend such as Marquez (the reference implementation), DataHub or a commercial catalog.</p>
+
+  <h3>3.8 PII classification</h3>
+  <p>You cannot protect what you have not labelled. Classify columns by sensitivity: direct identifiers (name, email, phone, government id), quasi-identifiers (zip code, birth date, precise location: combinations re-identify people), sensitive categories (health, biometrics, ethnicity, financial account numbers), and non-personal data. Classification combines declaration (producers tag fields in contracts), automated scanning (pattern and ML-based detectors over samples), and review. Tags propagate through lineage: a column derived from <code>email</code> inherits the PII tag. Location data deserves special care: precise coordinates combined with timestamps are highly re-identifying, because few people share the same home-to-work trip pattern. Recent TLC trip records contain taxi-zone ids rather than coordinates, which is a much safer granularity for a public dataset.</p>
+
+  <h3>3.9 Access control</h3>
+  <ul>
+    <li><strong>RBAC</strong>: grant privileges on catalogs, schemas, tables to roles (analyst, finance, data-eng). Simple, but explodes in large organizations.</li>
+    <li><strong>ABAC / tag-based policies</strong>: policies keyed on tags ("columns tagged <code>pii:email</code> are masked unless the user has attribute <code>pii_access=true</code> and purpose <code>support</code>"). Scales because new tables inherit protection by tagging.</li>
+    <li><strong>Column masking</strong>: dynamic masking functions return redacted, hashed or partial values based on the caller.</li>
+    <li><strong>Row-level security</strong>: filters applied per user (a regional manager sees only their region's rows). Postgres RLS, Snowflake row access policies, BigQuery row-level security, Unity Catalog row filters.</li>
+    <li><strong>Pseudonymization and tokenization</strong>: replace identifiers with stable tokens so joins still work; the mapping lives in a separately secured vault.</li>
+    <li><strong>Purpose and audit</strong>: log every access to sensitive data; review grants periodically.</li>
+  </ul>
+
+  <h3>3.10 GDPR, retention and deletion</h3>
+  <p>Key engineering implications (this is not legal advice): <strong>data minimization</strong> (collect and keep only what a purpose needs), <strong>purpose limitation</strong>, <strong>storage limitation</strong> (retention periods per dataset, enforced automatically), <strong>right of access</strong> (find all data about a subject), and <strong>right to erasure</strong> (delete it, including in derived datasets, backups within a reasonable time, and lakehouse snapshots). Erasure in a lakehouse means a row-level delete <em>and</em> snapshot expiry and file compaction so the bytes are physically gone. Designs that help: keep personal data in few, well-known tables keyed by subject id; reference subjects by pseudonymous ids elsewhere; or use <em>crypto-shredding</em> (encrypt each subject's data with a per-subject key and delete the key).</p>
+
+  <h3>3.11 Feature stores</h3>
+  <p>A <strong>feature</strong> is an input signal to a model ("zone's trip count in the last hour", "rider's average tip ratio over 30 days"). A feature store manages feature definitions and their data across the ML lifecycle:</p>
+  <ul>
+    <li><strong>Offline store</strong>: full history of feature values with timestamps, in the lakehouse or warehouse, used to build training datasets and batch scoring.</li>
+    <li><strong>Online store</strong>: latest feature values per entity in a low-latency key-value store (Redis, DynamoDB, Cassandra, Bigtable), read by serving systems at prediction time in milliseconds.</li>
+    <li><strong>Registry</strong>: definitions (entities, sources, transformations, TTLs, owners), versioned in Git.</li>
+    <li><strong>Materialization</strong>: jobs that compute or copy feature values from offline sources into the online store (batch), or stream processors that write fresh values continuously.</li>
+    <li><strong>Serving APIs</strong>: point-in-time historical retrieval for training; online lookup for inference.</li>
+  </ul>
+  <p>The two problems it exists to solve are <strong>training-serving skew</strong> (the same feature computed differently in the training notebook and the production service) and <strong>point-in-time correctness</strong>.</p>
+
+  <h3>3.12 Point-in-time correctness</h3>
+  <p>To train a model that predicts at time <em>t</em>, each training example must use feature values <em>as they were known at t</em>. Joining labels to the latest feature values leaks future information: a churn model trained with "support tickets in last 30 days" computed today, for customers labelled 6 months ago, includes tickets filed after the prediction point, often the very tickets caused by the churn. Offline metrics look superb; production performance collapses. The correct operation is an <strong>as-of join</strong> (point-in-time join): for each (entity, timestamp) in the label table, take the most recent feature row with <code>feature_ts &lt;= label_ts</code> (and within a TTL so stale values are treated as missing). Feature stores implement this for you; you can also write it with <code>ASOF JOIN</code> in DuckDB, window functions, or pandas <code>merge_asof</code>.</p>
+
+  <h3>3.13 Orchestration concepts</h3>
+  <p>An orchestrator schedules and coordinates units of work with dependencies. Core concepts: <strong>DAG</strong> (tasks plus dependency edges, no cycles); <strong>schedule</strong> (time-based, data-aware, or event-driven); <strong>logical date / data interval</strong> (the period of data a run is responsible for, distinct from wall-clock start time); <strong>retries</strong> with backoff; <strong>timeouts and SLAs</strong>; <strong>backfill</strong> (run past intervals); <strong>catchup</strong> (whether missed intervals run automatically); <strong>idempotency</strong> (every task safe to rerun for its interval); <strong>concurrency limits</strong> (pools, max active runs); <strong>sensors</strong> (wait for an external condition); and <strong>observability</strong> (run history, logs, alerts). An orchestrator should coordinate work, not do heavy work itself: tasks should call Spark, dbt, a warehouse or a Kubernetes pod.</p>
+
+  <h3>3.14 Airflow concepts</h3>
+  <ul>
+    <li><strong>DAG</strong>: a Python file defining tasks and dependencies; parsed repeatedly by the DAG processor.</li>
+    <li><strong>Operators</strong> (templates for tasks: <code>BashOperator</code>, <code>KubernetesPodOperator</code>, provider operators for Spark, Snowflake, BigQuery, dbt), <strong>TaskFlow</strong> functions decorated with <code>@task</code>, and <strong>sensors</strong> (tasks that wait for a condition).</li>
+    <li><strong>DAG run</strong> and <strong>task instance</strong>: one execution of a DAG for a logical date, and one execution of a task within it, with states (scheduled, queued, running, success, failed, up_for_retry, skipped, deferred...).</li>
+    <li><strong>XCom</strong>: small metadata passed between tasks (ids, paths), not datasets.</li>
+    <li><strong>Assets</strong> (Airflow 3; "datasets" in 2.x): logical data objects that tasks declare as outlets; DAGs can be scheduled when assets are updated, giving data-aware scheduling across teams.</li>
+    <li><strong>Deferrable operators and the triggerer</strong>: a waiting task releases its worker slot and hands an async trigger to the triggerer process, resuming when the condition fires; essential for sensors at scale.</li>
+    <li><strong>Pools</strong> and <strong>priority weights</strong>: limit concurrent use of shared resources (a warehouse, an API).</li>
+    <li><strong>Connections and variables</strong>: externalized configuration, ideally backed by a secrets manager.</li>
+    <li><strong>Dynamic task mapping</strong>: create N task instances at runtime from a list (one per partition or file).</li>
+  </ul>
+
+  <h3>3.15 dbt concepts</h3>
+  <ul>
+    <li><strong>Model</strong>: a <code>.sql</code> file containing a <code>SELECT</code>; dbt wraps it in DDL according to its materialization.</li>
+    <li><strong><code>ref()</code> and <code>source()</code></strong>: reference other models and declared raw tables; dbt builds the dependency DAG from these calls and resolves environment-specific names (dev schema vs prod).</li>
+    <li><strong>Materializations</strong>: <code>view</code>, <code>table</code>, <code>incremental</code> (insert or merge only new/changed rows), <code>ephemeral</code> (inlined as a CTE), <code>materialized_view</code>, plus snapshots.</li>
+    <li><strong>Tests</strong>: generic and singular data tests; unit tests on logic; source freshness.</li>
+    <li><strong>Snapshots</strong>: SCD Type 2 tables built by comparing source rows over time (timestamp or check strategy).</li>
+    <li><strong>Seeds</strong>: small CSVs versioned in the repo (mapping tables).</li>
+    <li><strong>Macros</strong> and <strong>packages</strong>: reusable Jinja/SQL.</li>
+    <li><strong>Contracts, versions and access</strong>: enforce a model's column names and types at build time; publish versioned models; mark models <code>public</code>/<code>protected</code>/<code>private</code> for cross-project use.</li>
+    <li><strong>Exposures</strong> and <strong>semantic layer</strong>: declare downstream dashboards; define metrics once (MetricFlow) for consistent consumption.</li>
+    <li><strong>Selectors and state</strong>: <code>dbt build --select state:modified+</code> builds only changed models and their descendants in CI ("slim CI").</li>
+  </ul>
+
+  <h3>3.16 Analytics engineering</h3>
+  <p>Analytics engineering is the practice of building and maintaining the transformed, tested, documented analytical data layer, usually in SQL with dbt, sitting between data engineering (raw data platform and pipelines) and analysis (data scientists and analysts). A typical layering: <em>staging</em> models (one per source table: rename, cast, light cleanup, no joins), <em>intermediate</em> models (reusable joins and business logic), and <em>marts</em> (facts and dimensions for a business domain, plus metric definitions). The analytics engineer owns the meaning of business entities and metrics, their tests, and their documentation.</p>
+
+  <h3>3.17 Dagster and Prefect</h3>
+  <p><strong>Dagster</strong> is asset-centric: you declare <em>software-defined assets</em> (a table, a model, a file) as Python functions with their upstream assets, and Dagster derives the graph, tracks materializations, partitions, freshness policies and lineage, and integrates deeply with dbt (each dbt model becomes an asset). It suits teams who think in terms of datasets rather than tasks. <strong>Prefect</strong> is flow-centric and Pythonic: decorate functions as <code>@flow</code> and <code>@task</code>, run them anywhere, with dynamic control flow, retries, caching, and a server or cloud API that coordinates work pools and workers. It suits dynamic, code-heavy workflows and teams that want minimal framework. Airflow remains the most widely deployed, with the largest provider ecosystem and managed offerings (Amazon MWAA, Google Cloud Composer, Astronomer).</p>
+</section>

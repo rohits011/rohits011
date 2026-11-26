@@ -1,0 +1,1669 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLAlchemy, Database Integration, Celery &amp; Task Queues — AI-Era Software Engineering</title>
+<meta name="description" content="SQLAlchemy 2.x Core and ORM internals (unit of work, identity map, session lifecycle, async engine, loading strategies, Alembic) compared with JPA/Hibernate, and background processing with FastAPI BackgroundTasks, Celery, and alternatives, beginning a production document-ingestion service.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p4-03-data-access-background-jobs" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 4 · Chapter 3</p>
+  <h1>SQLAlchemy, Database Integration, Celery &amp; Task Queues</h1>
+  <p class="lede">Persistence and asynchronous work are where Python services earn or lose their reliability. This chapter maps everything you know about JPA, Hibernate, Spring Data, Flyway and Spring's <code>@Async</code>/Kafka listeners onto SQLAlchemy 2.x, Alembic, Celery and its alternatives, then starts building <strong>docflow</strong>, a production-grade document-ingestion service for RAG pipelines that a Spring Boot estate can call.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Chapters 4.1–4.2; JPA/Hibernate (persistence context, flush modes, fetch types), Spring transactions, a message broker (RabbitMQ or Kafka).</li>
+    <li><strong>You will be able to:</strong> explain SQLAlchemy's unit of work and identity map; manage session lifecycles in sync, async and worker contexts; eliminate N+1 queries with the right loading strategy; write safe Alembic migrations; design Celery tasks that are idempotent, retry correctly and survive worker crashes; choose between Celery, RQ, Dramatiq, arq and Temporal; and lay out a real service's persistence and job layers.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: The Persistence Context and the Job Queue, Python Edition</h2>
+  <p>In Spring, <code>@Transactional</code> on a service method silently opens an <code>EntityManager</code>, binds it to the thread, flushes dirty entities on commit and closes everything afterwards. Background work is <code>@Async</code> on a thread pool, a <code>@KafkaListener</code>, or Spring Batch. You probably rarely think about the mechanics.</p>
+  <p>In Python you must think about them, because nothing is bound to the thread for you. SQLAlchemy has the same core ideas as Hibernate (a <em>Session</em> is a persistence context with a unit of work and an identity map), but its lifecycle is explicit: you create a session, use it inside a transaction block, and close it. In async code, the session cannot lazily load, so every relationship you touch must be loaded deliberately. Background jobs run in separate worker processes (Celery), so anything you pass to them is serialised, executed later, possibly more than once, on a different machine. Those three facts (explicit session, no implicit lazy I/O in async, at-least-once remote jobs) drive the design of every production Python data service.</p>
+  <p>For AI systems the stakes are concrete. A RAG ingestion pipeline receives documents, stores metadata, extracts text, chunks it, calls an embedding model and writes vectors. Each step can fail, take minutes and be expensive (embedding API costs). Getting idempotency, retries and transactional boundaries right is what separates a pipeline that silently double-bills your embedding provider from one that you can safely re-run.</p>
+
+<div class="bridge">
+  <h4>Bridging from Java &amp; Spring Boot</h4>
+  <dl>
+    <dt>What you already know</dt><dd>JPA entities, <code>EntityManager</code>/Hibernate <code>Session</code>, first-level cache, dirty checking, flush on commit, <code>FetchType.LAZY</code> vs <code>EAGER</code>, <code>JOIN FETCH</code> and entity graphs, Spring Data repositories, <code>@Transactional</code> propagation, HikariCP, Flyway/Liquibase migrations; <code>@Async</code>, <code>@Scheduled</code>, Spring Kafka/AMQP listeners with retry and DLQ, Spring Batch, maybe Temporal or Quartz.</dd>
+    <dt>Why that is not enough</dt><dd>Python has no thread-bound transaction manager or proxy-based <code>@Transactional</code>; async sessions cannot lazy-load (touching an unloaded attribute raises instead of querying); and Celery's default acknowledgement and serialisation semantics differ from Spring Kafka/AMQP listeners in ways that lose or duplicate work if you assume Java defaults.</dd>
+    <dt>The modern approach</dt><dd>SQLAlchemy 2.x with the unified <code>select()</code> API, typed <code>Mapped[...]</code> models, explicit <code>async with session.begin()</code> transaction blocks, eager loading via <code>selectinload</code>/<code>joinedload</code>, <code>lazy="raise"</code> to make N+1 impossible, Alembic for migrations; Celery (or a lighter queue) with <code>acks_late</code>, idempotent tasks, bounded retries with backoff and a transactional outbox for events.</dd>
+    <dt>Where Python and Go fit</dt><dd>Go favours thin data access (<code>database/sql</code>, pgx, sqlc) and explicit transactions; there is no mainstream Hibernate-style ORM culture. Python sits closer to Java: a powerful ORM is the default, with a SQL-expression layer (Core) beneath it for when you need control.</dd>
+    <dt>In production</dt><dd>FastAPI web workers use an async engine with a small pool per process; Celery workers use a sync engine; PgBouncer often sits in front of PostgreSQL; Alembic migrations run as a separate deployment step; Redis or RabbitMQ is the broker; long multi-step workflows move to Temporal.</dd>
+    <dt>Use it when / avoid it when</dt><dd>Use the ORM for transactional domain logic with object graphs; use Core or raw SQL for bulk loads, analytics and hot paths. Use Celery for fire-and-forget or retryable background jobs; avoid it for multi-day workflows with human steps or complex compensation (use Temporal) and for simple in-request follow-ups (use BackgroundTasks).</dd>
+  </dl>
+</div>
+  <div class="callout note"><p class="callout-title">Versions used</p><p><span class="tag version">Version-sensitive · checked Nov 2026</span> SQLAlchemy 2.1 (the 2.0 API style is unchanged; 2.1 final shipped in autumn 2026 and code here also runs on 2.0), Alembic 1.x, psycopg 3 / asyncpg, Celery 5.x, Redis 7+. The service targets Python 3.12+.</p></div>
+</section>
+
+<section id="history">
+  <h2>2. History</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Year</th><th>Event</th><th>Relevance</th></tr></thead>
+    <tbody>
+      <tr><td>2001</td><td>Hibernate started (Gavin King)</td><td>The reference ORM design SQLAlchemy is often compared to.</td></tr>
+      <tr><td>2003</td><td>Martin Fowler's <em>Patterns of Enterprise Application Architecture</em></td><td>Names the Unit of Work, Identity Map and Data Mapper patterns SQLAlchemy implements.</td></tr>
+      <tr><td>2006</td><td>SQLAlchemy 0.1 (Mike Bayer)</td><td>Data-mapper ORM on top of a SQL expression language, unlike Django's active record.</td></tr>
+      <tr><td>2006</td><td>JPA 1.0 (Java EE 5)</td><td>Standardises Hibernate's ideas in Java.</td></tr>
+      <tr><td>2009</td><td>Celery first released (Ask Solem)</td><td>Distributed task queue for Django, later framework-agnostic.</td></tr>
+      <tr><td>2011</td><td>Alembic released</td><td>Migration tool by the SQLAlchemy author; the Flyway/Liquibase of Python.</td></tr>
+      <tr><td>2011–2012</td><td>RQ (Redis Queue) released</td><td>Simpler Redis-only alternative to Celery.</td></tr>
+      <tr><td>2016</td><td>asyncpg released (MagicStack)</td><td>High-performance async PostgreSQL driver.</td></tr>
+      <tr><td>2016–2017</td><td>Dramatiq released</td><td>Celery alternative focused on reliability defaults.</td></tr>
+      <tr><td>2019–2020</td><td>Temporal forked from Uber's Cadence; Python SDK GA in 2023</td><td>Durable workflow execution beyond task queues.</td></tr>
+      <tr><td>2021</td><td>psycopg 3 released; SQLAlchemy 1.4 introduces asyncio support and 2.0-style API</td><td>Async and sync from one driver; migration path to 2.0.</td></tr>
+      <tr><td>2023</td><td>SQLAlchemy 2.0 (January): typed <code>Mapped[]</code>, unified <code>select()</code></td><td>The "modern SQLAlchemy" this chapter uses.</td></tr>
+      <tr><td>2026</td><td>SQLAlchemy 2.1 final</td><td>Incremental improvements; 2.0 idioms remain current.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Python went through the same ORM debate as Java (active record vs data mapper; Django ORM vs SQLAlchemy is roughly Rails-style vs Hibernate-style). Background jobs evolved from cron scripts to Celery to durable workflow engines, mirroring Java's path from Quartz and JMS listeners to Spring Batch and Temporal.</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+  <h3>3.1 Two layers: Core and ORM</h3>
+  <p><strong>SQLAlchemy Core</strong> is a SQL expression language plus connection/transaction management: you build <code>select(users.c.id).where(users.c.email == x)</code> and execute it on a <code>Connection</code>, getting rows back. It is comparable to jOOQ or Spring's <code>JdbcClient</code> with a type-aware query builder. <strong>The ORM</strong> maps classes to tables and adds the Session, unit of work, identity map, relationships and loading strategies: comparable to Hibernate. In 2.x both share one <code>select()</code> construct; the ORM simply accepts entity classes in it.</p>
+  <h3>3.2 Engine, connection pool and dialect</h3>
+  <p>An <code>Engine</code> owns a connection pool (<code>QueuePool</code> by default: <code>pool_size=5</code>, <code>max_overflow=10</code>) and a dialect/driver pair (<code>postgresql+psycopg</code>, <code>postgresql+asyncpg</code>). It is a process-wide singleton, like a <code>DataSource</code> backed by HikariCP. Pools are per process: with 8 Gunicorn workers and <code>pool_size=10</code> you hold up to 80 connections per pod (plus overflow). Key settings: <code>pool_pre_ping=True</code> (validate on checkout, like Hikari's connection test), <code>pool_recycle</code> (close connections older than N seconds, to beat idle-killing firewalls), <code>pool_timeout</code>.</p>
+  <h3>3.3 The Session as persistence context</h3>
+  <p>A <code>Session</code> is the equivalent of a JPA <code>EntityManager</code>: it holds an <em>identity map</em> (one Python object per primary key within the session, so loading the same row twice returns the same object) and tracks object states: <em>transient</em> (new, not added), <em>pending</em> (added, not flushed), <em>persistent</em> (in the identity map with a row), <em>detached</em> (session closed), <em>deleted</em>. At flush, the <em>unit of work</em> computes the minimal ordered set of INSERT/UPDATE/DELETE statements from the changes, topologically sorted by foreign-key dependencies.</p>
+  <h3>3.4 Transactions and autobegin</h3>
+  <p>In 2.x a session <em>autobegins</em> a transaction at first use and keeps it open until <code>commit()</code>, <code>rollback()</code> or <code>close()</code>. The idiomatic pattern is a context manager: <code>with Session(engine) as s, s.begin(): ...</code> commits on success and rolls back on exception, like a programmatic <code>TransactionTemplate</code>. There is no propagation model (<code>REQUIRES_NEW</code> etc.); you pass sessions explicitly or use nested savepoints with <code>session.begin_nested()</code>.</p>
+  <h3>3.5 Flush vs commit, and expire_on_commit</h3>
+  <p><em>Flush</em> sends pending SQL to the database inside the open transaction (autoflush happens before queries, like Hibernate's <code>FlushMode.AUTO</code>). <em>Commit</em> flushes and commits. After commit, by default every object is <em>expired</em>: the next attribute access reloads it from the database. That is safe in sync code but fatal in async code (the reload would be implicit I/O), which is why async sessions are created with <code>expire_on_commit=False</code>.</p>
+  <h3>3.6 Relationship loading strategies</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Strategy</th><th>SQL issued</th><th>Hibernate analogue</th><th>Use for</th></tr></thead>
+    <tbody>
+      <tr><td><code>lazy="select"</code> (default)</td><td>One SELECT per access, per parent</td><td><code>FetchType.LAZY</code></td><td>Rarely-accessed relations in sync code</td></tr>
+      <tr><td><code>joinedload</code></td><td>LEFT OUTER JOIN in the same query</td><td><code>JOIN FETCH</code></td><td>Many-to-one / one-to-one</td></tr>
+      <tr><td><code>selectinload</code></td><td>Second query: <code>WHERE parent_id IN (...)</code></td><td><code>@BatchSize</code> / <code>SUBSELECT</code></td><td>One-to-many collections (default choice)</td></tr>
+      <tr><td><code>subqueryload</code></td><td>Second query re-running the original as subquery</td><td>Subselect fetching</td><td>Legacy; prefer selectinload</td></tr>
+      <tr><td><code>raiseload</code> / <code>lazy="raise"</code></td><td>Raises on access</td><td>No direct analogue (closest: failing on lazy init outside session)</td><td>Make N+1 impossible; mandatory in async</td></tr>
+      <tr><td><code>write_only</code></td><td>Never loads; query explicitly</td><td>Not mapping the collection</td><td>Huge collections (millions of chunks)</td></tr>
+    </tbody>
+  </table></div>
+  <h3>3.7 Async SQLAlchemy</h3>
+  <p><code>create_async_engine</code> and <code>AsyncSession</code> wrap the sync machinery using greenlets: the ORM code is still synchronous internally, and when it needs I/O it switches (via <code>greenlet</code>) to the event loop to await the async driver. Implicit I/O (lazy loads, expired attribute refresh) cannot be awaited from attribute access, so it raises <code>MissingGreenlet</code>. Rules: eager-load what you need; set <code>expire_on_commit=False</code>; use <code>AsyncAttrs</code> and <code>await obj.awaitable_attrs.children</code> for explicit lazy loads; never share an <code>AsyncSession</code> between concurrent tasks (a session is not concurrency-safe, just as an <code>EntityManager</code> is not thread-safe).</p>
+  <h3>3.8 Alembic migrations</h3>
+  <p>Alembic keeps an ordered graph of revision scripts (each with <code>upgrade()</code>/<code>downgrade()</code>) and records the current revision in an <code>alembic_version</code> table, like Flyway's <code>flyway_schema_history</code>. <code>alembic revision --autogenerate</code> diffs model metadata against the database to draft a migration (always review it: it misses renames, some constraint changes and data migrations). Revisions form a DAG with branch merging, useful when two feature branches each add a migration.</p>
+  <h3>3.9 Background processing vocabulary</h3>
+  <ul>
+    <li><strong>Broker</strong>: transports task messages (RabbitMQ, Redis, SQS). Equivalent to the JMS/AMQP broker.</li>
+    <li><strong>Worker</strong>: a process that consumes messages and executes tasks, with a <em>pool</em> (prefork processes, threads, gevent greenlets, or solo).</li>
+    <li><strong>Result backend</strong>: optional store for task state and return values (Redis, database). Often unnecessary; prefer writing results to your own tables.</li>
+    <li><strong>Acknowledgement</strong>: early ack (on receipt; Celery default: at-most-once) vs late ack (after execution; at-least-once). Spring AMQP's default <code>AUTO</code> ack mode acknowledges after the listener returns, i.e. late.</li>
+    <li><strong>Visibility timeout</strong>: for Redis and SQS brokers, how long an unacknowledged message stays invisible before being redelivered. Tasks longer than it get executed twice.</li>
+    <li><strong>Idempotency</strong>: executing the same task twice produces the same effect as once. Mandatory with at-least-once delivery.</li>
+    <li><strong>Prefetch</strong>: how many messages a worker reserves in advance (<code>worker_prefetch_multiplier</code>, default 4 per process), like Spring AMQP's <code>prefetchCount</code>.</li>
+  </ul>
+  <h3>3.10 The spectrum of background work</h3>
+  <ol>
+    <li><strong>In-process after response</strong>: FastAPI <code>BackgroundTasks</code>; lost on crash; for best-effort follow-ups (send a notification, warm a cache).</li>
+    <li><strong>Task queue</strong>: Celery, RQ, Dramatiq, arq; durable messages, retries, separate workers.</li>
+    <li><strong>Log-based streaming</strong>: Kafka consumers; replayable, ordered per partition; for event-driven integration with the Spring estate.</li>
+    <li><strong>Durable workflows</strong>: Temporal; persisted execution history, timers, signals, compensation; for long multi-step processes.</li>
+  </ol>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working</h2>
+  <h3>4.1 What happens on <code>session.get()</code> and <code>session.execute(select(...))</code></h3>
+  <ol>
+    <li><code>session.get(Document, id)</code> first checks the identity map keyed by <code>(Document, (id,), None)</code>. Hit: return the object without SQL (Hibernate's first-level cache does the same for <code>find()</code>).</li>
+    <li>Miss or a query: the session autobegins a transaction, checks a connection out of the engine's pool, and (autoflush) flushes pending changes so the query sees them.</li>
+    <li>The statement is compiled for the dialect. Compiled forms are cached in the engine's LRU compiled cache keyed by the statement's structure, so repeated queries skip compilation (SQLAlchemy's equivalent of a prepared-statement cache at the Python level).</li>
+    <li>Rows come back; the ORM's loading machinery looks up each primary key in the identity map. Existing objects are returned as-is (their unflushed in-memory changes are <em>not</em> overwritten, unless <code>populate_existing</code> is requested); new ones are instantiated without calling <code>__init__</code> and registered.</li>
+    <li>Eager loaders run: <code>joinedload</code> data was in the same rows; <code>selectinload</code> issues a follow-up <code>IN</code> query, chunked (500 keys per batch by default).</li>
+  </ol>
+
+  <h3>4.2 Dirty checking and flush</h3>
+  <p>SQLAlchemy instruments mapped attributes with descriptors. Setting <code>doc.status = "READY"</code> records the change in the object's <code>InstanceState</code> (old value history) immediately, so dirty checking at flush only examines objects that were actually modified: cheaper than Hibernate's default snapshot comparison of every managed entity (Hibernate's bytecode enhancement gives similar tracking). On flush the unit of work:</p>
+  <ol>
+    <li>Collects new, dirty and deleted objects.</li>
+    <li>Builds a dependency graph between mappers (a <code>Chunk</code> row needs its <code>Document</code> row first) and topologically sorts it.</li>
+    <li>Batches INSERTs per table using <code>executemany</code> and, on PostgreSQL, the "insertmanyvalues" feature (multi-row <code>INSERT ... VALUES (...), (...) RETURNING id</code>), which fetches server-generated keys in bulk. This avoids Hibernate's classic problem where <code>IDENTITY</code> generation disables batch inserts.</li>
+    <li>Emits UPDATEs with only changed columns, optionally with a version column check (<code>version_id_col</code>, like <code>@Version</code>) raising <code>StaleDataError</code> on conflicts.</li>
+    <li>Emits DELETEs in reverse dependency order, handling cascades configured on relationships.</li>
+  </ol>
+
+  <h3>4.3 The async bridge: greenlets</h3>
+  <p>The ORM was not rewritten for async. Instead, <code>AsyncSession.execute()</code> runs the sync <code>Session.execute()</code> inside a greenlet via <code>greenlet_spawn</code>. When the sync code reaches the driver's <code>cursor.execute()</code>, SQLAlchemy's adapter for asyncpg/psycopg-async calls <code>await_only(coro)</code>, which switches from the greenlet back to the parent coroutine, which awaits the real driver coroutine on the event loop, then switches back with the result. From outside it is ordinary <code>await</code>; inside, the ORM logic is unchanged. Attribute access that triggers a lazy load happens outside any greenlet context, so <code>await_only</code> cannot switch and raises <code>MissingGreenlet</code>. That error is your "LazyInitializationException", raised earlier and more predictably.</p>
+
+  <h3>4.4 Connection pool mechanics per process</h3>
+  <p><code>QueuePool</code> holds idle connections in a LIFO queue (recently used connections first, which lets idle ones expire). Checkout: pop or create (if below <code>pool_size + max_overflow</code>), else wait up to <code>pool_timeout</code> then raise <code>TimeoutError</code>. On checkin, a rollback is issued ("reset on return") to clear transaction state. For async engines the pool is the same class with an async adaptation. After <code>fork()</code>, a child must not reuse the parent's connections (they share the same socket); call <code>engine.dispose(close=False)</code> in the child, which Celery and Gunicorn hooks make easy.</p>
+
+  <h3>4.5 Celery's message lifecycle</h3>
+  <ol>
+    <li><code>ingest_document.delay(doc_id)</code> serialises a message (JSON by default since Celery 4; never enable pickle with untrusted brokers) with headers: task name, id (UUID), retries, ETA, root/parent IDs. Kombu publishes it to the broker exchange/queue (with Redis: an <code>LPUSH</code> to a list).</li>
+    <li>A worker's consumer (in the main process) fetches up to <code>prefetch_multiplier x concurrency</code> messages. With Redis transport, fetched-but-unacked messages are tracked in an "unacked" sorted set with a timestamp; if not acked within <code>visibility_timeout</code> (default 1 hour), they are restored to the queue for redelivery.</li>
+    <li>The main process dispatches the task to a pool child (prefork) via pipes.</li>
+    <li>With default <code>acks_late=False</code>, the message is acknowledged <em>when execution starts</em>: if the child or machine dies mid-task, the task is lost (at-most-once). With <code>acks_late=True</code>, ack happens after completion (at-least-once); combined with <code>task_reject_on_worker_lost=True</code>, a killed child causes requeue.</li>
+    <li>On exception, <code>self.retry(exc=e, countdown=...)</code> publishes a <em>new</em> message with incremented retry count and an ETA, then raises <code>Retry</code> so the current one is acked. <code>autoretry_for</code> with <code>retry_backoff</code> and <code>retry_jitter</code> automates exponential backoff.</li>
+    <li>If a result backend is configured, state transitions (STARTED if tracked, SUCCESS, FAILURE, RETRY) are written there.</li>
+  </ol>
+  <div class="callout danger"><p class="callout-title">ETA tasks and visibility timeout</p><p>With Redis or SQS, a task scheduled with <code>countdown</code>/<code>eta</code> further in the future than <code>visibility_timeout</code> is held by the worker unacked; when the timeout expires it is redelivered to another worker, which also holds it. Result: duplicated executions. Keep ETAs short, raise <code>visibility_timeout</code> above your longest ETA plus task runtime, or use RabbitMQ (which redelivers only on connection loss), or schedule long delays elsewhere (database plus beat, or Temporal timers).</p></div>
+
+  <h3>4.6 Prefork pool and process recycling</h3>
+  <p>The prefork pool forks N children from the main worker process (CoW memory sharing; see Chapter 4.1). <code>worker_max_tasks_per_child</code> and <code>worker_max_memory_per_child</code> recycle children, which is the standard defence against fragmentation and leaky native libraries. Per-process resources (DB engines, HTTP clients, model weights) must be initialised in <code>worker_process_init</code>, never at import time in the parent if they hold sockets or threads.</p>
+
+  <h3>4.7 Alembic upgrade internals</h3>
+  <p><code>alembic upgrade head</code> loads <code>env.py</code>, which configures an engine and <code>target_metadata</code>; reads the current revision from <code>alembic_version</code>; walks the revision DAG to <code>head</code>; and runs each script's <code>upgrade()</code> inside a transaction (PostgreSQL supports transactional DDL, so a failed migration rolls back cleanly; MySQL does not). Operations such as <code>CREATE INDEX CONCURRENTLY</code> cannot run in a transaction and need <code>with op.get_context().autocommit_block():</code>.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture</h2>
+  <figure class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --&gt; Transient: Document()
+  Transient --&gt; Pending: session.add()
+  Pending --&gt; Persistent: flush (INSERT)
+  Persistent --&gt; Persistent: attribute change, flush (UPDATE)
+  Persistent --&gt; Deleted: session.delete() + flush
+  Persistent --&gt; Detached: session.close() or expunge
+  Detached --&gt; Persistent: session.merge() or add()
+  Deleted --&gt; Detached: commit
+  Pending --&gt; Transient: rollback
+</pre>
+  <figcaption>Figure 4.3.1 — ORM object states (compare with JPA's new/managed/detached/removed).</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the states map one-to-one to JPA: transient/new, persistent/managed, detached/detached, deleted/removed; "pending" is the extra state between <code>add()</code> and flush. <code>merge()</code> works like JPA's <code>merge()</code>, copying state onto a persistent instance and returning that instance, not the argument.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant API as FastAPI handler
+  participant AS as AsyncSession
+  participant G as greenlet bridge
+  participant P as Pool
+  participant PG as PostgreSQL
+  API-&gt;&gt;AS: async with session.begin()
+  API-&gt;&gt;AS: await session.execute(select(Document).options(selectinload(Document.chunks)))
+  AS-&gt;&gt;G: greenlet_spawn(sync Session.execute)
+  G-&gt;&gt;P: checkout connection
+  G-&gt;&gt;PG: SELECT documents ... (await via asyncpg)
+  G-&gt;&gt;PG: SELECT chunks WHERE document_id IN (...)
+  G--&gt;&gt;AS: ORM objects, identity map populated
+  API-&gt;&gt;AS: doc.status = "READY"
+  API-&gt;&gt;AS: exit block: commit
+  AS-&gt;&gt;PG: UPDATE documents SET status then COMMIT
+  AS-&gt;&gt;P: checkin (reset)
+</pre>
+  <figcaption>Figure 4.3.2 — An async ORM request with eager loading and a commit.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> two SELECTs, regardless of how many documents are returned, because <code>selectinload</code> batches the children. The greenlet bridge is invisible to the handler. The connection is held for the whole <code>begin()</code> block, so do not perform slow non-database awaits (LLM calls) inside a transaction: you would pin a pooled connection for seconds, the Python equivalent of a long <code>@Transactional</code> method calling a remote API.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph Web["FastAPI pods"]
+    A["POST /documents"] --&gt; DB1[("PostgreSQL")]
+    A --&gt; OB["outbox row (same tx)"]
+  end
+  OB --&gt; REL["Outbox relay"]
+  REL --&gt; BR[("Redis / RabbitMQ broker")]
+  BR --&gt; W1["Celery worker: extract"]
+  BR --&gt; W2["Celery worker: embed"]
+  W1 --&gt; S3[("Object storage")]
+  W1 --&gt; BR
+  W2 --&gt; EMB["Embedding model API"]
+  W2 --&gt; VDB[("pgvector")]
+  W2 --&gt; K[("Kafka: document.ingested")]
+  K --&gt; SB["Spring Boot consumers"]
+</pre>
+  <figcaption>Figure 4.3.3 — docflow architecture: API, outbox, Celery pipeline and events to the Spring estate.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the API never calls the broker inside its database transaction; it writes the document row and an outbox row atomically, and a relay publishes tasks. This avoids the dual-write problem (row committed but task lost, or task sent but row rolled back). Extraction and embedding are separate task types on separate queues so that slow, expensive embedding calls can be scaled and rate-limited independently. The final <code>document.ingested</code> event goes to Kafka for Java consumers (Chapter 4.4 covers the integration).</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant B as Broker
+  participant M as Worker main process
+  participant C as Pool child
+  participant DB as PostgreSQL
+  B-&gt;&gt;M: deliver task (prefetched, unacked)
+  M-&gt;&gt;C: execute ingest(doc_id)
+  C-&gt;&gt;DB: SELECT ... FOR UPDATE SKIP LOCKED / check status
+  alt already processed
+    C--&gt;&gt;M: return (idempotent no-op)
+  else work needed
+    C-&gt;&gt;DB: do work, update status in tx
+    C--&gt;&gt;M: success
+  end
+  M-&gt;&gt;B: ack (acks_late)
+  Note over C,B: child killed before ack: message redelivered, idempotency check absorbs the duplicate
+</pre>
+  <figcaption>Figure 4.3.4 — At-least-once execution with late acks and an idempotency check.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the only safe assumption with <code>acks_late</code> is that a task may run twice. The task first checks durable state (has this document version already been embedded?) and exits early if so. This is identical to designing an idempotent Kafka consumer in Spring.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+erDiagram
+  DOCUMENT ||--o{ CHUNK : has
+  DOCUMENT ||--o{ INGEST_JOB : tracked_by
+  OUTBOX }o--|| DOCUMENT : about
+  DOCUMENT {
+    uuid id PK
+    string tenant_id
+    string source_uri
+    string content_sha256
+    string status
+    int version
+    timestamptz created_at
+  }
+  CHUNK {
+    bigint id PK
+    uuid document_id FK
+    int ordinal
+    text content
+    vector embedding
+  }
+  INGEST_JOB {
+    uuid id PK
+    uuid document_id FK
+    string stage
+    string state
+    int attempts
+    string last_error
+  }
+  OUTBOX {
+    bigint id PK
+    string topic
+    jsonb payload
+    timestamptz created_at
+    timestamptz published_at
+  }
+</pre>
+  <figcaption>Figure 4.3.5 — docflow data model.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> <code>content_sha256</code> plus <code>tenant_id</code> gives a natural idempotency key: uploading the same bytes twice does not create a second document or re-bill embeddings. <code>INGEST_JOB</code> records progress per stage so operators can see and retry failures without digging through a result backend. The <code>vector</code> type comes from the pgvector extension.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math: Pools, Queues and Retries</h2>
+  <h3>6.1 Connection budget</h3>
+  <p>Total connections \( C = P \times W \times (s + o) \) for \( P \) pods, \( W \) worker processes per pod, pool size \( s \) and overflow \( o \). Ten pods, four workers, \( s=5, o=5 \): \( C = 400 \). Add Celery: 6 worker hosts with prefork concurrency 8 and a pool of 2 each: 96 more. PostgreSQL's per-connection memory (a backend process each) makes hundreds of mostly-idle connections expensive; PgBouncer in transaction mode multiplexes them onto a few dozen server connections (but disables session-level features such as server-side prepared statements unless configured; asyncpg's statement cache needs <code>statement_cache_size=0</code> or PgBouncer 1.21+ prepared-statement support).</p>
+  <h3>6.2 Worker count from Little's Law</h3>
+  <p>If documents arrive at \( \lambda = 20 \) per second and extraction takes \( W = 1.5 \) s on average, you need \( L = \lambda W = 30 \) concurrent extraction slots. Extraction is CPU-bound (PDF parsing), so that means 30 processes, e.g. 4 hosts with 8 prefork children. Embedding is I/O-bound (an API call taking 400 ms per batch) and rate-limited by the provider; concurrency is \( \lambda_{batches} \times 0.4 \) and is better served by a thread or async pool than by processes.</p>
+  <h3>6.3 Retry storms and backoff</h3>
+  <p>With exponential backoff, attempt \( k \) waits \( b \cdot 2^{k} \) seconds, capped at \( m \): \( d_k = \min(m, b \cdot 2^{k}) \). Add full jitter, \( d_k \sim U(0, \min(m, b \cdot 2^k)) \), to avoid synchronized retries after an outage. If an upstream fails for \( T \) seconds and \( R \) tasks are in flight, without jitter all \( R \) retry at nearly the same instants, producing load spikes of \( R \) requests; with full jitter the expected arrival rate during recovery is spread roughly uniformly. Bound the total: with \( b=2, m=300 \), and 8 retries, the worst-case time to give up is \( \sum_k d_k \approx 2+4+\dots+256+300 \approx 810 \) s, which must stay below your visibility timeout plus task runtime if using Redis or SQS.</p>
+  <h3>6.4 Probability of duplicate execution</h3>
+  <p>With late acks, a duplicate occurs if the worker dies between finishing the side effect and acking. If that window is \( \delta \) and crashes occur at rate \( r \) per second per worker, the duplicate probability per task is roughly \( r\delta \): small but nonzero, and deploys (SIGKILL after a grace period) make \( r \) much larger than hardware failure rates. Design for duplicates rather than estimating them away.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code: From JPA to SQLAlchemy, Celery, and the docflow Service</h2>
+
+  <h3>7.1 Entities: JPA vs SQLAlchemy 2.x vs Go</h3>
+  <div class="code-tabs">
+  <pre data-lang="Java"><code class="language-java">@Entity
+@Table(name = "authors")
+public class Author {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY) Long id;
+    @Column(nullable = false, length = 100) String name;
+    @OneToMany(mappedBy = "author", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY)
+    List&lt;Book&gt; books = new ArrayList&lt;&gt;();
+}
+
+@Entity
+@Table(name = "books")
+public class Book {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY) Long id;
+    @Column(nullable = false) String title;
+    @ManyToOne(fetch = FetchType.LAZY) @JoinColumn(name = "author_id") Author author;
+    @Version int version;
+}
+
+// Spring Data: N+1-safe query
+public interface AuthorRepo extends JpaRepository&lt;Author, Long&gt; {
+    @Query("select distinct a from Author a left join fetch a.books")
+    List&lt;Author&gt; findAllWithBooks();
+}</code></pre>
+  <pre data-lang="Python"><code class="language-python"># pip install "sqlalchemy[asyncio]&gt;=2.0" aiosqlite   (2.1 no longer pulls greenlet in by default)
+from sqlalchemy import ForeignKey, String, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
+
+class Base(DeclarativeBase):
+    pass
+
+class Author(Base):
+    __tablename__ = "authors"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))              # NOT NULL inferred from non-Optional
+    books: Mapped[list["Book"]] = relationship(
+        back_populates="author", cascade="all, delete-orphan",
+        lazy="raise")                                           # forbid implicit lazy loads
+
+class Book(Base):
+    __tablename__ = "books"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    author_id: Mapped[int] = mapped_column(ForeignKey("authors.id"))
+    author: Mapped[Author] = relationship(back_populates="books", lazy="raise")
+    version: Mapped[int] = mapped_column(default=1)
+    __mapper_args__ = {"version_id_col": version}               # optimistic locking, like @Version
+
+# "Repository" query: explicit eager loading instead of JOIN FETCH
+stmt = select(Author).options(selectinload(Author.books)).order_by(Author.id)</code></pre>
+  <pre data-lang="Go"><code class="language-go">// Go: no ORM by default; sqlc generates typed code from SQL (Chapter 5.3).
+package store
+
+type Author struct {
+	ID   int64
+	Name string
+}
+
+type Book struct {
+	ID       int64
+	Title    string
+	AuthorID int64
+	Version  int32
+}
+
+// -- name: ListBooksForAuthors :many
+// SELECT id, title, author_id, version FROM books WHERE author_id = ANY($1::bigint[]);
+// You write the batching ("selectin") query yourself and assemble the graph in code.</code></pre>
+  </div>
+  <p><code>Mapped[str]</code> vs <code>Mapped[str | None]</code> drives nullability; the type annotation is the column contract, checked statically by mypy/pyright (SQLAlchemy 2.x ships inline types, no plugin needed). <code>lazy="raise"</code> on every relationship is a strong team convention: it turns every accidental N+1 into an immediate error in tests rather than a slow page in production.</p>
+
+  <h3>7.2 N+1 demonstrated and fixed (runnable)</h3>
+  <pre data-file="n_plus_one.py"><code class="language-python"># python n_plus_one.py   (uses in-memory SQLite, prints every SQL statement count)
+from sqlalchemy import ForeignKey, String, create_engine, event, select
+from sqlalchemy.orm import (DeclarativeBase, Mapped, Session, joinedload, mapped_column,
+                            relationship, selectinload)
+
+class Base(DeclarativeBase): pass
+
+class Author(Base):
+    __tablename__ = "authors"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    books: Mapped[list["Book"]] = relationship(back_populates="author")   # default lazy="select"
+
+class Book(Base):
+    __tablename__ = "books"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    author_id: Mapped[int] = mapped_column(ForeignKey("authors.id"))
+    author: Mapped[Author] = relationship(back_populates="books")
+
+engine = create_engine("sqlite://")
+Base.metadata.create_all(engine)
+queries = 0
+@event.listens_for(engine, "before_cursor_execute")
+def count(*_):            # like Hibernate statistics / datasource-proxy in Spring tests
+    global queries; queries += 1
+
+with Session(engine) as s, s.begin():
+    for a in range(50):
+        s.add(Author(name=f"a{a}", books=[Book(title=f"b{a}-{i}") for i in range(3)]))
+
+def run(label, stmt):
+    global queries
+    queries = 0
+    with Session(engine) as s:
+        total = sum(len(a.books) for a in s.scalars(stmt).unique())
+    print(f"{label:&lt;14} books={total} queries={queries}")
+
+run("lazy (N+1)", select(Author))                                   # 1 + 50 queries
+run("selectinload", select(Author).options(selectinload(Author.books)))   # 2 queries
+run("joinedload", select(Author).options(joinedload(Author.books)))       # 1 query (JOIN)</code></pre>
+  <pre><code class="language-plaintext">lazy (N+1)     books=150 queries=51
+selectinload   books=150 queries=2
+joinedload     books=150 queries=1</code></pre>
+  <p><code>joinedload</code> on a collection multiplies parent rows (Cartesian growth with several collections, exactly as multiple <code>JOIN FETCH</code> bags do in Hibernate, which is why Hibernate throws <code>MultipleBagFetchException</code>). <code>selectinload</code> keeps row counts linear and is the default recommendation for collections. Note the <code>.unique()</code> call: required when joined-eager-loading collections, the analogue of <code>select distinct</code> in JPQL.</p>
+
+  <h3>7.3 Async session lifecycle patterns</h3>
+  <pre data-file="async_patterns.py"><code class="language-python">import asyncio
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from n_plus_one import Author, Base, Book   # reuse the models above
+
+engine = create_async_engine("sqlite+aiosqlite://", echo=False)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False)   # critical for async
+
+async def main() -&gt; None:
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    # Pattern 1: transaction block = TransactionTemplate.execute(...)
+    async with SessionLocal() as s, s.begin():
+        s.add(Author(name="Ada", books=[Book(title="Notes")]))
+
+    # Pattern 2: read with eager loading, then use objects after the session closes
+    async with SessionLocal() as s:
+        from sqlalchemy.orm import selectinload
+        authors = (await s.scalars(select(Author).options(selectinload(Author.books)))).all()
+    print([(a.name, [b.title for b in a.books]) for a in authors])   # safe: already loaded
+
+    # Pattern 3: forgetting eager loading -&gt; explicit error instead of hidden query
+    async with SessionLocal() as s:
+        a = (await s.scalars(select(Author))).first()
+        try:
+            print(a.books)                       # implicit I/O is impossible in async
+        except Exception as e:
+            print(type(e).__name__)              # MissingGreenlet (may be wrapped in StatementError)
+
+    # Pattern 4: bulk UPDATE without loading objects (Core-style, like @Modifying JPQL)
+    async with SessionLocal() as s, s.begin():
+        await s.execute(update(Book).where(Book.title.like("N%")).values(title="Notes v2"))
+
+    # Pattern 5: concurrent work needs one session PER task (sessions are not task-safe)
+    async def count_books() -&gt; int:
+        async with SessionLocal() as s:
+            return len((await s.scalars(select(Book))).all())
+    print(await asyncio.gather(count_books(), count_books()))
+    await engine.dispose()
+
+asyncio.run(main())</code></pre>
+
+  <h3>7.4 An Alembic migration done safely</h3>
+  <pre data-file="migrations/versions/20261101_0002_add_doc_language.py"><code class="language-python">"""add language column and index without locking the table
+
+Revision ID: 0002
+Revises: 0001
+"""
+import sqlalchemy as sa
+from alembic import op
+
+revision = "0002"
+down_revision = "0001"
+
+def upgrade() -&gt; None:
+    # 1. Nullable column first: no table rewrite, instant on PostgreSQL 11+
+    op.add_column("documents", sa.Column("language", sa.String(8), nullable=True))
+    # 2. Index concurrently: must run outside the migration transaction
+    with op.get_context().autocommit_block():
+        op.create_index("ix_documents_language", "documents", ["language"],
+                        postgresql_concurrently=True, if_not_exists=True)
+    # 3. Backfill and NOT NULL go in LATER releases (expand/contract), in batches,
+    #    never in the same deploy that introduces the column.
+
+def downgrade() -&gt; None:
+    with op.get_context().autocommit_block():
+        op.drop_index("ix_documents_language", table_name="documents",
+                      postgresql_concurrently=True, if_exists=True)
+    op.drop_column("documents", "language")</code></pre>
+  <p>This is exactly the expand/contract discipline you apply with Flyway: additive changes first, deploy code that tolerates both shapes, backfill, then tighten constraints. Run migrations as a Kubernetes Job or init step before rolling out the new version, never from every app replica at startup (concurrent migration attempts and slow startups).</p>
+
+  <h3>7.5 Background work: <code>@Async</code> vs BackgroundTasks vs Celery vs goroutine</h3>
+  <div class="code-tabs">
+  <pre data-lang="Java"><code class="language-java">@Service
+class NotificationService {
+    @Async("notificationExecutor")        // in-process, lost on crash
+    public CompletableFuture&lt;Void&gt; sendReceipt(UUID orderId) { /* ... */ return CompletableFuture.completedFuture(null); }
+}
+
+@Component
+class IngestListener {                     // durable, broker-backed
+    @RabbitListener(queues = "ingest.extract")
+    @Retryable(maxAttempts = 5, backoff = @Backoff(delay = 2000, multiplier = 2))
+    public void onMessage(IngestCommand cmd) { /* idempotent processing */ }
+}</code></pre>
+  <pre data-lang="Python"><code class="language-python">from fastapi import BackgroundTasks, FastAPI
+from celery import Celery
+
+app = FastAPI()
+celery = Celery("demo", broker="redis://localhost:6379/0")
+
+def send_receipt(order_id: str) -&gt; None:          # runs after the response, same process
+    print("receipt sent for", order_id)
+
+@celery.task(bind=True, acks_late=True, autoretry_for=(ConnectionError,),
+             retry_backoff=2, retry_backoff_max=300, retry_jitter=True, max_retries=5)
+def extract(self, document_id: str, version: int) -&gt; None:   # durable, separate worker
+    ...
+
+@app.post("/orders/{order_id}/pay")
+async def pay(order_id: str, background: BackgroundTasks) -&gt; dict[str, str]:
+    background.add_task(send_receipt, order_id)    # best effort
+    extract.delay("doc-123", 1)                    # durable (but see outbox, 7.6)
+    return {"status": "accepted"}</code></pre>
+  <pre data-lang="Go"><code class="language-go">package main
+
+import (
+	"context"
+	"log/slog"
+	"time"
+)
+
+// In-process: a goroutine bounded by a context; lost on crash, like @Async.
+func sendReceiptAsync(parent context.Context, orderID string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 10*time.Second)
+		defer cancel()
+		_ = ctx
+		slog.Info("receipt sent", "order", orderID)
+	}()
+}
+
+// Durable work in Go uses a broker client (Kafka, NATS JetStream, SQS) or
+// libraries such as asynq (Redis) or River (PostgreSQL), or Temporal.
+func main() { sendReceiptAsync(context.Background(), "o-1"); time.Sleep(100 * time.Millisecond) }</code></pre>
+  </div>
+  <p><code>context.WithoutCancel</code> (Go 1.21) matters: a goroutine started from a request must not be cancelled when the request ends, mirroring the fact that FastAPI background tasks run after the response is sent.</p>
+
+
+  <h3>7.6 Production project, part 1: docflow</h3>
+  <p><strong>docflow</strong> ingests documents (upload, deduplicate, extract text, chunk, embed, store vectors) and announces them to the rest of the company. It is the kind of Python service a Spring Boot organisation adds when it starts building RAG features: Java services own customers, orders and permissions; docflow owns document understanding. This chapter builds the persistence, API and job layers; Chapter 4.4 adds tests, packaging, Docker, observability and the Java integration (REST client, gRPC, Kafka).</p>
+  <pre class="ascii">
+docflow/
++-- pyproject.toml                  (4.4)  uv-managed, dependency groups, ruff/pyright/pytest config
++-- uv.lock                         (4.4)
++-- Dockerfile                      (4.4)  multi-stage, non-root, uv sync --frozen
++-- docker-compose.yml              (4.4)  postgres+pgvector, redis, kafka, api, worker, relay
++-- alembic.ini
++-- migrations/
+|   +-- env.py
+|   +-- versions/20261101_0001_init.py
++-- proto/docflow/v1/docflow.proto  (4.4)  gRPC contract shared with Java
++-- src/docflow/
+|   +-- __init__.py
+|   +-- settings.py                 pydantic-settings
+|   +-- db.py                       async + sync engines, session factories
+|   +-- models.py                   Document, Chunk, IngestJob, OutboxMessage
+|   +-- schemas.py                  API DTOs (Pydantic)
+|   +-- storage.py                  BlobStore protocol + local/S3 adapters
+|   +-- repository.py               DocumentRepository (async)
+|   +-- ingest/
+|   |   +-- extract.py              bytes -&gt; text
+|   |   +-- chunker.py              text -&gt; overlapping chunks
+|   |   +-- embedder.py             Embedder protocol, HTTP + deterministic fake
+|   +-- api/
+|   |   +-- app.py                  create_app(), lifespan, health
+|   |   +-- deps.py                 session, tenant, storage dependencies
+|   |   +-- routes.py               /v1/documents endpoints
+|   +-- worker/
+|   |   +-- celery_app.py           Celery config (acks_late, queues, limits)
+|   |   +-- tasks.py                extract_document, embed_document
+|   |   +-- relay.py                transactional outbox relay
+|   +-- events/kafka.py             (4.4) document.ingested publisher
+|   +-- grpc_server.py              (4.4) Search/GetDocument for Java callers
+|   +-- telemetry.py                (4.4) OpenTelemetry setup
++-- tests/                          (4.4) unit, API, worker, testcontainers integration
+</pre>
+
+  <h4>settings.py</h4>
+  <pre data-file="src/docflow/settings.py"><code class="language-python">from functools import lru_cache
+from pathlib import Path
+from pydantic import Field, SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="DOCFLOW_", env_file=".env", extra="ignore")
+
+    database_url: str = "postgresql+asyncpg://docflow:docflow@localhost:5432/docflow"
+    worker_database_url: str = "postgresql+psycopg://docflow:docflow@localhost:5432/docflow"
+    db_pool_size: int = Field(5, ge=1, le=50)
+    broker_url: str = "redis://localhost:6379/0"
+    blob_dir: Path = Path("/var/lib/docflow/blobs")
+    max_upload_bytes: int = 25 * 1024 * 1024
+    embedding_url: str | None = None          # OpenAI-compatible /v1/embeddings; None = fake
+    embedding_api_key: SecretStr | None = None
+    embedding_model: str = "text-embedding-3-small"
+    embedding_dim: int = 384
+    embedding_batch: int = Field(64, ge=1, le=2048)
+    chunk_tokens: int = 300
+    chunk_overlap: int = 50
+    kafka_bootstrap: str | None = None        # set to enable document.ingested events
+
+@lru_cache
+def get_settings() -&gt; Settings:
+    return Settings()</code></pre>
+
+  <h4>db.py</h4>
+  <pre data-file="src/docflow/db.py"><code class="language-python">from sqlalchemy import Engine, create_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import Session, sessionmaker
+
+def _pool_kwargs(url: str, size: int) -&gt; dict[str, object]:
+    if url.startswith("sqlite"):
+        return {}
+    return {"pool_size": size, "max_overflow": size, "pool_pre_ping": True,
+            "pool_recycle": 1800, "pool_timeout": 10}
+
+def make_async_engine(url: str, pool_size: int = 5) -&gt; AsyncEngine:
+    return create_async_engine(url, **_pool_kwargs(url, pool_size))
+
+def make_async_sessionmaker(engine: AsyncEngine) -&gt; async_sessionmaker[AsyncSession]:
+    return async_sessionmaker(engine, expire_on_commit=False)
+
+def make_sync_engine(url: str, pool_size: int = 2) -&gt; Engine:
+    return create_engine(url, **_pool_kwargs(url, pool_size))
+
+def make_sync_sessionmaker(engine: Engine) -&gt; sessionmaker[Session]:
+    return sessionmaker(engine, expire_on_commit=False)</code></pre>
+
+  <h4>models.py</h4>
+  <pre data-file="src/docflow/models.py"><code class="language-python">import enum
+import uuid
+from datetime import datetime
+from typing import Any
+
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import (JSON, BigInteger, DateTime, Enum, ForeignKey, Index, Integer, String,
+                        Text, UniqueConstraint, func)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+EMBED_DIM = 384
+BigId = BigInteger().with_variant(Integer, "sqlite")       # SQLite autoincrement needs INTEGER
+
+class Base(DeclarativeBase):
+    type_annotation_map = {dict[str, Any]: JSON().with_variant(JSONB(), "postgresql")}
+
+class DocStatus(enum.StrEnum):
+    RECEIVED = "RECEIVED"
+    EXTRACTED = "EXTRACTED"
+    READY = "READY"
+    FAILED = "FAILED"
+
+class Document(Base):
+    __tablename__ = "documents"
+    __table_args__ = (UniqueConstraint("tenant_id", "content_sha256", name="uq_documents_tenant_sha"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    filename: Mapped[str] = mapped_column(String(255))
+    content_type: Mapped[str] = mapped_column(String(100))
+    size_bytes: Mapped[int]
+    blob_key: Mapped[str] = mapped_column(String(512))
+    content_sha256: Mapped[str] = mapped_column(String(64))
+    status: Mapped[DocStatus] = mapped_column(
+        Enum(DocStatus, native_enum=False, length=16), default=DocStatus.RECEIVED)
+    version: Mapped[int] = mapped_column(default=1)          # bumped on reprocess
+    chunk_count: Mapped[int] = mapped_column(default=0)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    chunks: Mapped[list["Chunk"]] = relationship(
+        back_populates="document", cascade="all, delete-orphan",
+        order_by="Chunk.ordinal", lazy="raise")
+
+class Chunk(Base):
+    __tablename__ = "chunks"
+    __table_args__ = (UniqueConstraint("document_id", "ordinal", name="uq_chunks_doc_ordinal"),)
+
+    id: Mapped[int] = mapped_column(BigId, primary_key=True, autoincrement=True)
+    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
+    ordinal: Mapped[int]
+    content: Mapped[str] = mapped_column(Text)
+    token_count: Mapped[int]
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(EMBED_DIM).with_variant(JSON(none_as_null=True), "sqlite"), nullable=True)
+
+    document: Mapped[Document] = relationship(back_populates="chunks", lazy="raise")
+
+class IngestJob(Base):
+    __tablename__ = "ingest_jobs"
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
+    document_version: Mapped[int]
+    stage: Mapped[str] = mapped_column(String(16))           # extract | embed
+    state: Mapped[str] = mapped_column(String(16), default="RUNNING")   # RUNNING | DONE | FAILED
+    attempts: Mapped[int] = mapped_column(default=0)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+class OutboxMessage(Base):
+    __tablename__ = "outbox"
+    __table_args__ = (Index("ix_outbox_unpublished", "id",
+                            postgresql_where="published_at IS NULL"),)   # partial index
+    id: Mapped[int] = mapped_column(BigId, primary_key=True, autoincrement=True)
+    topic: Mapped[str] = mapped_column(String(128))
+    key: Mapped[str] = mapped_column(String(128))
+    payload: Mapped[dict[str, Any]]
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))</code></pre>
+  <p>The <code>with_variant</code> calls let the same models run on SQLite for fast unit tests while production uses PostgreSQL types (<code>JSONB</code>, <code>vector</code>). Integration tests in Chapter 4.4 still run against real PostgreSQL with Testcontainers, because SQLite hides concurrency and locking behaviour.</p>
+
+  <h4>schemas.py and storage.py</h4>
+  <pre data-file="src/docflow/schemas.py"><code class="language-python">import uuid
+from datetime import datetime
+from pydantic import BaseModel, ConfigDict
+from docflow.models import DocStatus
+
+class DocumentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    tenant_id: str
+    filename: str
+    content_type: str
+    size_bytes: int
+    content_sha256: str
+    status: DocStatus
+    version: int
+    chunk_count: int
+    last_error: str | None
+    created_at: datetime | None = None
+
+class ChunkOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    ordinal: int
+    content: str
+    token_count: int
+    has_embedding: bool = False
+
+class DocumentPage(BaseModel):
+    items: list[DocumentOut]
+    next_cursor: str | None</code></pre>
+  <pre data-file="src/docflow/storage.py"><code class="language-python">import asyncio
+from pathlib import Path
+from typing import Protocol
+
+class BlobStore(Protocol):
+    async def put(self, key: str, data: bytes) -&gt; None: ...
+    def get_sync(self, key: str) -&gt; bytes: ...          # used by Celery workers
+
+class LocalBlobStore:
+    """Dev/test adapter. Production: an S3/GCS adapter with the same two methods."""
+    def __init__(self, root: Path) -&gt; None:
+        self.root = root
+        root.mkdir(parents=True, exist_ok=True)
+
+    async def put(self, key: str, data: bytes) -&gt; None:
+        path = self.root / key
+        await asyncio.to_thread(self._write, path, data)    # file I/O off the event loop
+
+    @staticmethod
+    def _write(path: Path, data: bytes) -&gt; None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(data)
+        tmp.replace(path)                                    # atomic rename
+
+    def get_sync(self, key: str) -&gt; bytes:
+        return (self.root / key).read_bytes()</code></pre>
+
+  <h4>repository.py</h4>
+  <pre data-file="src/docflow/repository.py"><code class="language-python">import base64
+import uuid
+from datetime import datetime
+
+from sqlalchemy import func, select, tuple_, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from docflow.models import Chunk, DocStatus, Document, OutboxMessage
+
+EXTRACT_TOPIC = "docflow.tasks.extract"
+
+class DocumentRepository:
+    """Async repository; the caller owns the transaction (like a Spring @Transactional service)."""
+
+    def __init__(self, session: AsyncSession) -&gt; None:
+        self.s = session
+
+    async def get(self, tenant_id: str, doc_id: uuid.UUID) -&gt; Document | None:
+        return await self.s.scalar(
+            select(Document).where(Document.id == doc_id, Document.tenant_id == tenant_id))
+
+    async def find_by_sha(self, tenant_id: str, sha: str) -&gt; Document | None:
+        return await self.s.scalar(
+            select(Document).where(Document.tenant_id == tenant_id, Document.content_sha256 == sha))
+
+    def add_with_extract_request(self, doc: Document) -&gt; None:
+        """Insert the document and its outbox message in the SAME transaction."""
+        self.s.add(doc)
+        self.s.add(OutboxMessage(topic=EXTRACT_TOPIC, key=str(doc.id),
+                                 payload={"document_id": str(doc.id), "version": doc.version}))
+
+    async def request_reprocess(self, doc: Document) -&gt; None:
+        await self.s.execute(
+            update(Document).where(Document.id == doc.id)
+            .values(version=Document.version + 1, status=DocStatus.RECEIVED, last_error=None))
+        await self.s.refresh(doc)
+        self.s.add(OutboxMessage(topic=EXTRACT_TOPIC, key=str(doc.id),
+                                 payload={"document_id": str(doc.id), "version": doc.version}))
+
+    async def page(self, tenant_id: str, limit: int, cursor: str | None) -&gt; tuple[list[Document], str | None]:
+        """Keyset pagination on (created_at, id): stable under concurrent inserts, O(log n)."""
+        stmt = select(Document).where(Document.tenant_id == tenant_id)
+        if cursor:
+            ts_s, id_s = base64.urlsafe_b64decode(cursor.encode()).decode().split("|")
+            ts, last_id = datetime.fromisoformat(ts_s), uuid.UUID(id_s)
+            stmt = stmt.where(tuple_(Document.created_at, Document.id) &lt; tuple_(ts, last_id))
+        rows = list(await self.s.scalars(
+            stmt.order_by(Document.created_at.desc(), Document.id.desc()).limit(limit + 1)))
+        nxt = None
+        if len(rows) &gt; limit:
+            last = rows[limit - 1]
+            nxt = base64.urlsafe_b64encode(f"{last.created_at.isoformat()}|{last.id}".encode()).decode()
+        return rows[:limit], nxt
+
+    async def chunks(self, doc_id: uuid.UUID, limit: int, offset: int) -&gt; list[Chunk]:
+        return list(await self.s.scalars(
+            select(Chunk).where(Chunk.document_id == doc_id)
+            .order_by(Chunk.ordinal).limit(limit).offset(offset)))
+
+    async def count_chunks(self, doc_id: uuid.UUID) -&gt; int:
+        return await self.s.scalar(select(func.count()).where(Chunk.document_id == doc_id)) or 0</code></pre>
+  <p>Note <code>tuple_(created_at, id) &lt; tuple_(ts, last_id)</code> (a plain Python tuple comparison would not work: Python would try to evaluate the column expressions as booleans): SQLAlchemy renders a SQL row-value comparison, which PostgreSQL can serve from a composite index. Keyset pagination is the scalable alternative to <code>OFFSET</code>, just as with Spring Data's <code>ScrollPosition.keyset()</code>.</p>
+
+  <h4>api/deps.py, api/routes.py, api/app.py</h4>
+  <pre data-file="src/docflow/api/deps.py"><code class="language-python">from collections.abc import AsyncIterator
+from typing import Annotated
+
+from fastapi import Depends, Header, HTTPException, Request
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from docflow.repository import DocumentRepository
+from docflow.settings import Settings, get_settings
+from docflow.storage import BlobStore
+
+async def get_session(request: Request) -&gt; AsyncIterator[AsyncSession]:
+    async with request.app.state.sessionmaker() as session:
+        yield session          # endpoints open explicit `async with session.begin()` blocks
+
+def get_repo(session: Annotated[AsyncSession, Depends(get_session)]) -&gt; DocumentRepository:
+    return DocumentRepository(session)
+
+def get_blob_store(request: Request) -&gt; BlobStore:
+    return request.app.state.blob_store
+
+async def get_tenant(x_tenant_id: Annotated[str, Header(min_length=1, max_length=64,
+                                                        pattern=r"^[a-z0-9-]+$")]) -&gt; str:
+    # Production: derive the tenant from the verified JWT (Chapter 4.2), never trust the header alone.
+    return x_tenant_id
+
+SessionDep = Annotated[AsyncSession, Depends(get_session)]
+RepoDep = Annotated[DocumentRepository, Depends(get_repo)]
+TenantDep = Annotated[str, Depends(get_tenant)]
+BlobDep = Annotated[BlobStore, Depends(get_blob_store)]
+SettingsDep = Annotated[Settings, Depends(get_settings)]
+
+def not_found() -&gt; HTTPException:
+    return HTTPException(status_code=404, detail="document not found")</code></pre>
+  <pre data-file="src/docflow/api/routes.py"><code class="language-python">import hashlib
+import uuid
+from typing import Annotated
+
+from fastapi import APIRouter, Query, Response, UploadFile, status
+from fastapi.exceptions import HTTPException
+from sqlalchemy.exc import IntegrityError
+
+from docflow.api.deps import BlobDep, RepoDep, SessionDep, SettingsDep, TenantDep, not_found
+from docflow.models import DocStatus, Document
+from docflow.schemas import ChunkOut, DocumentOut, DocumentPage
+
+router = APIRouter(prefix="/v1/documents", tags=["documents"])
+ALLOWED_TYPES = {"text/plain", "text/markdown", "application/pdf"}
+
+@router.post("", status_code=status.HTTP_202_ACCEPTED, response_model=DocumentOut,
+             responses={200: {"model": DocumentOut, "description": "duplicate upload"}})
+async def upload(file: UploadFile, tenant: TenantDep, session: SessionDep, repo: RepoDep,
+                 blobs: BlobDep, settings: SettingsDep, response: Response) -&gt; Document:
+    ctype = (file.content_type or "").split(";")[0]
+    if ctype not in ALLOWED_TYPES:
+        raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, f"unsupported type {ctype}")
+    data = await file.read(settings.max_upload_bytes + 1)          # bounded read
+    if len(data) &gt; settings.max_upload_bytes:
+        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "file too large")
+    sha = hashlib.sha256(data).hexdigest()
+
+    async with session.begin():
+        existing = await repo.find_by_sha(tenant, sha)
+    if existing:                                                    # idempotent upload
+        response.status_code = status.HTTP_200_OK
+        return existing
+
+    doc_id = uuid.uuid4()
+    blob_key = f"{tenant}/{sha[:2]}/{sha}"
+    await blobs.put(blob_key, data)                                 # content-addressed: safe to repeat
+    # Column defaults (default=1) are applied at FLUSH time, so set values we read before flushing.
+    doc = Document(id=doc_id, tenant_id=tenant, filename=file.filename or "upload",
+                   content_type=ctype, size_bytes=len(data), blob_key=blob_key, content_sha256=sha,
+                   version=1, status=DocStatus.RECEIVED, chunk_count=0)
+    try:
+        async with session.begin():
+            repo.add_with_extract_request(doc)                      # row + outbox, one transaction
+    except IntegrityError:                                          # concurrent identical upload won
+        async with session.begin():
+            winner = await repo.find_by_sha(tenant, sha)
+        assert winner is not None
+        response.status_code = status.HTTP_200_OK
+        return winner
+    response.headers["Location"] = f"/v1/documents/{doc.id}"
+    return doc
+
+@router.get("", response_model=DocumentPage)
+async def list_documents(tenant: TenantDep, session: SessionDep, repo: RepoDep,
+                         limit: Annotated[int, Query(ge=1, le=100)] = 20,
+                         cursor: str | None = None) -&gt; DocumentPage:
+    async with session.begin():
+        docs, nxt = await repo.page(tenant, limit, cursor)
+    return DocumentPage(items=[DocumentOut.model_validate(d) for d in docs], next_cursor=nxt)
+
+@router.get("/{doc_id}", response_model=DocumentOut)
+async def get_document(doc_id: uuid.UUID, tenant: TenantDep, session: SessionDep, repo: RepoDep) -&gt; Document:
+    async with session.begin():
+        doc = await repo.get(tenant, doc_id)
+    if doc is None:
+        raise not_found()
+    return doc
+
+@router.get("/{doc_id}/chunks", response_model=list[ChunkOut])
+async def get_chunks(doc_id: uuid.UUID, tenant: TenantDep, session: SessionDep, repo: RepoDep,
+                     limit: Annotated[int, Query(ge=1, le=500)] = 100,
+                     offset: Annotated[int, Query(ge=0)] = 0) -&gt; list[ChunkOut]:
+    async with session.begin():
+        if await repo.get(tenant, doc_id) is None:
+            raise not_found()
+        rows = await repo.chunks(doc_id, limit, offset)
+    return [ChunkOut(ordinal=c.ordinal, content=c.content, token_count=c.token_count,
+                     has_embedding=c.embedding is not None) for c in rows]
+
+@router.post("/{doc_id}/reprocess", status_code=status.HTTP_202_ACCEPTED, response_model=DocumentOut)
+async def reprocess(doc_id: uuid.UUID, tenant: TenantDep, session: SessionDep, repo: RepoDep) -&gt; Document:
+    async with session.begin():
+        doc = await repo.get(tenant, doc_id)
+        if doc is None:
+            raise not_found()
+        await repo.request_reprocess(doc)
+    return doc</code></pre>
+  <pre data-file="src/docflow/api/app.py"><code class="language-python">from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Response
+from sqlalchemy import text
+
+from docflow.api.routes import router
+from docflow.db import make_async_engine, make_async_sessionmaker
+from docflow.settings import Settings, get_settings
+from docflow.storage import LocalBlobStore
+
+def create_app(settings: Settings | None = None) -&gt; FastAPI:
+    settings = settings or get_settings()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -&gt; AsyncIterator[None]:
+        engine = make_async_engine(settings.database_url, settings.db_pool_size)
+        app.state.engine = engine
+        app.state.sessionmaker = make_async_sessionmaker(engine)
+        app.state.blob_store = LocalBlobStore(settings.blob_dir)
+        yield
+        await engine.dispose()                        # close pooled connections on shutdown
+
+    app = FastAPI(title="docflow", version="1.0.0", lifespan=lifespan)
+    app.include_router(router)
+
+    @app.get("/healthz", include_in_schema=False)
+    async def healthz() -&gt; dict[str, str]:            # liveness: process is up
+        return {"status": "ok"}
+
+    @app.get("/readyz", include_in_schema=False)
+    async def readyz(response: Response) -&gt; dict[str, str]:   # readiness: DB reachable
+        try:
+            async with app.state.engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            return {"status": "ready"}
+        except Exception:
+            response.status_code = 503
+            return {"status": "db-unavailable"}
+
+    return app
+
+app = create_app()   # uvicorn docflow.api.app:app</code></pre>
+
+  <h4>ingest/: extraction, chunking, embedding</h4>
+  <pre data-file="src/docflow/ingest/extract.py"><code class="language-python">import io
+
+class UnsupportedDocument(Exception):
+    """Permanent failure: retrying will not help."""
+
+def extract_text(data: bytes, content_type: str) -&gt; str:
+    if content_type in ("text/plain", "text/markdown"):
+        return data.decode("utf-8", errors="replace")
+    if content_type == "application/pdf":
+        from pypdf import PdfReader                       # optional dependency group "pdf"
+        reader = PdfReader(io.BytesIO(data))
+        return "\n\n".join(page.extract_text() or "" for page in reader.pages)
+    raise UnsupportedDocument(content_type)</code></pre>
+  <pre data-file="src/docflow/ingest/chunker.py"><code class="language-python">import re
+from dataclasses import dataclass
+
+@dataclass(frozen=True, slots=True)
+class TextChunk:
+    ordinal: int
+    content: str
+    token_count: int
+
+_WS = re.compile(r"\s+")
+
+def chunk_text(text: str, max_tokens: int = 300, overlap: int = 50) -&gt; list[TextChunk]:
+    """Greedy word-window chunker with overlap.
+
+    Words approximate tokens (roughly 0.75 words per token for English); swap in a real
+    tokenizer (e.g. tiktoken or HF tokenizers) when chunk size must match a model limit exactly.
+    """
+    if overlap &gt;= max_tokens:
+        raise ValueError("overlap must be smaller than max_tokens")
+    words = _WS.split(text.strip())
+    if words == [""]:
+        return []
+    step = max_tokens - overlap
+    chunks: list[TextChunk] = []
+    for i, start in enumerate(range(0, len(words), step)):
+        window = words[start : start + max_tokens]
+        chunks.append(TextChunk(ordinal=i, content=" ".join(window), token_count=len(window)))
+        if start + max_tokens &gt;= len(words):
+            break
+    return chunks</code></pre>
+  <pre data-file="src/docflow/ingest/embedder.py"><code class="language-python">import hashlib
+import math
+from typing import Protocol
+
+import httpx
+
+class Embedder(Protocol):
+    dim: int
+    def embed(self, texts: list[str]) -&gt; list[list[float]]: ...
+
+class TransientEmbeddingError(Exception):
+    """Retryable: 429/5xx/timeouts."""
+
+class HttpEmbedder:
+    """OpenAI-compatible /v1/embeddings client (works with many hosted and self-hosted servers)."""
+    def __init__(self, url: str, api_key: str | None, model: str, dim: int, timeout: float = 30.0) -&gt; None:
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        self.client = httpx.Client(base_url=url, headers=headers, timeout=timeout)
+        self.model, self.dim = model, dim
+
+    def embed(self, texts: list[str]) -&gt; list[list[float]]:
+        try:
+            r = self.client.post("/v1/embeddings",
+                                 json={"model": self.model, "input": texts, "dimensions": self.dim})
+        except httpx.TransportError as e:
+            raise TransientEmbeddingError(str(e)) from e
+        if r.status_code == 429 or r.status_code &gt;= 500:
+            raise TransientEmbeddingError(f"embedding API {r.status_code}")
+        r.raise_for_status()                                  # 4xx: permanent, do not retry
+        data = sorted(r.json()["data"], key=lambda d: d["index"])
+        return [d["embedding"] for d in data]
+
+class HashEmbedder:
+    """Deterministic fake for dev/tests: same text -&gt; same unit vector. Not semantic."""
+    def __init__(self, dim: int) -&gt; None:
+        self.dim = dim
+    def embed(self, texts: list[str]) -&gt; list[list[float]]:
+        out = []
+        for t in texts:
+            seed = hashlib.sha256(t.encode()).digest()
+            raw = [((seed[i % 32] + i * 31) % 255) / 127.0 - 1.0 for i in range(self.dim)]
+            norm = math.sqrt(sum(x * x for x in raw)) or 1.0
+            out.append([x / norm for x in raw])
+        return out</code></pre>
+
+  <h4>worker/celery_app.py</h4>
+  <pre data-file="src/docflow/worker/celery_app.py"><code class="language-python">from celery import Celery
+from celery.signals import worker_process_init, worker_process_shutdown
+from kombu import Queue
+
+from docflow.settings import get_settings
+
+settings = get_settings()
+celery_app = Celery("docflow", broker=settings.broker_url, include=["docflow.worker.tasks"])
+celery_app.conf.update(
+    task_serializer="json", accept_content=["json"],      # never pickle over the network
+    task_acks_late=True,                                  # ack after success: at-least-once
+    task_reject_on_worker_lost=True,                      # requeue if the child is SIGKILLed
+    worker_prefetch_multiplier=1,                         # long tasks: do not hoard messages
+    task_time_limit=15 * 60, task_soft_time_limit=14 * 60,
+    worker_max_tasks_per_child=200,                       # recycle to cap fragmentation/leaks
+    broker_transport_options={"visibility_timeout": 2 * 60 * 60},   # &gt; longest task + retry ETA
+    task_queues=[Queue("extract"), Queue("embed")],
+    task_routes={"docflow.worker.tasks.extract_document": {"queue": "extract"},
+                 "docflow.worker.tasks.embed_document": {"queue": "embed"}},
+    task_default_queue="extract",
+    result_backend=None,                                  # state lives in our own tables
+    broker_connection_retry_on_startup=True,
+)
+
+# Per-child resources: created AFTER fork, never inherited from the parent.
+class _Resources:
+    sessionmaker = None
+    embedder = None
+    blob_store = None
+
+res = _Resources()
+
+@worker_process_init.connect
+def init_child(**_: object) -&gt; None:
+    from docflow.db import make_sync_engine, make_sync_sessionmaker
+    from docflow.ingest.embedder import HashEmbedder, HttpEmbedder
+    from docflow.storage import LocalBlobStore
+    engine = make_sync_engine(settings.worker_database_url)
+    res.sessionmaker = make_sync_sessionmaker(engine)
+    res.blob_store = LocalBlobStore(settings.blob_dir)
+    if settings.embedding_url:
+        key = settings.embedding_api_key.get_secret_value() if settings.embedding_api_key else None
+        res.embedder = HttpEmbedder(settings.embedding_url, key, settings.embedding_model,
+                                    settings.embedding_dim)
+    else:
+        res.embedder = HashEmbedder(settings.embedding_dim)
+
+@worker_process_shutdown.connect
+def close_child(**_: object) -&gt; None:
+    if res.sessionmaker is not None:
+        res.sessionmaker.kw["bind"].dispose()</code></pre>
+
+  <h4>worker/tasks.py</h4>
+  <pre data-file="src/docflow/worker/tasks.py"><code class="language-python">import logging
+import uuid
+
+from celery import Task
+from sqlalchemy import delete, select, update
+from sqlalchemy.orm import Session
+
+from docflow.ingest.chunker import chunk_text
+from docflow.ingest.embedder import TransientEmbeddingError
+from docflow.ingest.extract import UnsupportedDocument, extract_text
+from docflow.models import Chunk, DocStatus, Document, IngestJob, OutboxMessage
+from docflow.settings import get_settings
+from docflow.worker.celery_app import celery_app, res
+
+log = logging.getLogger(__name__)
+settings = get_settings()
+EMBED_TOPIC = "docflow.tasks.embed"
+INGESTED_TOPIC = "document.ingested"
+
+def _lock_doc(s: Session, doc_id: uuid.UUID) -&gt; Document | None:
+    # Row lock serialises duplicate deliveries of the same task (SKIP LOCKED is for queues;
+    # here we WANT the duplicate to wait, then observe the finished state and no-op).
+    return s.scalar(select(Document).where(Document.id == doc_id).with_for_update())
+
+def _fail(doc_id: uuid.UUID, version: int, stage: str, err: str) -&gt; None:
+    with res.sessionmaker() as s, s.begin():
+        s.execute(update(Document).where(Document.id == doc_id, Document.version == version)
+                  .values(status=DocStatus.FAILED, last_error=err[:2000]))
+        s.add(IngestJob(document_id=doc_id, document_version=version, stage=stage,
+                        state="FAILED", last_error=err[:2000]))
+
+@celery_app.task(bind=True, max_retries=5, autoretry_for=(OSError,),
+                 retry_backoff=2, retry_backoff_max=120, retry_jitter=True)
+def extract_document(self: Task, document_id: str, version: int) -&gt; str:
+    doc_id = uuid.UUID(document_id)
+    with res.sessionmaker() as s, s.begin():
+        doc = _lock_doc(s, doc_id)
+        if doc is None or doc.version != version or doc.status != DocStatus.RECEIVED:
+            return "skipped"                                  # idempotency: stale or already done
+        blob_key, ctype = doc.blob_key, doc.content_type
+    data = res.blob_store.get_sync(blob_key)                  # outside the transaction
+    try:
+        text = extract_text(data, ctype)
+    except UnsupportedDocument as e:                          # permanent: no retry
+        _fail(doc_id, version, "extract", f"unsupported: {e}")
+        return "failed"
+    pieces = chunk_text(text, settings.chunk_tokens, settings.chunk_overlap)
+    with res.sessionmaker() as s, s.begin():
+        doc = _lock_doc(s, doc_id)
+        if doc is None or doc.version != version or doc.status != DocStatus.RECEIVED:
+            return "skipped"                                  # lost a race with a duplicate
+        s.execute(delete(Chunk).where(Chunk.document_id == doc_id))   # replace on reprocess
+        s.add_all(Chunk(document_id=doc_id, ordinal=p.ordinal, content=p.content,
+                        token_count=p.token_count) for p in pieces)
+        doc.status, doc.chunk_count = DocStatus.EXTRACTED, len(pieces)
+        s.add(IngestJob(document_id=doc_id, document_version=version, stage="extract",
+                        state="DONE", attempts=self.request.retries + 1))
+        s.add(OutboxMessage(topic=EMBED_TOPIC, key=document_id,
+                            payload={"document_id": document_id, "version": version}))
+    return "extracted"
+
+@celery_app.task(bind=True, max_retries=8, autoretry_for=(TransientEmbeddingError, OSError),
+                 retry_backoff=5, retry_backoff_max=600, retry_jitter=True, rate_limit="30/m")
+def embed_document(self: Task, document_id: str, version: int) -&gt; str:
+    doc_id = uuid.UUID(document_id)
+    with res.sessionmaker() as s, s.begin():
+        doc = _lock_doc(s, doc_id)
+        if doc is None or doc.version != version or doc.status != DocStatus.EXTRACTED:
+            return "skipped"
+        pending = s.execute(select(Chunk.id, Chunk.content)
+                            .where(Chunk.document_id == doc_id, Chunk.embedding.is_(None))
+                            .order_by(Chunk.ordinal)).all()
+    # Embed in batches OUTSIDE any transaction; persist each batch so a retry resumes
+    # where it stopped instead of paying for the same embeddings again.
+    for i in range(0, len(pending), settings.embedding_batch):
+        batch = pending[i : i + settings.embedding_batch]
+        vectors = res.embedder.embed([c.content for c in batch])
+        with res.sessionmaker() as s, s.begin():
+            for (chunk_id, _), vec in zip(batch, vectors, strict=True):
+                s.execute(update(Chunk).where(Chunk.id == chunk_id, Chunk.embedding.is_(None))
+                          .values(embedding=vec))
+    with res.sessionmaker() as s, s.begin():
+        doc = _lock_doc(s, doc_id)
+        if doc is None or doc.version != version or doc.status != DocStatus.EXTRACTED:
+            return "skipped"
+        doc.status = DocStatus.READY
+        s.add(IngestJob(document_id=doc_id, document_version=version, stage="embed",
+                        state="DONE", attempts=self.request.retries + 1))
+        s.add(OutboxMessage(topic=INGESTED_TOPIC, key=document_id,
+                            payload={"document_id": document_id, "tenant_id": doc.tenant_id,
+                                     "version": version, "chunk_count": doc.chunk_count}))
+    return "ready"</code></pre>
+  <p>Three idempotency layers protect against at-least-once delivery: the <code>(version, status)</code> guard rejects stale or completed work; the row lock serialises concurrent duplicates; and per-batch persistence with <code>embedding IS NULL</code> guards makes the expensive step resumable, so a retry after a crash only pays for the embeddings that were not saved. This is the same reasoning you would apply to a Spring Kafka consumer that calls a paid API.</p>
+
+  <h4>worker/relay.py: the transactional outbox</h4>
+  <pre data-file="src/docflow/worker/relay.py"><code class="language-python">"""Publishes outbox rows. Run as its own Deployment: python -m docflow.worker.relay"""
+import logging
+import signal
+import time
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session, sessionmaker
+
+from docflow.models import OutboxMessage
+
+log = logging.getLogger("docflow.relay")
+Publisher = Callable[[OutboxMessage], None]
+
+def celery_publisher(msg: OutboxMessage) -&gt; None:
+    from docflow.worker.celery_app import celery_app
+    task = {"docflow.tasks.extract": "docflow.worker.tasks.extract_document",
+            "docflow.tasks.embed": "docflow.worker.tasks.embed_document"}[msg.topic]
+    celery_app.send_task(task, kwargs=msg.payload)
+
+def relay_once(sm: sessionmaker[Session], publishers: dict[str, Publisher], batch: int = 100) -&gt; int:
+    with sm() as s, s.begin():
+        rows = s.scalars(select(OutboxMessage)
+                         .where(OutboxMessage.published_at.is_(None))
+                         .order_by(OutboxMessage.id).limit(batch)
+                         .with_for_update(skip_locked=True)).all()   # several relays can run
+        for msg in rows:
+            publishers[msg.topic](msg)      # if this raises, the tx rolls back: retried next loop
+            msg.published_at = datetime.now(UTC)
+        return len(rows)
+    # Crash after publish but before commit -&gt; message republished: consumers must be idempotent.
+
+def main() -&gt; None:
+    from docflow.db import make_sync_engine, make_sync_sessionmaker
+    from docflow.settings import get_settings
+    settings = get_settings()
+    sm = make_sync_sessionmaker(make_sync_engine(settings.worker_database_url))
+    publishers: dict[str, Publisher] = {"docflow.tasks.extract": celery_publisher,
+                                        "docflow.tasks.embed": celery_publisher}
+    if settings.kafka_bootstrap:
+        from docflow.events.kafka import kafka_publisher           # Chapter 4.4
+        publishers["document.ingested"] = kafka_publisher(settings.kafka_bootstrap)
+    else:
+        publishers["document.ingested"] = lambda m: log.info("event %s %s", m.topic, m.payload)
+    stop = False
+    def _stop(*_: Any) -&gt; None:
+        nonlocal stop
+        stop = True
+    signal.signal(signal.SIGTERM, _stop)
+    while not stop:
+        n = relay_once(sm, publishers)
+        if n == 0:
+            time.sleep(0.5)                 # PostgreSQL LISTEN/NOTIFY can replace polling
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    main()</code></pre>
+
+  <h4>migrations/versions/20261101_0001_init.py</h4>
+  <pre data-file="migrations/versions/20261101_0001_init.py"><code class="language-python">"""initial schema
+
+Revision ID: 0001
+Revises:
+"""
+import sqlalchemy as sa
+from alembic import op
+from pgvector.sqlalchemy import Vector
+from sqlalchemy.dialects import postgresql as pg
+
+revision = "0001"
+down_revision = None
+
+def upgrade() -&gt; None:
+    op.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    op.create_table(
+        "documents",
+        sa.Column("id", sa.Uuid(), primary_key=True),
+        sa.Column("tenant_id", sa.String(64), nullable=False, index=True),
+        sa.Column("filename", sa.String(255), nullable=False),
+        sa.Column("content_type", sa.String(100), nullable=False),
+        sa.Column("size_bytes", sa.Integer(), nullable=False),
+        sa.Column("blob_key", sa.String(512), nullable=False),
+        sa.Column("content_sha256", sa.String(64), nullable=False),
+        sa.Column("status", sa.String(16), nullable=False),
+        sa.Column("version", sa.Integer(), nullable=False),
+        sa.Column("chunk_count", sa.Integer(), nullable=False),
+        sa.Column("last_error", sa.Text()),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.UniqueConstraint("tenant_id", "content_sha256", name="uq_documents_tenant_sha"),
+    )
+    op.create_index("ix_documents_tenant_created", "documents", ["tenant_id", "created_at", "id"])
+    op.create_table(
+        "chunks",
+        sa.Column("id", sa.BigInteger(), sa.Identity(), primary_key=True),
+        sa.Column("document_id", sa.Uuid(), sa.ForeignKey("documents.id", ondelete="CASCADE"),
+                  nullable=False, index=True),
+        sa.Column("ordinal", sa.Integer(), nullable=False),
+        sa.Column("content", sa.Text(), nullable=False),
+        sa.Column("token_count", sa.Integer(), nullable=False),
+        sa.Column("embedding", Vector(384)),
+        sa.UniqueConstraint("document_id", "ordinal", name="uq_chunks_doc_ordinal"),
+    )
+    op.execute("CREATE INDEX ix_chunks_embedding_hnsw ON chunks "
+               "USING hnsw (embedding vector_cosine_ops)")          # ANN index (pgvector 0.5+)
+    op.create_table(
+        "ingest_jobs",
+        sa.Column("id", sa.Uuid(), primary_key=True),
+        sa.Column("document_id", sa.Uuid(), sa.ForeignKey("documents.id", ondelete="CASCADE"),
+                  nullable=False, index=True),
+        sa.Column("document_version", sa.Integer(), nullable=False),
+        sa.Column("stage", sa.String(16), nullable=False),
+        sa.Column("state", sa.String(16), nullable=False),
+        sa.Column("attempts", sa.Integer(), nullable=False),
+        sa.Column("last_error", sa.Text()),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+    )
+    op.create_table(
+        "outbox",
+        sa.Column("id", sa.BigInteger(), sa.Identity(), primary_key=True),
+        sa.Column("topic", sa.String(128), nullable=False),
+        sa.Column("key", sa.String(128), nullable=False),
+        sa.Column("payload", pg.JSONB(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column("published_at", sa.DateTime(timezone=True)),
+    )
+    op.create_index("ix_outbox_unpublished", "outbox", ["id"],
+                    postgresql_where=sa.text("published_at IS NULL"))
+
+def downgrade() -&gt; None:
+    for t in ("outbox", "ingest_jobs", "chunks", "documents"):
+        op.drop_table(t)</code></pre>
+  <p>Run it locally with <code>uv run alembic upgrade head</code>; Chapter 4.4 wires it into Docker Compose and a Kubernetes Job. With the API, worker and relay running you can already exercise the pipeline:</p>
+  <pre><code class="language-bash">curl -s -X POST localhost:8000/v1/documents -H 'X-Tenant-ID: acme' \
+     -F 'file=@handbook.md;type=text/markdown'          # 202 + Location
+curl -s localhost:8000/v1/documents/&lt;id&gt; -H 'X-Tenant-ID: acme' | jq .status   # RECEIVED -&gt; EXTRACTED -&gt; READY</code></pre>
+</section>
+
+<section id="applications">
+  <h2>8. Applications</h2>
+  <h3>8.1 RAG ingestion and re-indexing</h3>
+  <p>Exactly the docflow pattern: upload, extract, chunk, embed, index, with a version number so that changing the chunker or embedding model triggers a controlled re-embed of the corpus (bump versions in batches through the outbox, throttle the embed queue with <code>rate_limit</code> to respect provider quotas).</p>
+  <h3>8.2 Model-serving side jobs</h3>
+  <p>Batch inference, evaluation runs over datasets, nightly fine-tuning data exports: Celery or a workflow engine schedules them; results land in tables that dashboards and Spring services read.</p>
+  <h3>8.3 Webhooks and third-party integrations</h3>
+  <p>Inbound webhooks are acknowledged quickly by FastAPI (store raw payload plus outbox row) and processed by workers with retries; outbound webhooks are tasks with exponential backoff and a dead-letter state.</p>
+  <h3>8.4 Analytics and reporting queries</h3>
+  <p>SQLAlchemy Core or raw SQL (with <code>text()</code> and bound parameters) for aggregations, window functions and bulk <code>COPY</code>; the ORM is not used for reporting, the same way you would bypass JPA for reporting in Spring.</p>
+  <h3>8.5 Long-running business processes</h3>
+  <p>Customer onboarding with KYC checks, document review with human approval, multi-day agent workflows: these move from Celery chains to Temporal, which persists workflow state and handles timers of days or weeks without broker visibility hacks.</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 Instagram: queue the slow work from day one</h3>
+  <p><span class="tag fact">Verified</span> Instagram's 2011 engineering post "What Powers Instagram: Hundreds of Instances, Dozens of Technologies" described a Django web tier that pushed slow work, such as fanning out a newly shared photo to followers, onto a task queue (Gearman at the time) processed by separate worker machines. The architecture lesson has not changed: Python web tiers stay thin and push anything slow or retryable into queues processed by separate worker fleets.</p>
+  <h3>9.2 Temporal's origin at Uber</h3>
+  <p><span class="tag fact">Verified</span> Temporal is a fork of Cadence, the workflow engine built at Uber; its founders Maxim Fateev and Samar Abbas previously worked on AWS Simple Workflow Service and Microsoft's Durable Task Framework respectively. Temporal publishes SDKs for Java, Go, Python and TypeScript, which makes it a natural cross-language choice for a Spring estate adding Python AI workers: a Java workflow can call Python activities on a dedicated task queue.</p>
+  <h3>9.3 Netflix Dispatch</h3>
+  <p><span class="tag fact">Verified</span> Netflix's open-source Dispatch (FastAPI) uses SQLAlchemy with Alembic migrations and separates Pydantic API models from ORM models, a public, production-quality reference for the layering used in docflow.</p>
+  <h3>9.4 The dual-write problem in the wild</h3>
+  <p><span class="tag illus">Illustrative</span> A typical failure: an API commits an order row, then publishes a Celery task; the broker is briefly unavailable; the request returns 500 even though the row exists, and the client retries, creating a duplicate. Or the publish succeeds but the commit fails, and a worker processes an order that does not exist. The outbox pattern (Debezium-style CDC or a polling relay as in docflow) removes this class of bug; it is the same pattern Spring teams implement with Spring Modulith's event publication registry or Debezium.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages, Limitations and Operational Cost</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Tool</th><th>Strengths</th><th>Limitations</th><th>Ops cost</th></tr></thead>
+    <tbody>
+      <tr><td>SQLAlchemy ORM</td><td>Mature unit of work, identity map, rich loading strategies, typed models, Core escape hatch</td><td>Learning curve; async via greenlets; easy to hold sessions too long</td><td>Low; watch pool sizes per process</td></tr>
+      <tr><td>SQLAlchemy Core / raw SQL</td><td>Full SQL control, fast bulk operations</td><td>No change tracking or graph management</td><td>Low</td></tr>
+      <tr><td>Django ORM</td><td>Batteries included, admin, migrations</td><td>Active record; async support partial; tied to Django</td><td>Low within Django</td></tr>
+      <tr><td>FastAPI BackgroundTasks</td><td>Zero infrastructure</td><td>Lost on crash/deploy; consumes web worker capacity</td><td>None</td></tr>
+      <tr><td>Celery</td><td>Feature-rich: routing, retries, rate limits, beat scheduler, canvas (chains, chords)</td><td>Complex config; default early ack; visibility-timeout pitfalls; async support limited</td><td>Broker + workers + monitoring (Flower)</td></tr>
+      <tr><td>RQ</td><td>Very simple, Redis-only</td><td>Fewer features; fork per job by default</td><td>Redis</td></tr>
+      <tr><td>Dramatiq</td><td>Safer defaults (late ack), simple API, middleware</td><td>Smaller ecosystem</td><td>RabbitMQ or Redis</td></tr>
+      <tr><td>arq</td><td>asyncio-native, Redis</td><td>Smaller project, fewer features</td><td>Redis</td></tr>
+      <tr><td>Temporal</td><td>Durable workflows, timers, signals, versioning, multi-language</td><td>Determinism constraints in workflow code; new paradigm</td><td>Temporal cluster (or Temporal Cloud)</td></tr>
+      <tr><td>Kafka consumers</td><td>Replay, ordering per key, integrates with Java estate</td><td>Not a task queue (no per-message retry/delay built in)</td><td>Kafka cluster</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  S{"Must the work survive a crash or deploy?"} --&gt;|no| BG["FastAPI BackgroundTasks"]
+  S --&gt;|yes| L{"Multi-step, long-running, human waits, compensation?"}
+  L --&gt;|yes| T["Temporal workflow"]
+  L --&gt;|no| E{"Is it an event other services consume or need to replay?"}
+  E --&gt;|yes| K["Kafka topic + idempotent consumers"]
+  E --&gt;|no| A{"Async-native code base and I/O-bound tasks?"}
+  A --&gt;|yes| ARQ["arq or Celery with gevent/threads pool"]
+  A --&gt;|no| C["Celery prefork (or Dramatiq)"]
+</pre>
+  <figcaption>Figure 4.3.6 — Choosing a background-processing mechanism.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> durability is the first cut, workflow complexity the second, and audience (internal job vs company-wide event) the third. Many real systems combine several: docflow uses Celery for its internal pipeline and Kafka for the cross-team event, with an outbox feeding both.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Decision</th><th>Choose</th><th>Because</th></tr></thead>
+    <tbody>
+      <tr><td>ORM vs Core for a 1M-row backfill</td><td>Core (<code>insert().values()</code> batches or <code>COPY</code>)</td><td>Identity map and per-object overhead dominate</td></tr>
+      <tr><td><code>selectinload</code> vs <code>joinedload</code> for collections</td><td><code>selectinload</code></td><td>No row multiplication; predictable 2 queries</td></tr>
+      <tr><td>Async engine in Celery tasks</td><td>No: sync engine</td><td>Celery tasks are sync; <code>asyncio.run</code> per task adds loop churn and pool issues</td></tr>
+      <tr><td>Redis vs RabbitMQ as broker</td><td>RabbitMQ for long tasks/ETAs; Redis for simplicity</td><td>Visibility timeout semantics; durability guarantees</td></tr>
+      <tr><td>Result backend</td><td>Usually none</td><td>Store business state in your DB; result backends grow and expire</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Production Failures</h2>
+  <ol>
+    <li><strong>N+1 queries</strong> from default lazy loading in sync code. Fix with <code>lazy="raise"</code> conventions and explicit loader options.</li>
+    <li><strong><code>MissingGreenlet</code> in async code</strong> from touching unloaded or expired attributes, often after commit with <code>expire_on_commit=True</code>.</li>
+    <li><strong>Sharing a session across tasks or threads</strong> (a global session object). Sessions are not thread- or task-safe, like <code>EntityManager</code>.</li>
+    <li><strong>Holding transactions open across slow I/O</strong> (calling an LLM inside <code>session.begin()</code>), pinning pool connections and holding row locks.</li>
+    <li><strong>Python-side defaults read before flush</strong>: <code>mapped_column(default=1)</code> is applied at INSERT time, so the attribute is <code>None</code> until flush (docflow hit this while being written; see the comment in <code>routes.py</code>).</li>
+    <li><strong>JSON <code>None</code> vs SQL NULL</strong>: SQLAlchemy's <code>JSON</code> type stores Python <code>None</code> as JSON <code>null</code> unless <code>none_as_null=True</code>, so <code>IS NULL</code> filters silently miss rows (also caught while testing docflow on SQLite).</li>
+    <li><strong>Autogenerated migrations applied unreviewed</strong>, dropping and recreating renamed columns (data loss) or locking big tables.</li>
+    <li><strong>Celery defaults assumed to be at-least-once</strong>: they are at-most-once (early ack). Enable <code>acks_late</code> and design idempotent tasks.</li>
+    <li><strong>Passing ORM objects to tasks</strong>: they are serialised (or fail to), go stale, and bypass tenancy checks. Pass IDs plus a version.</li>
+    <li><strong>Long ETAs on Redis/SQS brokers</strong> exceeding the visibility timeout, causing duplicate execution.</li>
+    <li><strong>Retrying permanent errors</strong> (bad input, 4xx) with the same backoff as transient ones, wasting capacity and money. Classify exceptions.</li>
+    <li><strong>Engines created before fork</strong>, sharing sockets across worker processes: random protocol errors. Create in <code>worker_process_init</code>.</li>
+    <li><strong>Unbounded queues</strong>: no back-pressure, so an upstream burst creates a backlog that takes hours to drain. Monitor queue depth and age; shed or throttle at the API.</li>
+  </ol>
+</section>
+
+<section id="production">
+  <h2>13. Production Concerns</h2>
+  <h3>13.1 Database</h3>
+  <ul>
+    <li>Size pools per process and add them up (§6.1); consider PgBouncer; set <code>statement_timeout</code> and <code>idle_in_transaction_session_timeout</code> in PostgreSQL as a safety net.</li>
+    <li>Use <code>echo=False</code> in production, but enable slow-query logging in PostgreSQL and SQLAlchemy event hooks for query counts per request in tests (assert query budgets, as you might with Hibernate statistics).</li>
+    <li>Migrations: expand/contract, <code>CONCURRENTLY</code> indexes, lock timeouts (<code>SET lock_timeout = '5s'</code> in migrations), run as a separate job.</li>
+    <li>Read replicas: a second engine and an explicit <code>get_read_session</code> dependency; do not hide replica routing behind magic.</li>
+  </ul>
+  <h3>13.2 Workers</h3>
+  <ul>
+    <li>Separate queues per workload class (CPU-bound extract vs I/O-bound embed) with separately scaled deployments; autoscale on queue depth (KEDA has Redis and RabbitMQ scalers).</li>
+    <li>Graceful shutdown: Celery's warm shutdown on SIGTERM finishes current tasks; set Kubernetes <code>terminationGracePeriodSeconds</code> above your soft time limit, or rely on <code>acks_late</code> plus idempotency for tasks that get killed.</li>
+    <li>Monitoring: queue length and oldest-message age, task runtime histograms, retry and failure counts by exception type, worker restarts. Flower for ad-hoc inspection; Prometheus exporters for alerting.</li>
+    <li>Dead letters: after max retries, mark the business entity FAILED (as docflow does) and alert; provide a reprocess endpoint rather than poking the broker.</li>
+  </ul>
+  <h3>13.3 Security</h3>
+  <ul>
+    <li>JSON serialisation only; disable pickle. Authenticate to the broker (Redis ACLs/TLS, RabbitMQ users/vhosts).</li>
+    <li>Tenant isolation in every query (<code>where tenant_id = ...</code>), or PostgreSQL row-level security with a per-transaction <code>SET LOCAL app.tenant_id</code>.</li>
+    <li>Bound upload sizes, validate content types, and treat extracted text as untrusted (it will later be inserted into LLM prompts: a prompt-injection vector covered in Part 8).</li>
+  </ul>
+  <h3>13.4 Cost control for AI pipelines</h3>
+  <p>Embedding calls are the expensive part. Deduplicate by content hash (docflow's unique constraint), persist progress per batch, rate-limit per provider, and record token counts per tenant for chargeback.</p>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundation</p>
+    <p>Write a query that returns each tenant's document count and total chunk count in a single SQL statement using SQLAlchemy 2.x Core-style constructs.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-python">from sqlalchemy import func, select
+from docflow.models import Chunk, Document
+
+stmt = (select(Document.tenant_id,
+               func.count(func.distinct(Document.id)).label("documents"),
+               func.count(Chunk.id).label("chunks"))
+        .outerjoin(Chunk, Chunk.document_id == Document.id)
+        .group_by(Document.tenant_id)
+        .order_by(func.count(Chunk.id).desc()))
+# rows = (await session.execute(stmt)).all()</code></pre>
+    <p>Selecting columns instead of entities bypasses the identity map entirely: cheaper, and the result is plain rows.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Add optimistic locking to <code>Document</code> so that two concurrent reprocess requests cannot both succeed silently, and map the conflict to HTTP 409.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Add <code>__mapper_args__ = {"version_id_col": version}</code>; then ORM UPDATEs include <code>WHERE version = :old</code> and increment it, raising <code>StaleDataError</code> when no row matches. Change <code>request_reprocess</code> to modify the loaded object (<code>doc.status = RECEIVED</code>) instead of a bulk <code>update()</code> (bulk statements bypass version checking), and register an exception handler mapping <code>StaleDataError</code> to 409. Note that docflow's version doubles as the pipeline generation number, which is convenient: tasks for older versions become no-ops.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Advanced</p>
+    <p>The embed queue processes 30 documents per minute but uploads arrive at 50 per minute during business hours. Propose a capacity and back-pressure plan.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Measure where the limit is: provider rate limit (tokens per minute), worker concurrency, or DB writes. If provider-bound, request a quota increase, batch larger (fewer requests per token), or add a second provider/region behind the <code>Embedder</code> protocol. If worker-bound, scale embed workers on queue depth (KEDA) and use a thread pool (I/O-bound). Back-pressure: expose queue age as a metric; when age exceeds an SLO, return 429 with <code>Retry-After</code> for bulk-upload tenants, or accept but mark as "queued" with an ETA. Over a day, 20 surplus documents per minute for 8 hours is a 9,600-document backlog, which must drain overnight at the same throughput: check that \( 30 \times 60 \times 16 \gt 9600 \).</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>Rewrite the extract-then-embed pipeline as a Temporal workflow (sketch the code) and list what you gain and lose versus Celery plus outbox.</p>
+    <details class="solution"><summary>Solution</summary><div>
+<pre><code class="language-python"># pip install temporalio   (sketch)
+from datetime import timedelta
+from temporalio import activity, workflow
+from temporalio.common import RetryPolicy
+
+@activity.defn
+async def extract(doc_id: str, version: int) -&gt; int: ...        # returns chunk count
+@activity.defn
+async def embed_batch(doc_id: str, version: int, start: int, size: int) -&gt; None: ...
+@activity.defn
+async def publish_ingested(doc_id: str, version: int) -&gt; None: ...
+
+@workflow.defn
+class IngestWorkflow:
+    @workflow.run
+    async def run(self, doc_id: str, version: int) -&gt; None:
+        retry = RetryPolicy(maximum_attempts=8, backoff_coefficient=2.0)
+        n = await workflow.execute_activity(extract, args=[doc_id, version],
+                start_to_close_timeout=timedelta(minutes=15), retry_policy=retry)
+        for start in range(0, n, 64):
+            await workflow.execute_activity(embed_batch, args=[doc_id, version, start, 64],
+                start_to_close_timeout=timedelta(minutes=2), retry_policy=retry)
+        await workflow.execute_activity(publish_ingested, args=[doc_id, version],
+                start_to_close_timeout=timedelta(seconds=30))</code></pre>
+    <p>Gains: explicit, versioned workflow code; durable progress without hand-written status tables; visibility UI; timers and signals (e.g. wait for human approval). Losses: a Temporal cluster to run, determinism rules for workflow code, new mental model; activities still need idempotency. Starting the workflow from the API still needs an outbox or Temporal's own idempotent workflow IDs (use <code>doc_id:version</code> as workflow ID).</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Expert</p>
+    <p>Prove (informally) that docflow never embeds a chunk twice for the same document version, even with duplicated task deliveries and crashes at any point. Identify any remaining gap.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Each batch update is guarded by <code>embedding IS NULL</code> and executed after the embed call; a crash before commit loses the vectors (the call is repeated: a paid duplicate, the gap), while a crash after commit leaves them saved and a retry skips those chunks. Duplicated concurrent deliveries both read the pending list and may both call the provider for the same batch before either commits: also a paid duplicate, though storage stays correct thanks to the guard. Closing the gap requires claiming batches before calling the provider (e.g. a <code>claimed_by</code>/<code>claimed_at</code> column set with <code>SELECT ... FOR UPDATE SKIP LOCKED</code>) or serialising per document with the row lock held only for the claim. So: correctness is guaranteed; at-most-once spending is not, and the fix is a claim step.</p></div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain SQLAlchemy's identity map and unit of work in JPA terms.</summary><div><p>The identity map is the persistence context's first-level cache: one object per primary key per session. The unit of work tracks new, dirty and deleted objects and flushes them as ordered SQL at flush/commit, like Hibernate's action queue. Differences: SQLAlchemy tracks changes via attribute instrumentation rather than snapshots, and session/transaction boundaries are explicit code rather than proxies.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why does async SQLAlchemy forbid lazy loading?</summary><div><p>Lazy loading happens on attribute access, which is synchronous and cannot be awaited; the async bridge only works inside greenlet-wrapped calls. Rather than block the loop, SQLAlchemy raises. You must eager-load or use <code>awaitable_attrs</code>.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What delivery guarantee does Celery give by default, and how do you get at-least-once?</summary><div><p>At-most-once: messages are acked when execution starts. Set <code>task_acks_late=True</code> (and <code>task_reject_on_worker_lost=True</code>) for at-least-once, and make tasks idempotent. Exactly-once is an end-to-end property you build with idempotency keys and transactional state, not a broker setting.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Design reliable "save then process asynchronously" for an upload API.</summary><div><p>Transactional outbox: insert entity and outbox row in one transaction; a relay publishes with <code>FOR UPDATE SKIP LOCKED</code> polling or CDC (Debezium), marks rows published; consumers are idempotent keyed by entity ID and version. Alternatives: CDC directly from the entity table, or Temporal with workflow IDs as idempotency keys.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How would you integrate Python workers into a Spring Boot system that already uses Kafka?</summary><div><p>Use Kafka as the integration contract (schemas in a registry, Avro or Protobuf), Python consumers via confluent-kafka with manual commits after processing and idempotent handlers; keep Celery (if at all) as an internal implementation detail of the Python service. Chapter 4.4 details this.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Write a retry policy for a task that calls a rate-limited API, distinguishing permanent and transient errors.</summary><div>
+<pre><code class="language-python">class Permanent(Exception): ...
+class Transient(Exception): ...
+
+@celery_app.task(bind=True, acks_late=True, autoretry_for=(Transient,), retry_backoff=2,
+                 retry_backoff_max=300, retry_jitter=True, max_retries=8, rate_limit="60/m")
+def call_api(self, item_id: str) -&gt; None:
+    resp = client.post("/x", json={"id": item_id}, headers={"Idempotency-Key": item_id})
+    if resp.status_code in (429, 502, 503, 504):
+        raise Transient(resp.status_code)
+    if 400 &lt;= resp.status_code &lt; 500:
+        mark_failed(item_id, resp.text)       # permanent: record, do not retry
+        return
+    resp.raise_for_status()</code></pre>
+  <p>Mention honouring <code>Retry-After</code> (use <code>self.retry(countdown=...)</code>), idempotency keys on the remote call, and that <code>rate_limit</code> is per worker, not global.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Tasks are executed twice roughly an hour after being scheduled. Why?</summary><div><p>Redis or SQS visibility timeout (default one hour in Celery's Redis transport) expiring for tasks with long ETAs or long runtimes, so the message is redelivered while the first worker still holds it. Raise the timeout, shorten ETAs, switch to RabbitMQ, and make tasks idempotent.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> After moving to async SQLAlchemy, the DB shows hundreds of idle-in-transaction connections. Diagnose.</summary><div><p>Sessions opened per request but transactions not closed promptly: handlers awaiting slow external calls inside <code>session.begin()</code>, or sessions never closed (no context manager). Fix scoping, set <code>idle_in_transaction_session_timeout</code>, and audit with <code>pg_stat_activity</code>.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> Describe a data migration you planned to avoid downtime.</summary><div><p>Expand/contract story: additive schema, dual writes or backfill in batches with progress tracking, feature-flagged read switch, verification queries, then contract. Mention lock timeouts, rollback plan and communication with dependent teams.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>SQLAlchemy's Session is a JPA persistence context with explicit lifecycle; use context-managed transactions.</li>
+    <li>Prefer <code>selectinload</code> for collections, <code>joinedload</code> for to-one, and <code>lazy="raise"</code> everywhere to prevent N+1.</li>
+    <li>Async sessions need <code>expire_on_commit=False</code>, eager loading and one session per task.</li>
+    <li>Alembic is Flyway for Python: review autogenerated scripts and practise expand/contract.</li>
+    <li>Celery is at-most-once by default; enable late acks, design idempotent tasks, classify errors, and mind the visibility timeout.</li>
+    <li>Use an outbox to avoid dual writes; pass IDs and versions to tasks, never ORM objects.</li>
+  </ul>
+  <div class="quiz" data-answer="c">
+    <p class="q">Which loader avoids N+1 for a one-to-many collection without multiplying parent rows?</p>
+    <ol><li data-k="a">lazy="select"</li><li data-k="b">joinedload</li><li data-k="c">selectinload</li><li data-k="d">noload</li></ol>
+    <div class="explain">selectinload issues one extra IN query for all parents' children, avoiding Cartesian growth.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">Why set <code>expire_on_commit=False</code> on async session factories?</p>
+    <ol><li data-k="a">Expired attributes would require implicit I/O on access, which async sessions cannot do</li><li data-k="b">To disable transactions</li><li data-k="c">To improve INSERT batching</li><li data-k="d">To enable the identity map</li></ol>
+    <div class="explain">Accessing an expired attribute triggers a refresh query; in async that raises MissingGreenlet.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">With Celery's default settings, a worker host loses power mid-task. What happens to the task?</p>
+    <ol><li data-k="a">It is redelivered automatically</li><li data-k="b">It is retried with backoff</li><li data-k="c">It moves to a dead-letter queue</li><li data-k="d">It is lost, because it was acknowledged when execution started</li></ol>
+    <div class="explain">Default early ack gives at-most-once semantics; enable acks_late for redelivery.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">What problem does the transactional outbox solve?</p>
+    <ol><li data-k="a">Slow queries</li><li data-k="b">Inconsistency between a DB commit and a message publish (dual write)</li><li data-k="c">Broker authentication</li><li data-k="d">Schema migrations</li></ol>
+    <div class="explain">Writing the message in the same transaction as the state guarantees both or neither; a relay publishes afterwards.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Which tool is the best fit for a multi-day onboarding process with human approval steps?</p>
+    <ol><li data-k="a">FastAPI BackgroundTasks</li><li data-k="b">Celery with long ETAs</li><li data-k="c">Temporal workflow</li><li data-k="d">A cron job</li></ol>
+    <div class="explain">Durable workflows handle long timers, signals and compensation without broker visibility problems.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.sqlalchemy.org/en/20/orm/quickstart.html">SQLAlchemy 2.0 ORM Quick Start</a> and <a href="https://docs.sqlalchemy.org/en/20/orm/queryguide/relationships.html">Relationship Loading Techniques</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.sqlalchemy.org/en/20/orm/extensions/asyncio.html">SQLAlchemy asyncio extension</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://alembic.sqlalchemy.org/">Alembic documentation</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.celeryq.dev/en/stable/userguide/tasks.html">Celery user guide: Tasks</a> (acks_late, retries, idempotency) and <a href="https://docs.celeryq.dev/en/stable/getting-started/backends-and-brokers/redis.html">Redis broker caveats</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.temporal.io/">Temporal documentation</a></li>
+    <li><span class="ref-kind">Docs</span> <a href="https://dramatiq.io/">Dramatiq</a>, <a href="https://python-rq.org/">RQ</a>, <a href="https://arq-docs.helpmanual.io/">arq</a></li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/pgvector/pgvector-python">pgvector-python</a></li>
+    <li><span class="ref-kind">Blog</span> <a href="https://microservices.io/patterns/data/transactional-outbox.html">Chris Richardson — Transactional outbox pattern</a></li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/Netflix/dispatch">Netflix Dispatch</a></li>
+    <li><span class="ref-kind">Book</span> Martin Fowler, <em>Patterns of Enterprise Application Architecture</em>, Addison-Wesley, 2002 — Unit of Work, Identity Map, Data Mapper.</li>
+    <li><span class="ref-kind">Book</span> Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, O'Reilly, 2017 — ch. 7 (transactions) and ch. 11 (stream processing).</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,717 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sorting, Binary Search &amp; Windows — AI-Era Software Engineering</title>
+<meta name="description" content="Sorting algorithms and their lower bound, the JDK and CPython sort implementations, binary search on indices and on answer spaces, two pointers, and fixed and variable sliding windows, with problem ladders.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p3-03-two-pointers-window-search" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 3 · Chapter 3</p>
+  <h1>Two Pointers, Sliding Window, Sorting &amp; Binary Search</h1>
+  <p class="lede">Order is information. Once data is sorted, a linear scan with two pointers replaces nested loops, binary search replaces scans, and a whole class of "find the minimum feasible X" problems becomes a logarithmic search over the answer. This chapter builds the sorting algorithms that create order (and proves why Θ(n log n) is optimal for comparison sorts), dissects what <code>Arrays.sort</code>, <code>list.sort()</code> and Go's <code>slices.Sort</code> actually run, then turns to the three scanning patterns that exploit order: binary search, two pointers and sliding windows.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Chapter 3.1 (complexity, recurrences, prefix sums).</li>
+    <li><strong>You will be able to:</strong> implement and analyse insertion, merge, quick, heap, counting and radix sort; explain stability and the comparison lower bound; write bug-free binary searches with explicit invariants (including on answer spaces and rotated arrays); and apply two-pointer and sliding-window templates to substring and subarray problems.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: Exploiting Order</h2>
+  <p>Many brute-force solutions examine all pairs or all subarrays: Θ(n²) or worse. The techniques in this chapter cut that down by exploiting <strong>monotonicity</strong> — a property that lets you discard many candidates with one comparison:</p>
+  <ul>
+    <li><strong>Sorting</strong> establishes order so later steps can be monotone. It is also the most common preprocessing step in interviews ("sort, then…").</li>
+    <li><strong>Binary search</strong> exploits a monotone predicate: if the predicate is false at x it is false everywhere to the left. Each probe discards half the candidates — on array indices, or on an abstract answer range such as "minimum capacity", "smallest time", "largest minimum distance".</li>
+    <li><strong>Two pointers</strong> exploit order between two positions: in a sorted array, if a[i] + a[j] is too big, no pair using j with any index ≥ i can work, so j moves inward.</li>
+    <li><strong>Sliding windows</strong> exploit monotonicity of a window property under extension and shrinking (e.g. "a window with a repeated character still has one if extended"), so each element enters and leaves the window once.</li>
+  </ul>
+  <p>The meta-skill an interviewer looks for: articulate the <em>invariant</em> ("everything left of lo fails the predicate", "the window never contains a duplicate") and argue why moving a pointer cannot skip an answer.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd><code>Collections.sort</code>, <code>Comparator.comparing(...).thenComparing(...)</code>, <code>Arrays.binarySearch</code>, SQL <code>ORDER BY</code> and <code>LIMIT</code>, pagination with keyset/seek methods, maybe <code>git bisect</code>.</dd>
+      <dt>Why that is not enough</dt><dd>Interviewers expect you to implement merge/quick sort and binary search variants from scratch, know which JDK sort is stable (objects: yes; primitives: not applicable but dual-pivot quicksort is not stable), explain the Ω(n log n) lower bound and when counting/radix sort beat it, and write off-by-one-free searches for "first element ≥ x" or "minimum feasible capacity".</dd>
+      <dt>The modern approach</dt><dd>Use the library sort in production (TimSort/powersort for objects, dual-pivot quicksort for primitives, pdqsort in Go and Rust), but understand their adaptivity and worst cases. Write binary search with half-open intervals and a predicate. Recognise window problems by the "longest/shortest subarray/substring satisfying…" phrasing.</dd>
+      <dt>Where Python and Go fit</dt><dd>Python: <code>list.sort</code>/<code>sorted</code> (stable, key functions, Timsort with powersort merge policy since 3.11) and <code>bisect.bisect_left/right</code> (with <code>key=</code> since 3.10). Go: <code>slices.Sort</code>/<code>sort.Slice</code> (pdqsort since 1.19, not stable; <code>slices.SortStableFunc</code> is) and <code>sort.Search</code>/<code>slices.BinarySearch</code>.</dd>
+      <dt>In production</dt><dd>External merge sort in databases for ORDER BY and sort-merge joins; binary search over sorted index blocks (SSTables, Lucene term dictionaries, B-tree pages); <code>git bisect</code>; capacity planning by binary search on load; sliding windows in rate limiters, streaming aggregations and anomaly detection.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Sort when you will query the data many times or need order-dependent algorithms; avoid sorting when a hash map answers the question in Θ(n) (e.g. Two Sum on unsorted data where indices matter). Use sliding windows only when the window property is monotone (non-negative numbers, "at most k distinct"); otherwise use prefix sums.</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="history">
+  <h2>2. History</h2>
+  <ul>
+    <li><strong>1945 — Merge sort.</strong> John von Neumann wrote a merge-sort program for the EDVAC; it is among the first programs written for a stored-program computer.</li>
+    <li><strong>1946 — Binary search</strong> was described by John Mauchly in the Moore School Lectures. Correct implementations proved elusive: until D. H. Lehmer's 1960 version, published algorithms worked only for array lengths of the form 2<sup>k</sup> − 1, and in 2006 Joshua Bloch reported that the midpoint overflow bug affected <code>Arrays.binarySearch</code> in the JDK for nearly a decade.</li>
+    <li><strong>1887–1954 — Radix sort.</strong> Herman Hollerith's tabulating machines sorted punched cards digit by digit (1880s–1890s); Harold Seward formalised radix and counting sort for computers at MIT in 1954.</li>
+    <li><strong>1959–1961 — Quicksort.</strong> Tony Hoare invented quicksort in Moscow in 1959 and published it (with Quickselect, "Find") in 1961–1962.</li>
+    <li><strong>1964 — Heapsort.</strong> J. W. J. Williams introduced the binary heap and heapsort; Robert Floyd gave the linear-time bottom-up heap construction the same year.</li>
+    <li><strong>1973 — Linear-time selection.</strong> Blum, Floyd, Pratt, Rivest and Tarjan published the median-of-medians algorithm, deterministic Θ(n) selection.</li>
+    <li><strong>1997 — Introsort.</strong> David Musser's introspective sort switches from quicksort to heapsort when recursion gets too deep, guaranteeing O(n log n); it became the basis of C++ <code>std::sort</code>.</li>
+    <li><strong>2002 — Timsort.</strong> Tim Peters designed Timsort for Python 2.3: a stable, adaptive merge sort that detects runs. Java 7 (2011) adopted it for object sorts.</li>
+    <li><strong>2009–2011 — Dual-pivot quicksort.</strong> Vladimir Yaroslavskiy's dual-pivot quicksort replaced the classic single-pivot sort for Java primitives in JDK 7; it was substantially reworked again in JDK 14.</li>
+    <li><strong>2015 — Timsort bug.</strong> Stijn de Gouw and colleagues, attempting to formally verify Java's TimSort with the KeY prover, found that its merge-stack invariant could be violated, causing an <code>ArrayIndexOutOfBoundsException</code> for specially crafted large inputs.</li>
+    <li><strong>2018–2022 — Powersort and pdqsort.</strong> Ian Munro and Sebastian Wild published powersort's nearly optimal merge policy (ESA 2018), adopted by CPython 3.11. Orson Peters's pattern-defeating quicksort (2016–2021) became Rust's unstable sort and Go's <code>sort.Sort</code> in Go 1.19 (2022).</li>
+  </ul>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 Sorting vocabulary</h3>
+  <ul>
+    <li><strong>Stable</strong>: equal keys keep their input order. Needed for multi-key sorts done as successive passes (sort by date, then stable-sort by customer → grouped by customer, dates in order) and for radix sort's correctness.</li>
+    <li><strong>In-place</strong>: O(1) (or O(log n) stack) extra memory.</li>
+    <li><strong>Adaptive</strong>: faster on partially sorted input (insertion sort, Timsort).</li>
+    <li><strong>Comparison-based</strong>: only learns about keys through comparisons — subject to the Ω(n log n) lower bound. <strong>Distribution</strong> sorts (counting, radix, bucket) inspect key digits and can beat it.</li>
+    <li><strong>Inversions</strong>: pairs i &lt; j with a[i] &gt; a[j]. A sorted array has 0; a reversed one has n(n−1)/2. Insertion sort's running time is Θ(n + inversions).</li>
+  </ul>
+
+  <h3>3.2 Insertion sort</h3>
+  <p><strong>Concept:</strong> grow a sorted prefix; insert each new element into place by shifting larger elements right — how you sort a hand of cards. <strong>Internals:</strong> each shift removes exactly one inversion. <strong>Complexity:</strong> best Θ(n) (sorted), worst/average Θ(n²), Θ(1) extra space, stable, adaptive, online. <strong>Why it matters:</strong> for tiny arrays (n ≲ 16–48) its low overhead beats everything, so every production hybrid sort (TimSort, dual-pivot quicksort, pdqsort, introsort) finishes small partitions with insertion sort (TimSort uses <em>binary</em> insertion sort to cut comparisons).</p>
+<pre class="ascii">
+[5 | 2 4 6 1 3]   sorted prefix | rest
+[2 5 | 4 6 1 3]   2 shifts past 5
+[2 4 5 | 6 1 3]
+[2 4 5 6 | 1 3]   6 stays
+[1 2 4 5 6 | 3]   1 shifts past four elements
+[1 2 3 4 5 6 |]   3 shifts past three
+</pre>
+
+  <h3>3.3 Merge sort</h3>
+  <p><strong>Concept:</strong> divide in half, sort each half recursively, merge two sorted halves with two pointers. <strong>Internals:</strong> the merge takes the smaller head each step; taking from the left on ties makes it stable. <strong>Complexity:</strong> T(n) = 2T(n/2) + Θ(n) = Θ(n log n) in every case; Θ(n) auxiliary array; stable; not adaptive in its basic form (natural merge sort and Timsort are). <strong>Strengths:</strong> predictable, stable, parallelisable, and sequential-access friendly — so it is <em>the</em> algorithm for linked lists and for external sorting of data larger than memory (sort runs that fit in RAM, then k-way merge them with a heap).</p>
+<pre class="ascii">
+             [38 27 43 3 9 82 10]
+          [38 27 43]        [3 9 82 10]
+        [38] [27 43]       [3 9]  [82 10]
+             [27][43]     [3][9]  [82][10]
+        merge: [27 43]     [3 9]   [10 82]
+        [27 38 43]         [3 9 10 82]
+             [3 9 10 27 38 43 82]
+</pre>
+
+  <h3>3.4 Quicksort</h3>
+  <p><strong>Concept:</strong> pick a pivot, partition so that smaller elements precede it and larger follow, recurse on both sides. The work happens <em>before</em> recursion (partitioning) whereas merge sort works <em>after</em> (merging).</p>
+  <p><strong>Partition schemes:</strong> <em>Lomuto</em> keeps one boundary and swaps small elements behind it — simple, but degrades to Θ(n²) on many duplicates. <em>Hoare</em> scans inward from both ends swapping out-of-place pairs — about three times fewer swaps on average. <em>Three-way</em> (Dijkstra's Dutch national flag) splits into &lt;, =, &gt; regions, making arrays with many equal keys linear. <strong>Pivot choice:</strong> a fixed first/last element makes sorted input the worst case; random pivots give expected Θ(n log n) for every input; median-of-three (or "ninther") reduces the constant. <strong>Complexity:</strong> expected Θ(n log n), worst Θ(n²), Θ(log n) expected stack if you recurse on the smaller side first and loop on the larger (guaranteeing O(log n) stack even in the worst case). Not stable. Its practical speed comes from in-place sequential scans with excellent locality and few data moves.</p>
+  <p><strong>Introsort / pdqsort</strong> fix the worst case: track recursion depth and switch to heapsort beyond ~2 log₂ n levels. pdqsort adds detection of already-sorted runs and of bad partitions, shuffling elements to break adversarial patterns.</p>
+
+  <h3>3.5 Heapsort</h3>
+  <p>Build a max-heap in Θ(n) (bottom-up sift-down), then repeatedly swap the root with the last element and sift down: Θ(n log n) worst case, Θ(1) extra space, not stable, poor cache behaviour (sift-down jumps between i and 2i+1). It is the safety net inside introsort and Java's JDK 14+ dual-pivot quicksort. Heap internals are covered in Chapter 4.</p>
+
+  <h3>3.6 The comparison-sort lower bound</h3>
+  <p>Any comparison sort can be modelled as a binary <strong>decision tree</strong>: internal nodes are comparisons, leaves are output permutations. To sort every input correctly the tree needs at least n! leaves, and a binary tree of height h has at most 2ʰ leaves, so h ≥ log₂(n!) = Θ(n log n). The height is the worst-case number of comparisons. The same argument applies to the <em>average</em> case (the average leaf depth of a tree with n! leaves is ≥ log₂ n!). Merge sort and heapsort are therefore asymptotically optimal; to beat n log n you must use more than comparisons.</p>
+
+  <h3>3.7 Counting, radix and bucket sort</h3>
+  <p><strong>Counting sort:</strong> for integer keys in [0, k), count occurrences, prefix-sum the counts to get each key's starting position, then place elements (iterating input in order — backwards if filling from the ends — to stay stable). Θ(n + k) time and space. Great when k = O(n): ages, HTTP status codes, small enums, characters.</p>
+  <p><strong>Radix sort (LSD):</strong> sort by the least significant digit with a stable counting sort, then the next digit, and so on. Stability preserves the order established by lower digits. With d digits in base b: Θ(d(n + b)). For 32-bit integers using base 2⁸, d = 4 passes over the data — linear time, which beats comparison sorts for large n of fixed-width keys. MSD radix sort recurses from the most significant digit and suits strings (it can stop early once prefixes differ). Negative numbers need an offset or a flipped sign bit.</p>
+  <p><strong>Bucket sort:</strong> for keys roughly uniform in [0, 1), distribute into n buckets, sort each (insertion sort), concatenate: expected Θ(n). Used for floating-point data with known distribution and in "Maximum Gap" (pigeonhole argument).</p>
+
+  <h3>3.8 Selection: k-th smallest</h3>
+  <p><strong>Quickselect</strong> partitions like quicksort but recurses into only the side containing the k-th position: expected T(n) = T(n/2) + Θ(n) = Θ(n), worst Θ(n²). Median-of-medians guarantees Θ(n) worst case but with a large constant; introselect falls back to it. Alternatives: a size-k heap, Θ(n log k), which also works on streams (Chapter 4). C++ <code>nth_element</code> is introselect; Java has no built-in selection — use a heap or sort.</p>
+
+  <h3>3.9 Binary search on a sorted array</h3>
+  <p>Think of binary search as finding the <strong>boundary</strong> of a monotone predicate over indices: P(i) is false…false, true…true, and we want the first true. With a half-open interval [lo, hi) and the invariant "the first true lies in [lo, hi]" (where hi = n means "none"):</p>
+<pre class="ascii">
+lo = 0, hi = n
+while lo &lt; hi:
+    mid = lo + (hi - lo) / 2        # never overflows; mid in [lo, hi)
+    if P(mid): hi = mid             # answer is mid or to the left
+    else:      lo = mid + 1         # answer is strictly right of mid
+return lo                           # first index with P true, or n
+</pre>
+  <ul>
+    <li><strong>lower_bound(x)</strong>: P(i) = a[i] ≥ x — first position where x could be inserted keeping order (Python <code>bisect_left</code>).</li>
+    <li><strong>upper_bound(x)</strong>: P(i) = a[i] &gt; x (<code>bisect_right</code>). The count of x equals upper − lower; the last occurrence is upper − 1.</li>
+    <li><strong>Exact search</strong>: lower_bound, then check a[lo] == x.</li>
+  </ul>
+  <p>The loop always terminates because the interval strictly shrinks (mid &lt; hi, so <code>hi = mid</code> shrinks it; <code>lo = mid + 1</code> shrinks it). Most binary-search bugs come from mixing closed and half-open conventions, e.g. <code>while (lo &lt;= hi)</code> with <code>hi = mid</code> (infinite loop) — pick one convention and keep it.</p>
+
+  <h3>3.10 Binary search on the answer space</h3>
+  <p>When the question is "the minimum X such that feasible(X)" and feasibility is monotone (if X works, every larger X works), binary search X over its numeric range and test feasibility with a greedy or linear check. Complexity: Θ(log(range) × cost(feasible)). Classic instances: minimum eating speed to finish piles within h hours, minimum ship capacity to deliver in d days, minimise the largest sum when splitting an array into k parts, maximise the minimum distance between placed items ("aggressive cows"), smallest divisor under a threshold, k-th smallest in a sorted matrix or multiplication table (count elements ≤ X). Real-valued answers use a fixed number of iterations (e.g. 100) instead of a <code>lo &lt; hi</code> test.</p>
+
+  <h3>3.11 Rotated sorted arrays and other partial orders</h3>
+  <p>A sorted array rotated at an unknown pivot is two sorted runs. At any mid, at least one of [lo, mid] or [mid, hi] is sorted; decide which by comparing with an endpoint, check whether the target lies within the sorted half's range, and discard the other half. Finding the minimum compares a[mid] with a[hi]: if a[mid] &gt; a[hi] the minimum is right of mid. With duplicates, a[mid] == a[hi] gives no information — shrink hi by one, degrading to Θ(n) worst case. Related: peak finding in an array where neighbours differ (move toward the larger neighbour — a peak must exist on that side), searching a row- and column-sorted matrix (start at the top-right corner: Θ(m + n) staircase walk).</p>
+
+  <h3>3.12 Two pointers</h3>
+  <p>Three shapes:</p>
+  <ol>
+    <li><strong>Opposite ends</strong> on sorted data: pair-sum problems (if the sum is too small, only increasing i can help), container with most water (move the shorter wall — the taller cannot produce a larger area with a narrower width), palindrome checks, 3Sum (fix one, two-pointer the rest: Θ(n²)).</li>
+    <li><strong>Same direction (read/write)</strong>: a slow write pointer and a fast read pointer for in-place filtering — remove duplicates, move zeroes, compact arrays. This is how <code>ArrayList.removeIf</code> compacts in one pass.</li>
+    <li><strong>Two sequences</strong>: merge two sorted arrays, intersection of sorted lists (posting-list intersection in search engines), subsequence checks.</li>
+  </ol>
+  <p>Partitioning (Dutch national flag) is a three-pointer generalisation: low/mid/high regions for &lt;, =, &gt;.</p>
+
+  <h3>3.13 Sliding windows</h3>
+  <p>A window is a contiguous range [l, r]. <strong>Fixed-size</strong> windows slide by adding a[r] and removing a[r−k] (moving average, max sum of k consecutive, anagram occurrences with a count array). <strong>Variable-size</strong> windows expand r every step and shrink l while the window is invalid (for "longest valid" problems) or while it remains valid (for "shortest valid" problems). Both pointers only move right, so total work is Θ(n) plus the cost of maintaining window state (counts in an array or map, a monotonic deque for extrema).</p>
+  <p><strong>Precondition — monotonicity:</strong> if a window is invalid, every larger window containing it is invalid too (or, for "shortest", if valid then every superset is valid). "Sum ≤ S with non-negative numbers", "at most k distinct characters" and "no repeated characters" satisfy it; "sum exactly k with negatives" does not (use prefix sums). <strong>"Exactly k" trick:</strong> exactly(k) = atMost(k) − atMost(k − 1), turning a non-monotone condition into two monotone ones.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working: What Your Standard Library Actually Runs</h2>
+
+  <h3>4.1 Java: Arrays.sort for primitives (dual-pivot quicksort)</h3>
+  <p>For <code>int[]</code>, <code>long[]</code>, <code>double[]</code> etc., <code>Arrays.sort</code> runs <code>java.util.DualPivotQuicksort</code>. Two pivots P1 ≤ P2 split the array into three parts (&lt; P1, between, &gt; P2), which reduces the number of passes over memory compared with single-pivot quicksort. Since the JDK 14 rewrite, the implementation also: sorts tiny ranges with insertion sort (and "mixed insertion sort" for small-to-medium ranges), detects and merges pre-existing runs (so nearly sorted data is fast), falls back to heapsort when recursion becomes too deep (guaranteeing O(n log n)), and in <code>Arrays.parallelSort</code> uses parallel merging. <code>float</code>/<code>double</code> sorts handle −0.0 and NaN specially so that the result matches <code>Double.compare</code> ordering. Stability is meaningless for primitives (equal values are indistinguishable). <span class="tag version">Version-sensitive · checked Nov 2026</span></p>
+
+  <h3>4.2 Java: Arrays.sort for objects and List.sort (TimSort)</h3>
+  <p>For <code>Object[]</code> and therefore <code>Collections.sort</code> and <code>List.sort</code> (<code>ArrayList.sort</code> sorts its backing array directly), the JDK uses <code>java.util.TimSort</code> (or <code>ComparableTimSort</code>) — stable, as the specification of <code>Arrays.sort(Object[])</code> requires:</p>
+  <ol>
+    <li>Compute <code>minRun</code> (between 16 and 32 for large arrays) so that n/minRun is close to a power of two.</li>
+    <li>Scan for natural <strong>runs</strong>: maximal ascending or strictly descending sequences (descending ones are reversed in place — strictness keeps stability). Short runs are extended to <code>minRun</code> with binary insertion sort.</li>
+    <li>Push runs on a stack and merge adjacent runs to maintain invariants on their lengths (roughly Fibonacci-like growth), which bounds the stack to O(log n) and keeps merges balanced. The 2015 verification work found the original invariant check incomplete; OpenJDK enlarged the stack bound rather than changing the merge rule.</li>
+    <li>Merge with a temporary array the size of the smaller run, using <strong>galloping</strong>: when one run "wins" many times in a row, switch to exponential search to find how many elements to copy in bulk.</li>
+  </ol>
+  <p>Consequences: Θ(n) on already-sorted or reverse-sorted input, Θ(n log n) worst case, up to n/2 extra references. A comparator that violates the contract (not transitive, inconsistent) can cause the famous <code>IllegalArgumentException: Comparison method violates its general contract!</code> — TimSort detects some inconsistencies during merging.</p>
+
+  <h3>4.3 Python: Timsort with the powersort merge policy</h3>
+  <p>CPython's <code>list.sort</code> is the original Timsort (run detection, binary insertion, galloping merges). In Python 3.11 Tim Peters replaced the ad-hoc stack-merging rules with Munro and Wild's <em>powersort</em> policy: each run boundary gets a "power" computed from the run's midpoint position, and runs are merged so that the merge tree is nearly optimal with respect to run lengths. The detailed design notes live in <code>Objects/listsort.txt</code>. <code>sorted(key=...)</code> computes each key once (decorate-sort-undecorate internally), so an expensive key function is called n times, not n log n. <span class="tag version">Version-sensitive · checked Nov 2026</span></p>
+
+  <h3>4.4 Go: pattern-defeating quicksort</h3>
+  <p>Since Go 1.19, <code>sort.Sort</code>, <code>sort.Slice</code> and later <code>slices.Sort</code> use pdqsort: an introsort descendant with insertion sort for small slices, ninther pivot selection, detection of already partitioned inputs, deliberate shuffling when partitions are unbalanced, and a heapsort fallback. Unstable — use <code>sort.Stable</code> or <code>slices.SortStableFunc</code> (insertion-sorted blocks merged with SymMerge, in place).</p>
+
+  <h3>4.5 Library binary searches</h3>
+  <ul>
+    <li><code>Arrays.binarySearch(a, key)</code> returns the index if found, otherwise <code>−(insertionPoint) − 1</code>. With duplicates it returns <em>some</em> matching index, not necessarily the first. Its midpoint is <code>(low + high) &gt;&gt;&gt; 1</code>, the fix Bloch described.</li>
+    <li><code>Collections.binarySearch</code> on a <code>LinkedList</code> uses an iterator-based search: O(log n) comparisons but O(n) traversal.</li>
+    <li><code>TreeMap.ceilingKey/floorKey</code> give lower/upper-bound semantics on a dynamic sorted set (Chapter 4).</li>
+    <li>Python <code>bisect_left/bisect_right</code> are exactly lower/upper bound; <code>insort</code> inserts keeping order (O(n) due to shifting).</li>
+    <li>Go <code>sort.Search(n, pred)</code> returns the first index where the predicate is true — the predicate formulation of §3.9.</li>
+  </ul>
+
+  <h3>4.6 Quicksort partition, traced (Hoare-style with random pivot = 4)</h3>
+<pre class="ascii">
+a = [7 2 4 9 1 4 8 3]   pivot value 4
+i scans right for a[i] &gt;= 4, j scans left for a[j] &lt;= 4, swap, continue
+
+i=0 (7)  j=7 (3)  swap -&gt; [3 2 4 9 1 4 8 7]
+i=2 (4)  j=5 (4)  swap -&gt; [3 2 4 9 1 4 8 7]   (equal keys swap: keeps splits balanced)
+i=3 (9)  j=4 (1)  swap -&gt; [3 2 4 1 9 4 8 7]
+i=4 (9)  j=3 (1)  i &gt; j stop: left = a[0..3] all &lt;= 4, right = a[4..7] all &gt;= 4
+recurse on [3 2 4 1] and [9 4 8 7]
+</pre>
+  <p>Stopping on <em>equal</em> keys (≥ / ≤ rather than &gt; / &lt;) looks wasteful but is what keeps Hoare partitioning balanced on arrays of identical values; Lomuto partitioning on such input puts everything on one side and goes quadratic.</p>
+
+  <h3>4.7 Sliding window, traced: longest substring without repeats</h3>
+<pre class="ascii">
+s = a b c a b c b b        last[] = last index where each char was seen
+r=0 'a' window [0,0] "a"        best 1
+r=1 'b' window [0,1] "ab"       best 2
+r=2 'c' window [0,2] "abc"      best 3
+r=3 'a' seen at 0 &gt;= l -&gt; l=1  window "bca"   best 3
+r=4 'b' seen at 1 &gt;= l -&gt; l=2  window "cab"
+r=5 'c' seen at 2 &gt;= l -&gt; l=3  window "abc"
+r=6 'b' seen at 4 &gt;= l -&gt; l=5  window "cb"
+r=7 'b' seen at 6 &gt;= l -&gt; l=7  window "b"
+answer 3; l and r each move at most n times
+</pre>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: Seeing the Algorithms Move</h2>
+
+  <figure class="diagram">
+    <div class="widget" data-widget="sorting"></div>
+    <figcaption>Widget 3.2 — Step through insertion, merge, quick and heap sort on the same array.</figcaption>
+  </figure>
+  <p><strong>What to try:</strong> run insertion sort on a nearly sorted array and then on a reversed one, and count the steps — that is the Θ(n + inversions) bound made visible. Run quicksort and watch partitions shrink around each pivot; notice how much of the work happens in long sequential sweeps (why it is cache-friendly). Run merge sort and observe that the amount of work per level is the same regardless of input order. Run heap sort and see the large "jumps" between parent and child positions, the reason it loses to quicksort in practice despite its better worst case.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A["Need to sort"] --> B{"Keys are small integers or fixed-width?"}
+  B -- yes --> C{"Range k comparable to n?"}
+  C -- yes --> CS["Counting sort: Theta(n + k)"]
+  C -- no --> RS["LSD radix sort: Theta(d(n + b))"]
+  B -- no --> D{"Data fits in memory?"}
+  D -- no --> EXT["External merge sort: sorted runs + k-way heap merge"]
+  D -- yes --> E{"Need stability?"}
+  E -- yes --> TS["Timsort / merge sort (Java objects, Python)"]
+  E -- no --> F{"Need worst-case guarantee and O(1) space?"}
+  F -- yes --> HS["Heapsort or introsort / pdqsort"]
+  F -- no --> QS["Quicksort family (Java primitives, Go)"]
+</pre>
+    <figcaption>Figure 3.9 — Choosing a sorting algorithm.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the first branch is the only way to beat n log n — exploit key structure. The memory branch is where databases live: PostgreSQL switches from in-memory quicksort to an external merge sort when the data exceeds <code>work_mem</code>. Stability is the next decisive property; the JDK's split (TimSort for objects, quicksort for primitives) is exactly this decision.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  S["lo = 0, hi = n (half-open)"] --> L{"lo less than hi?"}
+  L -- no --> R["return lo: first index where P is true, or n"]
+  L -- yes --> M["mid = lo + (hi - lo) / 2"]
+  M --> P{"P(mid) true?"}
+  P -- yes --> H["hi = mid (answer at mid or left)"]
+  P -- no --> G["lo = mid + 1 (answer strictly right)"]
+  H --> L
+  G --> L
+</pre>
+    <figcaption>Figure 3.10 — One binary-search template for every boundary problem.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> everything problem-specific is inside P. For lower_bound, P(i) is a[i] ≥ x; for "minimum capacity", the indices are capacities and P is "can ship within d days". For a rotated array, P(i) is a[i] ≤ a[n−1] (first index of the second run = the minimum). Memorise this loop once and you avoid off-by-one debugging under interview pressure.</p>
+
+  <figure class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> Expand
+  Expand --> Expand: add s[r], window still valid, update best
+  Expand --> Shrink: add s[r] makes window invalid
+  Shrink --> Shrink: remove s[l], l++ while invalid
+  Shrink --> Expand: window valid again, update best, r++
+  Expand --> [*]: r reaches n
+</pre>
+    <figcaption>Figure 3.11 — Variable-size sliding window for a "longest valid window" problem.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> r advances every iteration; l advances only inside Shrink. Because neither moves left, the two states together execute at most 2n transitions. For "shortest valid window" problems the roles flip: shrink <em>while valid</em>, recording the best before each shrink.</p>
+</section>
+
+<section id="math">
+  <h2>6. The Math</h2>
+
+  <h3>6.1 Insertion sort and inversions</h3>
+  <p>Each inner-loop shift swaps an adjacent inverted pair, removing exactly one inversion, so running time is Θ(n + I). For a uniformly random permutation each of the \(\binom{n}{2}\) pairs is inverted with probability ½, so \(E[I] = n(n-1)/4\) — average Θ(n²). The same fact shows that <em>any</em> algorithm that only swaps adjacent elements (bubble sort, insertion sort) is Ω(n²) on average.</p>
+
+  <h3>6.2 Comparison lower bound, quantitatively</h3>
+  \[ \log_2 n! = \sum_{i=1}^{n} \log_2 i \ \ge\ \frac{n}{2}\log_2\frac{n}{2} = \Omega(n \log n), \qquad \log_2 n! = n\log_2 n - n\log_2 e + O(\log n) \]
+  <p>So any comparison sort needs about n log₂ n − 1.44n comparisons in the worst case. Merge sort uses at most n⌈log₂ n⌉ − 2<sup>⌈log₂ n⌉</sup> + 1, within a lower-order term of optimal. For n = 10⁶, log₂ n! ≈ 1.85 × 10⁷ comparisons.</p>
+
+  <h3>6.3 Quicksort's expected cost</h3>
+  <p>Intuition: elements i and j (in sorted order) are compared only if one of them is the first pivot chosen among the j − i + 1 elements between them; that happens with probability 2/(j − i + 1). Summing over pairs:</p>
+  \[ E[C] = \sum_{i \lt j} \frac{2}{j-i+1} = 2(n+1)H_n - 4n \approx 2n\ln n \approx 1.39\, n\log_2 n \]
+  <p>About 39% more comparisons than merge sort, yet faster in practice because of in-place sequential partitioning. Worst case: the pivot is always the extreme, T(n) = T(n−1) + Θ(n) = Θ(n²). The probability that randomized quicksort exceeds c·n log n comparisons decays rapidly in c, so the worst case is a theoretical rather than practical concern — unless an adversary knows your pivot rule (McIlroy's 1999 "A Killer Adversary for Quicksort" constructs such inputs on the fly).</p>
+
+  <h3>6.4 Distribution sorts</h3>
+  <p>Counting sort: Θ(n + k). Radix sort with d digits in base b: Θ(d(n + b)); for w-bit keys choose b = 2ʳ, d = ⌈w/r⌉, total Θ((w/r)(n + 2ʳ)); with r ≈ log₂ n this is Θ(wn / log n) — linear for fixed w. <span class="tag illus">Illustrative</span> For n = 10⁷ 32-bit integers with r = 8: 4 passes × (10⁷ + 256) operations ≈ 4 × 10⁷, versus ≈ 2.3 × 10⁸ comparisons for a comparison sort — though memory traffic, not operation count, usually decides the real winner.</p>
+
+  <h3>6.5 Binary search</h3>
+  <p>Each iteration at least halves the interval, so at most ⌈log₂(n + 1)⌉ iterations: 20 for a million elements, 30 for a billion, 64 for any <code>long</code> range. For search on an answer range [L, H] with feasibility cost F: Θ(F · log₂(H − L)). For a real-valued answer with tolerance ε: ⌈log₂((H − L)/ε)⌉ iterations — 100 iterations reduce any double-precision interval to its last bit.</p>
+  <p><strong>Midpoint overflow:</strong> with 32-bit ints, lo + hi overflows once lo + hi &gt; 2³¹ − 1, i.e. for arrays over about 1.07 billion elements (in Bloch's report, the sum became negative). Use <code>lo + (hi − lo) / 2</code> or <code>(lo + hi) &gt;&gt;&gt; 1</code> (the unsigned shift treats the overflowed sum as an unsigned 32-bit number, which is correct for non-negative lo, hi).</p>
+
+  <h3>6.6 Two pointers and windows: why linear</h3>
+  <p>In opposite-ends two pointers, j − i decreases by one per step: at most n − 1 steps. In a sliding window, l and r are each non-decreasing and bounded by n: at most 2n pointer moves. With a hash map for window state, the total is Θ(n) expected; with an alphabet-sized array, Θ(n + σ).</p>
+
+  <h3>6.7 3Sum lower bound intuition</h3>
+  <p>3Sum is solvable in Θ(n²) by sort + two pointers. It was long conjectured that no Θ(n<sup>2−ε</sup>) algorithm exists; the conjecture in its strongest form was refuted in 2014 (Grønlund and Pettie showed slightly subquadratic algorithms), but a "3SUM-hardness" family of geometric problems is still used to argue that quadratic is essentially the best you can do. In an interview, Θ(n²) is the expected answer.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code</h2>
+
+  <h3>7.1 Sorting algorithms</h3>
+  <div class="code-tabs">
+<pre data-lang="Java" data-file="Sorts.java"><code class="language-java">import java.util.Arrays;
+import java.util.Random;
+import java.util.concurrent.ThreadLocalRandom;
+
+public final class Sorts {
+
+    static void insertionSort(int[] a, int lo, int hi) {          // sorts a[lo..hi]
+        for (int i = lo + 1; i &lt;= hi; i++) {
+            int x = a[i], j = i - 1;
+            while (j &gt;= lo &amp;&amp; a[j] &gt; x) { a[j + 1] = a[j]; j--; } // shift; strict &gt; keeps it stable
+            a[j + 1] = x;
+        }
+    }
+
+    /** Top-down merge sort with one reusable buffer and an insertion-sort cutoff. Stable. */
+    static void mergeSort(int[] a) {
+        int[] buf = new int[a.length];
+        mergeSort(a, buf, 0, a.length - 1);
+    }
+    private static void mergeSort(int[] a, int[] buf, int lo, int hi) {
+        if (hi - lo &lt; 16) { insertionSort(a, lo, hi); return; }
+        int mid = (lo + hi) &gt;&gt;&gt; 1;
+        mergeSort(a, buf, lo, mid);
+        mergeSort(a, buf, mid + 1, hi);
+        if (a[mid] &lt;= a[mid + 1]) return;                           // already in order: adaptive shortcut
+        System.arraycopy(a, lo, buf, lo, hi - lo + 1);
+        int i = lo, j = mid + 1;
+        for (int k = lo; k &lt;= hi; k++) {
+            if (i &gt; mid) a[k] = buf[j++];
+            else if (j &gt; hi) a[k] = buf[i++];
+            else if (buf[j] &lt; buf[i]) a[k] = buf[j++];              // take left on ties: stable
+            else a[k] = buf[i++];
+        }
+    }
+
+    /** Randomized 3-way quicksort (Dijkstra partition); recurse on smaller side to bound stack. */
+    static void quickSort(int[] a) { quickSort(a, 0, a.length - 1); }
+    private static void quickSort(int[] a, int lo, int hi) {
+        while (hi - lo &gt;= 16) {
+            int p = a[ThreadLocalRandom.current().nextInt(lo, hi + 1)];
+            int lt = lo, i = lo, gt = hi;                            // a[lo..lt-1] &lt; p, a[lt..i-1] == p, a[gt+1..hi] &gt; p
+            while (i &lt;= gt) {
+                if (a[i] &lt; p) swap(a, lt++, i++);
+                else if (a[i] &gt; p) swap(a, i, gt--);
+                else i++;
+            }
+            if (lt - lo &lt; hi - gt) { quickSort(a, lo, lt - 1); lo = gt + 1; }   // smaller side first
+            else { quickSort(a, gt + 1, hi); hi = lt - 1; }
+        }
+        insertionSort(a, lo, hi);
+    }
+
+    /** In-place heapsort: bottom-up heapify Theta(n), then n sift-downs. */
+    static void heapSort(int[] a) {
+        int n = a.length;
+        for (int i = n / 2 - 1; i &gt;= 0; i--) siftDown(a, i, n);
+        for (int end = n - 1; end &gt; 0; end--) { swap(a, 0, end); siftDown(a, 0, end); }
+    }
+    private static void siftDown(int[] a, int i, int n) {
+        while (true) {
+            int l = 2 * i + 1, r = l + 1, big = i;
+            if (l &lt; n &amp;&amp; a[l] &gt; a[big]) big = l;
+            if (r &lt; n &amp;&amp; a[r] &gt; a[big]) big = r;
+            if (big == i) return;
+            swap(a, i, big); i = big;
+        }
+    }
+
+    /** Stable counting sort for keys in [0, k). */
+    static int[] countingSort(int[] a, int k) {
+        int[] count = new int[k + 1];
+        for (int x : a) count[x + 1]++;
+        for (int i = 0; i &lt; k; i++) count[i + 1] += count[i];        // count[v] = start index of v
+        int[] out = new int[a.length];
+        for (int x : a) out[count[x]++] = x;                         // left-to-right keeps stability
+        return out;
+    }
+
+    /** LSD radix sort on 32-bit ints, 8 bits per pass; flips the sign bit so negatives sort first. */
+    static void radixSort(int[] a) {
+        int[] buf = new int[a.length];
+        for (int shift = 0; shift &lt; 32; shift += 8) {
+            int[] count = new int[257];
+            for (int x : a) count[(((x ^ Integer.MIN_VALUE) &gt;&gt;&gt; shift) &amp; 0xFF) + 1]++;
+            for (int i = 0; i &lt; 256; i++) count[i + 1] += count[i];
+            for (int x : a) buf[count[((x ^ Integer.MIN_VALUE) &gt;&gt;&gt; shift) &amp; 0xFF]++] = x;
+            System.arraycopy(buf, 0, a, 0, a.length);
+        }
+    }
+
+    /** Quickselect: k-th smallest (0-based), expected Theta(n). */
+    static int quickSelect(int[] a, int k) {
+        int lo = 0, hi = a.length - 1;
+        while (true) {
+            int p = a[ThreadLocalRandom.current().nextInt(lo, hi + 1)];
+            int lt = lo, i = lo, gt = hi;
+            while (i &lt;= gt) {
+                if (a[i] &lt; p) swap(a, lt++, i++);
+                else if (a[i] &gt; p) swap(a, i, gt--);
+                else i++;
+            }
+            if (k &lt; lt) hi = lt - 1;
+            else if (k &gt; gt) lo = gt + 1;
+            else return p;                                           // k falls in the == block
+        }
+    }
+
+    private static void swap(int[] a, int i, int j) { int t = a[i]; a[i] = a[j]; a[j] = t; }
+
+    public static void main(String[] args) {
+        var rnd = new Random(42);
+        for (int trial = 0; trial &lt; 200; trial++) {
+            int n = rnd.nextInt(2000);
+            int[] base = rnd.ints(n, -1000, 1000).toArray(), want = base.clone();
+            Arrays.sort(want);
+            int[] m = base.clone(); mergeSort(m);
+            int[] q = base.clone(); quickSort(q);
+            int[] h = base.clone(); heapSort(h);
+            int[] r = base.clone(); radixSort(r);
+            int[] c = Arrays.stream(base).map(x -&gt; x + 1000).toArray();
+            int[] cs = Arrays.stream(countingSort(c, 2000)).map(x -&gt; x - 1000).toArray();
+            for (int[] got : new int[][]{m, q, h, r, cs})
+                if (!Arrays.equals(got, want)) throw new AssertionError("trial " + trial);
+            if (n &gt; 0 &amp;&amp; quickSelect(base.clone(), n / 2) != want[n / 2]) throw new AssertionError("select");
+        }
+        System.out.println("all sorts agree with Arrays.sort");
+    }
+}</code></pre>
+<pre data-lang="Python"><code class="language-python">import random
+
+def merge_sort(a):
+    if len(a) &lt;= 1:
+        return a
+    mid = len(a) // 2
+    left, right = merge_sort(a[:mid]), merge_sort(a[mid:])
+    out, i, j = [], 0, 0
+    while i &lt; len(left) and j &lt; len(right):
+        if right[j] &lt; left[i]:
+            out.append(right[j]); j += 1
+        else:                       # ties take left: stable
+            out.append(left[i]); i += 1
+    out.extend(left[i:]); out.extend(right[j:])
+    return out
+
+def quick_sort(a, lo=0, hi=None):
+    """In-place randomized 3-way quicksort."""
+    hi = len(a) - 1 if hi is None else hi
+    while lo &lt; hi:
+        p = a[random.randint(lo, hi)]
+        lt, i, gt = lo, lo, hi
+        while i &lt;= gt:
+            if a[i] &lt; p:
+                a[lt], a[i] = a[i], a[lt]; lt += 1; i += 1
+            elif a[i] &gt; p:
+                a[i], a[gt] = a[gt], a[i]; gt -= 1
+            else:
+                i += 1
+        if lt - lo &lt; hi - gt:
+            quick_sort(a, lo, lt - 1); lo = gt + 1
+        else:
+            quick_sort(a, gt + 1, hi); hi = lt - 1
+
+def radix_sort_nonneg(a, base=256):
+    shift, m = 0, max(a, default=0)
+    while m &gt;&gt; shift:
+        buckets = [[] for _ in range(base)]
+        for x in a:
+            buckets[(x &gt;&gt; shift) &amp; (base - 1)].append(x)   # stable per pass
+        a = [x for b in buckets for x in b]
+        shift += 8
+    return a
+
+data = [random.randint(0, 10**6) for _ in range(5000)]
+assert merge_sort(data) == sorted(data) == radix_sort_nonneg(data)
+q = data[:]; quick_sort(q); assert q == sorted(data)
+
+# Multi-key sort, idiomatically: stability lets you sort by secondary key first
+orders = [("bob", 3), ("amy", 3), ("cat", 1)]
+orders.sort(key=lambda o: o[0])          # secondary: name
+orders.sort(key=lambda o: -o[1])         # primary: quantity desc; ties keep name order
+assert orders == [("amy", 3), ("bob", 3), ("cat", 1)]</code></pre>
+  </div>
+  <p>The comparison <code>a[mid] &lt;= a[mid + 1]</code> skip in merge sort makes already-sorted input Θ(n) — a cheap first step toward Timsort's adaptivity. Recursing into the smaller partition and looping on the larger bounds quicksort's stack to O(log n) even for adversarial pivots.</p>
+
+  <h3>7.2 Binary search toolkit</h3>
+  <div class="code-tabs">
+<pre data-lang="Java" data-file="BinarySearchKit.java"><code class="language-java">import java.util.function.LongPredicate;
+
+public final class BinarySearchKit {
+
+    /** First index i in [0, n) with a[i] &gt;= x, or n. */
+    static int lowerBound(int[] a, int x) {
+        int lo = 0, hi = a.length;
+        while (lo &lt; hi) {
+            int mid = (lo + hi) &gt;&gt;&gt; 1;
+            if (a[mid] &gt;= x) hi = mid; else lo = mid + 1;
+        }
+        return lo;
+    }
+
+    /** First index with a[i] &gt; x, or n. */
+    static int upperBound(int[] a, int x) {
+        int lo = 0, hi = a.length;
+        while (lo &lt; hi) {
+            int mid = (lo + hi) &gt;&gt;&gt; 1;
+            if (a[mid] &gt; x) hi = mid; else lo = mid + 1;
+        }
+        return lo;
+    }
+
+    /** Smallest v in [lo, hi] with p(v) true, assuming p is monotone false..true; returns hi + 1 if none. */
+    static long firstTrue(long lo, long hi, LongPredicate p) {
+        long l = lo, h = hi + 1;
+        while (l &lt; h) {
+            long mid = l + (h - l) / 2;
+            if (p.test(mid)) h = mid; else l = mid + 1;
+        }
+        return l;
+    }
+
+    /** Index of target in a rotated sorted array of distinct values, or -1. */
+    static int searchRotated(int[] a, int target) {
+        int lo = 0, hi = a.length - 1;
+        while (lo &lt;= hi) {                                   // closed interval variant
+            int mid = (lo + hi) &gt;&gt;&gt; 1;
+            if (a[mid] == target) return mid;
+            if (a[lo] &lt;= a[mid]) {                           // left half sorted
+                if (a[lo] &lt;= target &amp;&amp; target &lt; a[mid]) hi = mid - 1; else lo = mid + 1;
+            } else {                                         // right half sorted
+                if (a[mid] &lt; target &amp;&amp; target &lt;= a[hi]) lo = mid + 1; else hi = mid - 1;
+            }
+        }
+        return -1;
+    }
+
+    /** Minimum of a rotated sorted array (distinct values). */
+    static int rotatedMin(int[] a) {
+        int lo = 0, hi = a.length - 1;
+        while (lo &lt; hi) {
+            int mid = (lo + hi) &gt;&gt;&gt; 1;
+            if (a[mid] &gt; a[hi]) lo = mid + 1; else hi = mid;  // min is right of mid, or at/left of mid
+        }
+        return a[lo];
+    }
+
+    /** floor(sqrt(n)) for n &gt;= 0 via "last true": largest r with r*r &lt;= n. */
+    static long isqrt(long n) {
+        // r * r &gt; n would overflow near the top of the range; divide instead
+        long first = firstTrue(0, 3_037_000_500L, r -&gt; r &gt; 0 &amp;&amp; r &gt; n / r);   // first r with r^2 &gt; n
+        return first - 1;
+    }
+
+    public static void main(String[] args) {
+        int[] a = {1, 2, 2, 2, 5, 7};
+        if (lowerBound(a, 2) != 1 || upperBound(a, 2) != 4 || lowerBound(a, 6) != 5 || lowerBound(a, 9) != 6)
+            throw new AssertionError();
+        int[] r = {4, 5, 6, 7, 0, 1, 2};
+        if (searchRotated(r, 0) != 4 || searchRotated(r, 3) != -1 || rotatedMin(r) != 0) throw new AssertionError();
+        if (isqrt(0) != 0 || isqrt(15) != 3 || isqrt(16) != 4 || isqrt(Long.MAX_VALUE) != 3_037_000_499L)
+            throw new AssertionError(isqrt(Long.MAX_VALUE));
+        System.out.println("binary search kit ok");
+    }
+}</code></pre>
+<pre data-lang="Python"><code class="language-python">from bisect import bisect_left, bisect_right
+
+a = [1, 2, 2, 2, 5, 7]
+assert bisect_left(a, 2) == 1 and bisect_right(a, 2) == 4
+assert bisect_right(a, 2) - bisect_left(a, 2) == 3          # count of 2s
+
+def first_true(lo: int, hi: int, pred) -&gt; int:
+    """Smallest v in [lo, hi] with pred(v); hi + 1 if none. pred must be monotone."""
+    h = hi + 1
+    while lo &lt; h:
+        mid = (lo + h) // 2                                  # Python ints don't overflow
+        if pred(mid):
+            h = mid
+        else:
+            lo = mid + 1
+    return lo
+
+# Binary search on the answer: minimum eating speed to finish piles within h hours
+def min_speed(piles, h):
+    return first_true(1, max(piles), lambda k: sum((p + k - 1) // k for p in piles) &lt;= h)
+
+assert min_speed([3, 6, 7, 11], 8) == 4
+
+# Python 3.10+: bisect with key= on records sorted by that key
+events = [(1, "a"), (5, "b"), (9, "c")]
+assert bisect_left(events, 5, key=lambda e: e[0]) == 1</code></pre>
+  </div>
+
+  <h3>7.3 Two pointers and sliding window templates</h3>
+  <div class="code-tabs">
+<pre data-lang="Java" data-file="Windows.java"><code class="language-java">import java.util.*;
+
+public final class Windows {
+
+    /** Pair with sum = target in a sorted array (indices), or null. Opposite-end pointers. */
+    static int[] pairSum(int[] a, int target) {
+        int i = 0, j = a.length - 1;
+        while (i &lt; j) {
+            long s = (long) a[i] + a[j];
+            if (s == target) return new int[]{i, j};
+            if (s &lt; target) i++; else j--;
+        }
+        return null;
+    }
+
+    /** In-place dedupe of a sorted array; returns the new length. Read/write pointers. */
+    static int dedupe(int[] a) {
+        int w = 0;
+        for (int r = 0; r &lt; a.length; r++) if (r == 0 || a[r] != a[r - 1]) a[w++] = a[r];
+        return w;
+    }
+
+    /** Fixed window: maximum sum of any k consecutive elements. */
+    static long maxSumK(int[] a, int k) {
+        long sum = 0, best;
+        for (int i = 0; i &lt; k; i++) sum += a[i];
+        best = sum;
+        for (int r = k; r &lt; a.length; r++) { sum += a[r] - a[r - k]; best = Math.max(best, sum); }
+        return best;
+    }
+
+    /** Variable window, longest valid: longest substring with at most k distinct chars. */
+    static int longestAtMostKDistinct(String s, int k) {
+        Map&lt;Character, Integer&gt; count = new HashMap&lt;&gt;();
+        int best = 0;
+        for (int l = 0, r = 0; r &lt; s.length(); r++) {
+            count.merge(s.charAt(r), 1, Integer::sum);
+            while (count.size() &gt; k) {                               // shrink while invalid
+                char c = s.charAt(l++);
+                if (count.merge(c, -1, Integer::sum) == 0) count.remove(c);
+            }
+            best = Math.max(best, r - l + 1);
+        }
+        return best;
+    }
+
+    /** Variable window, shortest valid: min length with sum &gt;= target (non-negative values). */
+    static int minLenSumAtLeast(int[] a, int target) {
+        int best = Integer.MAX_VALUE;
+        long sum = 0;
+        for (int l = 0, r = 0; r &lt; a.length; r++) {
+            sum += a[r];
+            while (sum &gt;= target) {                                  // shrink while valid
+                best = Math.min(best, r - l + 1);
+                sum -= a[l++];
+            }
+        }
+        return best == Integer.MAX_VALUE ? 0 : best;
+    }
+
+    /** Exactly-k via atMost(k) - atMost(k-1): count subarrays with exactly k distinct values. */
+    static long exactlyKDistinct(int[] a, int k) { return atMost(a, k) - atMost(a, k - 1); }
+    private static long atMost(int[] a, int k) {
+        Map&lt;Integer, Integer&gt; count = new HashMap&lt;&gt;();
+        long total = 0;
+        for (int l = 0, r = 0; r &lt; a.length; r++) {
+            count.merge(a[r], 1, Integer::sum);
+            while (count.size() &gt; k) {
+                if (count.merge(a[l], -1, Integer::sum) == 0) count.remove(a[l]);
+                l++;
+            }
+            total += r - l + 1;                                      // subarrays ending at r
+        }
+        return total;
+    }
+
+    public static void main(String[] args) {
+        if (!Arrays.equals(pairSum(new int[]{1, 3, 4, 6, 9}, 10), new int[]{0, 4})) throw new AssertionError();
+        int[] d = {1, 1, 2, 3, 3, 3, 4};
+        if (dedupe(d) != 4 || d[3] != 4) throw new AssertionError();
+        if (maxSumK(new int[]{1, 12, -5, -6, 50, 3}, 4) != 51) throw new AssertionError();
+        if (longestAtMostKDistinct("eceba", 2) != 3) throw new AssertionError();
+        if (minLenSumAtLeast(new int[]{2, 3, 1, 2, 4, 3}, 7) != 2) throw new AssertionError();
+        if (exactlyKDistinct(new int[]{1, 2, 1, 2, 3}, 2) != 7) throw new AssertionError();
+        System.out.println("two pointers and windows ok");
+    }
+}</code></pre>
+<pre data-lang="Python"><code class="language-python">from collections import Counter
+
+def longest_no_repeat(s: str) -&gt; int:
+    last, l, best = {}, 0, 0
+    for r, ch in enumerate(s):
+        if last.get(ch, -1) &gt;= l:
+            l = last[ch] + 1                  # jump l past the previous occurrence
+        last[ch] = r
+        best = max(best, r - l + 1)
+    return best
+
+def anagram_starts(s: str, p: str) -&gt; list[int]:
+    """Fixed window of len(p) with a running Counter difference."""
+    need, win, out = Counter(p), Counter(), []
+    for r, ch in enumerate(s):
+        win[ch] += 1
+        if r &gt;= len(p):
+            left = s[r - len(p)]
+            win[left] -= 1
+            if win[left] == 0:
+                del win[left]
+        if win == need:
+            out.append(r - len(p) + 1)
+    return out
+
+assert longest_no_repeat("abcabcbb") == 3 and longest_no_repeat("pwwkew") == 3
+assert anagram_starts("cbaebabacd", "abc") == [0, 6]</code></pre>
+  </div>
+  <p>Comparing two <code>Counter</code>s each step costs O(σ); for large alphabets maintain a single "number of characters whose count matches" variable instead, which makes each step O(1).</p>
+</section>

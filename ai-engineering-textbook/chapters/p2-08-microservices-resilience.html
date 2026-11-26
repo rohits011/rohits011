@@ -336,7 +336,7 @@ flowchart LR
   SH -->|no| RT["Retry (budgeted, jittered, idempotent only)"]
   RT --> CB{"Circuit breaker"}
   CB -->|open| FB["Fallback or fail fast"]
-  CB -->|closed / half-open trial| TL["Time limiter (per-attempt timeout)"]
+  CB -->|"closed or half-open trial"| TL["Time limiter (per-attempt timeout)"]
   TL --> BH{"Bulkhead permit?"}
   BH -->|no| FB
   BH -->|yes| DEP[(Dependency)]
@@ -392,6 +392,497 @@ sequenceDiagram
 
   <h3>6.7 Lock lease safety</h3>
   <p>A lease-based lock is safe without fencing only if every holder finishes its critical section, including any pause \( p \) and clock drift \( \delta \), within the lease: \( t_{work} + p_{max} + \delta &lt; \text{TTL} \). Because \( p_{max} \) is unbounded in practice (GC, swapping, VM migration, network delays), no TTL makes this provably true. Fencing replaces the timing assumption with a check at the resource.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code: Modular Monolith, Resilient Clients, Shedding and Locks</h2>
+  <p>Stack: Java 21, Spring Boot 3.5/4.0, Spring Modulith, Resilience4j 2.x (<code>resilience4j-spring-boot3</code>, or the Boot 4-compatible artifact for your version), ShedLock, PostgreSQL, Redis. <span class="tag version">Version-sensitive · checked Nov 2026</span></p>
+
+  <h3>7.1 Enforcing module boundaries with Spring Modulith</h3>
+  <pre data-file="ModularityTests.java"><code class="language-java">package com.example.shop;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.modulith.core.ApplicationModules;
+import org.springframework.modulith.docs.Documenter;
+
+class ModularityTests {
+
+    private final ApplicationModules modules = ApplicationModules.of(ShopApplication.class);
+
+    @Test
+    void verifiesModuleStructure() {
+        modules.verify();   // fails on cycles or access to another module's internal packages
+    }
+
+    @Test
+    void writesDocumentation() {
+        new Documenter(modules).writeModulesAsPlantUml().writeIndividualModulesAsPlantUml();
+    }
+}</code></pre>
+  <pre data-file="inventory/InventoryEventHandlers.java"><code class="language-java">package com.example.shop.inventory;
+
+import com.example.shop.order.OrderPlaced;            // order module's public API type
+import org.springframework.modulith.events.ApplicationModuleListener;
+import org.springframework.stereotype.Component;
+
+@Component
+class InventoryEventHandlers {
+
+    private final StockReservations reservations;
+
+    InventoryEventHandlers(StockReservations reservations) {
+        this.reservations = reservations;
+    }
+
+    /**
+     * Runs asynchronously in its own transaction after the publishing transaction commits.
+     * The event publication registry records the event and marks it complete only when this
+     * method succeeds, so a crash leads to re-delivery (handler must be idempotent).
+     */
+    @ApplicationModuleListener
+    void on(OrderPlaced event) {
+        reservations.reserve(event.orderId(), event.lines());
+    }
+}</code></pre>
+  <p>Publishing is ordinary Spring: inject <code>ApplicationEventPublisher</code> into the order module's service and call <code>publishEvent(new OrderPlaced(...))</code> inside the <code>@Transactional</code> method. Add <code>spring-modulith-starter-jpa</code> (or <code>-jdbc</code>) for the publication registry and <code>spring-modulith-events-kafka</code> plus <code>@Externalized("orders::#{orderId()}")</code> on the event type to also send it to Kafka when the module is later extracted.</p>
+
+  <h3>7.2 A resilient outbound client with Resilience4j</h3>
+  <pre data-file="application.yml"><code class="language-yaml">resilience4j:
+  circuitbreaker:
+    instances:
+      pricing:
+        sliding-window-type: TIME_BASED
+        sliding-window-size: 20                # seconds
+        minimum-number-of-calls: 20
+        failure-rate-threshold: 50
+        slow-call-duration-threshold: 600ms
+        slow-call-rate-threshold: 60
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 5
+        automatic-transition-from-open-to-half-open-enabled: true
+        record-exceptions:
+          - java.io.IOException
+          - java.util.concurrent.TimeoutException
+          - org.springframework.web.client.HttpServerErrorException
+        ignore-exceptions:
+          - org.springframework.web.client.HttpClientErrorException   # 4xx are not dependency failures
+  retry:
+    instances:
+      pricing:
+        max-attempts: 2                        # includes the first call
+        wait-duration: 100ms
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2
+        enable-randomized-wait: true           # jitter
+        randomized-wait-factor: 0.5
+        retry-exceptions:
+          - java.io.IOException
+          - org.springframework.web.client.HttpServerErrorException$ServiceUnavailable
+        ignore-exceptions:
+          - io.github.resilience4j.circuitbreaker.CallNotPermittedException
+  bulkhead:
+    instances:
+      pricing:
+        max-concurrent-calls: 40               # Little's law: 200 rps x 0.15 s = 30, plus headroom
+        max-wait-duration: 0
+management:
+  endpoints.web.exposure.include: health,metrics,circuitbreakers,prometheus
+  health.circuitbreakers.enabled: true</code></pre>
+  <pre data-file="PricingClient.java"><code class="language-java">package com.example.shop.order;
+
+import io.github.resilience4j.bulkhead.annotation.Bulkhead;
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import io.github.resilience4j.retry.annotation.Retry;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
+import org.springframework.stereotype.Component;
+import org.springframework.web.client.RestClient;
+
+import java.math.BigDecimal;
+import java.net.http.HttpClient;
+import java.time.Duration;
+
+@Component
+public class PricingClient {
+
+    public record Quote(String sku, BigDecimal price, boolean fromCache) {}
+
+    private final RestClient http;
+    private final QuoteCache cache;    // last known good prices, e.g. Caffeine or Redis
+
+    public PricingClient(RestClient.Builder builder, QuoteCache cache) {
+        var jdk = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofMillis(200))      // connect timeout
+                .build();
+        var factory = new JdkClientHttpRequestFactory(jdk);
+        factory.setReadTimeout(Duration.ofMillis(500));     // per-attempt response timeout
+        this.http = builder.baseUrl("http://pricing.shop.svc.cluster.local:8080")
+                .requestFactory(factory)
+                .build();
+        this.cache = cache;
+    }
+
+    // Aspect order (outermost first): Retry -&gt; CircuitBreaker -&gt; Bulkhead -&gt; method
+    @Retry(name = "pricing")
+    @CircuitBreaker(name = "pricing", fallbackMethod = "cachedQuote")
+    @Bulkhead(name = "pricing")
+    public Quote quote(String sku) {
+        Quote q = http.get().uri("/v1/quotes/{sku}", sku)
+                .header("X-Request-Deadline-Ms", String.valueOf(RequestDeadline.remainingMillis()))
+                .retrieve()
+                .body(Quote.class);
+        cache.put(sku, q);
+        return q;
+    }
+
+    /** Fallback: same signature plus the exception. Cheap, local, no remote calls. */
+    private Quote cachedQuote(String sku, Throwable cause) {
+        Quote last = cache.get(sku);
+        if (last == null) {
+            throw new PricingUnavailableException(sku, cause);   // no safe default for prices
+        }
+        return new Quote(sku, last.price(), true);
+    }
+}</code></pre>
+  <p>Three details encode lessons from this chapter: only one retry, and only for clearly transient errors; <code>CallNotPermittedException</code> is never retried; and the fallback serves a stale price flagged as such, but refuses to invent one, so the caller can show "price may have changed" or block checkout. <code>RequestDeadline</code> stands for a request-scoped holder populated by a servlet filter from the inbound deadline header (partial: implement with a <code>ThreadLocal</code> or <code>ScopedValue</code>).</p>
+
+  <h3>7.3 A retry budget</h3>
+  <pre data-file="RetryBudget.java"><code class="language-java">package com.example.resilience;
+
+import java.util.concurrent.atomic.AtomicLong;
+
+/**
+ * Token-bucket retry budget in the style of Finagle/Linkerd: every request deposits
+ * `ratio` tokens, every retry withdraws one. Retries are allowed only while the balance
+ * covers them, so retries can never exceed ~ratio of traffic plus a small floor.
+ * Amounts are stored in milli-tokens to keep the arithmetic lock-free.
+ */
+public final class RetryBudget {
+    private final long depositMilli;
+    private final long maxBalanceMilli;
+    private final AtomicLong balanceMilli;
+
+    public RetryBudget(double ratio, int minRetriesFloor) {
+        this.depositMilli = Math.round(ratio * 1000);
+        this.maxBalanceMilli = Math.max(minRetriesFloor, 100) * 1000L;
+        this.balanceMilli = new AtomicLong(minRetriesFloor * 1000L);
+    }
+
+    public void onRequest() {
+        balanceMilli.accumulateAndGet(depositMilli, (cur, d) -&gt; Math.min(maxBalanceMilli, cur + d));
+    }
+
+    public boolean tryRetry() {
+        while (true) {
+            long cur = balanceMilli.get();
+            if (cur &lt; 1000) return false;                      // budget exhausted: fail fast
+            if (balanceMilli.compareAndSet(cur, cur - 1000)) return true;
+        }
+    }
+}</code></pre>
+  <p>Wire it into a Resilience4j <code>Retry</code> via <code>retryOnException(e -&gt; isTransient(e) &amp;&amp; budget.tryRetry())</code> and call <code>budget.onRequest()</code> per original request. With <code>ratio = 0.1</code>, a total outage produces at most about 10% extra load from retries instead of 2× or more.</p>
+
+  <h3>7.4 Load shedding at the service edge</h3>
+  <pre data-file="ConcurrencyLimitFilter.java"><code class="language-java">package com.example.resilience;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+import java.util.concurrent.Semaphore;
+
+/** Rejects work beyond a fixed in-flight limit, with priority for critical paths. */
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class ConcurrencyLimitFilter extends OncePerRequestFilter {
+
+    private final Semaphore general = new Semaphore(200);
+    private final Semaphore critical = new Semaphore(50);     // reserved for checkout
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest req, HttpServletResponse res, FilterChain chain)
+            throws ServletException, IOException {
+        boolean isCritical = req.getRequestURI().startsWith("/checkout");
+        Semaphore s = isCritical ? critical : general;
+        if (!s.tryAcquire()) {
+            if (isCritical &amp;&amp; general.tryAcquire()) {             // critical may borrow general capacity
+                s = general;
+            } else {
+                res.setStatus(503);
+                res.setHeader("Retry-After", "1");
+                return;                                          // shed: cheap, before any work
+            }
+        }
+        try {
+            chain.doFilter(req, res);
+        } finally {
+            s.release();
+        }
+    }
+}</code></pre>
+  <p>A fixed limit is a start; an adaptive limiter (e.g., Netflix's <code>concurrency-limits</code> library with a gradient algorithm) adjusts the limit as latency changes. Pair shedding with readiness probes that do <em>not</em> fail under load, or Kubernetes will remove capacity exactly when you need it.</p>
+
+  <h3>7.5 Spring Framework 7 built-in resilience</h3>
+  <pre data-file="ReportExporter.java"><code class="language-java">package com.example.shop.reporting;
+
+import org.springframework.resilience.annotation.ConcurrencyLimit;
+import org.springframework.resilience.annotation.Retryable;
+import org.springframework.stereotype.Service;
+
+@Service
+public class ReportExporter {
+
+    // Requires @EnableResilientMethods on a @Configuration class (Spring Framework 7+).
+    // maxAttempts here counts RETRIES, excluding the initial call.
+    @Retryable(includes = java.io.IOException.class, maxAttempts = 2,
+               delay = 200, multiplier = 2, jitter = 100, maxDelay = 2000)
+    @ConcurrencyLimit(10)   // at most 10 concurrent exports, protects the object store
+    public void upload(String key, byte[] body) throws java.io.IOException {
+        // call object storage
+    }
+}</code></pre>
+
+  <h3>7.6 Distributed locks: Redis for efficiency, fenced writes for correctness</h3>
+  <pre data-file="RedisLock.java"><code class="language-java">package com.example.locks;
+
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.stereotype.Component;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+
+/** Efficiency lock: avoids duplicate work most of the time. NOT a correctness guarantee. */
+@Component
+public class RedisLock {
+
+    private static final DefaultRedisScript&lt;Long&gt; RELEASE = new DefaultRedisScript&lt;&gt;("""
+        if redis.call('GET', KEYS[1]) == ARGV[1] then
+            return redis.call('DEL', KEYS[1])
+        else
+            return 0
+        end
+        """, Long.class);
+
+    private final StringRedisTemplate redis;
+
+    public RedisLock(StringRedisTemplate redis) { this.redis = redis; }
+
+    public Optional&lt;String&gt; tryAcquire(String name, Duration ttl) {
+        String token = UUID.randomUUID().toString();
+        Boolean ok = redis.opsForValue().setIfAbsent("lock:" + name, token, ttl);   // SET NX PX
+        return Boolean.TRUE.equals(ok) ? Optional.of(token) : Optional.empty();
+    }
+
+    public boolean release(String name, String token) {     // compare-and-delete, atomic in Lua
+        Long n = redis.execute(RELEASE, List.of("lock:" + name), token);
+        return n != null &amp;&amp; n == 1L;
+    }
+}</code></pre>
+  <pre data-file="FencedWrites.sql"><code class="language-sql">-- Correctness: a monotonic fencing token from the lock grant, checked by the resource.
+CREATE SEQUENCE lock_fence_seq;
+CREATE TABLE report (
+    id          TEXT PRIMARY KEY,
+    content     TEXT,
+    fence       BIGINT NOT NULL DEFAULT 0
+);
+
+-- At lock acquisition (e.g. together with a lock-row insert): obtain a token
+SELECT nextval('lock_fence_seq');                      -- say it returns 34
+
+-- Every protected write carries the token; stale holders affect 0 rows
+UPDATE report
+   SET content = :content, fence = :token
+ WHERE id = :id AND fence &lt; :token;</code></pre>
+  <pre data-file="AdvisoryLockJob.java"><code class="language-java">package com.example.locks;
+
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
+
+@Component
+public class AdvisoryLockJob {
+    private final JdbcTemplate jdbc;
+    public AdvisoryLockJob(JdbcTemplate jdbc) { this.jdbc = jdbc; }
+
+    /** Transaction-scoped advisory lock: released automatically at commit/rollback. */
+    @Transactional
+    public boolean rebuildIfFree(long tenantId) {
+        Boolean got = jdbc.queryForObject("SELECT pg_try_advisory_xact_lock(?)", Boolean.class, tenantId);
+        if (!Boolean.TRUE.equals(got)) return false;       // another instance is doing it
+        jdbc.update("DELETE FROM tenant_summary WHERE tenant_id = ?", tenantId);
+        jdbc.update("""
+            INSERT INTO tenant_summary (tenant_id, order_count)
+            SELECT ?, count(*) FROM orders WHERE tenant_id = ?
+            """, tenantId, tenantId);
+        return true;                                        // lock and writes commit atomically
+    }
+}</code></pre>
+  <pre data-file="SchedulingConfig.java"><code class="language-java">package com.example.locks;
+
+import net.javacrumbs.shedlock.core.LockProvider;
+import net.javacrumbs.shedlock.provider.jdbctemplate.JdbcTemplateLockProvider;
+import net.javacrumbs.shedlock.spring.annotation.EnableSchedulerLock;
+import net.javacrumbs.shedlock.spring.annotation.SchedulerLock;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+import javax.sql.DataSource;
+
+@Configuration
+@EnableScheduling
+@EnableSchedulerLock(defaultLockAtMostFor = "PT10M")
+class SchedulingConfig {
+    @Bean
+    LockProvider lockProvider(DataSource ds) {
+        // requires table: shedlock(name VARCHAR(64) PK, lock_until TIMESTAMP, locked_at TIMESTAMP, locked_by VARCHAR(255))
+        return new JdbcTemplateLockProvider(JdbcTemplateLockProvider.Configuration.builder()
+                .withJdbcTemplate(new JdbcTemplate(ds))
+                .usingDbTime()                  // avoid app-server clock skew
+                .build());
+    }
+}
+
+@Component
+class NightlyJobs {
+    @Scheduled(cron = "0 0 2 * * *")
+    @SchedulerLock(name = "nightlyInvoiceRun", lockAtMostFor = "PT30M", lockAtLeastFor = "PT1M")
+    void invoiceRun() {
+        // must still be idempotent: lockAtMostFor can expire while a slow run continues
+    }
+}</code></pre>
+
+  <h3>7.7 Go and Python equivalents</h3>
+  <div class="code-tabs">
+  <pre data-lang="Go"><code class="language-go">// go get github.com/sony/gobreaker/v2 go.etcd.io/etcd/client/v3
+package resilience
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"math/rand/v2"
+	"net/http"
+	"time"
+
+	"github.com/sony/gobreaker/v2"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/v3/concurrency"
+)
+
+var errTransient = errors.New("transient")
+
+var pricingCB = gobreaker.NewCircuitBreaker[[]byte](gobreaker.Settings{
+	Name:        "pricing",
+	MaxRequests: 5,                // trial calls in half-open
+	Interval:    20 * time.Second, // closed-state counting window
+	Timeout:     10 * time.Second, // open -&gt; half-open
+	ReadyToTrip: func(c gobreaker.Counts) bool {
+		return c.Requests &gt;= 20 &amp;&amp; float64(c.TotalFailures)/float64(c.Requests) &gt;= 0.5
+	},
+})
+
+var httpClient = &amp;http.Client{Timeout: 500 * time.Millisecond} // whole-attempt timeout
+
+// Quote calls pricing with the caller's deadline, one jittered retry, behind a breaker.
+func Quote(ctx context.Context, sku string) ([]byte, error) {
+	var lastErr error
+	for attempt := 0; attempt &lt; 2; attempt++ {
+		if attempt &gt; 0 {
+			backoff := time.Duration(rand.Int64N(int64(100*time.Millisecond) &lt;&lt; attempt)) // full jitter
+			select {
+			case &lt;-time.After(backoff):
+			case &lt;-ctx.Done():
+				return nil, ctx.Err() // caller's deadline passed: stop retrying
+			}
+		}
+		body, err := pricingCB.Execute(func() ([]byte, error) {
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://pricing:8080/v1/quotes/"+sku, nil)
+			resp, err := httpClient.Do(req)
+			if err != nil {
+				return nil, fmt.Errorf("%w: %v", errTransient, err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode &gt;= 500 {
+				return nil, fmt.Errorf("%w: status %d", errTransient, resp.StatusCode)
+			}
+			return io.ReadAll(resp.Body)
+		})
+		if err == nil {
+			return body, nil
+		}
+		if errors.Is(err, gobreaker.ErrOpenState) || !errors.Is(err, errTransient) {
+			return nil, err // do not retry an open breaker or a non-transient error
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// WithEtcdLock runs fn while holding a lock; fn receives a fencing token.
+func WithEtcdLock(ctx context.Context, cli *clientv3.Client, name string, fn func(fence int64) error) error {
+	sess, err := concurrency.NewSession(cli, concurrency.WithTTL(15)) // lease kept alive in background
+	if err != nil {
+		return err
+	}
+	defer sess.Close()
+	m := concurrency.NewMutex(sess, "/locks/"+name)
+	if err := m.Lock(ctx); err != nil {
+		return err
+	}
+	defer m.Unlock(context.Background())
+	return fn(m.Header().Revision) // monotonic across grants: pass it to the storage layer
+}</code></pre>
+  <pre data-lang="Python"><code class="language-python"># pip install httpx tenacity
+import asyncio
+import httpx
+from tenacity import (AsyncRetrying, retry_if_exception_type, stop_after_attempt,
+                      wait_random_exponential)
+
+TIMEOUT = httpx.Timeout(connect=0.2, read=0.5, write=0.5, pool=0.1)
+pricing_bulkhead = asyncio.Semaphore(40)          # concurrency limit for this dependency
+
+class Transient(Exception):
+    pass
+
+async def quote(client: httpx.AsyncClient, sku: str) -&gt; dict:
+    async for attempt in AsyncRetrying(
+        stop=stop_after_attempt(2),                                  # 1 retry
+        wait=wait_random_exponential(multiplier=0.1, max=1.0),       # full jitter
+        retry=retry_if_exception_type((Transient, httpx.TransportError)),
+        reraise=True,
+    ):
+        with attempt:
+            if pricing_bulkhead.locked():
+                raise RuntimeError("bulkhead full")                  # fail fast, not retried
+            async with pricing_bulkhead:
+                r = await client.get(f"http://pricing:8080/v1/quotes/{sku}", timeout=TIMEOUT)
+                if r.status_code &gt;= 500:
+                    raise Transient(f"status {r.status_code}")
+                r.raise_for_status()                                 # 4xx: not retried
+                return r.json()
+
+async def main() -&gt; None:
+    async with httpx.AsyncClient() as client:
+        # overall deadline for the whole operation, like a propagated gRPC deadline
+        print(await asyncio.wait_for(quote(client, "sku-1"), timeout=1.0))
+
+if __name__ == "__main__":
+    asyncio.run(main())</code></pre>
+  </div>
+  <p>For a circuit breaker in Python, libraries such as <code>pybreaker</code> or <code>aiobreaker</code> implement the same closed/open/half-open machine; at the platform level, Envoy outlier detection or Istio <code>DestinationRule</code> settings provide breaker-like ejection of failing endpoints regardless of language.</p>
 </section>
 
 </article>

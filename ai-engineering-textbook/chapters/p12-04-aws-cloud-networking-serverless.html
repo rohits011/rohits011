@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AWS Fundamentals, Cloud Networking &amp; Serverless — AI-Era Software Engineering</title>
+<meta name="description" content="Regions and AZs, IAM, compute, storage, databases and messaging on AWS; VPC design with subnets, routing, NAT, security groups, endpoints and load balancers; and serverless with Lambda, SnapStart, Step Functions and event-driven design.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p12-04-aws-cloud-networking-serverless" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 12 · Chapter 4</p>
+  <h1>AWS Fundamentals, Cloud Networking &amp; Serverless</h1>
+  <p class="lede">The Lumen platform now has images, manifests, pipelines and Terraform; it needs a home. This chapter covers the AWS building blocks a backend engineer must reason about — identity, compute, storage, databases, messaging — then designs the network that connects them (VPCs, subnets, routing, NAT, security groups, endpoints, load balancers, DNS and CDN), and finally shows when to drop servers entirely and run event-driven code on Lambda, including how to make Java start fast enough to be serverless.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Chapter 12.1 (IP, CIDR, NAT, DNS, L4/L7), 12.2 (Kubernetes), 12.3 (Terraform).</li>
+    <li><strong>You will be able to:</strong> design a three-AZ VPC for EKS and RDS; trace a packet from the internet to a pod and from a pod to S3; write least-privilege IAM; choose between EC2, ECS, EKS and Lambda, and between RDS, Aurora and DynamoDB; build an SQS-triggered Lambda in Java with SnapStart; and estimate the cost of NAT, data transfer and serverless.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: The Cloud as an API for Infrastructure</h2>
+  <p>On-premises, getting a server meant a purchase order; on AWS it is an API call that returns in seconds. That shift is why Infrastructure as Code (Chapter 3) works at all. But the cloud is not "someone else's computer" in a simple sense: it is a set of managed services with explicit failure domains (Regions and Availability Zones), a global identity system (IAM) that gates every API call, a software-defined network (VPC) with its own routing and firewall semantics, and a pricing model in which architecture decisions — especially data transfer and NAT — show up directly on the bill.</p>
+  <p>This chapter is about AWS because it is the most common target for Spring Boot teams and the platform Lumen runs on, but the concepts — regions and zones, identity-based access, private networks with NAT and private endpoints, L4/L7 load balancers, functions-as-a-service — exist in Google Cloud and Azure under different names.</p>
+
+<div class="bridge">
+  <h4>Bridging from Java &amp; Spring Boot</h4>
+  <dl>
+    <dt>What you already know</dt><dd>Spring Cloud AWS or the AWS SDK for Java v2 to call S3 and SQS; <code>@SqsListener</code>; datasource URLs pointing at RDS; maybe credentials in <code>application.yaml</code> or environment variables; a load balancer someone else configured in front of your service.</dd>
+    <dt>Why that is not enough</dt><dd>Static access keys leak; "the network team" cannot debug your security-group-induced timeouts for you; an un-designed VPC runs out of IP addresses as soon as EKS assigns one per pod; a Spring Boot fat JAR on Lambda can take seconds to cold start; and a single NAT gateway can quietly become your largest line item.</dd>
+    <dt>The modern approach</dt><dd>Workload identity (EKS Pod Identity, IAM roles for Lambda/ECS tasks) with least-privilege policies; a VPC designed for growth with private subnets per AZ, gateway and interface endpoints for AWS APIs; managed data services (RDS/Aurora, DynamoDB, SQS) instead of self-hosting; L7 ALB or L4 NLB chosen deliberately; and serverless for spiky, event-driven work with SnapStart or native images to fix JVM cold starts.</dd>
+    <dt>Where Python and Go fit</dt><dd>Python and Go cold-start fast on Lambda and dominate glue functions; boto3 and the Go SDK v2 are the usual clients. The Go gateway in Lumen benefits from NLB's static IPs and connection-level balancing; Python AI services call model APIs over interface endpoints (e.g., Amazon Bedrock) or through NAT.</dd>
+    <dt>In production</dt><dd>Most AWS incidents a backend team causes are networking (security group or route missing, NAT exhaustion, DNS), identity (AccessDenied after a policy change), quotas (throttling, ENI/IP limits) or cost surprises (cross-AZ and NAT data). Regional service events are rarer but real — design for AZ failure always, region failure when the business needs it.</dd>
+    <dt>Use it when / avoid it when</dt><dd>Use managed services by default; they remove undifferentiated operational work. Avoid serverless for steady, high-throughput, latency-critical workloads where containers are cheaper and more predictable, and avoid multi-region active-active unless the business case justifies its complexity.</dd>
+  </dl>
+</div>
+</section>
+
+<section id="history">
+  <h2>2. History</h2>
+  <p>Amazon Web Services launched its first broadly available infrastructure service, <strong>Amazon S3</strong>, in March 2006, followed by <strong>SQS</strong> (2006) and <strong>EC2</strong> (beta August 2006). Early EC2 instances lived on a flat shared network ("EC2-Classic"); <strong>Amazon VPC</strong> arrived in 2009 and became the default for new accounts from 2013, bringing private address spaces, subnets and routing under customer control. <strong>RDS</strong> launched in 2009, <strong>IAM</strong> in 2010–2011, <strong>DynamoDB</strong> in 2012 (based on lessons from the 2007 Dynamo paper), and <strong>Aurora</strong> in 2014–2015.</p>
+  <p><strong>AWS Lambda</strong> was announced at re:Invent in November 2014 and started the "serverless" era; API Gateway (2015), Step Functions (2016), EventBridge (2019, evolved from CloudWatch Events) and Fargate (2017) completed the picture. Containers on AWS came via ECS (2014–2015) and <strong>EKS</strong> (GA June 2018). Networking evolved with PrivateLink (2017), Transit Gateway (2018) and VPC Lattice (GA 2023). In December 2020 S3 became strongly consistent for all operations and Lambda moved to 1 ms billing granularity and container image packaging. <strong>Lambda SnapStart</strong> for Java was launched at re:Invent 2022 and extended to Python and .NET in November 2024 and to container image functions in 2026; <strong>EKS Auto Mode</strong>, which runs Karpenter-based node management, storage and load balancing as a managed capability, was announced in December 2024 <span class="tag version">Version-sensitive · checked Nov 2026</span>. In 2025 AWS raised the maximum SQS message size and Lambda asynchronous payload size from 256 KB to 1 MiB/1 MB.</p>
+  <p>The history of outages matters as much as the history of launches: major us-east-1 events in 2011 (EBS), 2017 (S3 in us-east-1, triggered by a mistyped command), December 2021 (internal network congestion) and October 2025 (a DNS race condition in DynamoDB's automation) shaped how both AWS and its customers think about blast radius — see §9.</p>
+</section>

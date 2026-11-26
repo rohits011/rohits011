@@ -1,0 +1,1848 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case Studies II: E-Commerce, Payments, Video Streaming — AI-Era Software Engineering</title>
+<meta name="description" content="End-to-end designs for an e-commerce platform with flash sales, a payment processing system with idempotency, double-entry ledger and reconciliation, and a video streaming platform with transcoding, adaptive bitrate and CDN delivery.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p2-11-case-studies-commerce" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 2 · Chapter 11</p>
+  <h1>Case Studies II: E-Commerce, Payments &amp; Video Streaming</h1>
+  <p class="lede">Money and media: the two workloads where mistakes are most visible. An e-commerce platform must never sell stock it does not have, even when a hundred thousand people press "buy" in the same second. A payment system must never charge twice, never lose a cent, and prove it to auditors. A video platform must move petabytes efficiently enough that the bandwidth bill does not consume the business. This chapter designs all three end to end and implements their hardest components in Spring Boot, Go and Python.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> <a href="p2-04-databases-indexing.html">database selection and indexing</a>, <a href="p2-06-consistency-transactions.html">transactions, sagas, outbox and idempotency</a>, <a href="p2-07-kafka-event-driven.html">Kafka</a>, <a href="p2-08-microservices-resilience.html">resilience patterns</a>, and <a href="p2-10-case-studies-messaging.html">Chapter 2.10</a> for the design method.</li>
+    <li><strong>You will be able to:</strong> design inventory reservation that survives flash sales; build an idempotent payment API backed by a double-entry ledger with reconciliation; reduce PCI DSS scope through tokenization; and design an upload-to-playback video pipeline with an adaptive bitrate ladder, CDN strategy and scalable view counting.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: Correctness Under Contention, and Bytes at Scale</h2>
+  <p>The previous chapter dealt with systems where the worst failure is usually a delayed or duplicated message. In this chapter the failures cost money directly. Overselling a limited-edition product means cancelling orders and losing customer trust; double-charging a card means chargebacks, fees and possibly regulatory attention; an inefficient video encoding ladder can multiply your CDN bill. These are also the systems where your Spring Boot experience is most directly relevant — commerce and payments are classic Java territory — and where the "it worked in the monolith" instincts are most dangerous once the system is distributed.</p>
+  <ul>
+    <li><strong>E-commerce</strong> is a federation of very different workloads: a read-heavy, search-driven catalog; a write-heavy, per-user cart; a contention-heavy inventory; and a transaction-heavy checkout that coordinates inventory, pricing, payment and fulfilment. Flash sales concentrate all of that onto a handful of SKUs for a few minutes.</li>
+    <li><strong>Payments</strong> are about <em>exactness</em>: idempotent APIs because clients retry, an append-only double-entry ledger because money must be conserved, reconciliation because external processors are the true source of settlement, and tokenization because storing card numbers puts your entire estate in PCI DSS scope.</li>
+    <li><strong>Video streaming</strong> is about <em>throughput and cost</em>: resumable uploads of multi-gigabyte files, a parallel transcoding pipeline, an adaptive bitrate ladder that trades quality against bandwidth, and a CDN strategy that keeps origin traffic tiny. View counting adds a classic stream-aggregation problem.</li>
+  </ul>
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>You have written <code>@Transactional</code> order services over JPA, probably decremented stock with <code>UPDATE ... SET qty = qty - 1</code>, integrated a payment gateway SDK, maybe used Spring State Machine or an enum-based status column, and run <code>@Scheduled</code> batch jobs for settlement reports. You may have streamed files with <code>StreamingResponseBody</code> or uploaded them to S3 with the AWS SDK.</dd>
+      <dt>Why that is not enough</dt><dd>A single <code>@Transactional</code> cannot span the inventory service, the payment service provider and the order database. A naive stock decrement on one hot row serialises every buyer of the flash-sale SKU. A retried HTTP call to a PSP without an idempotency key is a double charge. A <code>balance</code> column updated in place cannot be audited. A Spring service that proxies video bytes will saturate its NIC long before its CPU.</dd>
+      <dt>The modern approach</dt><dd>Reservations with TTLs and conditional updates (or atomic Redis scripts) for inventory; sagas with compensations orchestrated through an outbox; idempotency keys persisted with request fingerprints; an immutable double-entry ledger with balances as derived projections; tokenization via a PSP's hosted fields; asynchronous DAG-based transcoding; pre-signed URLs so bytes never pass through your application servers; CDNs with origin shielding.</dd>
+      <dt>Where Python and Go fit</dt><dd>Go is strong for the high-throughput edges: view-count ingestion, upload gateways, segment packagers and CDN-adjacent services. Python dominates the media and data tooling (FFmpeg orchestration, quality metrics such as VMAF, recommendation models, fraud-model training). Java/Spring remains the natural home for checkout, orders, payments and ledger services, where transactional rigour and a mature ecosystem matter most.</dd>
+      <dt>In production</dt><dd>Expect PostgreSQL or MySQL (often sharded) for orders, payments and ledger; Elasticsearch/OpenSearch for search; Redis for carts and flash-sale counters; Kafka with CDC for events; object storage plus a CDN for media; and a workflow engine (Temporal, AWS Step Functions, or a home-grown orchestrator) for transcoding and long-running payment flows.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use these designs when scale or regulation demands them. A small shop should use a hosted commerce platform and a PSP's hosted checkout — buying PCI compliance and fraud tooling is almost always cheaper than building it. A company with a few hundred videos should use a managed video platform. Build when the differentiation or the unit economics justify it.</dd>
+    </dl>
+  </div>
+  <div class="callout insight"><p class="callout-title">Labels in this chapter</p><p>Capacity numbers and infrastructure estimates are <span class="tag illus">Illustrative</span>. Company practices are <span class="tag fact">Verified</span> only where linked to the company's own publication in §9. Regulatory details (PCI DSS versions, SCA rules) are <span class="tag version">Version-sensitive · checked Nov 2026</span>; always confirm with your acquirer or QSA.</p></div>
+</section>
+
+<section id="history">
+  <h2>2. History: How These Systems Evolved</h2>
+  <h3>2.1 E-commerce: from the monolith to the cell</h3>
+  <p>The first generation of online retail (mid-1990s) ran on monolithic application servers and a single relational database. As traffic grew, the database became the bottleneck, and large retailers decomposed into services. Amazon's 2007 Dynamo paper is the landmark artefact from this period: it describes a highly available key-value store built so that the shopping cart would accept writes even during failures, deliberately choosing availability and later reconciliation (merging divergent cart versions) over strict consistency. That trade-off — "never refuse an add-to-cart" — still shapes cart design today.</p>
+  <p>The 2010s added two pressures. First, <strong>flash sales and drops</strong> (limited releases, Singles' Day in China, Black Friday/Cyber Monday) created traffic spikes of an order of magnitude above baseline for a few minutes, concentrated on few products. Shopify has written publicly about building queueing and throttling into its load-balancer tier for these "flash" events (§9). Second, <strong>multi-tenancy</strong>: commerce platforms hosting millions of merchants adopted cell or "pod" architectures, in which each shard of merchants runs on an isolated slice of infrastructure so one merchant's sale cannot take down everyone.</p>
+  <h3>2.2 Payments: from card imprinters to APIs and tokens</h3>
+  <p>Card payments run on a four-party model: cardholder, issuer (the cardholder's bank), merchant, and acquirer (the merchant's bank), connected by card networks. Online merchants historically integrated with acquirers or gateways through complex, batch-oriented interfaces. Two developments changed the engineering picture. The card brands created a common security standard, PCI DSS, in 2004 and formed the PCI Security Standards Council in 2006; version 4.0 was published in 2022 and v4.0.1 in 2024, and v3.2.1 was retired in 2024. In parallel, developer-focused payment service providers (PSPs) such as Stripe (launched publicly in 2011) offered simple REST APIs, client-side tokenization and hosted payment fields, so merchants could accept cards without card numbers ever touching their servers.</p>
+  <p>Regulation then reshaped flows: the EU's PSD2 introduced Strong Customer Authentication, which made 3-D Secure 2 challenges a normal step in European card payments around 2019–2021, and made payment flows inherently multi-step and asynchronous. The "payment intent" style of API — an object that moves through states such as <em>requires_payment_method</em>, <em>requires_action</em>, <em>processing</em> and <em>succeeded</em> — is the industry's answer to that complexity. Internally, large platforms (Uber, Airbnb and others) published how they rebuilt payment systems around idempotency and double-entry ledgers (§9).</p>
+  <h3>2.3 Video: from progressive download to adaptive streaming</h3>
+  <p>Early web video was either progressive download (fetch an MP4 over HTTP and start playing when enough has arrived) or proprietary streaming protocols such as RTMP with Flash. Two ideas made modern streaming possible. <strong>HTTP-based adaptive streaming</strong> splits the video into short segments encoded at several bitrates and lets the player switch between them as bandwidth changes; Apple introduced HTTP Live Streaming (HLS) in 2009 (later published as RFC 8216 in 2017), and MPEG standardised DASH in 2012. Because segments are ordinary HTTP objects, ordinary CDNs can cache them. <strong>Purpose-built CDNs</strong> followed: Netflix began building its own CDN, Open Connect, placing caching appliances inside ISP networks.</p>
+  <p>Encoding also became smarter. Netflix's 2015 "per-title encode optimization" replaced a one-size-fits-all bitrate ladder with one tuned to each title's complexity, and later work moved to per-shot optimisation. Codecs advanced from H.264/AVC (2003) to HEVC (2013), VP9 (2013) and AV1 (2018), each saving bandwidth at the price of more encoding compute and narrower device support. Storage and metadata scaled too: YouTube built Vitess (from 2010, open-sourced in 2012) to shard the MySQL databases behind its metadata.</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals: The Building Blocks Under All Three Designs</h2>
+  <h3>3.1 Inventory as a contended counter</h3>
+  <p>Inventory looks like a number, but semantically it is a set of claims: <em>on hand</em>, <em>reserved</em> (held for carts or checkouts in progress), <em>committed</em> (sold, awaiting fulfilment) and <em>available = on hand − reserved − committed</em>. The engineering question is where you place the decrement. Decrementing at add-to-cart over-reserves (most carts are abandoned); decrementing at payment success risks overselling between "checkout started" and "paid". The standard compromise is a <strong>reservation with a TTL</strong> created when checkout starts, converted to a commitment on payment success, and released on payment failure or timeout. For contention, the update must be a <em>conditional</em> write (<code>UPDATE ... SET reserved = reserved + :q WHERE sku = :s AND on_hand - reserved - committed &gt;= :q</code>), never a read-then-write in application code.</p>
+  <h3>3.2 State machines for long-lived business objects</h3>
+  <p>Orders, payments and transcoding jobs are long-lived objects driven by external events. Model each as an explicit finite-state machine with allowed transitions enforced in the database (<code>UPDATE ... WHERE id = ? AND status = 'AUTHORIZED'</code>), not just in Java. This gives you idempotency for free (a duplicate "capture succeeded" event finds the payment already in <code>CAPTURED</code> and does nothing) and makes concurrency races visible as failed conditional updates.</p>
+  <h3>3.3 Sagas, outbox and idempotency (recap)</h3>
+  <p>Checkout spans inventory, payment and order services. A two-phase commit across them is impractical (PSPs do not participate in your XA transactions), so checkout is a <strong>saga</strong>: a sequence of local transactions, each with a compensating action (release reservation, void authorization, refund). Every step publishes its result through a <strong>transactional outbox</strong> so that "state changed" and "event published" cannot diverge, and every consumer is idempotent. All three mechanisms are developed in <a href="p2-06-consistency-transactions.html">Chapter 2.6</a>; here we apply them.</p>
+  <h3>3.4 Double-entry bookkeeping for engineers</h3>
+  <p>Double-entry accounting records every movement of value as at least two entries — debits and credits — that sum to zero. Each entry belongs to an <strong>account</strong> (a customer's balance, a merchant's payable, the platform's fee revenue, cash held at the PSP). Balances are not stored as mutable fields; they are the sum of entries, materialised for speed. The invariants are mechanical and therefore checkable: every transaction balances, entries are immutable (corrections are new reversing entries), and the sum over all accounts is zero. For engineers, the key insight is that a ledger is an <em>event-sourced, append-only log with a conservation law</em>, which makes it easy to audit, replay and reconcile.</p>
+  <h3>3.5 Card payment lifecycle</h3>
+  <ul>
+    <li><strong>Authorization:</strong> the issuer approves and places a hold on the cardholder's funds. Nothing has moved yet.</li>
+    <li><strong>Capture:</strong> the merchant claims the authorized amount (immediately for digital goods, typically at shipment for physical goods). Authorizations expire if not captured (the window varies by network and card type).</li>
+    <li><strong>Clearing and settlement:</strong> captured transactions are batched, cleared through the networks, and funds settle to the acquirer and then to the merchant, net of fees, usually one or more days later.</li>
+    <li><strong>Refunds, voids, chargebacks:</strong> a void cancels an uncaptured authorization; a refund returns captured funds; a chargeback (dispute) is initiated by the cardholder through the issuer and has its own evidence workflow.</li>
+  </ul>
+  <h3>3.6 Tokenization and PCI DSS scope</h3>
+  <p>PCI DSS applies to every system component that stores, processes or transmits cardholder data, and to anything connected to those components. The most effective security control is therefore <em>not having the data</em>: card details are entered into PSP-hosted fields (iframes) or a PSP mobile SDK, which return an opaque <strong>token</strong> (or payment-method ID). Your servers only see the token, so most of your estate falls outside the cardholder-data environment, and your compliance obligations shrink accordingly (the exact self-assessment questionnaire depends on your integration and your acquirer's judgement). Network tokens issued by card schemes go further, replacing the card number even inside the payment chain.</p>
+  <h3>3.7 Video encoding vocabulary</h3>
+  <ul>
+    <li><strong>Container vs codec:</strong> MP4/fMP4 or MPEG-TS are containers; H.264, HEVC, VP9 and AV1 are video codecs; AAC and Opus are audio codecs.</li>
+    <li><strong>Rendition and ladder:</strong> one rendition is a (resolution, bitrate, codec) encoding; the ladder is the set of renditions offered for a title.</li>
+    <li><strong>Segment and GOP:</strong> streams are split into segments of a few seconds; each segment must start with a keyframe (IDR), so the encoder's GOP structure must align with segment boundaries across renditions to allow seamless switching.</li>
+    <li><strong>Manifest:</strong> HLS uses a master playlist (<code>.m3u8</code>) that lists variant playlists; DASH uses an MPD (XML). CMAF lets one set of fMP4 segments serve both.</li>
+    <li><strong>ABR algorithm:</strong> the player picks renditions based on throughput estimates and buffer occupancy.</li>
+    <li><strong>DRM:</strong> commercial content is encrypted (Common Encryption) and licences are issued by Widevine, FairPlay or PlayReady licence servers.</li>
+  </ul>
+  <h3>3.8 Content delivery networks and origin shielding</h3>
+  <p>A CDN caches objects at edge locations near users. For video, the cache hit ratio is everything: a 98% edge hit ratio means origin serves 2% of bytes; 95% means 5% — two and a half times as much. <strong>Origin shielding</strong> adds a mid-tier cache so that edge misses from many locations collapse into one request to origin. Popular content can be pre-positioned (pushed to edges off-peak), which is the principle behind ISP-embedded appliances.</p>
+  <h3>3.9 Counting at scale</h3>
+  <p>View counts, likes and inventory telemetry share a pattern: very high write rates to few keys. Updating a database row per event fails on hot keys. The standard approach is <strong>aggregate-then-write</strong>: buffer increments in memory or in a stream processor, flush periodic deltas, and accept that displayed counts lag by seconds. For distinct counts (unique viewers), use probabilistic sketches such as HyperLogLog, which estimate cardinality with about 1–2% error in a few kilobytes. Fraud filtering (bots, replay) determines which views count at all — a policy decision as much as a technical one.</p>
+</section>
+
+<section id="internals">
+  <h2>4. Internal Working: Requirements, Estimates, APIs and Data Models</h2>
+
+  <h3>4.1 Case study A — E-commerce platform with flash sales</h3>
+  <h4>Functional requirements</h4>
+  <ul>
+    <li><strong>Catalog:</strong> products, variants (SKUs), attributes, images, prices (including promotions), per-region availability.</li>
+    <li><strong>Search and browse:</strong> full-text search with facets (brand, size, price range), sorting, typo tolerance, personalised ranking hook.</li>
+    <li><strong>Cart:</strong> add/remove/update, guest carts merged on login, price and stock re-validation at checkout.</li>
+    <li><strong>Checkout:</strong> address, shipping options, tax, promotions, payment; produces an order.</li>
+    <li><strong>Inventory:</strong> per-SKU per-warehouse stock with reservations; never oversell.</li>
+    <li><strong>Orders:</strong> lifecycle from placed through paid, fulfilled, shipped, delivered, cancelled, returned; customer order history.</li>
+    <li><strong>Flash sales:</strong> scheduled sales of limited stock (e.g. 10,000 units of one SKU) with fair access and bot protection.</li>
+  </ul>
+  <h4>Non-functional requirements</h4>
+  <ul>
+    <li>Product page p99 under 200 ms; search p99 under 300 ms; checkout p99 under 1.5 s (excluding 3-D Secure challenges).</li>
+    <li>Checkout availability 99.95%; catalog/search 99.99% (stale reads acceptable).</li>
+    <li>Zero oversell for limited stock; bounded oversell tolerated for back-orderable stock (business choice).</li>
+    <li>Flash sale: sustain 50× normal traffic on a handful of SKUs for 10 minutes without affecting the rest of the site.</li>
+    <li>Order data durable and auditable for years (tax, consumer law).</li>
+  </ul>
+
+  <h4>Capacity estimation <span class="tag illus">Illustrative</span></h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Quantity</th><th>Assumption / calculation</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>DAU</td><td>assumption</td><td>20 M</td></tr>
+      <tr><td>Page/API views</td><td>20 M × 30 requests</td><td>600 M/day ≈ 7 K/s avg, 21 K/s peak</td></tr>
+      <tr><td>Search queries</td><td>20 M × 5</td><td>100 M/day ≈ 1.2 K/s avg, 4 K/s peak</td></tr>
+      <tr><td>Cart writes</td><td>20 M × 3</td><td>60 M/day ≈ 700/s avg</td></tr>
+      <tr><td>Orders</td><td>2% conversion of DAU</td><td>400 K/day ≈ 5/s avg, 50/s peak</td></tr>
+      <tr><td>Flash-sale burst</td><td>2 M users try to buy within 60 s</td><td>≈ 33 K checkout attempts/s on one SKU</td></tr>
+      <tr><td>Catalog size</td><td>50 M SKUs × 5 KB (attributes, text)</td><td>250 GB primary; search index ≈ 2–3× with replicas</td></tr>
+      <tr><td>Images</td><td>50 M × 6 images × 4 sizes × 100 KB</td><td>≈ 120 TB object storage, CDN-served</td></tr>
+      <tr><td>Orders storage</td><td>400 K/day × 10 KB (lines, addresses, events) × 365 × 7 years</td><td>≈ 10 TB</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>What the numbers tell us:</strong> normal order volume is tiny for a relational database (50 orders/s); the catalog is read-heavy and cacheable; search needs a dedicated engine. The two hard numbers are the <em>flash-sale burst</em> — 33 K/s contending on a single inventory row — and the <em>fan-in to checkout</em> from cart and inventory under that burst. The design must therefore protect the inventory row and the checkout pipeline with admission control, not raw scaling.</p>
+
+  <h4>API design</h4>
+<pre data-file="commerce-api.http"><code class="language-plaintext">GET  /v1/products/{productId}                      -&gt; product, variants, price, availability badge (cached)
+GET  /v1/search?q=running+shoes&amp;brand=acme&amp;size=42&amp;sort=price_asc&amp;cursor=...
+GET  /v1/cart                                       -&gt; current cart (guest via cookie, or user)
+PUT  /v1/cart/items/{skuId}   { "quantity": 2 }     -&gt; idempotent set, not "add 1"
+DELETE /v1/cart/items/{skuId}
+POST /v1/checkouts            { "cartVersion": 17 } -&gt; creates checkout session, reserves stock (TTL 10 min)
+     201 { "checkoutId": "chk_..", "expiresAt": "...", "lines": [...], "totals": {...} }
+     409 { "code": "OUT_OF_STOCK", "skus": ["..."] }
+PATCH /v1/checkouts/{id}      { "shippingAddress": {...}, "shippingOption": "std" }
+POST /v1/checkouts/{id}/complete
+     Idempotency-Key: 9b1d...
+     { "paymentMethodToken": "pm_tok_..." }         -&gt; 202 { "orderId": "ord_..", "status": "PAYMENT_PENDING" }
+GET  /v1/orders/{orderId}                           -&gt; status timeline
+POST /v1/orders/{orderId}/cancel
+
+# flash sale (separate edge path)
+POST /v1/drops/{dropId}/entries                      -&gt; queue ticket (virtual waiting room)
+GET  /v1/drops/{dropId}/entries/{ticket}             -&gt; { "state": "WAITING|ADMITTED|SOLD_OUT", "position": 1234 }</code></pre>
+  <p>Notice <code>PUT</code> for cart quantities: setting a quantity is idempotent, while "add one" is not; a retried "add one" doubles the item. <code>cartVersion</code> on checkout creation gives optimistic concurrency: if the cart changed in another tab, checkout fails fast instead of reserving the wrong items. Completion returns <code>202</code> because payment may require asynchronous steps (3-D Secure, PSP webhooks).</p>
+
+  <h4>Data model</h4>
+  <figure class="diagram">
+<pre class="mermaid">
+erDiagram
+  PRODUCT ||--o{ SKU : "has variants"
+  SKU ||--o{ STOCK : "stocked in"
+  WAREHOUSE ||--o{ STOCK : holds
+  STOCK ||--o{ RESERVATION : "held by"
+  CART ||--o{ CART_LINE : contains
+  CHECKOUT ||--o{ RESERVATION : creates
+  CHECKOUT ||--|| ORDER : "completes as"
+  ORDER ||--o{ ORDER_LINE : contains
+  ORDER ||--o{ ORDER_EVENT : "history"
+  PRODUCT {
+    string product_id PK
+    string title
+    json attributes
+    string status
+  }
+  SKU {
+    string sku_id PK
+    string product_id
+    json options
+    bigint price_minor
+    string currency
+  }
+  STOCK {
+    string sku_id PK
+    string warehouse_id PK
+    int on_hand
+    int reserved
+    int committed
+    bigint version
+  }
+  RESERVATION {
+    string reservation_id PK
+    string checkout_id
+    string sku_id
+    string warehouse_id
+    int qty
+    timestamp expires_at
+    string state
+  }
+  CART {
+    string cart_id PK
+    string user_id
+    bigint version
+  }
+  CART_LINE {
+    string cart_id PK
+    string sku_id PK
+    int qty
+  }
+  CHECKOUT {
+    string checkout_id PK
+    string user_id
+    string state
+    timestamp expires_at
+  }
+  ORDER {
+    string order_id PK
+    string user_id
+    string status
+    bigint total_minor
+    string payment_id
+  }
+  ORDER_LINE {
+    string order_id PK
+    int line_no PK
+    string sku_id
+    int qty
+    bigint unit_price_minor
+  }
+  ORDER_EVENT {
+    string order_id PK
+    bigint seq PK
+    string type
+    json payload
+  }
+</pre>
+  <figcaption>Figure 11.1 — Commerce data model: catalog, stock with reservations, cart, checkout and orders.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> stock is per (SKU, warehouse) with three counters, and each reservation is a row with a TTL. Reservations reference a checkout, not a cart: carts are cheap and abandoned constantly; checkouts are short-lived and committed. Orders snapshot the unit price at purchase (<code>unit_price_minor</code> in minor units — cents — as integers, never floating point), because catalog prices change. <code>ORDER_EVENT</code> is the append-only history used for customer timelines, audits and event publishing.</p>
+  <p><strong>Database choices.</strong> Orders, checkouts, reservations and stock belong in a relational database with real transactions — PostgreSQL or MySQL, sharded by <code>user_id</code> for orders (customer history queries stay single-shard) and by <code>sku_id</code> for stock. The catalog's system of record is also relational (merchandisers edit it transactionally), but reads are served from a denormalised document cache and a search index (Elasticsearch/OpenSearch) fed by CDC through Kafka. Carts are a per-user document with high write rates and loose consistency needs: Redis with persistence or DynamoDB, backed up to the user's account. <span class="tag opinion">Opinion</span>: resist putting orders in a document store "for flexibility" — you will want joins, constraints and transactions on the day finance asks for a report.</p>
+
+  <h4>Inventory reservation: three algorithms</h4>
+  <ol>
+    <li><strong>Pessimistic row lock</strong> — <code>SELECT ... FOR UPDATE</code>, check, update, commit. Correct but serialises all buyers on the row; at 33 K/s with ~2 ms lock hold time you top out near 500/s.</li>
+    <li><strong>Conditional atomic update</strong> — a single statement <code>UPDATE stock SET reserved = reserved + :q WHERE sku_id = :s AND warehouse_id = :w AND on_hand - reserved - committed &gt;= :q</code>, checking the affected-row count. No read-modify-write race, shorter lock hold, but still one hot row. Good to a few thousand/s per row.</li>
+    <li><strong>Sharded or pre-allocated counters</strong> — split the flash-sale stock into N buckets (e.g. 10,000 units into 100 rows of 100) and have each request pick a random bucket, or hold the sale stock in Redis and decrement with an atomic Lua script, writing reservations to the database asynchronously through a queue. This is the flash-sale design.</li>
+  </ol>
+  <p>Reservations expire. A sweeper (or a delay-queue message scheduled at creation) releases expired reservations with a conditional update <code>WHERE state = 'HELD' AND expires_at &lt; now()</code>, so a late payment success and an expiry cannot both win: whichever transition commits first moves the state, and the other finds zero rows affected and compensates (e.g. a payment that succeeds after expiry is refunded automatically, or re-reserved if stock remains).</p>
+
+  <h4>Flash sales: admission control first</h4>
+  <p>The key insight: when 2 M people compete for 10 K units, 99.5% of them will fail. The design goal is to make those failures <em>cheap and early</em> rather than letting them reach the database. The layered approach:</p>
+  <ol>
+    <li><strong>Static pre-rendering:</strong> the drop page is served from the CDN; nothing dynamic until the sale opens.</li>
+    <li><strong>Virtual waiting room:</strong> at open, each client obtains a queue ticket (signed token with a random or arrival-ordered position) from an edge service. Admission proceeds at a controlled rate (say 2,000/s) that downstream checkout can absorb.</li>
+    <li><strong>Bot defence:</strong> per-account and per-device limits, proof-of-work or CAPTCHA challenges for suspicious clients, purchase limits per customer.</li>
+    <li><strong>Atomic stock gate:</strong> admitted users hit a Redis counter (<code>DECRBY</code> inside a Lua script that refuses to go below zero). Success yields a short-lived reservation token; failure returns "sold out" immediately and closes the waiting room once stock reaches zero.</li>
+    <li><strong>Durable reservation:</strong> the reservation token is written to the database via Kafka by a consumer that processes at a sustainable rate; checkout completion validates the token.</li>
+    <li><strong>Reconciliation:</strong> unclaimed reservations expire and return units to the Redis counter (re-opening the queue if desired); at the end, Redis and database counts are reconciled.</li>
+  </ol>
+  <div class="callout warn"><p class="callout-title">Redis is not your system of record</p><p>The Redis counter is an <em>admission gate</em>. If Redis fails over and loses the last few acknowledged decrements (replication is asynchronous), you may admit a few extra buyers. The durable reservation step must therefore also enforce the stock constraint in the database (the conditional update), and the business must decide what happens to the handful of losers there (an apology and a coupon is the usual answer). This two-level design gives Redis speed with database correctness.</p></div>
+
+  <h4>Search indexing pipeline</h4>
+  <p>Catalog changes flow from the relational system of record via CDC (Debezium) into Kafka, where an indexer enriches them (category paths, computed availability badges, popularity signals) and writes to the search cluster with versioned upserts (<code>version_type=external</code> using the source row version) so out-of-order events cannot overwrite newer documents. Availability in search results is a <em>badge</em> ("in stock", "low stock"), refreshed every few minutes, not a live count — querying inventory per search hit would couple the search tier to the most contended service in the system.</p>
+
+  <h3>4.2 Case study B — Payment processing system</h3>
+  <p>We design the payments platform <em>inside</em> a company like the e-commerce business above (or a marketplace): it sits between product services and one or more external PSPs/acquirers. We are not designing a card network or an acquirer.</p>
+  <h4>Functional requirements</h4>
+  <ul>
+    <li>Create a <strong>payment intent</strong> for an amount and currency tied to an order; confirm it with a tokenized payment method; support authorize-then-capture and immediate capture.</li>
+    <li>Handle asynchronous steps: 3-D Secure challenges, PSP webhooks, delayed methods (bank transfers, wallets).</li>
+    <li>Refunds (full and partial), voids, and dispute (chargeback) intake.</li>
+    <li>Record every money movement in a <strong>double-entry ledger</strong>; produce balances for customers (wallet credit), merchants/sellers (payables) and the platform (fees).</li>
+    <li><strong>Reconciliation</strong> against PSP settlement reports; payouts to sellers in a marketplace.</li>
+    <li>Fraud hooks: pre-authorization risk scoring, rules, and manual review queue.</li>
+  </ul>
+  <h4>Non-functional requirements</h4>
+  <ul>
+    <li><strong>Exactly-once effect:</strong> no double charges under retries, timeouts, crashes or duplicate webhooks.</li>
+    <li><strong>Conservation:</strong> the ledger always balances; every external movement is matched during reconciliation.</li>
+    <li>Availability 99.99% for confirm; graceful degradation when a PSP is down (fail over to another PSP for new payments where contracts allow).</li>
+    <li>Latency: confirm p99 under 2 s excluding issuer and challenge time.</li>
+    <li>Auditability: immutable records retained for regulatory periods (often 5–10 years depending on jurisdiction).</li>
+    <li>PCI DSS: no raw card data in our systems; least-privilege access; encryption in transit and at rest.</li>
+  </ul>
+
+  <h4>Capacity estimation <span class="tag illus">Illustrative</span></h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Quantity</th><th>Assumption / calculation</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>Payments per day</td><td>marketplace of 2 M orders/day</td><td>2 M ≈ 23/s avg; 10× peak ≈ 230/s</td></tr>
+      <tr><td>API calls per payment</td><td>create, confirm, webhooks, capture, status reads</td><td>≈ 10 → 2.3 K/s peak</td></tr>
+      <tr><td>Ledger entries</td><td>~6 entries per payment (auth hold, capture, fee, seller payable, settlement)</td><td>12 M/day ≈ 4.4 B/year</td></tr>
+      <tr><td>Ledger storage</td><td>4.4 B × 300 B × RF 3</td><td>≈ 4 TB/year</td></tr>
+      <tr><td>Idempotency records</td><td>20 M/day × 2 KB (stored response), 7-day retention</td><td>≈ 280 GB</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>What the numbers tell us:</strong> payments are <em>low throughput, high stakes</em>. A well-run PostgreSQL cluster handles this volume on one primary; the engineering effort goes into correctness, not scale. Throughput becomes interesting only for very large processors or for the ledger at billions of entries per year, where partitioning by account and time matters.</p>
+
+  <h4>API design</h4>
+<pre data-file="payments-api.http"><code class="language-plaintext">POST /v1/payment_intents                      Idempotency-Key: ord_81723-pay
+{ "orderId": "ord_81723", "amount": 4599, "currency": "EUR",
+  "captureMethod": "manual", "customerId": "cus_42",
+  "metadata": { "sellerId": "sel_9" } }
+201 { "id": "pi_01J...", "status": "requires_payment_method", "clientSecret": "pi_01J..._secret_..." }
+
+POST /v1/payment_intents/{id}/confirm          Idempotency-Key: 4f7c...
+{ "paymentMethod": "pm_tok_visa_...", "returnUrl": "https://shop/return" }
+200 { "status": "requires_action", "nextAction": { "type": "redirect_3ds", "url": "..." } }
+  | { "status": "processing" } | { "status": "requires_capture" } | { "status": "succeeded" }
+402 { "status": "requires_payment_method", "error": { "code": "card_declined", "declineCode": "insufficient_funds" } }
+
+POST /v1/payment_intents/{id}/capture          Idempotency-Key: ...   { "amountToCapture": 4599 }
+POST /v1/payment_intents/{id}/cancel           (void if uncaptured)
+POST /v1/refunds                               Idempotency-Key: ...   { "paymentIntent": "pi_..", "amount": 1000 }
+POST /internal/psp/{psp}/webhooks              (signature-verified; idempotent by PSP event id)
+GET  /v1/ledger/accounts/{accountId}/balance?asOf=...
+GET  /v1/ledger/accounts/{accountId}/entries?cursor=...</code></pre>
+  <p>Amounts are integers in minor units with an explicit ISO 4217 currency (note that not every currency has two decimal places). The <code>clientSecret</code> allows the browser or app to complete confirmation with the PSP's SDK directly, so card data flows from the device to the PSP and never through our servers.</p>
+
+  <h4>Payment state machine</h4>
+  <figure class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> REQUIRES_PAYMENT_METHOD
+  REQUIRES_PAYMENT_METHOD --> PROCESSING: confirm
+  PROCESSING --> REQUIRES_ACTION: issuer wants 3DS
+  REQUIRES_ACTION --> PROCESSING: challenge completed
+  PROCESSING --> REQUIRES_CAPTURE: authorized (manual capture)
+  PROCESSING --> SUCCEEDED: authorized and captured
+  PROCESSING --> REQUIRES_PAYMENT_METHOD: declined
+  REQUIRES_CAPTURE --> SUCCEEDED: capture
+  REQUIRES_CAPTURE --> CANCELED: void or auth expired
+  REQUIRES_PAYMENT_METHOD --> CANCELED: order cancelled
+  SUCCEEDED --> PARTIALLY_REFUNDED: refund part
+  SUCCEEDED --> REFUNDED: refund all
+  PARTIALLY_REFUNDED --> REFUNDED: refund rest
+  SUCCEEDED --> DISPUTED: chargeback opened
+  DISPUTED --> SUCCEEDED: won
+  DISPUTED --> REFUNDED: lost
+</pre>
+  <figcaption>Figure 11.2 — Payment intent state machine.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> every arrow is a conditional update in the database (<code>WHERE status = :from</code>), which makes each transition idempotent and race-safe. The <code>PROCESSING</code> state is crucial: it means "we have sent a request to the PSP and do not yet know the outcome". A crash in <code>PROCESSING</code> is resolved not by retrying blindly but by <em>querying the PSP</em> for the result (using the same idempotency key or our reference), which is the essence of making payments self-healing.</p>
+
+  <h4>Data model and ledger</h4>
+  <figure class="diagram">
+<pre class="mermaid">
+erDiagram
+  PAYMENT_INTENT ||--o{ PAYMENT_ATTEMPT : "tries"
+  PAYMENT_INTENT ||--o{ REFUND : has
+  LEDGER_TXN ||--|{ LEDGER_ENTRY : "balanced set of"
+  ACCOUNT ||--o{ LEDGER_ENTRY : "posted to"
+  PAYMENT_INTENT ||--o{ LEDGER_TXN : "recorded as"
+  IDEMPOTENCY_KEY }o--|| PAYMENT_INTENT : "guards"
+  PAYMENT_INTENT {
+    string id PK
+    string order_id
+    bigint amount_minor
+    string currency
+    string status
+    string psp
+    string psp_reference
+    bigint version
+  }
+  PAYMENT_ATTEMPT {
+    string intent_id PK
+    int attempt_no PK
+    string psp
+    string psp_request_key
+    string outcome
+    string decline_code
+  }
+  IDEMPOTENCY_KEY {
+    string scope PK
+    string key PK
+    string request_hash
+    string state
+    int response_code
+    json response_body
+    timestamp locked_until
+  }
+  LEDGER_TXN {
+    string txn_id PK
+    string type
+    string external_ref
+    timestamp effective_at
+  }
+  LEDGER_ENTRY {
+    string txn_id PK
+    int line PK
+    string account_id
+    bigint amount_minor "positive debit, negative credit"
+    string currency
+  }
+  ACCOUNT {
+    string account_id PK
+    string type
+    string currency
+    string normal_balance
+  }
+  REFUND {
+    string id PK
+    string intent_id
+    bigint amount_minor
+    string status
+  }
+</pre>
+  <figcaption>Figure 11.3 — Payments data model: intents, attempts, idempotency keys and a double-entry ledger.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> a <code>LEDGER_TXN</code> groups entries that must sum to zero per currency (enforced by a deferred constraint trigger or by the posting service and verified continuously). Accounts are typed: <code>customer_receivable</code>, <code>psp_clearing</code> (money the PSP owes us), <code>seller_payable</code>, <code>platform_fee_revenue</code>, <code>bank_cash</code>. <code>PAYMENT_ATTEMPT</code> exists because one intent may be tried with several payment methods or PSPs, each with its own PSP-side idempotency key. <code>IDEMPOTENCY_KEY</code> stores a hash of the request body so that reuse of a key with a <em>different</em> payload is rejected (422) instead of silently returning the old response.</p>
+  <p>A captured €45.99 card payment with a 10% platform fee posts, for example: debit <code>psp_clearing</code> 4599; credit <code>seller_payable</code> 4139; credit <code>platform_fee_revenue</code> 460. When the PSP settles to our bank net of its own €0.40 fee: debit <code>bank_cash</code> 4559; debit <code>psp_fee_expense</code> 40; credit <code>psp_clearing</code> 4599. After both, <code>psp_clearing</code> nets to zero for that payment — and if it does not, reconciliation flags it. <span class="tag illus">Illustrative</span></p>
+  <p><strong>Database choice.</strong> PostgreSQL (or MySQL) with serializable or carefully designed read-committed transactions, synchronous replication to a standby in another AZ, and point-in-time recovery. Ledger entries are append-only and partitioned by month; account balances are materialised in a <code>balance</code> table updated in the same transaction as the entries (with optimistic version checks) or derived asynchronously for high-volume accounts. At very large scale, purpose-built ledger stores (Uber's LedgerStore is a published example) or ledger databases such as TigerBeetle become relevant.</p>
+
+  <h4>Idempotency mechanics, precisely</h4>
+  <p>The idempotency protocol for a mutating endpoint (adapted from the pattern Stripe documents publicly):</p>
+  <ol>
+    <li>On request, insert <code>(scope, key, request_hash, state='IN_PROGRESS', locked_until=now()+30s)</code>. If the insert conflicts:
+      <ul>
+        <li>If the stored hash differs → 422 (key reused with different parameters).</li>
+        <li>If <code>state = 'COMPLETED'</code> → return the stored response verbatim.</li>
+        <li>If <code>IN_PROGRESS</code> and the lock is live → 409 "request in progress, retry later".</li>
+        <li>If <code>IN_PROGRESS</code> and the lock expired (previous handler crashed) → take over the lock and <em>resume</em> (look up the payment's state and, if it was in <code>PROCESSING</code>, query the PSP rather than resending).</li>
+      </ul></li>
+    <li>Execute the operation in steps, persisting "recovery points" (e.g. <code>intent_created</code>, <code>psp_called</code>) so a resumed request knows how far the previous one got.</li>
+    <li>On completion, store the response code and body with <code>state='COMPLETED'</code>.</li>
+  </ol>
+  <p>Downstream, every PSP call carries <em>our</em> idempotency key (most PSPs accept one), derived deterministically from the attempt (<code>pi_01J…:attempt-1</code>), so even a resent request to the PSP cannot create a second charge.</p>
+
+  <h4>Webhooks, polling and reconciliation</h4>
+  <p>PSPs report asynchronous outcomes through webhooks, which can arrive late, duplicated or out of order. Handle them by (1) verifying signatures, (2) recording the raw event with a unique constraint on the PSP event ID (dedup), (3) applying it as a conditional state transition, and (4) never trusting a webhook as the only signal — a reconciler polls the PSP for intents stuck in <code>PROCESSING</code> beyond a threshold.</p>
+  <p><strong>Reconciliation</strong> is the daily (or intraday) process that proves our ledger matches reality. Inputs: the PSP's settlement report (each transaction, fee and payout) and our bank statement. Steps: normalise, match on PSP reference (exact match), then on amount/date/currency heuristics for leftovers, classify breaks (missing in ours, missing in theirs, amount mismatch, timing difference), auto-resolve known patterns, and queue the rest for finance operations. Unmatched items age into alerts. Treat reconciliation as a first-class product with its own data pipeline, not a spreadsheet.</p>
+
+  <h4>Fraud hooks</h4>
+  <p>Before confirming with the PSP, the payments service calls a risk service with order context (account age, device fingerprint, velocity, address mismatch, basket composition). The response is <em>allow</em>, <em>challenge</em> (force 3-D Secure), <em>review</em> (authorize, hold capture, queue for manual review) or <em>block</em>. The call must have a strict timeout with a pre-agreed default (usually allow-with-monitoring for low amounts, review for high amounts), because the fraud service must not become a single point of failure for revenue. Outcomes (chargebacks, confirmed fraud) flow back to label training data.</p>
+
+  <h3>4.3 Case study C — Video streaming platform</h3>
+  <h4>Functional requirements</h4>
+  <ul>
+    <li>Creators upload videos (up to 50 GB), with resumable uploads; metadata (title, description, tags, visibility).</li>
+    <li>Processing: validation, transcoding into an ABR ladder (multiple resolutions and codecs), thumbnails, captions ingestion, content-safety and copyright checks.</li>
+    <li>Playback: HLS and DASH with adaptive bitrate; seek; resume position; offline download for some clients.</li>
+    <li>Discovery: search, channel pages, and a recommendations feed (consumed from a recommendations service — a hook, not designed here).</li>
+    <li>Engagement: view counts, likes, comments (comments behave like Chapter 2.10's messaging at lower intensity).</li>
+  </ul>
+  <h4>Non-functional requirements</h4>
+  <ul>
+    <li>Time to first frame under 2 s p90 on reasonable connections; rebuffering ratio below 0.5% of watch time.</li>
+    <li>Upload-to-available within minutes for short videos (fast path for low renditions first).</li>
+    <li>Playback availability 99.99% (CDN multi-provider); metadata reads highly available; upload pipeline can degrade to "processing delayed".</li>
+    <li>Cost efficiency: bandwidth is the largest cost; storage second; encoding compute third.</li>
+  </ul>
+
+  <h4>Capacity estimation <span class="tag illus">Illustrative</span></h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Quantity</th><th>Assumption / calculation</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>DAU</td><td>assumption</td><td>100 M</td></tr>
+      <tr><td>Watch time</td><td>100 M × 40 min</td><td>4 B minutes/day</td></tr>
+      <tr><td>Average delivered bitrate</td><td>mixed mobile/TV</td><td>3 Mbit/s</td></tr>
+      <tr><td>Egress per day</td><td>4 × 10⁹ min × 60 s × 3 Mbit/s / 8</td><td>≈ 90 PB/day</td></tr>
+      <tr><td>Average egress rate</td><td>90 PB / 86,400 s</td><td>≈ 8.3 Tbit/s avg; peak ×2 ≈ 17 Tbit/s</td></tr>
+      <tr><td>Uploads</td><td>500 K videos/day × average 10 min</td><td>5 M minutes/day of source</td></tr>
+      <tr><td>Source storage</td><td>10 min at ~10 Mbit/s mezzanine ≈ 750 MB</td><td>≈ 375 TB/day</td></tr>
+      <tr><td>Encoded storage</td><td>ladder of ~8 renditions summing to ~15 Mbit/s for H.264, plus AV1 for popular titles</td><td>≈ 560 TB/day H.264</td></tr>
+      <tr><td>Transcoding compute</td><td>assume 1 CPU-second per second of output per 1080p rendition, ladder ≈ 3× that</td><td>5 M min × 60 × 3 ≈ 9 × 10⁸ CPU-s/day ≈ 10,400 cores busy</td></tr>
+      <tr><td>View events</td><td>100 M × 8 views</td><td>800 M/day ≈ 9 K/s avg; hot videos up to 100 K/s each</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>What the numbers tell us:</strong> everything is dominated by <em>egress</em> — terabits per second — which can only be served by CDNs with very high cache hit ratios, ideally with capacity inside ISP networks. Storage grows by about a petabyte a day, so lifecycle policies (deleting the mezzanine after N days, moving rarely watched renditions to cold storage, re-encoding only popular titles with expensive codecs) are cost levers. Encoding needs a large elastic compute pool, a natural fit for spot/preemptible instances because jobs are chunked and restartable.</p>
+
+  <h4>API design</h4>
+<pre data-file="video-api.http"><code class="language-plaintext">POST /v1/uploads                       { "filename": "talk.mov", "sizeBytes": 7340032000, "sha256": "..." }
+201 { "uploadId": "up_..", "partSize": 67108864, "parts": 110,
+      "partUrls": "GET /v1/uploads/up_../parts?from=1&amp;to=20" }   -&gt; pre-signed PUT URLs (S3 multipart)
+PUT  &lt;pre-signed url for part n&gt;       (client -&gt; object storage directly; resumable per part)
+POST /v1/uploads/{uploadId}/complete   { "parts": [{ "n": 1, "etag": "..." }, ...] }
+POST /v1/videos                        { "uploadId": "up_..", "title": "...", "visibility": "public" }
+202 { "videoId": "v_..", "status": "PROCESSING" }
+
+GET  /v1/videos/{id}                   metadata, status, available renditions, thumbnails
+GET  /v1/videos/{id}/playback          { "hls": "https://cdn.example/v_../master.m3u8?token=...",
+                                         "dash": "https://cdn.example/v_../manifest.mpd?token=...",
+                                         "drm": { "widevine": "https://lic.example/..." } }
+POST /v1/videos/{id}/views             { "sessionId": "...", "positionSec": 31, "event": "heartbeat" } (batched)
+GET  /v1/feed?cursor=...               recommendations hook</code></pre>
+  <p>The upload API never receives video bytes: it hands out pre-signed part URLs and the client uploads straight to object storage, retrying individual 64 MB parts. Playback URLs are CDN URLs with signed tokens (or signed cookies) that expire, so links cannot be hot-linked indefinitely.</p>
+
+  <h4>Data model</h4>
+  <figure class="diagram">
+<pre class="mermaid">
+erDiagram
+  CHANNEL ||--o{ VIDEO : publishes
+  VIDEO ||--o{ RENDITION : "encoded as"
+  VIDEO ||--o{ JOB : "processed by"
+  JOB ||--o{ TASK : "split into"
+  VIDEO ||--o{ VIEW_COUNT : "counted in"
+  VIDEO {
+    string video_id PK
+    string channel_id
+    string title
+    string status
+    int duration_sec
+    string source_object_key
+    timestamp published_at
+  }
+  RENDITION {
+    string video_id PK
+    string rendition_id PK
+    string codec
+    int height
+    int bitrate_kbps
+    string playlist_key
+  }
+  JOB {
+    string job_id PK
+    string video_id
+    string state
+    int attempts
+  }
+  TASK {
+    string job_id PK
+    string task_id PK
+    string type "probe, chunk_encode, stitch, package, thumbs"
+    string state
+    string input_key
+    string output_key
+  }
+  VIEW_COUNT {
+    string video_id PK
+    date day PK
+    bigint views
+  }
+</pre>
+  <figcaption>Figure 11.4 — Video platform data model: catalog metadata, renditions, processing jobs and aggregated counts.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> metadata is small and relational (sharded MySQL via Vitess is the classic choice at YouTube scale; PostgreSQL with Citus or a managed distributed SQL also works). Media bytes live only in object storage, referenced by keys. <code>JOB</code>/<code>TASK</code> model the processing DAG so that individual chunk encodes can be retried. <code>VIEW_COUNT</code> stores aggregated counts per day; raw view events never enter the metadata database.</p>
+
+  <h4>The transcoding pipeline as a DAG</h4>
+  <ol>
+    <li><strong>Probe and validate</strong> (FFprobe): container, codecs, duration, resolution, frame rate, corruption checks; reject or normalise.</li>
+    <li><strong>Split</strong> the mezzanine into chunks at keyframes (e.g. 30–60 s each) so encoding parallelises across many workers; a 2-hour film becomes ~150 parallel tasks per rendition.</li>
+    <li><strong>Encode</strong> each chunk for each rendition of the ladder. Fast path: encode the 360p/720p H.264 renditions first so the video becomes playable quickly; expensive codecs (AV1) and higher renditions follow, and only for videos that earn the compute through popularity.</li>
+    <li><strong>Quality check</strong>: compute a perceptual metric (Netflix's open-source VMAF is widely used) per rendition; per-title or per-shot optimisation chooses the ladder points.</li>
+    <li><strong>Stitch and package</strong>: concatenate chunk outputs, segment into 2–6 s CMAF segments with aligned keyframes, generate HLS and DASH manifests, apply DRM encryption if required.</li>
+    <li><strong>Thumbnails, captions, safety checks</strong> run as parallel branches.</li>
+    <li><strong>Publish</strong>: write renditions to metadata, flip status to <code>READY</code> through the outbox, warm the CDN for expected-popular content.</li>
+  </ol>
+  <p>A sample HLS master playlist for a 4-rung ladder looks like this (bandwidths in bits per second):</p>
+<pre data-file="master.m3u8"><code class="language-plaintext">#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-STREAM-INF:BANDWIDTH=800000,AVERAGE-BANDWIDTH=650000,RESOLUTION=640x360,CODECS="avc1.4d401e,mp4a.40.2"
+360p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1800000,AVERAGE-BANDWIDTH=1500000,RESOLUTION=1280x720,CODECS="avc1.4d401f,mp4a.40.2"
+720p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=4500000,AVERAGE-BANDWIDTH=3800000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2"
+1080p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=12000000,AVERAGE-BANDWIDTH=10000000,RESOLUTION=3840x2160,CODECS="hvc1.2.4.L150.B0,mp4a.40.2"
+2160p/index.m3u8</code></pre>
+
+  <h4>View counting</h4>
+  <p>Players send a "view start" and periodic heartbeats. A view <em>counts</em> according to a policy (for example, a minimum watched duration, deduplicated per user/device per video per time window, excluding detected bots). The pipeline: events → Kafka (partitioned by <code>video_id</code>) → stream processor (validates, dedups with keyed state over a window, aggregates per video per 10 s) → increments to a counter store (Redis or Cassandra counters) for display, and → the warehouse for exact, audited counts (creator analytics and monetisation). Displayed counts are approximate and lag; audited counts are recomputed in batch from raw events. Hot videos are handled naturally by pre-aggregation: 100 K events/s for one video become one counter update every 10 s per processing partition.</p>
+</section>
+
+<section id="architecture">
+  <h2>5. Architecture: The Three Designs End to End</h2>
+
+  <h3>5.1 E-commerce — high-level architecture</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TB
+  U[Web and mobile] --> CDN["CDN (static, product pages, images)"]
+  CDN --> GW["API gateway / BFF"]
+  CDN --> WR["Waiting room (edge, flash sales)"]
+  WR --> GW
+  GW --> CAT[Catalog service]
+  GW --> SRCH[Search service]
+  GW --> CART[Cart service]
+  GW --> CHK[Checkout orchestrator]
+  GW --> ORD[Order service]
+  CAT --> CATDB[("Catalog DB (PostgreSQL)")]
+  CATDB -- CDC --> K[(Kafka)]
+  K --> IDX[Indexer] --> ES[("Search cluster")]
+  SRCH --> ES
+  CART --> CR[("Redis / DynamoDB carts")]
+  CHK --> INV[Inventory service]
+  INV --> INVDB[("Stock + reservations (sharded SQL)")]
+  INV --> FS[("Redis flash-sale counters")]
+  CHK --> PRICE[Pricing and promotions]
+  CHK --> TAX[Tax service]
+  CHK --> PAY[Payments platform]
+  CHK --> ORD
+  ORD --> ODB[("Orders DB (sharded by user)")]
+  ODB -- outbox/CDC --> K
+  K --> FUL[Fulfilment and WMS]
+  K --> NOTIF["Notification platform (Ch 2.10)"]
+  K --> AN[Analytics and recommendations]
+</pre>
+  <figcaption>Figure 11.5 — E-commerce architecture: cached read paths, a checkout orchestrator coordinating inventory, pricing and payments, and an event backbone.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the read path (catalog, search, images) is served mostly from the CDN and caches and is fed asynchronously by CDC, so a slow catalog database cannot break browsing. The write path converges on the <em>checkout orchestrator</em>, which runs the checkout saga: price and tax the cart, reserve inventory, create the order in <code>PENDING_PAYMENT</code>, confirm payment, then commit inventory and mark the order paid. The waiting room sits at the edge and only engages for flash-sale paths. Every state change leaves through an outbox into Kafka, which feeds fulfilment, notifications (Chapter 2.10's platform) and analytics.</p>
+
+  <h4>Key flow: checkout saga</h4>
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant O as Checkout orchestrator
+  participant I as Inventory
+  participant D as Orders
+  participant P as Payments
+  C->>O: complete(checkoutId, token, Idempotency-Key)
+  O->>O: load checkout, verify not expired
+  O->>I: reserve lines (already held? extend TTL)
+  I-->>O: reservation ok
+  O->>D: create order PENDING_PAYMENT (idempotent on checkoutId)
+  D-->>O: orderId
+  O->>P: confirm intent (key = orderId-pay)
+  alt authorized
+    P-->>O: requires_capture or succeeded
+    O->>I: commit reservation
+    O->>D: mark PAID (outbox: OrderPaid)
+    O-->>C: 202 orderId, PAID
+  else declined
+    P-->>O: declined
+    O->>D: mark PAYMENT_FAILED
+    O-->>C: 402, keep reservation until TTL for a retry
+  else timeout or unknown
+    P-->>O: timeout
+    O->>O: park saga, poll payment status later
+    O-->>C: 202 orderId, PAYMENT_PENDING
+  end
+</pre>
+  <figcaption>Figure 11.6 — Checkout saga with three payment outcomes.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the third branch is the one naive implementations miss. A timeout from payments does <em>not</em> mean the payment failed; releasing inventory and telling the customer "payment failed" would invite them to pay again — a double charge. Instead the saga parks in a pending state and resolves by querying the payment status (or waiting for its event). Each step is idempotent on a natural key (<code>checkoutId</code>, <code>orderId-pay</code>), so the orchestrator can crash and resume from its persisted saga state. Explore failure injection and compensations interactively:</p>
+  <figure class="diagram">
+    <div class="widget" data-widget="saga"></div>
+    <figcaption>Figure 11.7 — Interactive: orchestrated saga with failure injection and compensations, compared with 2PC.</figcaption>
+  </figure>
+  <p><strong>What to try:</strong> inject a failure at the payment step and watch the compensations run in reverse (release inventory, cancel order). Then inject a failure at the final step after payment succeeded — the compensation must now be a <em>refund</em>, which is an external, slow, partially-visible action. That asymmetry is why we place the most-likely-to-fail and hardest-to-compensate steps as late as possible but before irreversible external effects such as shipping.</p>
+
+  <h4>Key flow: flash sale</h4>
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant U as Buyer
+  participant E as Edge waiting room
+  participant G as Stock gate (Redis Lua)
+  participant Q as Kafka reservations
+  participant W as Reservation writer
+  participant DB as Inventory DB
+  U->>E: join drop (bot checks)
+  E-->>U: ticket, position 18,204
+  E->>E: admit 2,000 per second
+  E-->>U: admitted (signed token)
+  U->>G: claim 1 unit (token)
+  G->>G: if remaining at least 1 then decrement
+  G-->>U: reservation token valid 10 min
+  G--)Q: reservation event
+  Q->>W: consume at steady rate
+  W->>DB: conditional reserve (stock constraint)
+  U->>U: proceeds to checkout with reservation token
+  Note over G,E: when remaining hits 0 the room closes with SOLD_OUT
+</pre>
+  <figcaption>Figure 11.8 — Flash sale: admission control at the edge, an atomic in-memory gate, and asynchronous durable reservations.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the database sees at most the admitted rate (2,000/s), not the 33,000/s of attempts. The Redis gate turns most of those attempts into cheap "sold out" responses within milliseconds of stock running out. The waiting room's admission rate is the control knob operators tune live.</p>
+
+  <h4>Component responsibilities</h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Component</th><th>Responsibility</th><th>Store</th></tr></thead>
+    <tbody>
+      <tr><td>Catalog</td><td>Products, SKUs, media references, merchandising edits, CDC source.</td><td>PostgreSQL + document cache</td></tr>
+      <tr><td>Search</td><td>Query parsing, retrieval, facets, ranking (learning-to-rank hook).</td><td>Elasticsearch/OpenSearch</td></tr>
+      <tr><td>Cart</td><td>Per-user cart document, guest merge, cheap writes.</td><td>Redis with AOF / DynamoDB</td></tr>
+      <tr><td>Pricing and promotions</td><td>Price lists, coupon validation, promotion rules; deterministic price quote with expiry.</td><td>SQL + cache</td></tr>
+      <tr><td>Inventory</td><td>Stock per SKU per warehouse, reservations with TTL, commit/release, flash-sale gates.</td><td>Sharded SQL + Redis</td></tr>
+      <tr><td>Checkout orchestrator</td><td>Saga state, idempotency, coordination, timeouts.</td><td>SQL (saga table) or Temporal</td></tr>
+      <tr><td>Orders</td><td>Order record, state machine, history, cancellation and returns.</td><td>Sharded SQL by user</td></tr>
+      <tr><td>Fulfilment</td><td>Warehouse allocation, picking, shipping labels, tracking.</td><td>Separate domain</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Scaling bottlenecks</h4>
+  <ul>
+    <li><strong>Hot SKU rows</strong> — conditional updates, bucketed stock, Redis gates (above).</li>
+    <li><strong>Search cluster under sale traffic</strong> — cache popular queries at the BFF for seconds; pre-warm; degrade facets before results.</li>
+    <li><strong>Checkout fan-out latency</strong> — pricing, tax, inventory and fraud calls in parallel where independent; strict timeouts with fallbacks (cached tax tables for estimates).</li>
+    <li><strong>Order DB growth</strong> — shard by user; archive completed orders older than N months to cheaper storage with a read-through for history.</li>
+    <li><strong>Noisy tenants</strong> (in multi-merchant platforms) — cell/pod architecture so one merchant's sale is isolated.</li>
+  </ul>
+
+  <h4>Failure scenarios and mitigations</h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Failure</th><th>Impact</th><th>Mitigation</th></tr></thead>
+    <tbody>
+      <tr><td>Payment timeout</td><td>Unknown charge state.</td><td>Park saga in PAYMENT_PENDING; resolve by status query/event; never auto-fail.</td></tr>
+      <tr><td>Reservation expires while customer is in 3-D Secure</td><td>Paid order without stock.</td><td>Extend TTL when payment starts; if lost, try re-reserve, else auto-refund with apology flow.</td></tr>
+      <tr><td>Search cluster down</td><td>No search results.</td><td>Fallback to category browse from catalog cache; serve cached popular queries.</td></tr>
+      <tr><td>Redis gate failover loses writes</td><td>Minor over-admission.</td><td>Database conditional reserve as the final arbiter; compensation for losers.</td></tr>
+      <tr><td>Kafka backlog</td><td>Order confirmations and emails delayed; inventory sync lag.</td><td>Separate topics by criticality; consumer autoscaling; lag alerts.</td></tr>
+      <tr><td>Price changed between cart and checkout</td><td>Customer charged unexpected price.</td><td>Price quote with expiry at checkout creation; re-quote and show diff if expired.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Security considerations</h4>
+  <ul>
+    <li>Bots and scalpers: device fingerprinting, rate limits per account/payment method/address, purchase limits, CAPTCHAs on suspicious paths.</li>
+    <li>Price and coupon tampering: never trust client-sent prices; checkout re-prices server-side; coupons are validated against redemption counters atomically.</li>
+    <li>IDOR on orders and carts: authorise by ownership on every read (<code>WHERE order_id = ? AND user_id = ?</code>).</li>
+    <li>Account takeover: step-up authentication on changes of email, password, address and saved payment methods.</li>
+  </ul>
+
+  <h4>Trade-offs</h4>
+  <p>Reserving at add-to-cart gives the best customer experience for scarce items but locks stock in abandoned carts; reserving at checkout start is the usual compromise. Strong consistency on stock costs throughput; eventual consistency on availability badges in search is acceptable. A central orchestrator is easier to reason about and observe than choreography but becomes a critical service; we choose orchestration for checkout <span class="tag opinion">Opinion</span>.</p>
+
+  <h4>Estimated infrastructure <span class="tag illus">Illustrative</span></h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Tier</th><th>Estimate</th></tr></thead>
+    <tbody>
+      <tr><td>BFF/API pods</td><td>21 K req/s peak at ~1 K/s/pod → ~30 pods (×3 for sales: autoscale to 100)</td></tr>
+      <tr><td>Search</td><td>4 K qps, 250 GB × 2 replicas → ~12 data nodes</td></tr>
+      <tr><td>Orders/inventory SQL</td><td>8 shards, each primary + 2 replicas, 2 TB storage each</td></tr>
+      <tr><td>Redis</td><td>carts 50 GB + flash-sale gates; 6 shards with replicas</td></tr>
+      <tr><td>Kafka</td><td>6 brokers</td></tr>
+      <tr><td>CDN + images</td><td>120 TB origin storage; image egress the dominant bandwidth cost</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>5.2 Payments — high-level architecture</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  APP["Checkout / product services"] --> PAPI["Payments API (Spring Boot)"]
+  DEV["Browser or app SDK"] -- "card data" --> PSPH["PSP hosted fields"]
+  PSPH -- token --> DEV
+  PAPI --> IDEM[("Idempotency store")]
+  PAPI --> RISK["Risk / fraud service"]
+  PAPI --> ROUTER["PSP router"]
+  ROUTER --> A1["PSP adapter A"]
+  ROUTER --> A2["PSP adapter B"]
+  A1 --> PSPA[(PSP A)]
+  A2 --> PSPB[(PSP B)]
+  PSPA -. webhooks .-> WH["Webhook ingester"]
+  PSPB -. webhooks .-> WH
+  WH --> PAPI
+  PAPI --> PDB[("Payments DB: intents, attempts, outbox")]
+  PDB -- outbox --> K[(Kafka)]
+  K --> LEDG["Ledger service"]
+  LEDG --> LDB[("Ledger DB: append-only entries + balances")]
+  SETT["Settlement files (SFTP / API)"] --> RECON["Reconciliation pipeline"]
+  LDB --> RECON
+  RECON --> OPS["Finance ops console"]
+  K --> PAYOUT["Payouts service"]
+</pre>
+  <figcaption>Figure 11.9 — Payments architecture: tokenized card capture at the edge, idempotent API, PSP routing, ledger via outbox, and reconciliation.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> card data travels only between the user's device and the PSP's hosted fields; our services handle tokens. That single choice removes the payments API, the databases and most of the estate from the cardholder-data environment. The payments API owns intents and attempts and is the only writer of payment state; it emits events through an outbox, and the ledger service posts balanced transactions from those events — idempotently, keyed on event ID. Reconciliation consumes external settlement files and the ledger, and its breaks surface in an operations console. The PSP router chooses a PSP per payment (cost, currency, card brand, health) and is where failover happens.</p>
+
+  <h4>Key flow: confirm, authorize, capture, post to ledger</h4>
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant S as Checkout
+  participant API as Payments API
+  participant DB as Payments DB
+  participant R as Risk
+  participant PSP as PSP
+  participant K as Kafka
+  participant L as Ledger
+  S->>API: confirm(pi, token, Idempotency-Key)
+  API->>DB: insert idem key IN_PROGRESS (or replay stored response)
+  API->>R: score (timeout 150 ms)
+  R-->>API: allow
+  API->>DB: intent PROCESSING, attempt 1 (key pi:1)
+  API->>PSP: authorize(amount, token, idempotency pi:1)
+  PSP-->>API: authorized, psp_ref
+  API->>DB: tx: intent REQUIRES_CAPTURE + outbox AuthorizationSucceeded + idem COMPLETED
+  API-->>S: requires_capture
+  DB--)K: relay outbox
+  K->>L: AuthorizationSucceeded (memo entries only)
+  S->>API: capture(pi, key)
+  API->>PSP: capture(psp_ref, idempotency pi:cap)
+  PSP-->>API: captured
+  API->>DB: tx: intent SUCCEEDED + outbox PaymentCaptured
+  DB--)K: relay
+  K->>L: PaymentCaptured
+  L->>L: post balanced txn (dedup on event id)
+</pre>
+  <figcaption>Figure 11.10 — Payment confirmation and capture with idempotency at every hop and ledger posting via the outbox.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> three layers of idempotency appear: the client's key at our API (step 2), our key at the PSP (steps 6 and 12), and the event ID at the ledger (step 17). The state change, the outbox record and the idempotency completion commit in <em>one local transaction</em> (step 8), so there is no window where the payment is authorized but no event will ever be emitted. If the process crashes between steps 6 and 8, the intent sits in <code>PROCESSING</code> and the recovery job queries the PSP with the attempt reference — it does not issue a new authorization.</p>
+
+  <h4>Component responsibilities</h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Component</th><th>Responsibility</th></tr></thead>
+    <tbody>
+      <tr><td>Payments API</td><td>Intent lifecycle, idempotency, state machine, outbox, recovery of stuck PROCESSING intents.</td></tr>
+      <tr><td>PSP router and adapters</td><td>PSP selection, request mapping, error classification (hard decline / soft decline / technical), circuit breaking, PSP-side idempotency keys.</td></tr>
+      <tr><td>Webhook ingester</td><td>Signature verification, raw event storage with dedup, ordering by PSP timestamps and state rules.</td></tr>
+      <tr><td>Risk service</td><td>Scoring, rules, 3-D Secure decisioning, manual review queue, feedback labels.</td></tr>
+      <tr><td>Ledger</td><td>Chart of accounts, balanced posting, immutability, balances, as-of queries.</td></tr>
+      <tr><td>Reconciliation</td><td>Ingest settlement and bank files, match, classify breaks, aging and alerts.</td></tr>
+      <tr><td>Payouts</td><td>Compute seller payables, schedule payouts, KYC gates, payout file generation.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>PSP failover and the circuit breaker</h4>
+  <p>Routing new payments to a secondary PSP when the primary is degraded is a major availability lever, but there are subtleties: a token issued by PSP A's vault is usually not usable at PSP B (unless you use network tokens or a third-party vault that can forward card data to multiple PSPs), so failover works only for payment methods available at both. And a payment that already started at PSP A must <em>never</em> be retried at PSP B unless A's attempt is definitively failed — otherwise the customer may be charged by both.</p>
+  <figure class="diagram">
+    <div class="widget" data-widget="circuit-breaker"></div>
+    <figcaption>Figure 11.11 — Interactive: circuit breaker states as the PSP failure rate changes.</figcaption>
+  </figure>
+  <p><strong>What to try:</strong> raise the failure rate past the threshold and watch the breaker open; in the open state, new payments are routed to the secondary PSP immediately instead of waiting for timeouts. Then lower the failure rate and observe half-open probes. Ask yourself which errors should count: a <em>card decline</em> is a successful PSP call with a negative business result and must not trip the breaker; only technical failures (timeouts, 5xx, connection errors) should.</p>
+
+  <h4>Failure scenarios and mitigations</h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Failure</th><th>Impact</th><th>Mitigation</th></tr></thead>
+    <tbody>
+      <tr><td>Timeout after PSP charged</td><td>Unknown outcome.</td><td>PROCESSING state; query PSP by our idempotency key/reference; never resend without key.</td></tr>
+      <tr><td>Duplicate or out-of-order webhook</td><td>State regression or double posting.</td><td>Dedup on PSP event ID; state machine rejects backwards transitions; ledger dedup on event ID.</td></tr>
+      <tr><td>Ledger service down</td><td>Balances stale.</td><td>Events wait in Kafka; payments continue; balances catch up (payouts paused until caught up).</td></tr>
+      <tr><td>PSP outage</td><td>Payments fail.</td><td>Breaker + secondary PSP for eligible methods; queue capture requests (authorizations stay valid for days).</td></tr>
+      <tr><td>Reconciliation break</td><td>Money unaccounted.</td><td>Break classification, auto-resolution rules, aging alerts, finance-ops workflow.</td></tr>
+      <tr><td>Risk service slow</td><td>Checkout latency.</td><td>150 ms timeout, default decision by amount band, async post-auth review.</td></tr>
+      <tr><td>Region failure</td><td>Payments unavailable.</td><td>Synchronous replication to a standby; RPO 0 for payment state; tested failover; idempotency store replicated with the same guarantees.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Security considerations</h4>
+  <ul>
+    <li><strong>PCI scope reduction:</strong> hosted fields/SDK tokenization; network segmentation so that even tokens and PSP API keys live in a restricted zone; no card data in logs (scrubbers on log pipelines as defence in depth).</li>
+    <li><strong>Secrets:</strong> PSP API keys in a secrets manager, rotated; separate keys per environment; restricted-permission keys where the PSP supports them.</li>
+    <li><strong>Webhook authenticity:</strong> verify signatures and timestamps (replay window), allow-list PSP IPs where documented.</li>
+    <li><strong>Insider risk:</strong> four-eyes approval for manual ledger adjustments and payout changes; immutable audit logs.</li>
+    <li><strong>Strong Customer Authentication:</strong> 3-D Secure flows for regulated regions; exemptions requested deliberately via the PSP.</li>
+  </ul>
+
+  <h4>Trade-offs</h4>
+  <p>Synchronous ledger posting in the payment transaction gives immediate balance accuracy but couples availability; asynchronous posting via outbox decouples them with seconds of lag — usually the right choice, with payouts gated on ledger catch-up. Multiple PSPs improve availability and negotiating power but multiply integration, reconciliation and token-portability work. Building your own vault (to hold card data and forward to PSPs) gives routing flexibility but brings the full PCI DSS burden back in-house.</p>
+
+  <h4>Estimated infrastructure <span class="tag illus">Illustrative</span></h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Tier</th><th>Estimate</th></tr></thead>
+    <tbody>
+      <tr><td>Payments API</td><td>2.3 K req/s peak → 8–12 pods across 3 AZs</td></tr>
+      <tr><td>Payments DB</td><td>PostgreSQL primary + synchronous standby + async replica; ~2 TB</td></tr>
+      <tr><td>Ledger DB</td><td>PostgreSQL partitioned monthly; ~4 TB/year at RF 3</td></tr>
+      <tr><td>Kafka</td><td>shared cluster, dedicated topics, RF 3, <code>min.insync.replicas=2</code></td></tr>
+      <tr><td>Reconciliation</td><td>Batch jobs (Spark or SQL) over daily files; warehouse tables</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>5.3 Video streaming — high-level architecture</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+  CR[Creator app] --> UAPI["Upload API"]
+  CR -- "multipart PUT (pre-signed)" --> RAW[("Object storage: raw uploads")]
+  UAPI --> META[("Metadata DB (Vitess / sharded SQL)")]
+  RAW -- "object created event" --> ORCH["Workflow orchestrator"]
+  ORCH --> WQ[(Task queue)]
+  WQ --> ENC["Encoder fleet (spot instances, FFmpeg)"]
+  ENC --> ENCD[("Object storage: renditions")]
+  ORCH --> PKG["Packager: CMAF, HLS, DASH, DRM"]
+  PKG --> ENCD
+  ORCH --> META
+  ENCD --> SHIELD["Origin shield"]
+  SHIELD --> CDN1["CDN A edges"]
+  SHIELD --> CDN2["CDN B / ISP-embedded caches"]
+  V[Viewer player] --> PAPI["Playback API"]
+  PAPI --> META
+  PAPI --> LIC["DRM licence service"]
+  V --> CDN1
+  V --> CDN2
+  V -- "view events" --> ING["Event ingest (Go)"]
+  ING --> K[(Kafka)]
+  K --> SP["Stream processor: dedup, aggregate"]
+  SP --> CNT[("Counters store")]
+  K --> WH[("Warehouse")]
+  WH --> REC["Recommendations"]
+</pre>
+  <figcaption>Figure 11.12 — Video platform: direct-to-storage uploads, an orchestrated encoding DAG, packaged renditions behind an origin shield and multiple CDNs, and a separate analytics path.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> there are three independent planes. The <em>ingest plane</em> (upload, orchestrate, encode, package) is batch-like and elastic. The <em>delivery plane</em> (origin shield, CDNs) carries the terabits and contains almost no application logic — the playback API only issues manifest URLs, tokens and DRM licences. The <em>analytics plane</em> (view events, counters, warehouse, recommendations) is a streaming pipeline. Keeping them separate means an encoding backlog never affects playback, and a CDN incident never affects uploads.</p>
+
+  <h4>Key flow: upload to ready</h4>
+  <figure class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant C as Creator
+  participant U as Upload API
+  participant S as Object storage
+  participant O as Orchestrator
+  participant E as Encoders
+  participant P as Packager
+  participant M as Metadata
+  C->>U: POST /uploads (size, hash)
+  U-->>C: uploadId + pre-signed part URLs
+  loop each 64 MB part, retry individually
+    C->>S: PUT part n
+  end
+  C->>U: complete(etags)
+  U->>S: complete multipart
+  C->>U: POST /videos (metadata)
+  U->>M: video PROCESSING
+  S--)O: object created
+  O->>E: probe, then split into chunks
+  par fast path
+    O->>E: encode 360p and 720p chunks
+  and full ladder
+    O->>E: encode 1080p, 4K, other codecs
+  end
+  E-->>O: chunk outputs
+  O->>P: stitch, segment, manifests
+  P-->>O: playlists ready (fast path)
+  O->>M: READY (partial ladder) via outbox
+  O->>M: add renditions as they complete
+</pre>
+  <figcaption>Figure 11.13 — Upload and processing flow with a fast path for early availability.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the creator's bytes go straight to object storage in parts, so a dropped connection costs at most one part. The orchestrator is triggered by storage events, not by the API, so processing begins only when the object truly exists. The fast path publishes a playable video once low renditions are packaged; higher renditions are appended to the master playlist later (players fetch the master playlist at session start, so new viewers see them).</p>
+
+  <h4>Key flow: playback</h4>
+  <p>The player calls the playback API (authorisation, geo and entitlement checks; returns signed manifest URLs and a DRM licence URL), fetches the master playlist from the CDN, picks a starting rendition (often conservative to minimise time-to-first-frame), then fetches segments, measuring throughput and buffer level to switch up or down. Seeking fetches the segment containing the target time. Heartbeats report position for resume and views.</p>
+
+  <h4>Component responsibilities</h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Component</th><th>Responsibility</th></tr></thead>
+    <tbody>
+      <tr><td>Upload API</td><td>Quota checks, pre-signed URLs, multipart completion, hash validation.</td></tr>
+      <tr><td>Orchestrator</td><td>DAG execution, retries per task, priorities (fast path, popular re-encodes), cost-aware scheduling.</td></tr>
+      <tr><td>Encoder fleet</td><td>Stateless FFmpeg workers on spot capacity; checkpoint per chunk.</td></tr>
+      <tr><td>Packager</td><td>CMAF segmentation, HLS/DASH manifests, DRM encryption, keyframe alignment checks.</td></tr>
+      <tr><td>Playback API</td><td>Entitlement, signed URLs, CDN selection (steering), licence URLs.</td></tr>
+      <tr><td>CDN layer</td><td>Edge caching, origin shield, ISP-embedded caches, pre-positioning.</td></tr>
+      <tr><td>View pipeline</td><td>Ingest, validation, dedup, aggregation, fraud filtering, counters and warehouse.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Scaling bottlenecks</h4>
+  <ul>
+    <li><strong>Egress cost</strong> — maximise CDN hit ratio (consistent cache keys, no per-user query strings in segment URLs; use signed cookies or token-in-path schemes the CDN can strip), origin shield, pre-positioning of new popular releases, efficient codecs for heavy-watch titles.</li>
+    <li><strong>Long-tail storage</strong> — tiered storage, dropping rarely watched high renditions and regenerating on demand, deleting mezzanines after a retention period.</li>
+    <li><strong>Encoding backlog</strong> after a viral upload wave — priority queues; spot-instance pools across instance types; cap AV1 encodes to popular content.</li>
+    <li><strong>Hot counters</strong> — pre-aggregation in the stream processor.</li>
+    <li><strong>Metadata reads</strong> — cache video metadata at the playback API; the read:write ratio is extreme.</li>
+  </ul>
+
+  <h4>Failure scenarios and mitigations</h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Failure</th><th>Impact</th><th>Mitigation</th></tr></thead>
+    <tbody>
+      <tr><td>CDN provider degradation in a region</td><td>Rebuffering, start failures.</td><td>Multi-CDN with client-side or DNS steering based on real-user measurements.</td></tr>
+      <tr><td>Spot instances reclaimed</td><td>Tasks interrupted.</td><td>Chunked tasks, idempotent outputs keyed by (video, rendition, chunk), automatic retry.</td></tr>
+      <tr><td>Corrupt source file</td><td>Encode failures.</td><td>Probe and validate first; clear error to creator; quarantine.</td></tr>
+      <tr><td>Misaligned keyframes across renditions</td><td>Glitches on ABR switches.</td><td>Fixed GOP aligned to segment duration; packager validation.</td></tr>
+      <tr><td>DRM licence service down</td><td>Protected content unplayable.</td><td>Multi-region licence service, licence caching/persistence on clients within policy.</td></tr>
+      <tr><td>View pipeline lag</td><td>Counts stale.</td><td>Acceptable; display "updated a few minutes ago"; audited counts from batch.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Security considerations</h4>
+  <ul>
+    <li>Signed URLs or cookies with short TTL and path scoping; prevent hot-linking.</li>
+    <li>DRM for licensed content; forensic watermarking for premium releases.</li>
+    <li>Upload safety: file-type validation, sandboxed FFmpeg (it parses untrusted input — run it in isolated containers with seccomp profiles and no network), size limits, malware scanning of attachments.</li>
+    <li>Content moderation and copyright matching before public visibility.</li>
+    <li>View fraud: bot detection to protect monetisation and ranking integrity.</li>
+  </ul>
+
+  <h4>Trade-offs</h4>
+  <p>Shorter segments reduce start latency and live latency but increase request rates and manifest size; 2–6 s is the common range. More rungs in the ladder improve adaptation but cost storage and encoding. Efficient codecs save egress but cost compute and device compatibility, so they pay off only for content watched enough. Owning CDN capacity (ISP-embedded appliances) is only economical at very large scale; everyone else buys from multiple CDNs.</p>
+
+  <h4>Estimated infrastructure <span class="tag illus">Illustrative</span></h4>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Tier</th><th>Estimate</th></tr></thead>
+    <tbody>
+      <tr><td>CDN egress</td><td>~8 Tbit/s average, ~17 Tbit/s peak; origin egress at 98% hit ratio ≈ 170–340 Gbit/s before shield</td></tr>
+      <tr><td>Encoding</td><td>~10,400 busy cores average; ~20,000 cores peak capacity on spot</td></tr>
+      <tr><td>Object storage</td><td>~1 PB/day gross growth before lifecycle policies</td></tr>
+      <tr><td>Metadata</td><td>sharded MySQL/Vitess, tens of shards</td></tr>
+      <tr><td>View pipeline</td><td>Kafka ~10 brokers; Flink job with ~50 task slots; Redis/Cassandra counters</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="math">
+  <h2>6. Mathematical Foundations</h2>
+  <h3>6.1 Contention on a hot row</h3>
+  <p>Intuition: if each transaction holds the row lock for \(t\) seconds, at most \(1/t\) transactions per second can update that row, no matter how many servers you add.</p>
+  \[ X_{\max} = \frac{1}{t_{\text{lock}}} \]
+  <p>With a 2 ms lock hold (network round trip to the database plus commit), \(X_{\max} = 500/\text{s}\). Splitting stock into \(B\) buckets raises the ceiling to \(B / t_{\text{lock}}\) — 100 buckets give 50,000/s — at the cost of "false sold-out" when a randomly chosen bucket is empty but others are not (mitigated by retrying another bucket). Moving the gate to Redis reduces \(t\) to tens of microseconds of single-threaded execution.</p>
+
+  <h3>6.2 Reservation TTL and stock utilisation</h3>
+  <p>If checkouts arrive at rate \(\lambda\) and each holds stock for an average of \(W\) (time to pay or to expire), Little's law gives the stock tied up in reservations:</p>
+  \[ R = \lambda W \]
+  <p>At 2,000 admitted checkouts/s with a 10-minute TTL and a 40% abandonment rate, the abandoned ones alone hold \(0.4 \times 2{,}000 \times 600 = 480{,}000\) units-seconds per second, i.e. up to 480,000 units in limbo — far more than 10,000 in stock. Hence flash sales use short TTLs (2–3 minutes) and release reservations eagerly on cancellation.</p>
+
+  <h3>6.3 Ledger invariants</h3>
+  <p>For every transaction \(T\) and currency \(c\):</p>
+  \[ \sum_{e \in T,\; e.\text{currency}=c} e.\text{amount} = 0 \]
+  <p>and the balance of account \(a\) at time \(\tau\) is \(B_a(\tau) = \sum_{e:\,e.\text{account}=a,\; e.t \le \tau} e.\text{amount}\). Because these are sums, they can be checked incrementally (per transaction at write time) and globally (nightly: the sum over all accounts per currency must be zero).</p>
+
+  <h3>6.4 Adaptive bitrate and bandwidth</h3>
+  <p>Egress volume is watch time times delivered bitrate:</p>
+  \[ E = T_{\text{watch}} \cdot \bar{b} \]
+  <p>A codec that reduces bitrate by a fraction \(s\) at equal quality saves \(s \cdot E\) for the content encoded with it. If the extra encoding cost per title is \(C_{\text{enc}}\) and egress costs \(p\) per GB, re-encoding a title pays off when \(s \cdot T_{\text{watch}} \cdot \bar{b} \cdot p \gt C_{\text{enc}}\) — i.e. only for titles with enough watch time. That inequality is the economic logic behind "re-encode popular titles with expensive codecs".</p>
+  <p>The ABR ladder is a set of points on a rate–quality curve. With quality measured by a perceptual metric \(Q(b)\) that is concave in bitrate, adding rungs where \(Q\) is changing fastest yields the most improvement per bit; per-title encoding fits \(Q(b)\) for each title rather than assuming one curve for all.</p>
+
+  <h3>6.5 CDN hit ratio and origin load</h3>
+  \[ \text{Origin egress} = (1 - h_{\text{edge}})(1 - h_{\text{shield}}) \cdot E \]
+  <p>With edge hit ratio 0.97 and shield hit ratio 0.8, origin serves \(0.03 \times 0.2 = 0.6\%\) of bytes. Improving the edge hit ratio from 0.95 to 0.98 cuts origin traffic by 60%.</p>
+
+  <h3>6.6 Distinct counting with HyperLogLog</h3>
+  <p>HyperLogLog with \(m\) registers estimates the number of distinct items with relative standard error approximately</p>
+  \[ \sigma \approx \frac{1.04}{\sqrt{m}} \]
+  <p>Redis uses \(m = 16{,}384\) registers, giving \(\sigma \approx 0.81\%\) in at most 12 KB per key. For unique viewers per video per day, that is a few gigabytes for millions of videos — far smaller than storing viewer sets.</p>
+
+  <h3>6.7 Probability of a double charge without idempotency</h3>
+  <p>If a fraction \(f\) of PSP calls time out after the PSP has actually processed them (the response was lost), and the client blindly retries, the double-charge rate equals \(f\). Even \(f = 10^{-4}\) on 2 M daily payments is 200 double charges per day — each a support ticket, a refund and a potential chargeback. With idempotency keys at the PSP, the rate drops to zero by construction.</p>
+</section>
+
+<section id="code">
+  <h2>7. Code: Implementing the Hard Parts</h2>
+  <p>Versions: Java 21, Spring Boot 3.3+, PostgreSQL 15+, Go 1.22+, Python 3.11+ <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p>
+
+  <h3>7.1 Idempotent payment confirmation in Spring Boot</h3>
+  <p>The schema first. The idempotency table stores a request fingerprint and the final response; the intent table enforces state transitions; the outbox table is relayed to Kafka by Debezium or a poller.</p>
+<pre data-file="V1__payments.sql"><code class="language-sql">CREATE TABLE idempotency_key (
+  scope          text        NOT NULL,             -- e.g. caller service or merchant
+  key            text        NOT NULL,
+  request_hash   text        NOT NULL,
+  state          text        NOT NULL CHECK (state IN ('IN_PROGRESS','COMPLETED')),
+  locked_until   timestamptz,
+  response_code  int,
+  response_body  jsonb,
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (scope, key)
+);
+
+CREATE TABLE payment_intent (
+  id             text PRIMARY KEY,
+  order_id       text   NOT NULL UNIQUE,
+  amount_minor   bigint NOT NULL CHECK (amount_minor &gt; 0),
+  currency       char(3) NOT NULL,
+  status         text   NOT NULL,
+  psp            text,
+  psp_reference  text,
+  attempt_no     int    NOT NULL DEFAULT 0,
+  version        bigint NOT NULL DEFAULT 0,
+  updated_at     timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE outbox (
+  id             bigserial PRIMARY KEY,
+  aggregate_id   text  NOT NULL,
+  type           text  NOT NULL,
+  payload        jsonb NOT NULL,
+  created_at     timestamptz NOT NULL DEFAULT now()
+);</code></pre>
+<pre data-file="ConfirmPaymentService.java"><code class="language-java">package dev.book.payments;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.dao.DuplicateKeyException;
+import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.web.bind.annotation.*;
+
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.HexFormat;
+import java.util.Map;
+
+record ConfirmRequest(String paymentMethod) {}
+record PspResult(Outcome outcome, String reference, String declineCode) {
+    enum Outcome { AUTHORIZED, DECLINED, REQUIRES_ACTION, UNKNOWN }
+}
+interface PspClient {
+    /** Must forward idempotencyKey to the PSP; UNKNOWN on timeout. */
+    PspResult authorize(String intentId, long amountMinor, String currency, String paymentMethod, String idempotencyKey);
+    PspResult lookup(String idempotencyKey);
+}
+
+@RestController
+@RequestMapping("/v1/payment_intents")
+class PaymentController {
+    private final ConfirmPaymentService service;
+    PaymentController(ConfirmPaymentService service) { this.service = service; }
+
+    @PostMapping("/{id}/confirm")
+    ResponseEntity&lt;String&gt; confirm(@PathVariable String id,
+                                   @RequestHeader("Idempotency-Key") String key,
+                                   @RequestHeader("X-Caller") String caller,   // set by the mTLS-authenticated gateway
+                                   @RequestBody ConfirmRequest body) {
+        return service.confirm(caller, key, id, body);
+    }
+}
+
+@Service
+public class ConfirmPaymentService {
+    private final JdbcTemplate jdbc;
+    private final TransactionTemplate tx;
+    private final PspClient psp;
+    private final ObjectMapper json = new ObjectMapper();
+
+    public ConfirmPaymentService(JdbcTemplate jdbc, TransactionTemplate tx, PspClient psp) {
+        this.jdbc = jdbc; this.tx = tx; this.psp = psp;
+    }
+
+    public ResponseEntity&lt;String&gt; confirm(String scope, String key, String intentId, ConfirmRequest req) {
+        String hash = sha256(intentId + "|" + req.paymentMethod());
+
+        // 1. Claim the key, or replay / reject.
+        try {
+            jdbc.update("""
+                INSERT INTO idempotency_key(scope, key, request_hash, state, locked_until)
+                VALUES (?, ?, ?, 'IN_PROGRESS', now() + interval '30 seconds')""", scope, key, hash);
+        } catch (DuplicateKeyException dup) {
+            Map&lt;String, Object&gt; row = jdbc.queryForMap(
+                "SELECT request_hash, state, response_code, response_body::text AS body, locked_until &gt; now() AS locked " +
+                "FROM idempotency_key WHERE scope = ? AND key = ?", scope, key);
+            if (!hash.equals(row.get("request_hash")))
+                return ResponseEntity.unprocessableEntity().body("{\"error\":\"idempotency key reused with different request\"}");
+            if ("COMPLETED".equals(row.get("state")))
+                return ResponseEntity.status((Integer) row.get("response_code")).body((String) row.get("body"));
+            if (Boolean.TRUE.equals(row.get("locked")))
+                return ResponseEntity.status(409).body("{\"error\":\"request in progress\"}");
+            // previous handler died: take over the lock and resume below
+            int taken = jdbc.update("""
+                UPDATE idempotency_key SET locked_until = now() + interval '30 seconds'
+                WHERE scope = ? AND key = ? AND state = 'IN_PROGRESS' AND locked_until &lt;= now()""", scope, key);
+            if (taken == 0) return ResponseEntity.status(409).body("{\"error\":\"request in progress\"}");
+        }
+
+        // 2. Move intent to PROCESSING exactly once (or find it already there after a crash).
+        Map&lt;String, Object&gt; intent = jdbc.queryForMap(
+            "SELECT status, amount_minor, currency, attempt_no FROM payment_intent WHERE id = ?", intentId);
+        String status = (String) intent.get("status");
+        int attempt = (Integer) intent.get("attempt_no");
+        PspResult result;
+        if ("REQUIRES_PAYMENT_METHOD".equals(status)) {
+            int next = attempt + 1;
+            int moved = jdbc.update("""
+                UPDATE payment_intent SET status = 'PROCESSING', attempt_no = ?, version = version + 1, updated_at = now()
+                WHERE id = ? AND status = 'REQUIRES_PAYMENT_METHOD'""", next, intentId);
+            if (moved == 0) return ResponseEntity.status(409).body("{\"error\":\"concurrent confirm\"}");
+            result = psp.authorize(intentId, (Long) intent.get("amount_minor"), (String) intent.get("currency"),
+                                   req.paymentMethod(), intentId + ":" + next);
+        } else if ("PROCESSING".equals(status)) {
+            result = psp.lookup(intentId + ":" + attempt);     // resume: ask, never resend blindly
+        } else {
+            return finish(scope, key, intentId, 409, "{\"error\":\"invalid state " + status + "\"}", null, null);
+        }
+
+        // 3. Apply the outcome, emit the event and complete the key atomically.
+        return switch (result.outcome()) {
+            case AUTHORIZED -&gt; finish(scope, key, intentId, 200,
+                    "{\"id\":\"" + intentId + "\",\"status\":\"requires_capture\"}", "REQUIRES_CAPTURE", result);
+            case DECLINED -&gt; finish(scope, key, intentId, 402,
+                    "{\"status\":\"requires_payment_method\",\"declineCode\":\"" + result.declineCode() + "\"}",
+                    "REQUIRES_PAYMENT_METHOD", result);
+            case REQUIRES_ACTION -&gt; finish(scope, key, intentId, 200,
+                    "{\"id\":\"" + intentId + "\",\"status\":\"requires_action\"}", "REQUIRES_ACTION", result);
+            case UNKNOWN -&gt; ResponseEntity.accepted()            // key stays IN_PROGRESS; recovery job resolves it
+                    .body("{\"id\":\"" + intentId + "\",\"status\":\"processing\"}");
+        };
+    }
+
+    private ResponseEntity&lt;String&gt; finish(String scope, String key, String intentId, int code, String body,
+                                          String newStatus, PspResult r) {
+        tx.executeWithoutResult(s -&gt; {
+            if (newStatus != null) {
+                int n = jdbc.update("""
+                    UPDATE payment_intent SET status = ?, psp_reference = ?, version = version + 1, updated_at = now()
+                    WHERE id = ? AND status = 'PROCESSING'""", newStatus, r.reference(), intentId);
+                if (n == 1) {
+                    jdbc.update("INSERT INTO outbox(aggregate_id, type, payload) VALUES (?, ?, ?::jsonb)",
+                        intentId, "PaymentIntent." + newStatus, toJson(Map.of("intentId", intentId, "pspRef",
+                            String.valueOf(r.reference()))));
+                }
+            }
+            jdbc.update("""
+                UPDATE idempotency_key SET state = 'COMPLETED', response_code = ?, response_body = ?::jsonb, locked_until = NULL
+                WHERE scope = ? AND key = ?""", code, body, scope, key);
+        });
+        return ResponseEntity.status(code).body(body);
+    }
+
+    private String toJson(Object o) {
+        try { return json.writeValueAsString(o); } catch (Exception e) { throw new IllegalStateException(e); }
+    }
+
+    private static String sha256(String s) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(s.getBytes(StandardCharsets.UTF_8)));
+        } catch (Exception e) { throw new IllegalStateException(e); }
+    }
+}</code></pre>
+  <p><strong>Why the PSP call is outside the database transaction:</strong> holding a database transaction (and its connection and row locks) open during a network call to a third party that may take seconds is a classic way to exhaust the Hikari pool under load. Instead, the design uses <em>persisted intermediate state</em> (<code>PROCESSING</code> plus the attempt number) so that any crash between steps is recoverable by lookup. A background job scans for intents in <code>PROCESSING</code> older than a threshold and calls <code>psp.lookup</code> with the same deterministic key.</p>
+  <div class="callout java"><p class="callout-title">Spring pitfalls this code avoids</p><p>(1) <code>@Transactional</code> around the whole method would hold the transaction during the PSP call. (2) <code>@Retryable</code> on the PSP client without an idempotency key would double-charge on timeouts. (3) Catching <code>DataIntegrityViolationException</code> generically would also swallow check-constraint failures; <code>DuplicateKeyException</code> is the precise subclass for unique-key conflicts.</p></div>
+
+  <h3>7.2 Posting balanced ledger transactions</h3>
+<pre data-file="V2__ledger.sql"><code class="language-sql">CREATE TABLE account (
+  account_id     text PRIMARY KEY,
+  type           text NOT NULL,          -- asset, liability, revenue, expense
+  currency       char(3) NOT NULL
+);
+
+CREATE TABLE ledger_txn (
+  txn_id         text PRIMARY KEY,       -- deterministic: source event id
+  type           text NOT NULL,
+  external_ref   text,
+  effective_at   timestamptz NOT NULL,
+  created_at     timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE ledger_entry (
+  txn_id         text   NOT NULL REFERENCES ledger_txn(txn_id),
+  line           int    NOT NULL,
+  account_id     text   NOT NULL REFERENCES account(account_id),
+  amount_minor   bigint NOT NULL CHECK (amount_minor &lt;&gt; 0),   -- debit &gt; 0, credit &lt; 0
+  currency       char(3) NOT NULL,
+  PRIMARY KEY (txn_id, line)
+);
+
+CREATE TABLE account_balance (
+  account_id     text PRIMARY KEY REFERENCES account(account_id),
+  balance_minor  bigint NOT NULL DEFAULT 0,
+  version        bigint NOT NULL DEFAULT 0
+);
+
+-- Entries are immutable: corrections are new reversing transactions.
+REVOKE UPDATE, DELETE ON ledger_entry, ledger_txn FROM payments_app;</code></pre>
+<pre data-file="LedgerPoster.java"><code class="language-java">package dev.book.ledger;
+
+import org.springframework.dao.DuplicateKeyException;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Instant;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+record Entry(String accountId, long amountMinor, String currency) {}
+
+@Service
+class LedgerPoster {
+    private final JdbcTemplate jdbc;
+    LedgerPoster(JdbcTemplate jdbc) { this.jdbc = jdbc; }
+
+    /** Idempotent on txnId (use the source event id). Returns false if already posted. */
+    @Transactional
+    public boolean post(String txnId, String type, String externalRef, Instant effectiveAt, List&lt;Entry&gt; entries) {
+        Map&lt;String, Long&gt; sums = entries.stream()
+            .collect(Collectors.groupingBy(Entry::currency, Collectors.summingLong(Entry::amountMinor)));
+        if (entries.size() &lt; 2 || sums.values().stream().anyMatch(s -&gt; s != 0))
+            throw new IllegalArgumentException("unbalanced transaction " + txnId + ": " + sums);
+
+        try {
+            jdbc.update("INSERT INTO ledger_txn(txn_id, type, external_ref, effective_at) VALUES (?,?,?,?)",
+                txnId, type, externalRef, java.sql.Timestamp.from(effectiveAt));
+        } catch (DuplicateKeyException alreadyPosted) {
+            return false;
+        }
+        // Update balances in a stable account order to avoid deadlocks between concurrent postings.
+        List&lt;Entry&gt; ordered = entries.stream().sorted(Comparator.comparing(Entry::accountId)).toList();
+        int line = 0;
+        for (Entry e : ordered) {
+            jdbc.update("INSERT INTO ledger_entry(txn_id, line, account_id, amount_minor, currency) VALUES (?,?,?,?,?)",
+                txnId, ++line, e.accountId(), e.amountMinor(), e.currency());
+            jdbc.update("""
+                INSERT INTO account_balance(account_id, balance_minor, version) VALUES (?, ?, 1)
+                ON CONFLICT (account_id) DO UPDATE
+                SET balance_minor = account_balance.balance_minor + EXCLUDED.balance_minor,
+                    version = account_balance.version + 1""", e.accountId(), e.amountMinor());
+        }
+        return true;
+    }
+}
+
+// Example: capture of EUR 45.99 with a 10% platform fee (illustrative accounts)
+// post("evt_cap_123", "CAPTURE", "psp_ref_9", now, List.of(
+//     new Entry("psp_clearing:EUR",        4599, "EUR"),
+//     new Entry("seller_payable:sel_9",    -4139, "EUR"),
+//     new Entry("platform_fee_revenue:EUR", -460, "EUR")));</code></pre>
+  <p>Two design points: the transaction ID is the <em>source event ID</em>, so redelivery from Kafka is harmless; and balance rows are updated in sorted account order so that two concurrent postings touching the same pair of accounts cannot deadlock. For very hot accounts (the platform fee account receives a posting on every payment) the balance update itself becomes a hot row; split it into N sub-balances summed on read, or compute it asynchronously.</p>
+
+  <h3>7.3 Inventory reservation: SQL for normal stock, Redis Lua for flash sales</h3>
+<pre data-file="InventoryService.java"><code class="language-java">package dev.book.inventory;
+
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+import java.util.UUID;
+
+@Service
+public class InventoryService {
+    private final JdbcTemplate jdbc;
+    private final StringRedisTemplate redis;
+
+    // Atomically claim qty units unless that would go below zero; also enforces a per-user limit.
+    private static final DefaultRedisScript&lt;Long&gt; CLAIM = new DefaultRedisScript&lt;&gt;("""
+        local remaining = tonumber(redis.call('GET', KEYS[1]) or '0')
+        local qty = tonumber(ARGV[1])
+        local perUser = tonumber(redis.call('HINCRBY', KEYS[2], ARGV[2], qty))
+        if perUser &gt; tonumber(ARGV[3]) then
+          redis.call('HINCRBY', KEYS[2], ARGV[2], -qty)
+          return -2
+        end
+        if remaining &lt; qty then
+          redis.call('HINCRBY', KEYS[2], ARGV[2], -qty)
+          return -1
+        end
+        return redis.call('DECRBY', KEYS[1], qty)
+        """, Long.class);
+
+    public InventoryService(JdbcTemplate jdbc, StringRedisTemplate redis) { this.jdbc = jdbc; this.redis = redis; }
+
+    /** Normal path: one conditional UPDATE per line; no read-modify-write race. */
+    @Transactional
+    public String reserve(String checkoutId, String skuId, String warehouseId, int qty, int ttlSeconds) {
+        int updated = jdbc.update("""
+            UPDATE stock SET reserved = reserved + ?, version = version + 1
+            WHERE sku_id = ? AND warehouse_id = ? AND on_hand - reserved - committed &gt;= ?""",
+            qty, skuId, warehouseId, qty);
+        if (updated == 0) throw new OutOfStockException(skuId);
+        String id = UUID.randomUUID().toString();
+        jdbc.update("""
+            INSERT INTO reservation(reservation_id, checkout_id, sku_id, warehouse_id, qty, expires_at, state)
+            VALUES (?, ?, ?, ?, ?, now() + make_interval(secs =&gt; ?), 'HELD')""",
+            id, checkoutId, skuId, warehouseId, qty, ttlSeconds);
+        return id;
+    }
+
+    /** Release is a guarded state transition, so expiry and payment success cannot both win. */
+    @Transactional
+    public boolean release(String reservationId) {
+        List&lt;Object[]&gt; rows = jdbc.query("""
+            UPDATE reservation SET state = 'RELEASED' WHERE reservation_id = ? AND state = 'HELD'
+            RETURNING sku_id, warehouse_id, qty""",
+            (rs, i) -&gt; new Object[]{rs.getString(1), rs.getString(2), rs.getInt(3)}, reservationId);
+        if (rows.isEmpty()) return false;
+        Object[] r = rows.get(0);
+        jdbc.update("UPDATE stock SET reserved = reserved - ? WHERE sku_id = ? AND warehouse_id = ?", r[2], r[0], r[1]);
+        return true;
+    }
+
+    /** Flash-sale gate: returns remaining units, or -1 sold out, -2 per-user limit exceeded. */
+    public long claimFlash(String dropId, String userId, int qty, int perUserLimit) {
+        Long r = redis.execute(CLAIM, List.of("drop:" + dropId + ":remaining", "drop:" + dropId + ":users"),
+                               String.valueOf(qty), userId, String.valueOf(perUserLimit));
+        return r == null ? -1 : r;
+    }
+
+    public static class OutOfStockException extends RuntimeException {
+        public OutOfStockException(String sku) { super("out of stock: " + sku); }
+    }
+}</code></pre>
+  <p>Both keys in the Lua script must hash to the same Redis Cluster slot; in production name them <code>drop:{dropId}:remaining</code> and <code>drop:{dropId}:users</code> so the hash tag <code>{dropId}</code> co-locates them. A successful claim is then published to Kafka and persisted by the reservation writer using the same conditional <code>UPDATE</code>, which remains the final arbiter of stock.</p>
+
+  <h3>7.4 View-count ingestion and aggregation in Go</h3>
+  <p>A compact ingest service: it accepts batched player events, applies the counting policy (a view counts once per viewer per video per 30 minutes after 30 s of watch time — an illustrative policy), aggregates increments in memory, and flushes deltas to Redis every few seconds with one pipelined round trip. Unique viewers are tracked with Redis HyperLogLog. In the full architecture this logic lives in a stream processor reading Kafka; the in-process version shows the core mechanics. Module: <code>github.com/redis/go-redis/v9</code>.</p>
+<pre data-file="viewcount/main.go"><code class="language-go">package main
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+type Event struct {
+	VideoID     string `json:"videoId"`
+	ViewerID    string `json:"viewerId"` // user id or device id
+	WatchedSecs int    `json:"watchedSecs"`
+}
+
+type Aggregator struct {
+	rdb     *redis.Client
+	mu      sync.Mutex
+	pending map[string]int64    // videoId -&gt; counted views since last flush
+	uniques map[string][]string // videoId -&gt; viewer ids since last flush (for HLL)
+}
+
+const (
+	minWatch   = 30
+	dedupTTL   = 30 * time.Minute
+	flushEvery = 5 * time.Second
+)
+
+// Count applies the policy. The dedup marker uses SET NX so only the first qualifying
+// event per viewer/video/window is counted, across all ingest replicas.
+func (a *Aggregator) Count(ctx context.Context, evs []Event) error {
+	pipe := a.rdb.Pipeline()
+	type pendingCmd struct {
+		ev  Event
+		cmd *redis.BoolCmd
+	}
+	var cmds []pendingCmd
+	for _, e := range evs {
+		if e.WatchedSecs &lt; minWatch || e.VideoID == "" || e.ViewerID == "" {
+			continue
+		}
+		key := "vdedup:" + e.VideoID + ":" + e.ViewerID
+		cmds = append(cmds, pendingCmd{e, pipe.SetNX(ctx, key, 1, dedupTTL)})
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	if _, err := pipe.Exec(ctx); err != nil &amp;&amp; err != redis.Nil {
+		return err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, c := range cmds {
+		if c.cmd.Val() { // first time in this window
+			a.pending[c.ev.VideoID]++
+			a.uniques[c.ev.VideoID] = append(a.uniques[c.ev.VideoID], c.ev.ViewerID)
+		}
+	}
+	return nil
+}
+
+// Flush swaps the maps and writes all deltas in a single pipeline.
+func (a *Aggregator) Flush(ctx context.Context) {
+	a.mu.Lock()
+	pending, uniques := a.pending, a.uniques
+	a.pending, a.uniques = make(map[string]int64), make(map[string][]string)
+	a.mu.Unlock()
+	if len(pending) == 0 {
+		return
+	}
+	day := time.Now().UTC().Format("20060102")
+	pipe := a.rdb.Pipeline()
+	for vid, n := range pending {
+		pipe.IncrBy(ctx, "views:"+vid, n)
+		pipe.IncrBy(ctx, "views:"+vid+":"+day, n)
+		ids := make([]interface{}, len(uniques[vid]))
+		for i, v := range uniques[vid] {
+			ids[i] = v
+		}
+		pipe.PFAdd(ctx, "uniq:"+vid+":"+day, ids...)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		log.Printf("flush failed, re-queueing %d videos: %v", len(pending), err)
+		a.mu.Lock()
+		for vid, n := range pending { // put deltas back; counts are approximate on crash, exact in the warehouse
+			a.pending[vid] += n
+			a.uniques[vid] = append(a.uniques[vid], uniques[vid]...)
+		}
+		a.mu.Unlock()
+	}
+}
+
+func main() {
+	ctx := context.Background()
+	agg := &amp;Aggregator{
+		rdb:     redis.NewClient(&amp;redis.Options{Addr: "localhost:6379"}),
+		pending: make(map[string]int64),
+		uniques: make(map[string][]string),
+	}
+	go func() {
+		t := time.NewTicker(flushEvery)
+		for range t.C {
+			agg.Flush(ctx)
+		}
+	}()
+	http.HandleFunc("/v1/view-events", func(w http.ResponseWriter, r *http.Request) {
+		var evs []Event
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1&lt;&lt;20)).Decode(&amp;evs); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if err := agg.Count(r.Context(), evs); err != nil {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	})
+	log.Fatal(http.ListenAndServe(":8081", nil))
+}</code></pre>
+  <p>A viral video at 100 K qualifying events/s produces one <code>INCRBY</code> per ingest replica every 5 seconds instead of 100 K writes per second. The dedup <code>SETNX</code> keys are the remaining per-event cost; at larger scale replace them with keyed state in a stream processor (Flink keyed by <code>(videoId, viewerId)</code> with a TTL), which is what <a href="p2-12-case-studies-realtime-ai.html">Chapter 2.12</a>'s analytics platform does.</p>
+
+  <h3>7.5 Building an ABR ladder with FFmpeg from Python</h3>
+  <p>This script probes the source, drops rungs above the source resolution, and builds one FFmpeg invocation that produces aligned-keyframe fMP4 HLS renditions plus a master playlist. Keyframes are forced every segment duration, independent of frame rate, so all renditions switch cleanly. Requires FFmpeg 6+ with libx264 on <code>PATH</code>.</p>
+<pre data-file="ladder.py"><code class="language-python">"""Encode an HLS (fMP4/CMAF) ABR ladder. Usage: python ladder.py input.mp4 out_dir"""
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+SEGMENT_SECONDS = 4
+
+
+@dataclass(frozen=True)
+class Rung:
+    height: int
+    video_kbps: int
+    audio_kbps: int
+
+
+LADDER = [  # illustrative fixed ladder; per-title encoding would compute this per source
+    Rung(360, 800, 96),
+    Rung(540, 1400, 96),
+    Rung(720, 2800, 128),
+    Rung(1080, 5000, 128),
+]
+
+
+def probe_height(src: Path) -&gt; int:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height",
+         "-of", "json", str(src)],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    return int(json.loads(out)["streams"][0]["height"])
+
+
+def build_command(src: Path, out: Path, rungs: list[Rung]) -&gt; list[str]:
+    n = len(rungs)
+    split = f"[0:v]split={n}" + "".join(f"[v{i}]" for i in range(n))
+    scales = ";".join(f"[v{i}]scale=-2:{r.height}[v{i}o]" for i, r in enumerate(rungs))
+    cmd = ["ffmpeg", "-y", "-i", str(src), "-filter_complex", f"{split};{scales}"]
+    for i, r in enumerate(rungs):
+        cmd += [
+            "-map", f"[v{i}o]", f"-c:v:{i}", "libx264", f"-b:v:{i}", f"{r.video_kbps}k",
+            f"-maxrate:v:{i}", f"{int(r.video_kbps * 1.07)}k", f"-bufsize:v:{i}", f"{int(r.video_kbps * 1.5)}k",
+            "-map", "a:0?", f"-c:a:{i}", "aac", f"-b:a:{i}", f"{r.audio_kbps}k", "-ac", "2",
+        ]
+    cmd += [
+        "-preset", "medium", "-profile:v", "high",
+        "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_SECONDS})", "-sc_threshold", "0",
+        "-f", "hls", "-hls_time", str(SEGMENT_SECONDS), "-hls_playlist_type", "vod",
+        "-hls_segment_type", "fmp4", "-hls_flags", "independent_segments",
+        "-master_pl_name", "master.m3u8",
+        "-var_stream_map", " ".join(f"v:{i},a:{i}" for i in range(n)),
+        str(out / "%v" / "index.m3u8"),
+    ]
+    return cmd
+
+
+def main() -&gt; None:
+    src, out = Path(sys.argv[1]), Path(sys.argv[2])
+    out.mkdir(parents=True, exist_ok=True)
+    src_h = probe_height(src)
+    rungs = [r for r in LADDER if r.height &lt;= src_h] or LADDER[:1]   # never upscale
+    cmd = build_command(src, out, rungs)
+    print(" ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+  <p>In the real pipeline this runs per <em>chunk</em> on many workers, and a separate packaging step concatenates chunk outputs and writes manifests; the single-process version is ideal for local experiments and for understanding the knobs. Note the security point from §5.3: FFmpeg parses untrusted input, so production workers run it in sandboxed containers without network access.</p>
+</section>
+
+<section id="applications">
+  <h2>8. Real-World Applications</h2>
+  <ul>
+    <li><strong>Retail and marketplaces</strong> use the checkout saga, reservations and event backbone exactly as above; marketplaces add split payments (one payment funding several sellers) and delayed payouts, which is where the ledger earns its keep.</li>
+    <li><strong>Subscriptions and SaaS billing</strong> reuse the payments platform with recurring intents, dunning (retrying failed renewals on a schedule) and proration, all posted to the same ledger.</li>
+    <li><strong>Ticketing and drops</strong> (concerts, sneakers, game consoles) are flash sales every day; the virtual waiting room plus atomic gate pattern is standard there.</li>
+    <li><strong>Food delivery and ride-hailing</strong> use authorize-then-capture heavily (authorize an estimate, capture the final amount), plus tips added after capture.</li>
+    <li><strong>Learning platforms, news and social apps</strong> run the same video pipeline at smaller scale, often on managed services, and the same view-counting pipeline for engagement metrics.</li>
+    <li><strong>AI-era additions:</strong> LLM-generated product descriptions and semantic search over catalogs (see <a href="p8-04-rag-retrieval.html">RAG &amp; retrieval</a>), ML fraud scoring at the payment hook, automatic chaptering, captions and translations in the video pipeline, and AI-driven per-shot encoding decisions. None of these change the correctness core designed here; they plug into its hooks.</li>
+  </ul>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies: What Real Companies Did</h2>
+  <h3>9.1 Amazon Dynamo and the always-writable cart <span class="tag fact">Verified</span></h3>
+  <p>Amazon's SOSP 2007 paper describes Dynamo, a key-value store designed so that services such as the shopping cart could always accept writes, using consistent hashing, sloppy quorums, hinted handoff and vector clocks, with divergent versions reconciled by the application (for the cart, by merging). It is the canonical example of choosing availability for a commerce workload. Source: <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store (SOSP 2007)</a>.</p>
+  <h3>9.2 Shopify: surviving flash sales <span class="tag fact">Verified</span></h3>
+  <p>Shopify's 2017 two-part series explains how it built queueing and throttling for write-heavy flash-sale traffic into scriptable (Nginx + Lua / OpenResty) load balancers, because provisioning permanent capacity for rare spikes was not economical — the same "admission control at the edge" principle as our waiting room. Shopify has also described its "pods" architecture isolating groups of shops. Sources: <a href="https://shopify.engineering/surviving-flashes-of-high-write-traffic-using-scriptable-load-balancers-part-i">Surviving Flashes of High-Write Traffic Using Scriptable Load Balancers, Part I</a> and <a href="https://shopify.engineering/surviving-flashes-of-high-write-traffic-using-scriptable-load-balancers-part-ii">Part II</a>.</p>
+  <h3>9.3 Stripe: idempotency keys <span class="tag fact">Verified</span></h3>
+  <p>Stripe's blog post "Designing robust and predictable APIs with idempotency" frames the client and the API as a distributed system and describes the <code>Idempotency-Key</code> header on mutating requests plus client retries with exponential backoff and jitter. Stripe's API documentation specifies how saved responses are replayed for repeated keys. Sources: <a href="https://stripe.com/blog/idempotency">Stripe blog — idempotency</a>, <a href="https://docs.stripe.com/api/idempotent_requests">Stripe API — Idempotent requests</a>. Brandur Leach (then at Stripe) also published a detailed write-up of implementing idempotency keys in PostgreSQL with recovery points: <a href="https://brandur.org/idempotency-keys">brandur.org/idempotency-keys</a>.</p>
+  <h3>9.4 Airbnb: avoiding double payments <span class="tag fact">Verified</span></h3>
+  <p>Airbnb's 2019 post describes Orpheus, a general-purpose idempotency library used across its payment services, built around splitting each request into pre-RPC, RPC and post-RPC phases with database commits around the remote call, and classifying errors as retryable or not — the same structure as our <code>ConfirmPaymentService</code>. Source: <a href="https://medium.com/airbnb-engineering/avoiding-double-payments-in-a-distributed-payments-system-2981f6b070bb">Avoiding Double Payments in a Distributed Payments System</a>.</p>
+  <h3>9.5 Uber: Gulfstream and LedgerStore <span class="tag fact">Verified</span></h3>
+  <p>Uber's 2020 post introduces Gulfstream, its fifth-generation collection and disbursement platform, built on double-entry accounting with orders whose entries sum to zero so that the system cannot create or destroy money and can reconcile itself. A 2024 post describes LedgerStore, Uber's immutable storage for ledger data, and how it supports indexes at trillion scale. Sources: <a href="https://www.uber.com/blog/money-scale-strong-data/">Revolutionizing Money Movements at Scale with Strong Data Consistency</a>, <a href="https://www.uber.com/blog/how-ledgerstore-supports-trillions-of-indexes/">How LedgerStore Supports Trillions of Indexes at Uber</a>.</p>
+  <h3>9.6 Netflix: per-title encoding, the encoding pipeline, and Open Connect <span class="tag fact">Verified</span></h3>
+  <p>Netflix's December 2015 post "Per-Title Encode Optimization" argued for a bitrate ladder tailored to each title's complexity instead of a fixed ladder. In 2024 Netflix described rebuilding its video processing pipeline as microservices on its Cosmos platform, splitting the earlier monolithic encoding module into services such as video encoding and video quality. Open Connect is Netflix's own CDN, with appliances deployed in and near ISP networks. Sources: <a href="https://netflixtechblog.com/per-title-encode-optimization-7e99442b62a2">Per-Title Encode Optimization</a>, <a href="https://atscaleconference.com/videos/building-netflixs-new-video-pipeline/">Building Netflix's New Video Pipeline (@Scale talk)</a>, <a href="https://openconnect.netflix.com/">Netflix Open Connect</a>.</p>
+  <h3>9.7 YouTube and Vitess <span class="tag fact">Verified</span></h3>
+  <p>Vitess started at YouTube in 2010 to scale the MySQL databases holding video metadata — first as a connection-pooling proxy, later adding sharding — and was open-sourced in 2012; it became a CNCF project in 2018. Source: <a href="https://vitess.io/docs/overview/history/">Vitess — History</a>.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages, Limitations and Operational Cost</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Choice</th><th>Advantages</th><th>Limitations</th><th>Operational cost</th></tr></thead>
+    <tbody>
+      <tr><td>Reservation with TTL</td><td>No oversell, releases abandoned stock</td><td>Stock in limbo during TTL; sweeper and race handling</td><td>Low</td></tr>
+      <tr><td>Redis flash-sale gate</td><td>Absorbs 10–100× bursts</td><td>Not durable; needs DB arbiter and reconciliation</td><td>Medium: per-drop runbooks</td></tr>
+      <tr><td>Orchestrated checkout saga</td><td>Explicit state, easy debugging, timeouts</td><td>Central critical service</td><td>Medium; or adopt a workflow engine</td></tr>
+      <tr><td>Hosted-fields tokenization</td><td>Shrinks PCI scope dramatically</td><td>PSP lock-in for stored tokens</td><td>Low compliance cost</td></tr>
+      <tr><td>Own card vault</td><td>Multi-PSP routing freedom</td><td>Full PCI DSS scope in-house</td><td>High: audits, HSMs, staff</td></tr>
+      <tr><td>Double-entry ledger</td><td>Auditable, self-checking, replayable</td><td>Modelling effort; hot accounts</td><td>Medium; finance partnership required</td></tr>
+      <tr><td>Multi-CDN delivery</td><td>Resilience and price leverage</td><td>Steering complexity, cache fragmentation</td><td>Contract and tooling overhead</td></tr>
+      <tr><td>Advanced codecs (AV1)</td><td>Lower egress at equal quality</td><td>Encoding compute, device support</td><td>High compute; pays off only for popular titles</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs and Decisions</h2>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  S{"How scarce is the item and how spiky is demand?"} -- "plentiful, normal traffic" --> A["Conditional UPDATE at checkout start"]
+  S -- "scarce, moderate spikes" --> B["Bucketed stock rows + short TTL reservations"]
+  S -- "scarce, extreme spikes (drops)" --> C["Waiting room + Redis gate + async durable reservation"]
+  A --> D{"Back-orders allowed?"}
+  D -- yes --> E["Allow negative available with SLA messaging"]
+  D -- no --> F["Hard constraint in SQL"]
+  C --> F
+  B --> F
+</pre>
+  <figcaption>Figure 11.14 — Choosing an inventory strategy.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> the strategy is driven by the product's scarcity and the demand shape, not by technology preference. Most catalogues need only the conditional update; the expensive machinery is reserved for drops. Whatever the front end, the SQL constraint remains the final arbiter whenever overselling is forbidden.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Decision</th><th>Option A</th><th>Option B</th><th>Guidance</th></tr></thead>
+    <tbody>
+      <tr><td>Capture timing</td><td>Immediate capture</td><td>Authorize now, capture at shipment</td><td>B for physical goods (fewer refunds on cancellations); watch authorization expiry windows</td></tr>
+      <tr><td>Ledger posting</td><td>Synchronous in payment tx</td><td>Async via outbox</td><td>B, with payouts gated on ledger catch-up</td></tr>
+      <tr><td>PSP strategy</td><td>Single PSP</td><td>Multi-PSP with router</td><td>A until volume, geography or availability requirements justify B</td></tr>
+      <tr><td>Segment length</td><td>2 s</td><td>6 s</td><td>Shorter for live/low-latency; longer for VOD efficiency</td></tr>
+      <tr><td>View count consistency</td><td>Exact, synchronous</td><td>Approximate real-time + exact batch</td><td>B; display and audit have different needs</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes and Production Failures</h2>
+  <ul>
+    <li><strong>Read-then-write stock checks</strong> (<code>if (stock &gt; 0) stock--</code> in Java): oversells under concurrency even inside <code>@Transactional</code> at READ COMMITTED.</li>
+    <li><strong>Floating-point money</strong>: <code>double</code> amounts produce rounding drift; use integer minor units or <code>BigDecimal</code> with explicit scale and rounding mode.</li>
+    <li><strong>Treating a timeout as a decline</strong>: the customer retries and is charged twice.</li>
+    <li><strong>Calling the PSP inside a database transaction</strong>: connection-pool exhaustion when the PSP slows down.</li>
+    <li><strong>Mutable balance columns without entries</strong>: impossible to audit or reconcile; one bug silently corrupts money.</li>
+    <li><strong>Trusting webhooks blindly</strong>: unsigned webhooks let anyone mark orders paid; unordered webhooks regress states.</li>
+    <li><strong>Logging request bodies on payment endpoints</strong>: card data or tokens in logs expands PCI scope and leaks secrets.</li>
+    <li><strong>Circuit breakers counting declines as failures</strong>: a fraud wave trips the breaker and fails over healthy traffic.</li>
+    <li><strong>Proxying video bytes through app servers</strong>: NIC-bound servers and enormous bills; use pre-signed URLs and CDNs.</li>
+    <li><strong>Per-user tokens in segment URLs</strong>: every viewer gets a distinct cache key, and the CDN hit ratio collapses.</li>
+    <li><strong>Unaligned keyframes</strong>: visible glitches on every bitrate switch.</li>
+    <li><strong>Updating a counter row per view</strong>: hot-row contention on viral videos.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production Readiness</h2>
+  <h3>13.1 Performance and scalability</h3>
+  <ul>
+    <li>Load-test flash sales with realistic bot-like traffic and verify the waiting-room admission rate end to end.</li>
+    <li>Keep payment transactions short; measure connection-pool wait time as a first-class metric.</li>
+    <li>For video, track CDN hit ratio per provider and per region; alert on drops after deploys that might have changed URL formats.</li>
+  </ul>
+  <h3>13.2 Monitoring</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>System</th><th>Business SLIs</th><th>Technical signals</th></tr></thead>
+    <tbody>
+      <tr><td>Commerce</td><td>Checkout success rate, oversell count (must be 0), cart-to-order conversion</td><td>Reservation expiry rate, saga stuck count, hot-row lock waits</td></tr>
+      <tr><td>Payments</td><td>Authorization rate by PSP/BIN/country, double-charge count, unreconciled amount and age</td><td>PROCESSING intents older than N minutes, webhook lag, breaker state, idempotency conflicts</td></tr>
+      <tr><td>Video</td><td>Time to first frame, rebuffer ratio, playback failures, upload-to-ready time</td><td>Encoder queue depth, spot interruption rate, origin egress, licence errors</td></tr>
+    </tbody>
+  </table></div>
+  <h3>13.3 Reliability</h3>
+  <ul>
+    <li>Game days: kill the payments primary, inject PSP timeouts, drop webhooks, fail a CDN — and verify the system self-heals.</li>
+    <li>Daily automated invariant checks: ledger sums to zero, stock counters equal on-hand minus open reservations, every captured payment has a ledger transaction.</li>
+  </ul>
+  <h3>13.4 Security and compliance</h3>
+  <ul>
+    <li>Annual PCI DSS assessment scoped as narrowly as the architecture allows; quarterly scans; key rotation.</li>
+    <li>Segregation of duties for refunds, manual adjustments and payout changes.</li>
+    <li>Content security: sandboxed media processing, signed delivery URLs, DRM for licensed content.</li>
+  </ul>
+  <h3>13.5 Maintainability</h3>
+  <ul>
+    <li>Explicit state machines in code and database constraints; generated diagrams from the transition table keep documentation honest.</li>
+    <li>PSP adapters with contract tests against sandboxes; reconciliation rules versioned and reviewed like code.</li>
+    <li>Encoding ladders as configuration with A/B quality experiments, not constants in code.</li>
+  </ul>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundational</p>
+    <p>A product page shows "only 3 left". Two users click "Buy" at the same instant for 2 units each. Walk through what happens with (a) read-then-write in Java under READ COMMITTED, (b) the conditional UPDATE of §7.3.</p>
+    <details class="solution"><summary>Solution</summary><div><p>(a) Both transactions read available = 3, both decide 2 ≤ 3, both write available = 1 (or reserved += 2 twice): one sale is lost or 4 units are sold from 3 — an oversell. READ COMMITTED does not prevent this lost-update anomaly. (b) The first UPDATE locks the row and succeeds (reserved becomes 2); the second waits on the row lock, then re-evaluates the WHERE clause against the committed row (PostgreSQL re-checks the predicate on the updated row version), finds available = 1 &lt; 2, updates 0 rows, and the application reports out of stock.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>Write the ledger entries for: a €100 order with a 15% platform fee; a partial refund of €20 (platform refunds its fee proportionally); and the PSP settling the net amount minus a €1.20 processing fee. Show that each transaction balances and compute the final balances of every account.</p>
+    <details class="solution"><summary>Solution</summary><div><p>Capture: psp_clearing +10000; seller_payable −8500; fee_revenue −1500. Refund: seller_payable +1700; fee_revenue +300; psp_clearing −2000. Settlement of net 8000 minus 120 fee: bank_cash +7880; psp_fee_expense +120; psp_clearing −8000. Each sums to zero. Final: psp_clearing 0; seller_payable −6800 (we owe the seller €68); fee_revenue −1200 (€12 revenue, credit-normal); bank_cash +7880; psp_fee_expense +120. Check: 7880 + 120 − 6800 − 1200 = 0. <span class="tag illus">Illustrative</span></p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>Your idempotency table keeps keys for 24 hours. A client retries a confirm 30 hours later with the same key. What happens, and how would you prevent a double charge in that case?</p>
+    <details class="solution"><summary>Solution</summary><div><p>The key has expired, so the request is treated as new. Protection comes from the second layer: the payment intent's state machine. The intent is no longer in <code>REQUIRES_PAYMENT_METHOD</code> (it is <code>REQUIRES_CAPTURE</code> or <code>SUCCEEDED</code>), so the conditional transition fails and the API returns 409/400 "invalid state" instead of charging. This is why idempotency should never rely on a single mechanism: natural keys (one intent per order, enforced by a unique constraint) and state guards are the durable backstop.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>Design reconciliation for a PSP settlement file of 2 million rows per day against your ledger. Specify matching keys, break categories, and how you would make the job idempotent and re-runnable.</p>
+    <details class="solution"><summary>Solution</summary><div><p>Load the file into a staging table keyed by (file_id, row_no) with a checksum (re-loading the same file is a no-op). Normalise (currency, sign, timestamps). Pass 1: exact match on PSP reference to ledger <code>external_ref</code> and amount. Pass 2: for unmatched, match on (amount, currency, date ± 1 day, last4/BIN) with uniqueness checks. Categories: missing internally (PSP charged, we never recorded — critical), missing externally (we think captured, PSP has nothing — check timing), amount mismatch (fees, FX), timing (will match tomorrow), duplicates. Persist results as a reconciliation run with versioned rules; re-running a day replaces that day's results transactionally. Alert on critical categories and on unmatched value above thresholds; age timing breaks and escalate after N days.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced</p>
+    <p>A title will be watched for 50 million hours in its first month at an average of 4 Mbit/s with H.264. AV1 saves 30% bitrate at equal quality. Encoding the AV1 ladder costs an extra 20,000 core-hours at $0.02 per core-hour; egress costs $0.002 per GB. Is it worth it for this title? At what watch time does it break even?</p>
+    <details class="solution"><summary>Solution</summary><div><p>Egress at H.264: 50 × 10⁶ h × 3600 s × 4 Mbit/s / 8 = 9 × 10¹⁰ MB = 90 PB = 9 × 10⁷ GB → $180,000. AV1 saves 30% (assuming most devices can play it) = $54,000. Encoding costs 20,000 × $0.02 = $400. Clearly worth it. Break-even: savings proportional to watch time; $400 / $54,000 × 50 M h ≈ 370,000 hours. Titles below that (most of the long tail) are not worth AV1 at these prices. Adjust for the fraction of AV1-capable devices. <span class="tag illus">Illustrative</span></p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 6 · Expert</p>
+    <p>Extend the payment design to a marketplace where one checkout pays three sellers, one of which later cancels its part. Describe the payment, ledger and payout implications.</p>
+    <details class="solution"><summary>Solution</summary><div><p>Use one payment intent for the customer (one card charge) and allocate it in the ledger to three seller payables plus fees in one balanced transaction (split payment). Seller cancellation triggers a partial refund of that seller's portion: reverse that seller's payable and the associated fee, credit psp_clearing. Payouts are computed from payable balances after a hold period (to cover refunds and chargebacks), so the cancelled portion never leaves. If the cancellation happens after payout, the seller's payable goes negative and is recovered from future payouts (or invoiced). Regulatory note: holding funds for third parties may require licensing or using a PSP's marketplace product that handles fund flows <span class="tag version">Version-sensitive · checked Nov 2026</span>.</p></div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions and Answers</h2>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How do you prevent overselling during a flash sale with 100× normal traffic on one SKU?</summary><div><p>Admission control first (CDN-served page, virtual waiting room admitting at a sustainable rate, bot defences, per-customer limits); then an atomic in-memory gate (Redis Lua decrement that refuses below zero) to fail most attempts in milliseconds; then durable reservations written asynchronously with the database's conditional update as final arbiter; short TTLs and eager releases; reconciliation at the end. Explain why Redis alone is insufficient (async replication) and what happens to the rare loser.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is an idempotency key, where is it stored, and what does it protect against?</summary><div><p>A client-generated unique value sent with a mutating request. The server records it with a request fingerprint and the response, atomically with (or recoverably around) the side effect, and replays the response for duplicates. It protects against duplicates caused by client retries after timeouts or dropped connections. It does not protect against a client generating a new key for the same intent — natural keys and state guards cover that.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> A PSP call times out during authorization. What do you do?</summary><div><p>Do not report failure or retry blindly. Keep the intent in PROCESSING, return "processing" to the caller, and resolve by querying the PSP using the same idempotency key/reference (immediately with backoff and via a recovery job), or wait for the webhook. If the PSP confirms authorization, continue; if it has no record, it is then safe to retry with the same key.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why use double-entry bookkeeping instead of a balance column?</summary><div><p>Because every change becomes an immutable, balanced record: you can audit how a balance came to be, replay history, prove conservation (sum of all accounts is zero), and reconcile against external statements. A mutable balance column loses history and makes bugs silently destructive.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How does tokenization reduce PCI DSS scope?</summary><div><p>Card data is collected by PSP-hosted fields or SDKs directly into the PSP; your systems receive only tokens, which are not cardholder data in the PCI sense. Systems that never store, process or transmit card data (and are not connected to systems that do) are out of the cardholder-data environment, so far fewer controls apply. Scope still includes the pages that embed the hosted fields (script integrity matters) — confirm the exact SAQ with your acquirer.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> Design the upload path for 50 GB video files from flaky mobile connections.</summary><div><p>Multipart/resumable upload direct to object storage with pre-signed part URLs (e.g. 64 MB parts), client-side checksums per part, a server-side session that tracks completed parts so the client can resume after app restarts, completion call that validates all parts and the overall hash, and processing triggered by the storage event. Application servers never touch bytes.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What is adaptive bitrate streaming and why must keyframes be aligned?</summary><div><p>The video is encoded at multiple bitrates/resolutions and segmented; the player switches between renditions per segment based on throughput and buffer. Each segment must begin with a keyframe at the same timestamps across renditions so that a segment from any rendition can follow a segment from any other without decoding errors or visual glitches.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> Your CDN bill doubled after a release though traffic was flat. What happened?</summary><div><p>Most likely the cache hit ratio dropped: a change introduced per-user or per-session query parameters into segment URLs (cache-key fragmentation), changed cache headers, or broke origin shielding. Check hit ratio by path, compare URL formats before/after, and fix by moving auth into signed cookies or token-in-path schemes the CDN normalises.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Write a SQL statement that reserves stock safely without explicit locks.</summary><div><p><code>UPDATE stock SET reserved = reserved + :q WHERE sku_id = :s AND warehouse_id = :w AND on_hand - reserved - committed &gt;= :q</code>, then check that exactly one row was updated. The row lock taken by UPDATE and the predicate re-check make it race-free; insert the reservation row in the same transaction.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> Tell me about a time you found a data-integrity bug in production. How did you limit the damage?</summary><div><p>Strong answers cover detection (an invariant check or reconciliation break), immediate containment (feature flag, stop payouts), quantification (query the blast radius), customer remediation, root cause (e.g. a missing idempotency key on a retry path), and systemic prevention (invariant monitors, tests that inject duplicates and timeouts).</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>Inventory needs reservations with TTLs and conditional updates; flash sales need admission control before any database.</li>
+    <li>Checkout is a saga; a payment timeout is "unknown", never "failed".</li>
+    <li>Idempotency has layers: client key at your API, your key at the PSP, event IDs at consumers, and state machines as the durable backstop.</li>
+    <li>Ledgers are append-only, balanced, and reconciled against external truth; balances are projections.</li>
+    <li>Tokenization via hosted fields is the biggest PCI DSS scope reduction available.</li>
+    <li>Video economics are dominated by egress: CDN hit ratio, ladder design and codec choice are the levers; bytes never pass through app servers.</li>
+    <li>Counting at scale means aggregate-then-write, sketches for distinct counts, and separate display versus audited counts.</li>
+  </ul>
+  <div class="quiz" data-answer="b">
+    <p class="q">During checkout the payments service times out after sending an authorization request to the PSP. What should the checkout saga do?</p>
+    <ol>
+      <li data-k="a">Mark the payment failed and release the inventory reservation</li>
+      <li data-k="b">Keep the order pending and resolve the payment's real status by querying the PSP or awaiting its event</li>
+      <li data-k="c">Immediately retry the authorization with a new idempotency key</li>
+      <li data-k="d">Route the same payment to a secondary PSP</li>
+    </ol>
+    <div class="explain">The charge may have succeeded. Failing or retrying with a new key (or another PSP) risks double charges. Resolve the unknown state first.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">Which ledger rule is correct for a refund of a captured payment?</p>
+    <ol>
+      <li data-k="a">Update the original ledger entries to the new amounts</li>
+      <li data-k="b">Delete the capture transaction</li>
+      <li data-k="c">Post a new balanced transaction that reverses the relevant amounts</li>
+      <li data-k="d">Decrease the customer's balance column directly</li>
+    </ol>
+    <div class="explain">Ledger entries are immutable; corrections and refunds are new balanced transactions, preserving the audit trail.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">Why should card declines not count as failures in the PSP circuit breaker?</p>
+    <ol>
+      <li data-k="a">A decline is a successful technical call with a negative business outcome; counting it could fail over healthy traffic during a fraud wave</li>
+      <li data-k="b">Declines are always retried automatically by the PSP</li>
+      <li data-k="c">Circuit breakers only measure latency</li>
+      <li data-k="d">Declines are reported only via webhooks</li>
+    </ol>
+    <div class="explain">Breakers should measure technical health (timeouts, 5xx, connection errors), not business results.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">A video platform raises its CDN edge hit ratio from 95% to 98%. By how much does edge-miss traffic toward the shield/origin fall?</p>
+    <ol>
+      <li data-k="a">3%</li>
+      <li data-k="b">About 3.2%</li>
+      <li data-k="c">30%</li>
+      <li data-k="d">60%</li>
+    </ol>
+    <div class="explain">Misses go from 5% to 2% of traffic: a reduction of 3/5 = 60%.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">What is the primary reason uploads use pre-signed URLs to object storage rather than streaming through the API service?</p>
+    <ol>
+      <li data-k="a">Object storage compresses video automatically</li>
+      <li data-k="b">It keeps large byte transfers off application servers and lets clients resume per part</li>
+      <li data-k="c">Pre-signed URLs encrypt the video end to end</li>
+      <li data-k="d">API gateways cannot handle HTTP PUT</li>
+    </ol>
+    <div class="explain">Application servers would be NIC-bound and stateful per upload; multipart uploads to storage scale independently and resume cheaply.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">With a 2 ms row-lock hold time, roughly what is the maximum rate of stock updates on a single SKU row?</p>
+    <ol>
+      <li data-k="a">50 per second</li>
+      <li data-k="b">5,000 per second</li>
+      <li data-k="c">500 per second</li>
+      <li data-k="d">Unlimited with enough application servers</li>
+    </ol>
+    <div class="explain">Updates to one row serialise: 1 / 0.002 s = 500/s. Adding servers does not help; bucketing or moving the gate does.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Book</span> Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, O'Reilly, 2017 — ch. 7 (transactions), 9 (consistency), 11 (streams).</li>
+    <li><span class="ref-kind">Paper</span> <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">DeCandia et al., Dynamo: Amazon's Highly Available Key-value Store, SOSP 2007</a>.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://stripe.com/blog/idempotency">Stripe — Designing robust and predictable APIs with idempotency</a>; <a href="https://brandur.org/idempotency-keys">Brandur Leach — Implementing Stripe-like Idempotency Keys in Postgres</a>.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://medium.com/airbnb-engineering/avoiding-double-payments-in-a-distributed-payments-system-2981f6b070bb">Airbnb — Avoiding Double Payments in a Distributed Payments System</a>.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://www.uber.com/blog/money-scale-strong-data/">Uber — Revolutionizing Money Movements at Scale with Strong Data Consistency</a>.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://www.moderntreasury.com/journal/accounting-for-developers-part-i">Modern Treasury — Accounting for Developers</a>.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://www.pcisecuritystandards.org/document_library/">PCI Security Standards Council — Document Library (PCI DSS v4.x)</a>.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://www.rfc-editor.org/rfc/rfc8216">RFC 8216: HTTP Live Streaming</a>.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://netflixtechblog.com/per-title-encode-optimization-7e99442b62a2">Netflix — Per-Title Encode Optimization</a>.</li>
+    <li><span class="ref-kind">Blog</span> <a href="https://shopify.engineering/surviving-flashes-of-high-write-traffic-using-scriptable-load-balancers-part-i">Shopify — Surviving Flashes of High-Write Traffic</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://vitess.io/docs/overview/history/">Vitess — History</a>; <a href="https://ffmpeg.org/ffmpeg-formats.html#hls-2">FFmpeg formats documentation (HLS muxer)</a>.</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

@@ -810,3 +810,292 @@ jobs:
           patterns:
             - pattern-regex: ^(Account|User|Order|Customer)$   # or generate the list of entity class names in CI</code></pre>
 </section>
+
+<section id="applications">
+  <h2>8. Applications: How Teams Keep These Bugs Out</h2>
+  <h3>8.1 Secure-by-construction libraries</h3>
+  <p>Teams with low vulnerability rates make the unsafe thing hard: a shared <code>SafeUrlFetcher</code> is the only HTTP client allowed to take user URLs (enforced by an ArchUnit or Semgrep rule); a <code>TenantScopedRepository</code> base adds tenant predicates automatically; DTO-only controllers are enforced by a lint rule; the HTML templating setup forbids <code>th:utext</code> outside one sanitised component. Google has written publicly about this approach ("safe coding"): eliminating vulnerability classes through safe APIs rather than relying on developer vigilance.</p>
+  <h3>8.2 Security unit tests for API invariants</h3>
+  <p>Every endpoint gets at least three negative tests: unauthenticated → 401; authenticated without the scope/role → 403; authenticated with scope but another user's object → 404. Payload tests assert that unknown fields are rejected (mass assignment) and that responses do not contain forbidden properties (BOPLA) — e.g. asserting that the JSON has no <code>passwordHash</code> or <code>internalNotes</code> key.</p>
+  <h3>8.3 DAST in the pipeline</h3>
+  <p>An OWASP ZAP baseline scan against an ephemeral staging environment on every merge catches missing headers, cookie flags, reflected XSS and information leaks; an authenticated, OpenAPI-driven ZAP scan nightly covers more depth. Findings flow into the same triage process as SCA results.</p>
+  <h3>8.4 Bug bounty and pen testing</h3>
+  <p>External testers find what internal tooling misses — mostly authorization and business-logic flaws. Mature programmes route each valid report back to a root cause ("why did our tests and review not catch this class?") and add a rule, test or library change.</p>
+  <h3>8.5 Reviewing AI-generated code</h3>
+  <p>Assistants reproduce common patterns from training data, including insecure ones (string-built SQL, disabled TLS verification in examples, entities as request bodies, permissive CORS). Treat AI-authored diffs like any external contribution: run the same SAST/SCA gates, require tests for authorization, and apply the checklist in §13. Chapter 1.2 covers the empirical evidence on security of generated code.</p>
+</section>
+
+<section id="case-studies">
+  <h2>9. Case Studies</h2>
+  <h3>9.1 Capital One (2019): SSRF plus an over-privileged role <span class="tag fact">Verified</span></h3>
+  <p>In July 2019 Capital One announced that an outside individual had obtained data on about 100 million people in the US and about 6 million in Canada, mostly from credit card applications. Public court filings and subsequent analysis described a misconfigured web application firewall that could be induced to make requests to the EC2 instance metadata service, yielding temporary credentials for a role that could list and read many S3 buckets. The response from the industry included AWS's IMDSv2 (November 2019), which requires a PUT-obtained session token and limits hop count precisely to blunt this class of SSRF. Lessons: SSRF is an access-control problem (as OWASP 2025 now classifies it); least privilege on instance roles turns a bug into a contained incident; network-layer controls on metadata access are cheap and effective. Sources: <a href="https://www.capitalone.com/digital/facts2019/">Capital One, "Information on the Capital One cyber incident"</a>; <a href="https://aws.amazon.com/blogs/security/defense-in-depth-open-firewalls-reverse-proxies-ssrf-vulnerabilities-ec2-instance-metadata-service/">AWS Security Blog on IMDSv2</a>.</p>
+  <h3>9.2 GitHub mass assignment (2012) <span class="tag fact">Verified</span></h3>
+  <p>A researcher demonstrated that GitHub's public-key update form accepted a <code>user_id</code> parameter that was mass-assigned onto the key record, letting him attach a key to another account (the Rails organisation's). GitHub's incident write-up attributed the root cause to failing to properly check incoming form parameters and audited the codebase; Rails subsequently made "strong parameters" the default. The Spring equivalent is binding a request body to an entity — the pattern §7.1 eliminates. Source: <a href="https://github.blog/news-insights/the-library/public-key-security-vulnerability-and-mitigation/">GitHub blog, "Public Key Security Vulnerability and Mitigation" (March 2012)</a>.</p>
+  <h3>9.3 The Samy worm (2005) <span class="tag fact">Verified</span></h3>
+  <p>A MySpace user found a way past MySpace's input filters to store JavaScript in his profile; anyone viewing it executed the script, which added him as a friend and copied itself to the viewer's profile. It spread to over a million profiles in about 20 hours. Lessons: deny-list filtering of HTML is fragile; stored XSS in social features is wormable; output encoding and CSP (which did not exist then) are the robust answers. Source: <a href="https://samy.pl/myspace/">Samy Kamkar's technical explanation</a>.</p>
+  <h3>9.4 MOVEit Transfer (2023): SQL injection at supply-chain scale <span class="tag fact">Verified</span></h3>
+  <p>As summarised in Chapter 11.1, CVE-2023-34362 — a SQL injection in an internet-facing file-transfer product — was exploited by the Cl0p group to steal data from many organisations. It is a reminder that injection, decades old, remains a live risk in commercial software, and that parameterised queries are not optional anywhere. Source: <a href="https://www.cisa.gov/news-events/cybersecurity-advisories/aa23-158a">CISA advisory AA23-158A</a>.</p>
+  <h3>9.5 Google's CSP research <span class="tag fact">Verified</span></h3>
+  <p>Google researchers analysed CSP deployments across the web and found that the large majority of host-allow-list policies offered no effective XSS protection because of unsafe allowed hosts or <code>unsafe-inline</code>. This work produced the nonce-plus-<code>strict-dynamic</code> recommendation used in §7.4. Source: <a href="https://research.google/pubs/csp-is-dead-long-live-csp-on-the-insecurity-of-whitelists-and-the-future-of-content-security-policy/">Weichselbaum et al., "CSP Is Dead, Long Live CSP!", ACM CCS 2016</a>.</p>
+</section>
+
+<section id="tradeoffs-limits">
+  <h2>10. Advantages and Limits of Each Defence</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Defence</th><th>Stops</th><th>Does not stop</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td>Parameter binding</td><td>SQL/JPQL value injection</td><td>Identifier injection (ORDER BY, table names)</td><td>None</td></tr>
+      <tr><td>Input validation</td><td>Malformed input, some attacks</td><td>Valid-but-dangerous data in other contexts</td><td>Low</td></tr>
+      <tr><td>Contextual output encoding</td><td>Most reflected/stored XSS</td><td>DOM XSS in client code; escape hatches</td><td>Low (template engines)</td></tr>
+      <tr><td>Strict CSP (nonce)</td><td>Execution of injected scripts</td><td>HTML injection without script (e.g. phishing forms), logic bugs</td><td>Medium: template changes, inline handlers removed</td></tr>
+      <tr><td>Trusted Types</td><td>DOM XSS at sinks</td><td>Server-side XSS; non-supporting browsers</td><td>Medium: refactor sinks, third-party libraries</td></tr>
+      <tr><td>SameSite cookies</td><td>Most cross-site CSRF</td><td>Same-site attackers; GET state changes under Lax</td><td>Low; may break legitimate cross-site flows</td></tr>
+      <tr><td>CSRF tokens</td><td>CSRF generally</td><td>XSS (which can read tokens)</td><td>Low–medium for SPAs</td></tr>
+      <tr><td>SSRF allow-list + IP checks</td><td>Most SSRF</td><td>Bugs in other fetch paths; open redirects on allowed hosts</td><td>Medium</td></tr>
+      <tr><td>IMDSv2 / metadata blocking</td><td>Credential theft via simple SSRF</td><td>Access to other internal services</td><td>Low</td></tr>
+      <tr><td>WAF</td><td>Known payload patterns; virtual patching</td><td>BOLA, logic flaws, novel encodings</td><td>Licence + tuning; false positives</td></tr>
+      <tr><td>Rate limiting</td><td>Brute force, scraping, cost abuse</td><td>Distributed low-and-slow abuse</td><td>State store; tuning</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="tradeoffs">
+  <h2>11. Engineering Trade-offs</h2>
+  <h3>11.1 Validate, encode or sanitise?</h3>
+  <figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+  A["Untrusted value"] --> B{"Is it going into an interpreter (SQL, shell, URL fetch, path)?"}
+  B -- yes --> C["Use a typed/parameterised API; allow-list identifiers"]
+  B -- no --> D{"Is it rendered in HTML/JS?"}
+  D -- yes --> E{"Must it contain markup?"}
+  E -- no --> F["Contextual encoding via template engine"]
+  E -- yes --> G["Allow-list sanitizer + CSP"]
+  D -- no --> H["Validate shape and bounds; store as data"]
+</pre>
+  <figcaption>Figure 6 — Choosing between validation, encoding and sanitisation.</figcaption>
+  </figure>
+  <p><strong>Reading the diagram:</strong> validation always applies at the boundary, but it is the <em>destination</em> that determines the primary defence. Sanitisation is a last resort for genuinely rich content because sanitizers must anticipate every browser quirk; encoding is simpler and safer when markup is not needed.</p>
+  <h3>11.2 Where to rate-limit</h3>
+  <p>Gateway limits are cheap and protect everything, but key only on what the gateway knows (API key, IP, token subject). Service-level limits can key on business entities (per phone number, per card, per tenant) and protect business flows (API6). <span class="tag opinion">Opinion</span> Do both: coarse at the edge for availability, precise in the service for abuse.</p>
+  <h3>11.3 Strict CSP: effort vs benefit</h3>
+  <p>Retrofitting a nonce CSP onto a legacy server-rendered app with inline handlers can take weeks; a modern SPA built by a bundler often needs only a nonce on the bootstrap script. Prioritise by exposure: authenticated apps handling sensitive data and apps with user-generated content first. Start in report-only mode and fix violations iteratively.</p>
+  <h3>11.4 Generic 404 vs precise errors</h3>
+  <p>Returning 404 for unauthorised objects hides existence but can confuse legitimate clients and support teams. A reasonable compromise: 404 externally, with the precise reason (not found vs not permitted) in the server log and audit trail, correlated by request ID.</p>
+</section>
+
+<section id="mistakes">
+  <h2>12. Common Mistakes</h2>
+  <ul>
+    <li><strong>Disabling CSRF globally</strong> in a service that also has a cookie-based login form or admin UI.</li>
+    <li><strong>Assuming JSON content type prevents CSRF.</strong> Some frameworks accept form-encoded or <code>text/plain</code> bodies on JSON endpoints; enforce <code>Content-Type: application/json</code> and still use tokens with cookies.</li>
+    <li><strong>CORS with reflected origins and credentials</strong> — echoing any <code>Origin</code> into <code>Access-Control-Allow-Origin</code> with <code>Allow-Credentials: true</code> lets any site read authenticated responses.</li>
+    <li><strong>Validating a URL, then fetching a different one</strong> (following redirects, re-resolving DNS, or using a different parser than the HTTP client).</li>
+    <li><strong>Blocking <code>169.254.169.254</code> by string match</strong> — alternative encodings and IPv6 forms bypass it; classify resolved IPs instead.</li>
+    <li><strong>Sanitising input once at write time</strong> and then rendering it in a different context (JS, attribute) at read time.</li>
+    <li><strong>Using <code>th:utext</code> / <code>dangerouslySetInnerHTML</code></strong> for convenience.</li>
+    <li><strong>String-building <code>ORDER BY</code></strong> from a request parameter.</li>
+    <li><strong>Returning entities from controllers</strong>, leaking fields added later (BOPLA via schema evolution).</li>
+    <li><strong>Unbounded pagination, file sizes, JSON nesting, regexes</strong> (ReDoS) and batch sizes.</li>
+    <li><strong>Trusting third-party responses</strong> (API10): rendering partner-provided HTML, following partner-provided redirect URLs, or deserializing partner payloads polymorphically.</li>
+    <li><strong>Old API versions left running</strong> (API9) without the fixes applied to the current version.</li>
+    <li><strong>Relying on the WAF</strong> instead of fixing the code.</li>
+  </ul>
+</section>
+
+<section id="production">
+  <h2>13. Production: The Secure Code Review Checklist</h2>
+  <p>Use this checklist on every pull request that touches an endpoint, a query, a template, an outbound call, or file handling. It is deliberately short enough to actually use.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Area</th><th>Questions</th></tr></thead>
+    <tbody>
+      <tr><td>Authentication</td><td>Is the endpoint covered by an explicit rule (no accidental <code>permitAll</code>)? Are new chains/matchers ordered correctly?</td></tr>
+      <tr><td>Function-level authz</td><td>Who may call this? Is it enforced by URL rule or <code>@PreAuthorize</code>, not just hidden in the UI?</td></tr>
+      <tr><td>Object-level authz</td><td>Every ID from the request — is ownership/tenancy checked in the query? Also in list/search/export variants?</td></tr>
+      <tr><td>Property-level authz</td><td>Request DTO contains only client-settable fields? Response DTO only visible fields? Unknown fields rejected?</td></tr>
+      <tr><td>Injection</td><td>Any string concatenation into SQL/JPQL/Mongo/LDAP/shell/SpEL/templates? Identifiers allow-listed?</td></tr>
+      <tr><td>Output</td><td>Any unescaped rendering? User URLs with scheme checks? CSP intact?</td></tr>
+      <tr><td>CSRF/CORS</td><td>Cookie auth → CSRF on? CORS origins explicit, no wildcard with credentials?</td></tr>
+      <tr><td>SSRF</td><td>Any outbound call with user-influenced host/URL? Using the safe fetcher? Redirects off?</td></tr>
+      <tr><td>Files</td><td>User-influenced paths? Normalised and confined? Upload size/type validated? Archives extracted safely?</td></tr>
+      <tr><td>Deserialization</td><td>Any native deserialization, polymorphic Jackson, YAML from untrusted sources?</td></tr>
+      <tr><td>Resources</td><td>Limits on page size, payload size, rate, timeouts, downstream cost?</td></tr>
+      <tr><td>Errors</td><td>Fail closed? No stack traces or internals in responses?</td></tr>
+      <tr><td>Logging</td><td>Security events logged? No secrets/tokens/PII in logs? CR/LF stripped?</td></tr>
+      <tr><td>Secrets &amp; deps</td><td>No secrets in code/config? New dependencies justified, pinned, scanned?</td></tr>
+      <tr><td>Tests</td><td>Negative tests for 401/403/404 and mass assignment present?</td></tr>
+    </tbody>
+  </table></div>
+  <h3>13.1 Monitoring</h3>
+  <p>Track 401/403/404 rates per endpoint and per principal (BOLA probing shows as many 404s from one principal across sequential IDs), 429 rates (limits too tight or abuse), CSP violation reports (new XSS or a broken deployment), WAF block rates, and outbound connection attempts denied by the egress proxy (SSRF attempts or misconfiguration).</p>
+  <h3>13.2 Performance</h3>
+  <p>Most of these controls are cheap. Exceptions: HTML sanitisation of large documents (cache sanitised output), distributed rate-limit state (Redis round-trip per request — use local pre-filters or batching), and egress proxies (connection reuse matters). Measure before and after.</p>
+  <h3>13.3 Reliability</h3>
+  <p>Rate limiters and security filters are in the request path; if the Redis behind a distributed limiter fails, decide explicitly whether to fail open (availability) or closed (abuse protection), per endpoint. Login and OTP endpoints should fail closed; catalogue browsing can fail open with local limits.</p>
+</section>
+
+<section id="exercises">
+  <h2>14. Exercises</h2>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 1 · Foundation</p>
+    <p>Classify each finding against the OWASP API Security Top 10 2023: (a) <code>GET /api/users/{id}/addresses</code> returns any user's addresses; (b) <code>GET /api/users/me</code> returns <code>passwordHash</code>; (c) <code>POST /api/admin/refunds</code> works with a customer token; (d) <code>POST /api/otp/send</code> has no per-number limit; (e) <code>v1</code> of the API, deprecated two years ago, is still deployed without the latest fixes.</p>
+    <details class="solution"><summary>Solution</summary><div><p>(a) API1 BOLA. (b) API3 BOPLA (excessive exposure). (c) API5 BFLA. (d) API4 Unrestricted Resource Consumption (and API6 if abused as a business flow, e.g. SMS pumping). (e) API9 Improper Inventory Management.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 2 · Intermediate</p>
+    <p>This code builds a report query. Identify every vulnerability and rewrite it safely.</p>
+<pre><code class="language-java">@GetMapping("/api/reports")
+List&lt;Map&lt;String,Object&gt;&gt; report(@RequestParam String from, @RequestParam String sort, @RequestParam String tenant) {
+    return jdbc.queryForList("SELECT * FROM orders WHERE tenant_id = '" + tenant +
+        "' AND created_at &gt;= '" + from + "' ORDER BY " + sort);
+}</code></pre>
+    <details class="solution"><summary>Solution</summary><div>
+      <p>Problems: SQL injection via <code>tenant</code>, <code>from</code> and <code>sort</code>; tenant taken from the request instead of the token (BOLA across tenants); <code>SELECT *</code> exposing all columns (BOPLA); no limit (API4); <code>from</code> not validated as a date.</p>
+<pre><code class="language-java">private static final Map&lt;String, String&gt; SORT = Map.of("date", "created_at", "total", "total_cents");
+
+@GetMapping("/api/reports")
+List&lt;OrderSummary&gt; report(@RequestParam LocalDate from, @RequestParam(defaultValue = "date") String sort,
+                          @AuthenticationPrincipal Jwt jwt) {
+    String tenant = jwt.getClaimAsString("tenant_id");              // from the token, not the request
+    String sql = "SELECT id, created_at, total_cents FROM orders WHERE tenant_id = :t AND created_at &gt;= :f ORDER BY "
+               + SORT.getOrDefault(sort, "created_at") + " LIMIT 500";
+    return named.query(sql, Map.of("t", tenant, "f", from.atStartOfDay()),
+        (rs, i) -&gt; new OrderSummary(rs.getObject("id", UUID.class), rs.getTimestamp("created_at").toInstant(), rs.getLong("total_cents")));
+}</code></pre>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 3 · Intermediate</p>
+    <p>A team says: "Our API uses JWTs in an HttpOnly cookie, so XSS can't steal tokens and we disabled CSRF because it's a REST API." Evaluate.</p>
+    <details class="solution"><summary>Solution</summary><div><p>HttpOnly prevents token theft by script, but cookies are ambient credentials, so the API is CSRF-able: re-enable CSRF protection (tokens) and set <code>SameSite=Lax</code> or <code>Strict</code>. Also ensure CORS is not reflecting arbitrary origins with credentials, require <code>Content-Type: application/json</code>, and remember XSS can still act as the user during the session — CSP remains necessary.</p></div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 4 · Advanced</p>
+    <p>Design a "webhook URL" feature where tenants register an HTTPS endpoint that your platform POSTs events to. Address SSRF, abuse and integrity.</p>
+    <details class="solution"><summary>Solution</summary><div>
+      <ul>
+        <li>Validate at registration and at every delivery: HTTPS only, port 443 (or allow-listed), no credentials in URL, resolved IPs must be public; re-check at connect time (Go <code>Dialer.Control</code>-style or egress proxy) to defeat DNS rebinding.</li>
+        <li>Send deliveries from a dedicated worker pool in an isolated network segment whose egress permits only the public internet — no route to internal services or metadata.</li>
+        <li>Disable redirects; short timeouts; cap response size read (you only need the status code).</li>
+        <li>Sign each delivery with an HMAC over timestamp + body using a per-tenant secret, so receivers can verify integrity and reject replays.</li>
+        <li>Verify ownership of the endpoint (challenge on registration), rate-limit per tenant and per destination host, and back off on failures so you cannot be weaponised to flood a third party.</li>
+      </ul>
+    </div></details>
+  </div>
+  <div class="exercise">
+    <p class="exercise-title">Exercise 5 · Advanced (local lab)</p>
+    <p>Run WebGoat locally (<code>docker run --rm -p 127.0.0.1:8080:8080 -p 127.0.0.1:9090:9090 webgoat/webgoat</code>). Complete its SQL injection and XSS lessons, then for each lesson write the Spring fix you would apply to the equivalent code in your own service, plus a regression test.</p>
+    <details class="solution"><summary>Solution</summary><div><p>For SQL injection lessons, the fix is parameter binding (<code>NamedParameterJdbcTemplate</code> or JPA named parameters) plus allow-listed identifiers; a regression test submits a quote-containing value and asserts that the result set matches a literal search (no extra rows). For XSS lessons, the fix is template auto-escaping and removing <code>utext</code>-style escape hatches; a test renders a value containing <code>&lt;script&gt;</code> and asserts the response body contains <code>&amp;lt;script&amp;gt;</code>. Always keep WebGoat bound to 127.0.0.1 — it is deliberately vulnerable.</p></div></details>
+  </div>
+</section>
+
+<section id="interview">
+  <h2>15. Interview Questions</h2>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why is BOLA the #1 API risk, and why don't scanners find it?</summary><div><p>Every endpoint taking an object ID needs a business-specific ownership check, so the opportunity for omission is everywhere. Scanners lack the knowledge of who should own what; detecting BOLA requires two identities and a model of ownership — that is, tests written by people who understand the domain.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Explain why prepared statements prevent SQL injection but not ORDER BY injection.</summary><div><p>Placeholders carry literal values in a separate protocol field after the query is parsed, so they cannot change structure. Identifiers and keywords are part of the structure and cannot be placeholders, so they are often concatenated; the fix is mapping user choices to a fixed allow-list of SQL fragments.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Does a stateless REST API need CSRF protection?</summary><div><p>Only if the browser sends credentials automatically — cookies, HTTP Basic, client certificates. Bearer tokens set explicitly in the Authorization header are not sent by cross-site forms, so CSRF does not apply; tokens stored in cookies bring it back.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Architecture</span> How would you design defence against SSRF for a URL-preview feature?</summary><div><p>Isolated fetcher service in a network segment with internet-only egress; scheme/host/port validation; resolve and classify IPs and dial the vetted IP (or check at connect time); no redirects or re-validate each; timeouts and size limits; strip and re-encode content; IMDSv2 and metadata blocking; least-privilege identity for the fetcher; logging of denied destinations.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> How do you prevent mass assignment in Spring?</summary><div><p>Never bind request bodies to entities; use request records with only settable fields; map explicitly; enable <code>FAIL_ON_UNKNOWN_PROPERTIES</code>; for form binding use <code>setAllowedFields</code> or constructor/declarative binding; test that unknown/privileged fields are rejected.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> What does a strict CSP protect against, and what does it not?</summary><div><p>It prevents execution of injected scripts lacking the nonce (and inline handlers), turning most XSS into non-executing HTML injection. It does not prevent HTML injection used for phishing, data exfiltration via allowed connections, logic flaws, or attacks via compromised trusted scripts. It is defense in depth on top of encoding.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Scenario</span> A pen test shows that changing an invoice ID in the mobile app's API call returns another customer's invoice. What do you do in the next 24 hours and the next month?</summary><div><p>24 hours: hot-fix with owner-scoped query; search logs for cross-customer access patterns (many invoice IDs per principal, 200s for non-owned IDs) to determine exposure; engage incident response and privacy/legal if data was accessed. Month: audit all endpoints taking IDs; add a negative-test template and an ArchUnit/Semgrep rule; introduce tenant-scoped repositories or RLS; add BOLA monitoring alerts.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Coding</span> Write a safe file-download path check in Java.</summary><div><p>Resolve the base with <code>toRealPath()</code>; resolve the candidate against it, <code>normalize()</code>, check <code>startsWith(base)</code> using <code>Path</code>, then <code>toRealPath()</code> again to defeat symlinks and re-check; better still, look up the stored name by an authorised ID rather than accepting a path (see §7.7).</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Conceptual</span> Why is Java native deserialization of untrusted data dangerous even if your code never calls dangerous methods?</summary><div><p>The stream selects classes from the classpath and triggers their deserialization hooks; gadget chains of ordinary library classes can reach reflection or command execution. Your code does not need to call anything — <code>readObject</code> does it. Use data-only formats or strict <code>ObjectInputFilter</code> allow-lists.</p></div></details>
+  <details class="qa"><summary><span class="qa-kind">Behavioral</span> How do you get a team to adopt a secure code review checklist without slowing delivery?</summary><div><p>Keep it short (one table), automate the mechanical items (SAST rules, ArchUnit, test templates), attach it to the PR template only for relevant file types, show a concrete bug it would have caught, and measure review time before and after. Make the safe path the easiest path via libraries.</p></div></details>
+</section>
+
+<section id="knowledge-check">
+  <h2>16. Knowledge Check</h2>
+  <ul class="takeaways">
+    <li>API risks are dominated by authorization at three levels: object (BOLA), property (BOPLA/mass assignment) and function (BFLA).</li>
+    <li>Bind request bodies to DTOs, reject unknown fields, return view DTOs.</li>
+    <li>Parameterise every query; allow-list identifiers; the same applies to JPQL and MongoDB.</li>
+    <li>Encode output for its context; sanitise only true rich text; add a nonce-based strict CSP and Trusted Types.</li>
+    <li>CSRF matters whenever credentials are ambient (cookies); SameSite plus tokens; bearer-header APIs are not CSRF-able.</li>
+    <li>SSRF: allow-list, classify resolved IPs, check at connect time, no redirects, egress controls, IMDSv2, least-privilege roles.</li>
+    <li>Never deserialize untrusted native formats; confine file paths; limit every resource.</li>
+  </ul>
+  <div class="quiz" data-answer="c">
+    <p class="q">A user updates their profile and adds <code>"isAdmin": true</code> to the JSON; the change persists. Which API Top 10 risk is this?</p>
+    <ol>
+      <li data-k="a">API1 BOLA</li>
+      <li data-k="b">API5 BFLA</li>
+      <li data-k="c">API3 BOPLA (mass assignment)</li>
+      <li data-k="d">API8 Security Misconfiguration</li>
+    </ol>
+    <div class="explain">Writing a property the caller is not authorised to change is property-level authorization (mass assignment is part of API3).</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">Which rendering is safe for an untrusted invoice note in Thymeleaf?</p>
+    <ol>
+      <li data-k="a"><code>th:utext="${note}"</code></li>
+      <li data-k="b"><code>th:text="${note}"</code></li>
+      <li data-k="c">String concatenation into the template</li>
+      <li data-k="d"><code>th:utext</code> after removing the word "script"</li>
+    </ol>
+    <div class="explain"><code>th:text</code> HTML-encodes; <code>utext</code> renders raw HTML and deny-list filtering is bypassable.</div>
+  </div>
+  <div class="quiz" data-answer="d">
+    <p class="q">An API uses only <code>Authorization: Bearer</code> headers set by JavaScript, with no cookies. Which statement is correct?</p>
+    <ol>
+      <li data-k="a">It must enable CSRF tokens on every endpoint</li>
+      <li data-k="b">CORS alone protects it from CSRF and XSS</li>
+      <li data-k="c">SameSite cookies are required</li>
+      <li data-k="d">It is not exposed to CSRF, because browsers do not attach that header to cross-site requests automatically</li>
+    </ol>
+    <div class="explain">CSRF depends on ambient credentials; explicit headers are not ambient.</div>
+  </div>
+  <div class="quiz" data-answer="a">
+    <p class="q">What makes IMDSv2 effective against typical SSRF?</p>
+    <ol>
+      <li data-k="a">Metadata access requires a session token obtained via a PUT request with a custom header, which most SSRF primitives cannot issue</li>
+      <li data-k="b">It encrypts metadata responses</li>
+      <li data-k="c">It moves the metadata service to a public IP</li>
+      <li data-k="d">It removes IAM roles from instances</li>
+    </ol>
+    <div class="explain">Simple SSRF usually allows only GETs without custom headers; the PUT + token requirement (and hop limit) blocks them.</div>
+  </div>
+  <div class="quiz" data-answer="c">
+    <p class="q">A fixed-window limiter allows 100 requests per minute. What is the worst-case number of requests admitted within a few seconds around a window boundary?</p>
+    <ol>
+      <li data-k="a">100</li>
+      <li data-k="b">150</li>
+      <li data-k="c">About 200</li>
+      <li data-k="d">Unlimited</li>
+    </ol>
+    <div class="explain">100 at the end of one window plus 100 at the start of the next; sliding windows and token buckets avoid this boundary burst.</div>
+  </div>
+  <div class="quiz" data-answer="b">
+    <p class="q">Which Go mechanism checks the actual destination IP at connection time, defeating DNS rebinding in SSRF defences?</p>
+    <ol>
+      <li data-k="a"><code>http.Client.CheckRedirect</code></li>
+      <li data-k="b"><code>net.Dialer.Control</code></li>
+      <li data-k="c"><code>url.Parse</code></li>
+      <li data-k="d"><code>html/template</code></li>
+    </ol>
+    <div class="explain"><code>Control</code> runs on the resolved address just before the socket connects.</div>
+  </div>
+</section>
+
+<section id="further-reading">
+  <h2>17. Further Reading</h2>
+  <ul class="refs">
+    <li><span class="ref-kind">Spec</span> <a href="https://owasp.org/API-Security/editions/2023/en/0x11-t10/">OWASP API Security Top 10 2023</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://cheatsheetseries.owasp.org/">OWASP Cheat Sheet Series</a> — SQL Injection Prevention, XSS Prevention, DOM XSS, CSRF Prevention, SSRF Prevention, Deserialization, Mass Assignment, File Upload.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.spring.io/spring-security/reference/servlet/exploits/csrf.html">Spring Security: CSRF</a> and <a href="https://docs.spring.io/spring-security/reference/servlet/exploits/headers.html">Security HTTP Response Headers</a>.</li>
+    <li><span class="ref-kind">Spec</span> <a href="https://www.w3.org/TR/CSP3/">W3C Content Security Policy Level 3</a>; <a href="https://w3c.github.io/trusted-types/dist/spec/">Trusted Types</a>.</li>
+    <li><span class="ref-kind">Paper</span> <a href="https://research.google/pubs/csp-is-dead-long-live-csp-on-the-insecurity-of-whitelists-and-the-future-of-content-security-policy/">Weichselbaum et al., "CSP Is Dead, Long Live CSP!" (CCS 2016)</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html">AWS: Configure the Instance Metadata Service (IMDSv2)</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://docs.oracle.com/en/java/javase/21/core/serialization-filtering1.html">Java SE: Serialization Filtering</a>.</li>
+    <li><span class="ref-kind">Course</span> <a href="https://portswigger.net/web-security">PortSwigger Web Security Academy</a> — free labs hosted for authorised practice.</li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/WebGoat/WebGoat">OWASP WebGoat</a> and <a href="https://github.com/juice-shop/juice-shop">OWASP Juice Shop</a>.</li>
+    <li><span class="ref-kind">Docs</span> <a href="https://semgrep.dev/docs/">Semgrep documentation</a>; <a href="https://codeql.github.com/docs/">CodeQL documentation</a>; <a href="https://www.zaproxy.org/docs/">ZAP documentation</a>.</li>
+    <li><span class="ref-kind">Repo</span> <a href="https://github.com/bucket4j/bucket4j">Bucket4j</a>.</li>
+  </ul>
+</section>
+
+</article>
+<script src="../assets/js/toc.js"></script>
+<script src="../assets/js/widgets.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

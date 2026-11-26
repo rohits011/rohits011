@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unsupervised Learning: Clustering &amp; Dimensionality Reduction — AI-Era Software Engineering</title>
+<meta name="description" content="K-means and k-means++, silhouette and elbow methods, hierarchical clustering, DBSCAN, Gaussian mixtures and EM, PCA via eigen-decomposition and SVD, t-SNE, UMAP and isolation forests, with production applications.">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script src="../assets/js/theme-init.js"></script>
+</head>
+<body data-chapter="p6-04-unsupervised-learning" data-root="..">
+<article class="chapter" id="content">
+
+<header class="chapter-head">
+  <p class="eyebrow">Part 6 · Chapter 4</p>
+  <h1>Unsupervised Learning: Clustering &amp; Dimensionality Reduction</h1>
+  <p class="lede">Most data has no labels. Unsupervised learning finds structure anyway: groups of similar customers, a handful of directions that explain most of the variation in hundreds of metrics, the rare request that looks like nothing seen before. This chapter derives the main algorithms (k-means, hierarchical clustering, DBSCAN, Gaussian mixtures, PCA, t-SNE, UMAP, isolation forests), shows exactly what each one optimises, and is candid about the central difficulty: without labels, "good" is defined by you, so evaluation needs as much care as the algorithm.</p>
+  <ul class="chapter-meta">
+    <li><strong>Prerequisites:</strong> Chapter 6.1 (distances, eigenvectors, SVD, Gaussian distribution, MLE) and Chapter 6.2 (scaling).</li>
+    <li><strong>You will be able to:</strong> implement k-means and PCA from scratch; choose k with elbow and silhouette analysis; pick between k-means, hierarchical, DBSCAN and GMMs based on cluster shape and noise; explain EM; compute and interpret explained variance; use t-SNE and UMAP responsibly for visualisation; and build anomaly detectors with isolation forests for logs and metrics.</li>
+  </ul>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction: Structure Without Labels</h2>
+  <p>In supervised learning, the labels define the goal. In unsupervised learning you only have inputs x, and you ask the data to describe itself. Three questions cover most practical uses:</p>
+  <ul>
+    <li><strong>Clustering:</strong> which examples belong together? Customer segments, groups of similar log lines, families of malware samples, near-duplicate documents.</li>
+    <li><strong>Dimensionality reduction:</strong> can these many correlated measurements be summarised by a few coordinates? Compressing 500 service metrics into 10 components, plotting 768-dimensional embeddings in 2-D, denoising inputs before a downstream model.</li>
+    <li><strong>Anomaly detection:</strong> which examples do not fit? A login from an impossible location, a latency pattern unlike any previous deploy, a transaction that is isolated from everything else.</li>
+  </ul>
+  <p>The difficulty is that there is no single right answer. Customers can be segmented by spend, by behaviour, or by product mix; all three are valid clusterings of the same table. The algorithm's objective (a distance, a density, a likelihood) encodes an assumption about what "similar" means, and the features you feed it encode the rest. So the engineering skill is less about running <code>KMeans.fit</code> and more about choosing representation, objective and evaluation so that the structure found is useful for a decision.</p>
+
+  <div class="bridge">
+    <h4>Bridging from Java &amp; Spring Boot</h4>
+    <dl>
+      <dt>What you already know</dt><dd>You have grouped things by key (<code>Collectors.groupingBy</code>), deduplicated with hashes, set static alert thresholds in Prometheus, and grepped logs for unfamiliar error messages. Clustering is "group by" when there is no key; anomaly detection is a learned alert threshold in many dimensions; PCA is compression with a known, bounded loss.</dd>
+      <dt>Why that is not enough</dt><dd>Static thresholds fail on multi-dimensional, seasonal, evolving behaviour: a CPU of 70% is normal at peak and alarming at 4 a.m. Exact-match grouping misses near-duplicates and new variants. With hundreds of metrics, humans cannot see the correlations.</dd>
+      <dt>The modern approach</dt><dd>Represent entities as scaled feature vectors or learned embeddings, then cluster (k-means/GMM for compact groups, HDBSCAN/DBSCAN for arbitrary shapes and noise), reduce (PCA for compression and preprocessing, UMAP/t-SNE for visualisation only), and score anomalies (isolation forest, reconstruction error, density). Validate with domain experts and downstream metrics.</dd>
+      <dt>Where Python and Go fit</dt><dd>Exploration and model fitting in Python (scikit-learn, umap-learn, hdbscan support in scikit-learn). Serving is cheap and portable: k-means assignment is "nearest centroid", a dot-product loop over k centroids you can ship as a JSON array to a Java or Go service; PCA projection is one matrix multiply; isolation forests export to ONNX.</dd>
+      <dt>In production</dt><dd>Segments are recomputed in batch (nightly Spark or Python jobs) and written to a customer attribute table that Spring services read; anomaly scores are computed in streaming jobs and turned into alerts; embedding projections feed internal dashboards for model debugging.</dd>
+      <dt>Use it when / avoid it when</dt><dd>Use it for exploration, compression, segmentation and novelty detection when labels are unavailable or expensive. Avoid it when you actually have labels for the decision (use supervised learning), or when stakeholders will treat discovered clusters as ground truth without validation.</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="history">
+  <h2>2. History</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Year</th><th>Milestone</th></tr></thead>
+    <tbody>
+      <tr><td>1901, 1933</td><td>Karl Pearson introduces principal components ("lines and planes of closest fit"); Harold Hotelling develops PCA for correlated variables (1933).</td></tr>
+      <tr><td>1957–1967</td><td>Stuart Lloyd devises the k-means iteration at Bell Labs (1957, published 1982); James MacQueen coins "k-means" (1967).</td></tr>
+      <tr><td>1963</td><td>Ward's minimum-variance criterion for hierarchical clustering.</td></tr>
+      <tr><td>1977</td><td>Dempster, Laird and Rubin formalise the EM algorithm.</td></tr>
+      <tr><td>1987</td><td>Rousseeuw introduces silhouettes for cluster validation.</td></tr>
+      <tr><td>1996</td><td>Ester, Kriegel, Sander, Xu: DBSCAN (KDD 1996).</td></tr>
+      <tr><td>2007</td><td>Arthur and Vassilvitskii: k-means++ seeding with an O(log k) approximation guarantee.</td></tr>
+      <tr><td>2008</td><td>van der Maaten and Hinton: t-SNE (JMLR). Liu, Ting, Zhou: Isolation Forest (ICDM).</td></tr>
+      <tr><td>2013</td><td>Campello, Moulavi, Sander: HDBSCAN (hierarchical density-based clustering).</td></tr>
+      <tr><td>2018</td><td>McInnes, Healy, Melville: UMAP (arXiv:1802.03426).</td></tr>
+      <tr><td>2023</td><td>scikit-learn 1.3 adds <code>HDBSCAN</code> <span class="tag version">Version-sensitive · checked Nov 2026</span>.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The older methods (PCA, k-means, hierarchical) remain the workhorses because they are fast, well understood and easy to deploy. The newer ones (t-SNE, UMAP, HDBSCAN) arrived when datasets of high-dimensional embeddings made visualisation and density-based grouping essential.</p>
+</section>
+
+<section id="fundamentals">
+  <h2>3. Fundamentals</h2>
+
+  <h3>3.1 Similarity is a design decision</h3>
+  <p>Every clustering algorithm needs a notion of closeness. For scaled tabular features, Euclidean distance is the default; for embeddings, cosine distance (1 − cosine similarity); for binary feature sets (which products did the customer buy?), Jaccard distance (1 − |A ∩ B| / |A ∪ B|). Scaling matters enormously (Chapter 6.2): cluster customers on (annual spend in dollars, number of orders) without scaling and you are clustering on spend alone. Feature choice matters even more: clustering on behaviour features finds behavioural segments; clustering on demographics finds demographic ones.</p>
+
+  <h3>3.2 K-means</h3>
+  <p><strong>Intuition.</strong> Choose k "centres". Assign each point to its nearest centre. Move each centre to the average of the points assigned to it. Repeat until nothing changes. The result is k groups, each summarised by its centre (centroid), and the space is carved into regions (Voronoi cells) closest to each centroid.</p>
+  <p><strong>Objective.</strong> K-means minimises the total squared distance from points to their assigned centroid, the <em>within-cluster sum of squares</em> (WCSS, called <code>inertia_</code> in scikit-learn):</p>
+  \[ J = \sum_{i=1}^{m}\big\|\mathbf{x}_i - \boldsymbol\mu_{c(i)}\big\|_2^2. \]
+  <p><strong>Worked example (1-D).</strong> Points 1, 2, 3, 10, 11, 12 and k = 2, starting centroids at 1 and 2. Assign: 1 → c₁; 2, 3, 10, 11, 12 → c₂ (closer to 2). Update: μ₁ = 1, μ₂ = (2 + 3 + 10 + 11 + 12)/5 = 7.6. Reassign: 1, 2, 3 are closer to 1 than 7.6 (3 is 2 from 1, 4.6 from 7.6), 10, 11, 12 to 7.6. Update: μ₁ = 2, μ₂ = 11. Reassign: no change. Converged with J = (1 + 0 + 1) + (1 + 0 + 1) = 4.</p>
+  <p><strong>Why it converges.</strong> Each step can only lower J: the assignment step picks the closest centroid for each point (cannot increase distance), and the update step sets each centroid to the mean, which is the point minimising the sum of squared distances to a set (proved in §6). J is bounded below and there are finitely many assignments, so it stops. But it converges to a <em>local</em> minimum, which depends on initialisation.</p>
+  <p><strong>Assumptions baked in.</strong> Squared Euclidean distance and mean centroids favour <em>convex, roughly spherical clusters of similar size</em>. K-means will split one elongated cluster in two and merge two nearby round ones; it cannot find rings or crescents; every point is forced into some cluster, including outliers, which drag centroids. And you must choose k.</p>
+
+  <h3>3.3 K-means++ initialisation</h3>
+  <p>Random initial centroids often start two centroids in the same true cluster, leaving another cluster without one, and Lloyd's iterations cannot escape. <strong>K-means++</strong> spreads the seeds out: pick the first centroid uniformly at random from the data; then pick each next centroid from the data with probability proportional to D(x)², the squared distance from x to the nearest centroid chosen so far. Points far from existing centroids are much more likely to be chosen.</p>
+  <p>Example: centroid 1 is at 1 among points {1, 2, 3, 10, 11, 12}. D² values: 0, 1, 4, 81, 100, 121, total 307. The probability that the second seed lands in the right-hand group is (81 + 100 + 121)/307 ≈ 98%. Arthur and Vassilvitskii proved the expected cost after seeding alone is within O(log k) of optimal. scikit-learn uses k-means++ by default and also runs several initialisations (<code>n_init</code>) keeping the best.</p>
+
+  <h3>3.4 Choosing k: elbow and silhouette</h3>
+  <p><strong>Elbow method.</strong> Plot WCSS against k. WCSS always decreases as k grows (with k = m it is zero), but the decrease slows sharply once k passes the "natural" number of groups. The k at the bend is a candidate. It is often ambiguous, a smooth curve with no clear elbow.</p>
+  <p><strong>Silhouette.</strong> For each point i, let a(i) be its average distance to other points in its own cluster (cohesion), and b(i) the average distance to points in the <em>nearest other</em> cluster (separation). The silhouette is</p>
+  \[ s(i) = \frac{b(i) - a(i)}{\max\{a(i), b(i)\}} \in [-1, 1]. \]
+  <p>Near 1: well inside its cluster and far from others. Near 0: on a boundary. Negative: probably assigned to the wrong cluster. Example: a(i) = 2, b(i) = 8 gives s = 6/8 = 0.75; a(i) = 5, b(i) = 4 gives s = −1/5 = −0.2. The mean silhouette over all points summarises a clustering; plotting per-cluster silhouette distributions reveals weak clusters. Its cost is O(m²) distances, so use a sample for large data. Other internal indices: Davies-Bouldin (lower is better), Calinski-Harabasz (higher is better). All of them, like k-means itself, prefer compact convex clusters.</p>
+  <p><strong>The real criterion is usefulness.</strong> A segmentation with k = 5 that marketing can act on beats k = 7 with a higher silhouette that nobody can name. Check stability (do clusters persist across bootstrap samples and random seeds?) and interpretability (can you describe each centroid?).</p>
+
+  <h3>3.5 Hierarchical (agglomerative) clustering</h3>
+  <p><strong>Intuition.</strong> Start with every point as its own cluster. Repeatedly merge the two closest clusters until one remains. The full merge history is a tree, the <strong>dendrogram</strong>; cutting it at a height yields a flat clustering, and you can choose the cut after seeing the tree.</p>
+  <p>"Closest clusters" needs a <strong>linkage</strong> rule:</p>
+  <ul>
+    <li><strong>Single</strong>: distance between the closest pair of points. Finds elongated, chained shapes but suffers "chaining" (a thin bridge of points merges two clusters).</li>
+    <li><strong>Complete</strong>: distance between the farthest pair. Compact clusters; sensitive to outliers.</li>
+    <li><strong>Average</strong>: mean pairwise distance. A compromise.</li>
+    <li><strong>Ward</strong>: merge the pair that increases total within-cluster variance the least. Produces k-means-like compact clusters; scikit-learn's default.</li>
+  </ul>
+  <p>Example with points A = 0, B = 1, C = 5, D = 6, E = 20 under single linkage: merge A-B (distance 1) and C-D (1), then {A, B}-{C, D} (distance 4, between B and C), then E (distance 14). Cutting between heights 4 and 14 gives {A, B, C, D} and {E}; cutting between 1 and 4 gives {A, B}, {C, D}, {E}.</p>
+  <p>Cost: standard algorithms need O(m²) memory for the distance matrix and O(m²) to O(m³) time, so hierarchical clustering suits thousands to tens of thousands of points, not millions. It shines when the hierarchy itself is meaningful (taxonomies of products, families of log templates) and when connectivity constraints matter (only merge geographically adjacent regions).</p>
+
+  <h3>3.6 DBSCAN and HDBSCAN: density-based clustering</h3>
+  <p><strong>Intuition.</strong> A cluster is a region where points are packed densely, separated from other clusters by sparse regions. Points in sparse regions are <em>noise</em>, not forced into any cluster. Two parameters: a radius ε and a minimum count <code>min_samples</code>.</p>
+  <ul>
+    <li>A <strong>core point</strong> has at least <code>min_samples</code> points (including itself) within ε.</li>
+    <li>A <strong>border point</strong> is within ε of a core point but is not core itself.</li>
+    <li>A <strong>noise point</strong> is neither.</li>
+  </ul>
+  <p>Clusters are formed by connecting core points within ε of each other (transitively) and attaching their border points. Consequences: DBSCAN finds arbitrarily shaped clusters (rings, crescents, river-shaped GPS traces), determines the number of clusters itself, and labels outliers as noise (label −1). Its weaknesses: one global ε cannot handle clusters of very different densities, and ε is hard to choose in high dimensions. The <em>k-distance plot</em> helps: sort every point's distance to its k-th nearest neighbour (k = min_samples) and choose ε near the knee.</p>
+  <p><strong>HDBSCAN</strong> removes the single-ε limitation: conceptually it runs DBSCAN over all ε values, builds a hierarchy of density-connected clusters, and extracts the most persistent (stable) ones. Its main parameter, <code>min_cluster_size</code>, is far more intuitive than ε. For embeddings and geospatial data, HDBSCAN is usually a better default than DBSCAN <span class="tag opinion">Opinion</span>.</p>
+
+  <h3>3.7 Gaussian mixture models and EM</h3>
+  <p><strong>Intuition.</strong> Assume the data were generated by K Gaussian "blobs": to create a point, pick blob k with probability π<sub>k</sub>, then sample from that blob's Gaussian with mean μ<sub>k</sub> and covariance Σ<sub>k</sub>. Fitting the model means recovering the blobs. Unlike k-means, each point gets a <em>soft</em> assignment, a probability of belonging to each blob (its <em>responsibility</em>), and blobs can be elongated ellipses of different sizes thanks to full covariance matrices.</p>
+  \[ p(\mathbf{x}) = \sum_{k=1}^{K}\pi_k\,\mathcal{N}(\mathbf{x}\mid\boldsymbol\mu_k,\Sigma_k). \]
+  <p><strong>EM (expectation-maximisation)</strong> fits it by alternating two steps, structurally the same as k-means:</p>
+  <ul>
+    <li><strong>E-step</strong>: given current parameters, compute each point's responsibilities r<sub>ik</sub> = π<sub>k</sub>𝒩(x<sub>i</sub>|μ<sub>k</sub>, Σ<sub>k</sub>) / Σ<sub>j</sub> π<sub>j</sub>𝒩(x<sub>i</sub>|μ<sub>j</sub>, Σ<sub>j</sub>). That is Bayes' theorem: prior π<sub>k</sub> times likelihood, normalised.</li>
+    <li><strong>M-step</strong>: given responsibilities, re-estimate each blob as a weighted MLE: π<sub>k</sub> = average responsibility; μ<sub>k</sub> = responsibility-weighted mean; Σ<sub>k</sub> = responsibility-weighted covariance.</li>
+  </ul>
+  <p>Numeric E-step example (1-D): two components with equal weights, μ₁ = 0, μ₂ = 4, both σ = 1. For x = 1: the densities are proportional to e<sup>−0.5</sup> = 0.607 and e<sup>−4.5</sup> = 0.011, so r₁ = 0.607/0.618 ≈ 0.982, r₂ ≈ 0.018. For x = 2 (equidistant), r₁ = r₂ = 0.5.</p>
+  <p>Each EM iteration provably does not decrease the data log-likelihood. K-means is the limit of EM for a GMM with equal, spherical covariances shrinking to zero, where soft responsibilities become hard assignments. GMMs give you a density p(x), useful for anomaly scoring (low p(x) is unusual), and a principled way to choose K via the <strong>BIC</strong> (Bayesian information criterion), which trades log-likelihood against parameter count: BIC = −2 log L + (number of parameters) × log m, lower is better.</p>
+
+  <h3>3.8 Principal component analysis</h3>
+  <p><strong>Intuition.</strong> Rotate the coordinate system so that the first axis points along the direction in which the data vary the most, the second along the direction of most remaining variation (perpendicular to the first), and so on. Keep only the first few axes. Because many real features are correlated (CPU and request rate; height and weight; pixels near each other), a few directions often carry most of the variation, and dropping the rest loses little.</p>
+  <p>Picture 2-D points scattered along the line y ≈ x: say (1, 1.2), (2, 1.9), (3, 3.1), (4, 3.8). The first principal direction is close to (0.707, 0.707), along the diagonal; projecting onto it gives each point a single coordinate, and the second direction (−0.707, 0.707) carries only small wiggles. One number per point instead of two, with little error.</p>
+  <p><strong>How it is computed.</strong> Centre the data (subtract each feature's mean, essential). Then either eigen-decompose the covariance matrix C = XᵀX/(m − 1), whose eigenvectors are the principal directions and eigenvalues the variances along them, or (as libraries do) take the SVD of the centred X = UΣVᵀ: the rows of Vᵀ are the principal directions, the projected coordinates (scores) are UΣ = XV, and the variances are σ<sub>j</sub>²/(m − 1). §6 derives why the top eigenvector maximises variance.</p>
+  <p><strong>Explained variance.</strong> The fraction of total variance captured by component j is λ<sub>j</sub>/Σλ. If eigenvalues are [4.0, 1.0, 0.5, 0.3, 0.2] (total 6.0), the first component explains 66.7%, the first two 83.3%, the first three 91.7%. A <strong>scree plot</strong> of these values, or a rule like "keep enough components for 95% cumulative variance" (<code>PCA(n_components=0.95)</code>), sets the dimension.</p>
+  <p><strong>Standardise or not?</strong> PCA on raw features is dominated by the features with the largest variance (units!). Standardise when features have different units (equivalent to PCA on the correlation matrix); do not when features share a unit and their raw variance is meaningful (pixel intensities).</p>
+  <p><strong>Uses.</strong> Compression and denoising (reconstruct from the top k components: X̂ = X V<sub>k</sub>V<sub>k</sub>ᵀ, adding back the mean); decorrelating features before linear models; speeding up downstream models and k-NN; visualising (first two components); anomaly detection via reconstruction error (a point poorly reconstructed by the top components does not follow the usual correlations, e.g. CPU high while request rate is low). PCA is linear: it cannot unroll curved structures (a "Swiss roll"), which is where t-SNE and UMAP come in.</p>
+
+  <h3>3.9 t-SNE</h3>
+  <p><strong>Intuition.</strong> t-SNE (t-distributed stochastic neighbour embedding) places points in 2-D so that each point's <em>neighbours</em> in high dimensions remain its neighbours on the plot. It converts high-dimensional distances into neighbour probabilities (each point "picks" a neighbour with probability decreasing in distance, using a Gaussian whose width is set per point so that its effective number of neighbours equals the <strong>perplexity</strong>, typically 5–50). It then finds 2-D positions whose neighbour probabilities, computed with a heavy-tailed Student-t kernel, match the originals, by minimising the KL divergence between the two distributions with gradient descent.</p>
+  <p>The heavy tail is the clever part: in 2-D there is not enough room to keep all moderate distances, so the t-kernel lets moderately distant points be placed far apart, producing well-separated visual clusters (alleviating the "crowding problem").</p>
+  <p><strong>Read t-SNE plots carefully.</strong> Local neighbourhoods are meaningful; global geometry largely is not. Cluster sizes in the plot do not reflect real spread; distances between clusters do not reflect real distances; different perplexities and seeds give different pictures; and random data can show apparent clusters at low perplexity. t-SNE is for visualisation and hypothesis generation only, never as features for a model or as proof of cluster structure. It is also O(m log m) at best (Barnes-Hut approximation) and has no straightforward transform for new points.</p>
+
+  <h3>3.10 UMAP</h3>
+  <p><strong>Intuition.</strong> UMAP (uniform manifold approximation and projection) builds a weighted k-nearest-neighbour graph in high dimensions (with each point's distances rescaled by its local density) and then lays that graph out in low dimensions, pulling connected points together and pushing random non-neighbours apart, optimising a cross-entropy between the high- and low-dimensional edge weights. Parameters: <code>n_neighbors</code> (local versus global emphasis, like perplexity) and <code>min_dist</code> (how tightly points may pack).</p>
+  <p>Compared with t-SNE, UMAP is typically faster on large datasets, tends to preserve somewhat more global structure, supports transforming new points, and can embed into more than 2 dimensions as a preprocessing step for clustering (UMAP to ~10 dimensions, then HDBSCAN, is a popular pipeline for clustering text embeddings, used for example by the BERTopic library). The same caveats about interpreting distances and cluster sizes apply.</p>
+
+  <h3>3.11 Anomaly detection and isolation forests</h3>
+  <p>Anomaly detection asks "how unusual is this point?" Approaches: <em>statistical</em> (z-scores, robust thresholds, seasonal baselines for time series); <em>distance/density</em> (distance to k-th neighbour, Local Outlier Factor, low GMM density); <em>reconstruction</em> (large PCA or autoencoder reconstruction error); and <em>isolation</em>.</p>
+  <p><strong>Isolation forest intuition.</strong> Anomalies are few and different, so they are <em>easy to isolate</em>. Build random trees by repeatedly picking a random feature and a random split value between its min and max until each point sits alone. A normal point deep inside a dense region needs many random cuts to be isolated; an anomaly far from the rest is often isolated in a few cuts. Average the path length over many random trees: short average path means anomalous. Example: on a 1-D dataset of 99 values in [0, 1] and one value at 50, a random threshold between 0 and 50 lands above 1 with probability 98%, isolating the outlier in a single cut.</p>
+  <p>The anomaly score normalises the average path length E[h(x)] by c(n), the average path length of an unsuccessful search in a binary search tree of n points:</p>
+  \[ s(x, n) = 2^{-\frac{\mathbb{E}[h(x)]}{c(n)}},\qquad c(n) = 2H(n-1) - \frac{2(n-1)}{n},\quad H(i)\approx\ln i + 0.5772. \]
+  <p>Scores near 1 are anomalies, well below 0.5 normal, around 0.5 everywhere means no distinct anomalies. Isolation forests use small subsamples per tree (256 by default), which makes them fast (linear in m), memory-light, and resistant to "masking" by clusters of anomalies. Limitations: axis-parallel cuts struggle with anomalies defined by correlations between features (Extended Isolation Forest addresses this), and the <code>contamination</code> parameter only sets the threshold; it does not make the model smarter.</p>
+  <p>Without labels, anomaly detectors are judged by the alerts they produce. Treat them as ranking systems: the top of the ranking must be dense with real issues, which you measure with precision at k on investigated alerts.</p>
+</section>
